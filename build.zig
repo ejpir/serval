@@ -1,0 +1,240 @@
+const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    // =========================================================================
+    // Serval Library Modules
+    // =========================================================================
+
+    // Foundation module - no dependencies
+    const serval_core_module = b.addModule("serval-core", .{
+        .root_source_file = b.path("serval-core/mod.zig"),
+    });
+
+    // Network utilities - no dependencies
+    const serval_net_module = b.addModule("serval-net", .{
+        .root_source_file = b.path("serval-net/mod.zig"),
+    });
+
+    // CLI module - no dependencies
+    const serval_cli_module = b.addModule("serval-cli", .{
+        .root_source_file = b.path("serval-cli/mod.zig"),
+    });
+
+    // Pool module - depends on core
+    const serval_pool_module = b.addModule("serval-pool", .{
+        .root_source_file = b.path("serval-pool/mod.zig"),
+        .imports = &.{
+            .{ .name = "serval-core", .module = serval_core_module },
+        },
+    });
+
+    // HTTP parser module - depends on core
+    const serval_http_module = b.addModule("serval-http", .{
+        .root_source_file = b.path("serval-http/mod.zig"),
+        .imports = &.{
+            .{ .name = "serval-core", .module = serval_core_module },
+        },
+    });
+
+    // Metrics module - depends on core
+    const serval_metrics_module = b.addModule("serval-metrics", .{
+        .root_source_file = b.path("serval-metrics/mod.zig"),
+        .imports = &.{
+            .{ .name = "serval-core", .module = serval_core_module },
+        },
+    });
+
+    // Tracing module - depends on core
+    const serval_tracing_module = b.addModule("serval-tracing", .{
+        .root_source_file = b.path("serval-tracing/mod.zig"),
+        .imports = &.{
+            .{ .name = "serval-core", .module = serval_core_module },
+        },
+    });
+
+    // OpenTelemetry module - depends on core + tracing
+    const serval_otel_module = b.addModule("serval-otel", .{
+        .root_source_file = b.path("serval-otel/mod.zig"),
+        .imports = &.{
+            .{ .name = "serval-core", .module = serval_core_module },
+            .{ .name = "serval-tracing", .module = serval_tracing_module },
+        },
+    });
+
+    // Proxy module - depends on core, net, pool, tracing, http
+    const serval_proxy_module = b.addModule("serval-proxy", .{
+        .root_source_file = b.path("serval-proxy/mod.zig"),
+        .imports = &.{
+            .{ .name = "serval-core", .module = serval_core_module },
+            .{ .name = "serval-net", .module = serval_net_module },
+            .{ .name = "serval-pool", .module = serval_pool_module },
+            .{ .name = "serval-tracing", .module = serval_tracing_module },
+            .{ .name = "serval-http", .module = serval_http_module },
+        },
+    });
+
+    // Server module - composes core, net, http, pool, proxy, metrics, tracing
+    const serval_server_module = b.addModule("serval-server", .{
+        .root_source_file = b.path("serval-server/mod.zig"),
+        .imports = &.{
+            .{ .name = "serval-core", .module = serval_core_module },
+            .{ .name = "serval-net", .module = serval_net_module },
+            .{ .name = "serval-http", .module = serval_http_module },
+            .{ .name = "serval-pool", .module = serval_pool_module },
+            .{ .name = "serval-proxy", .module = serval_proxy_module },
+            .{ .name = "serval-metrics", .module = serval_metrics_module },
+            .{ .name = "serval-tracing", .module = serval_tracing_module },
+        },
+    });
+
+    // Load balancer handler module - depends on core
+    const serval_lb_module = b.addModule("serval-lb", .{
+        .root_source_file = b.path("serval-lb/mod.zig"),
+        .imports = &.{
+            .{ .name = "serval-core", .module = serval_core_module },
+        },
+    });
+
+    // Main serval module - composes all (umbrella)
+    const serval_module = b.addModule("serval", .{
+        .root_source_file = b.path("serval/mod.zig"),
+        .imports = &.{
+            .{ .name = "serval-core", .module = serval_core_module },
+            .{ .name = "serval-net", .module = serval_net_module },
+            .{ .name = "serval-http", .module = serval_http_module },
+            .{ .name = "serval-pool", .module = serval_pool_module },
+            .{ .name = "serval-proxy", .module = serval_proxy_module },
+            .{ .name = "serval-metrics", .module = serval_metrics_module },
+            .{ .name = "serval-tracing", .module = serval_tracing_module },
+            .{ .name = "serval-otel", .module = serval_otel_module },
+            .{ .name = "serval-server", .module = serval_server_module },
+        },
+    });
+
+    // =========================================================================
+    // Tests
+    // =========================================================================
+
+    // Serval library tests (full integration)
+    const serval_tests_mod = b.createModule(.{
+        .root_source_file = b.path("serval/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    serval_tests_mod.addImport("serval-core", serval_core_module);
+    serval_tests_mod.addImport("serval-net", serval_net_module);
+    serval_tests_mod.addImport("serval-http", serval_http_module);
+    serval_tests_mod.addImport("serval-pool", serval_pool_module);
+    serval_tests_mod.addImport("serval-proxy", serval_proxy_module);
+    serval_tests_mod.addImport("serval-metrics", serval_metrics_module);
+    serval_tests_mod.addImport("serval-tracing", serval_tracing_module);
+    serval_tests_mod.addImport("serval-otel", serval_otel_module);
+    serval_tests_mod.addImport("serval-server", serval_server_module);
+    const serval_tests = b.addTest(.{
+        .name = "serval_tests",
+        .root_module = serval_tests_mod,
+    });
+    const run_serval_tests = b.addRunArtifact(serval_tests);
+
+    const test_step = b.step("test", "Run all serval library tests");
+    test_step.dependOn(&run_serval_tests.step);
+
+    // Load balancer handler tests
+    const lb_tests_mod = b.createModule(.{
+        .root_source_file = b.path("serval-lb/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lb_tests_mod.addImport("serval-core", serval_core_module);
+    const lb_tests = b.addTest(.{
+        .name = "lb_tests",
+        .root_module = lb_tests_mod,
+    });
+    const run_lb_tests = b.addRunArtifact(lb_tests);
+
+    const lb_test_step = b.step("test-lb", "Run serval-lb library tests");
+    lb_test_step.dependOn(&run_lb_tests.step);
+
+    // OpenTelemetry module tests
+    const otel_tests_mod = b.createModule(.{
+        .root_source_file = b.path("serval-otel/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "serval-core", .module = serval_core_module },
+            .{ .name = "serval-tracing", .module = serval_tracing_module },
+        },
+    });
+    const otel_tests = b.addTest(.{
+        .name = "otel_tests",
+        .root_module = otel_tests_mod,
+    });
+    const run_otel_tests = b.addRunArtifact(otel_tests);
+
+    const otel_test_step = b.step("test-otel", "Run serval-otel library tests");
+    otel_test_step.dependOn(&run_otel_tests.step);
+
+    // =========================================================================
+    // Examples
+    // =========================================================================
+
+    // Stats display module (for use by examples)
+    const stats_display_module = b.addModule("stats_display", .{
+        .root_source_file = b.path("examples/stats_display.zig"),
+        .imports = &.{
+            .{ .name = "serval", .module = serval_module },
+            .{ .name = "serval-metrics", .module = serval_metrics_module },
+            .{ .name = "serval-core", .module = serval_core_module },
+        },
+    });
+
+    // Load balancer example
+    const lb_example_mod = b.createModule(.{
+        .root_source_file = b.path("examples/lb_example.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lb_example_mod.addImport("serval", serval_module);
+    lb_example_mod.addImport("serval-lb", serval_lb_module);
+    lb_example_mod.addImport("serval-cli", serval_cli_module);
+    lb_example_mod.addImport("serval-otel", serval_otel_module);
+    lb_example_mod.addImport("serval-metrics", serval_metrics_module);
+    lb_example_mod.addImport("stats_display", stats_display_module);
+    const lb_example = b.addExecutable(.{
+        .name = "lb_example",
+        .root_module = lb_example_mod,
+    });
+    const build_lb_example = b.addInstallArtifact(lb_example, .{});
+    const run_lb_example = b.addRunArtifact(lb_example);
+
+    if (b.args) |args| {
+        run_lb_example.addArgs(args);
+    }
+
+    const run_lb_example_step = b.step("run-lb-example", "Run load balancer example");
+    run_lb_example_step.dependOn(&run_lb_example.step);
+
+    // OTLP test example
+    const otel_test_mod = b.createModule(.{
+        .root_source_file = b.path("examples/otel_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    otel_test_mod.addImport("serval-otel", serval_otel_module);
+    const otel_test = b.addExecutable(.{
+        .name = "otel_test",
+        .root_module = otel_test_mod,
+    });
+    const build_otel_test = b.addInstallArtifact(otel_test, .{});
+    _ = build_otel_test;
+
+    const run_otel_test = b.addRunArtifact(otel_test);
+    const run_otel_test_step = b.step("run-otel-test", "Run OTLP export test");
+    run_otel_test_step.dependOn(&run_otel_test.step);
+
+    // Default step
+    b.default_step = &build_lb_example.step;
+}
