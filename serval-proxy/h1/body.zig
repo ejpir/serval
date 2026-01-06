@@ -2,6 +2,7 @@
 //! Body Transfer
 //!
 //! Zero-copy body streaming using splice (Linux) or buffered copy.
+//! Supports both Content-Length and chunked transfer encoding.
 //! TigerStyle: Platform selection at comptime, bounded loops.
 
 const std = @import("std");
@@ -16,6 +17,9 @@ const BodyInfo = proxy_types.BodyInfo;
 
 const request_mod = @import("request.zig");
 const sendBuffer = request_mod.sendBuffer;
+
+const chunked_transfer = @import("chunked.zig");
+const forwardChunkedBody = chunked_transfer.forwardChunkedBody;
 
 const core = @import("serval-core");
 const SPLICE_CHUNK_SIZE_BYTES = core.config.SPLICE_CHUNK_SIZE_BYTES;
@@ -46,11 +50,14 @@ pub fn forwardBody(
     assert(client_fd >= 0);
 
     // Comptime select: Linux uses splice, others use buffered copy
-    if (comptime builtin.os.tag == .linux) {
-        return forwardBodySplice(upstream_fd, client_fd, length_bytes);
-    } else {
-        return forwardBodyCopy(upstream_fd, client_fd, length_bytes);
-    }
+    const result = if (comptime builtin.os.tag == .linux)
+        try forwardBodySplice(upstream_fd, client_fd, length_bytes)
+    else
+        try forwardBodyCopy(upstream_fd, client_fd, length_bytes);
+
+    // Postcondition: forwarded at most requested bytes (may be less on EOF/error).
+    assert(result <= length_bytes);
+    return result;
 }
 
 // =============================================================================
@@ -170,29 +177,68 @@ fn forwardBodyCopy(upstream_fd: i32, client_fd: i32, length_bytes: u64) ForwardE
 // =============================================================================
 
 /// Stream request body from client to upstream.
-/// Sends already-read bytes first, then splices/copies remaining.
-/// TigerStyle: Uses stream for initial bytes, raw fds for splice zero-copy.
+/// Supports Content-Length bodies (known size) and chunked transfer encoding.
+/// Sends already-read bytes first, then streams remaining from client.
+/// TigerStyle: Uses stream for initial bytes, raw fds for zero-copy transfer.
 pub fn streamRequestBody(
     client_fd: i32,
     upstream_stream: Io.net.Stream,
     io: Io,
     body_info: BodyInfo,
 ) ForwardError!u64 {
+    // Precondition: valid client file descriptor.
     assert(client_fd >= 0);
+    assert(upstream_stream.socket.handle >= 0);
 
-    const content_length = body_info.content_length orelse return 0;
-    assert(body_info.bytes_already_read <= content_length);
+    // Dispatch based on body framing mode.
+    const result = switch (body_info.framing) {
+        .none => 0, // No body to stream (GET, HEAD, etc.)
+        .content_length => |length| try streamContentLengthBody(
+            client_fd,
+            upstream_stream,
+            io,
+            length,
+            body_info.bytes_already_read,
+            body_info.initial_body,
+        ),
+        .chunked => try streamChunkedRequestBody(
+            client_fd,
+            upstream_stream,
+            io,
+            body_info.initial_body,
+        ),
+    };
+
+    // Postcondition: returned bytes is non-negative (always true for u64).
+    // For content_length, result <= length; for chunked, result >= 5 (min "0\r\n\r\n").
+    return result;
+}
+
+/// Stream Content-Length body from client to upstream.
+/// Sends initial_body first, then zero-copy transfers remaining bytes.
+/// TigerStyle: Explicit length, bounded transfer.
+fn streamContentLengthBody(
+    client_fd: i32,
+    upstream_stream: Io.net.Stream,
+    io: Io,
+    content_length: u64,
+    bytes_already_read: u64,
+    initial_body: []const u8,
+) ForwardError!u64 {
+    // Preconditions: valid fd, bytes_already_read cannot exceed content_length.
+    assert(client_fd >= 0);
+    assert(bytes_already_read <= content_length);
 
     var total_sent: u64 = 0;
 
-    // Send already-read body bytes via async stream
-    if (body_info.initial_body.len > 0) {
-        try sendBuffer(upstream_stream, io, body_info.initial_body);
-        total_sent += body_info.initial_body.len;
+    // Send already-read body bytes via async stream.
+    if (initial_body.len > 0) {
+        try sendBuffer(upstream_stream, io, initial_body);
+        total_sent += initial_body.len;
     }
 
-    // Stream remaining bytes using splice (extract raw fd for zero-copy)
-    const remaining = content_length - body_info.bytes_already_read;
+    // Stream remaining bytes using splice (extract raw fd for zero-copy).
+    const remaining = content_length - bytes_already_read;
     if (remaining > 0) {
         const upstream_fd = upstream_stream.socket.handle;
         if (comptime builtin.os.tag == .linux) {
@@ -205,5 +251,48 @@ pub fn streamRequestBody(
     // Postcondition: sent at most content_length bytes.
     // May be less if upstream closed early, client disconnected, or network error.
     assert(total_sent <= content_length);
+    return total_sent;
+}
+
+/// Stream chunked request body from client to upstream.
+/// Sends initial_body first (may contain partial chunk data), then streams
+/// remaining chunks using forwardChunkedBody.
+///
+/// Design note: For chunked bodies, initial_body may contain partial chunk framing
+/// read during header parsing. We send this first via the async stream, then
+/// continue streaming the rest of the chunked body from the raw client fd.
+///
+/// TigerStyle: Bounded chunk iteration (in forwardChunkedBody), explicit error handling.
+fn streamChunkedRequestBody(
+    client_fd: i32,
+    upstream_stream: Io.net.Stream,
+    io: Io,
+    initial_body: []const u8,
+) ForwardError!u64 {
+    // Precondition: valid client file descriptor.
+    assert(client_fd >= 0);
+
+    // Derive upstream_fd from stream - single source of truth.
+    const upstream_fd = upstream_stream.socket.handle;
+    assert(upstream_fd >= 0);
+
+    var total_sent: u64 = 0;
+
+    // Send already-read chunk data via async stream.
+    // This may contain partial chunk headers/data read during request parsing.
+    if (initial_body.len > 0) {
+        try sendBuffer(upstream_stream, io, initial_body);
+        total_sent += initial_body.len;
+    }
+
+    // Stream remaining chunks from client to upstream.
+    // forwardChunkedBody reads chunks from first fd and writes to second.
+    // Direction: client_fd (source) -> upstream_fd (destination).
+    // Note: forwardChunkedBody has its own postcondition asserting >= 5 bytes.
+    total_sent += try forwardChunkedBody(client_fd, upstream_fd);
+
+    // Postcondition: total_sent includes initial_body plus chunked stream bytes.
+    // Minimum chunked body is "0\r\n\r\n" (5 bytes) if no initial_body.
+    assert(total_sent >= initial_body.len);
     return total_sent;
 }

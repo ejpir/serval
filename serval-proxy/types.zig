@@ -4,6 +4,9 @@
 //! Error, result, and metadata types for upstream forwarding.
 //! TigerStyle: Explicit types, units in names (_ns suffix).
 
+const core = @import("serval-core");
+const BodyFraming = core.BodyFraming;
+
 // =============================================================================
 // Forward Errors
 // =============================================================================
@@ -53,13 +56,38 @@ pub const ForwardResult = struct {
 /// Information about request body for streaming forwarding.
 /// Used to pass body metadata to the forwarder so it can stream
 /// the body from client to upstream without full buffering.
+///
+/// TigerStyle: Uses tagged union (BodyFraming) to prevent invalid states
+/// like having both Content-Length and chunked encoding simultaneously.
 pub const BodyInfo = struct {
-    /// Content-Length from request headers (null if chunked/unknown).
-    content_length: ?u64,
+    /// Body framing mode: content_length, chunked, or none.
+    /// Determines how the forwarder reads the body from client.
+    framing: BodyFraming,
     /// Number of body bytes already read during header parsing.
+    /// For chunked bodies, this counts raw bytes including chunk framing.
     bytes_already_read: u64,
     /// Initial body bytes read with headers (slice into parser buffer).
+    /// For chunked bodies, may contain partial chunk data.
     initial_body: []const u8,
+
+    /// Returns Content-Length if body has known length, null otherwise.
+    /// Convenience method for callers that only handle Content-Length bodies.
+    /// TigerStyle: Trivial delegation to BodyFraming, assertion-exempt.
+    pub fn getContentLength(self: BodyInfo) ?u64 {
+        return self.framing.getContentLength();
+    }
+
+    /// Returns true if body uses chunked transfer encoding.
+    /// TigerStyle: Trivial delegation to BodyFraming, assertion-exempt.
+    pub fn isChunked(self: BodyInfo) bool {
+        return self.framing == .chunked;
+    }
+
+    /// Returns true if there is no body.
+    /// TigerStyle: Trivial delegation to BodyFraming, assertion-exempt.
+    pub fn hasNoBody(self: BodyInfo) bool {
+        return self.framing == .none;
+    }
 };
 
 // =============================================================================
@@ -108,12 +136,14 @@ test "CRITICAL: ForwardError covers all failure modes" {
 
 test "BodyInfo: No body scenario (GET, DELETE)" {
     const no_body = BodyInfo{
-        .content_length = null,
+        .framing = .none,
         .bytes_already_read = 0,
         .initial_body = "",
     };
 
-    try testing.expectEqual(@as(?u64, null), no_body.content_length);
+    try testing.expect(no_body.hasNoBody());
+    try testing.expect(!no_body.isChunked());
+    try testing.expectEqual(@as(?u64, null), no_body.getContentLength());
     try testing.expectEqual(@as(u64, 0), no_body.bytes_already_read);
     try testing.expectEqual(@as(usize, 0), no_body.initial_body.len);
 }
@@ -121,34 +151,65 @@ test "BodyInfo: No body scenario (GET, DELETE)" {
 test "BodyInfo: POST with small body" {
     const body_text = "name=value&foo=bar";
     const small_body = BodyInfo{
-        .content_length = body_text.len,
+        .framing = .{ .content_length = body_text.len },
         .bytes_already_read = body_text.len,
         .initial_body = body_text,
     };
 
-    try testing.expectEqual(@as(u64, 18), small_body.content_length.?);
+    try testing.expect(!small_body.hasNoBody());
+    try testing.expect(!small_body.isChunked());
+    try testing.expectEqual(@as(u64, 18), small_body.getContentLength().?);
     try testing.expectEqual(@as(u64, 18), small_body.bytes_already_read);
     try testing.expectEqual(@as(usize, 18), small_body.initial_body.len);
 
     // All bytes already read (fits in parser buffer)
-    try testing.expectEqual(small_body.content_length.?, small_body.bytes_already_read);
+    try testing.expectEqual(small_body.getContentLength().?, small_body.bytes_already_read);
 }
 
 test "BodyInfo: POST with partial body" {
     // Large body, only first 100 bytes read with headers
     const partial = BodyInfo{
-        .content_length = 10_000,
+        .framing = .{ .content_length = 10_000 },
         .bytes_already_read = 100,
         .initial_body = &[_]u8{0} ** 100,
     };
 
-    try testing.expectEqual(@as(u64, 10_000), partial.content_length.?);
+    try testing.expect(!partial.hasNoBody());
+    try testing.expect(!partial.isChunked());
+    try testing.expectEqual(@as(u64, 10_000), partial.getContentLength().?);
     try testing.expectEqual(@as(u64, 100), partial.bytes_already_read);
     try testing.expectEqual(@as(usize, 100), partial.initial_body.len);
 
     // Still have bytes to stream: 10_000 - 100 = 9_900
-    const remaining = partial.content_length.? - partial.bytes_already_read;
+    const remaining = partial.getContentLength().? - partial.bytes_already_read;
     try testing.expectEqual(@as(u64, 9_900), remaining);
+}
+
+test "BodyInfo: Chunked body" {
+    // Chunked transfer encoding - size unknown upfront
+    const chunked_body = BodyInfo{
+        .framing = .chunked,
+        .bytes_already_read = 0,
+        .initial_body = "",
+    };
+
+    try testing.expect(!chunked_body.hasNoBody());
+    try testing.expect(chunked_body.isChunked());
+    try testing.expectEqual(@as(?u64, null), chunked_body.getContentLength());
+}
+
+test "BodyInfo: Chunked body with initial data" {
+    // Chunked body where some chunk data was read with headers
+    const partial_chunk = "5\r\nhello";
+    const chunked_partial = BodyInfo{
+        .framing = .chunked,
+        .bytes_already_read = partial_chunk.len,
+        .initial_body = partial_chunk,
+    };
+
+    try testing.expect(chunked_partial.isChunked());
+    try testing.expectEqual(@as(usize, 8), chunked_partial.initial_body.len);
+    try testing.expectEqualStrings("5\r\nhello", chunked_partial.initial_body);
 }
 
 test "ForwardResult: Connection reuse flag semantics" {

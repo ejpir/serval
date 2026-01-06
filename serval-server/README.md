@@ -88,10 +88,12 @@ Connection state and lifecycle utilities:
 ### h1/response.zig
 HTTP/1.1 response writing utilities (pure functions with explicit I/O parameters):
 - `statusText()`: Get HTTP status reason phrase per RFC 9110
-- `sendResponse()`: Format and send complete response to client
+- `sendResponse()`: Format and send complete response to client (Content-Length or chunked)
 - `sendErrorResponse()`: Send error responses (4xx, 5xx)
 - `send100Continue()`: Send 100 Continue for Expect headers
 - `send501NotImplemented()`: Send 501 for unsupported HTTP methods
+
+Supports both `Content-Length` and `Transfer-Encoding: chunked` responses via `ResponseMode`.
 
 ### h1/reader.zig
 Request reading utilities with zero allocation:

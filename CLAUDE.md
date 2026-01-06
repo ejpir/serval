@@ -16,14 +16,14 @@
 </commands>
 
 <architecture>
-  <module name="serval" path="lib/serval/">Main HTTP/1.1 server library (imports all modules)</module>
-  <module name="serval-core" path="lib/serval-core/">Foundation: types, config, errors, context, log</module>
-  <module name="serval-http" path="lib/serval-http/">HTTP/1.1 parser</module>
-  <module name="serval-pool" path="lib/serval-pool/">Connection pooling</module>
-  <module name="serval-proxy" path="lib/serval-proxy/">Upstream forwarding (splice zero-copy)</module>
-  <module name="serval-metrics" path="lib/serval-metrics/">Metrics interfaces</module>
-  <module name="serval-tracing" path="lib/serval-tracing/">Distributed tracing interfaces</module>
-  <module name="serval-lb" path="lib/serval-lb/">Load balancer handler (round-robin)</module>
+  <module name="serval" path="serval/">Main HTTP/1.1 server library (imports all modules)</module>
+  <module name="serval-core" path="serval-core/">Foundation: types, config, errors, context, log</module>
+  <module name="serval-http" path="serval-http/">HTTP/1.1 parser</module>
+  <module name="serval-pool" path="serval-pool/">Connection pooling</module>
+  <module name="serval-proxy" path="serval-proxy/">Upstream forwarding (splice zero-copy)</module>
+  <module name="serval-metrics" path="serval-metrics/">Metrics interfaces</module>
+  <module name="serval-tracing" path="serval-tracing/">Distributed tracing interfaces</module>
+  <module name="serval-lb" path="serval-lb/">Load balancer handler (round-robin)</module>
 
   <design-points>
     <point>Concurrent connection handling via Io.Group.concurrent (io_uring batch submission)</point>
@@ -210,12 +210,12 @@
     <answer if="yes">
       <sub-question>Is the existing file under 300 lines and cohesive?</sub-question>
       <sub-answer if="yes">Add to the existing file.</sub-answer>
-      <sub-answer if="no">Create a new file within the same module (lib/serval-X/).</sub-answer>
+      <sub-answer if="no">Create a new file within the same module (serval-X/).</sub-answer>
     </answer>
     <answer if="no">Continue to question 3.</answer>
 
     <question id="3">Is this a new cross-cutting concern or infrastructure capability?</question>
-    <answer if="yes">Create a new module at layer 2 (lib/serval-newmodule/).</answer>
+    <answer if="yes">Create a new module at layer 2 (serval-newmodule/).</answer>
     <answer if="no">Continue to question 4.</answer>
 
     <question id="4">Is this a new routing/selection algorithm?</question>
@@ -241,7 +241,7 @@
     </guideline>
 
     <guideline name="new-module-criteria">
-      Create a new lib/serval-X/ module ONLY when ALL of these apply:
+      Create a new serval-X/ module ONLY when ALL of these apply:
       - Functionality is reusable across multiple handlers/contexts
       - Has its own lifecycle (init, deinit) or state
       - Would require 2+ files if kept in existing module
@@ -275,7 +275,7 @@
       → headers.zig in serval-http (new file, if parser.zig is large)
     </example>
     <example trigger="Add circuit breaker">
-      → New lib/serval-health/ module (cross-cutting, has state, layer 2)
+      → New serval-health/ module (cross-cutting, has state, layer 2)
     </example>
     <example trigger="Add weighted round-robin">
       → handler.zig in serval-lb (extends existing LB logic)
@@ -319,8 +319,8 @@
 
   <step order="1">Write idiomatic Zig code</step>
   <step order="2">Run /tigerstyle code review</step>
-  <step order="3">Update README.md files in lib/ folders for any modified modules</step>
-  <step order="4">Verify lib/serval/ARCHITECTURE.md is still accurate</step>
+  <step order="3">Update README.md files in serval-*/ folders for any modified modules</step>
+  <step order="4">Verify serval/ARCHITECTURE.md is still accurate</step>
   <step order="5">Build and test</step>
 </workflow>
 
@@ -329,11 +329,13 @@
 
   <doc path="ROADMAP.md">Development phases, priorities, deliverables checklist</doc>
   <doc path="plans/">Detailed implementation plans for major features</doc>
-  <doc path="lib/serval/ARCHITECTURE.md">Module structure, request flow, interfaces</doc>
-  <doc path="lib/*/README.md">Per-module purpose, exports, implementation status</doc>
+  <doc path="serval/ARCHITECTURE.md">Module structure, request flow, interfaces</doc>
+  <doc path="serval-*/README.md">Per-module purpose, exports, implementation status</doc>
 </documentation>
 
 <code-review>
   <skill>/tigerstyle</skill>
   <usage>Use for reviewing code changes before committing</usage>
+  <CRITICAL>You MUST check EVERY rule (S1-S7, P1-P4, C1-C5, Y1-Y6) - NO EXCEPTIONS</CRITICAL>
+  <CRITICAL>Do NOT skip rules. Do NOT summarize. Check each rule individually and report status.</CRITICAL>
 </code-review>

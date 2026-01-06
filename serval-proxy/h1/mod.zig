@@ -24,4 +24,5 @@ test {
     _ = @import("request.zig");
     _ = @import("response.zig");
     _ = @import("body.zig");
+    _ = @import("chunked.zig");
 }

@@ -16,6 +16,8 @@ Zero-dependency foundation module containing shared types, errors, configuration
 - `Method` - HTTP methods enum
 - `Version` - HTTP version enum
 - `Action` - Handler action enum (continue_request, send_response)
+- `BodyFraming` - Body framing type (content_length, chunked, none)
+- `ResponseMode` - Response encoding mode (content_length, chunked)
 
 ### HeaderMap O(1) Lookups
 

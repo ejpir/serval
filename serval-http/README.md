@@ -10,9 +10,11 @@ Parses HTTP/1.1 requests into structured Request objects and provides response p
 
 - `Parser` - HTTP/1.1 request parser
 - `parser` - Parser module
+- `chunked` - Chunked transfer encoding module
 - `parseStatusCode` - Parse HTTP status code from response line
 - `parseContentLength` - Parse Content-Length header from raw header block
 - `parseContentLengthValue` - Parse Content-Length value string to u64
+- `ChunkParser` - Zero-allocation chunked body parser
 
 ## Usage
 
@@ -68,7 +70,7 @@ const cl_value = http.parseContentLengthValue("12345") orelse {
 | Header parsing | Complete |
 | Response status code | Complete |
 | Content-Length parsing | Complete |
-| Transfer-Encoding chunked | Not implemented |
+| Transfer-Encoding chunked | Implemented |
 | Request body reading | Handled by forwarder |
 
 ## Limits

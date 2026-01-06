@@ -354,25 +354,20 @@ pub fn Server(
                 var upstream = handler.selectUpstream(&ctx, &parser.request);
                 ctx.upstream = upstream;
 
-                // Extract body info for streaming
-                const content_length_header = parser.request.headers.get("Content-Length");
-                const content_length_value: ?u64 = if (content_length_header) |cl|
-                    parseContentLengthValue(cl)
-                else
-                    null;
-
-                // Calculate body bytes available in current buffer (relative to buffer_offset)
+                // Extract body info for streaming using parser's body_framing.
+                // body_framing is determined by Transfer-Encoding (chunked) or Content-Length.
                 const data_after_headers = buffer_len - buffer_offset - parser.headers_end;
-                const body_bytes_in_buffer = if (content_length_value) |cl|
-                    @min(data_after_headers, cl)
-                else
-                    0; // No Content-Length means no body for requests
+                const body_bytes_in_buffer: u64 = switch (parser.body_framing) {
+                    .content_length => |cl| @min(data_after_headers, cl),
+                    .chunked => data_after_headers, // May contain partial chunk data
+                    .none => 0,
+                };
 
                 const body_info = BodyInfo{
-                    .content_length = content_length_value,
-                    .bytes_already_read = @intCast(body_bytes_in_buffer),
+                    .framing = parser.body_framing,
+                    .bytes_already_read = body_bytes_in_buffer,
                     .initial_body = if (body_bytes_in_buffer > 0)
-                        recv_buf[buffer_offset + parser.headers_end ..][0..body_bytes_in_buffer]
+                        recv_buf[buffer_offset + parser.headers_end ..][0..@intCast(body_bytes_in_buffer)]
                     else
                         &[_]u8{},
                 };

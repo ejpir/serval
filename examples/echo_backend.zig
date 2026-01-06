@@ -10,6 +10,7 @@
 //! Options:
 //!   --port <PORT>    Listening port (default: 8001)
 //!   --id <ID>        Instance identifier (default: "echo-1")
+//!   --chunked        Use Transfer-Encoding: chunked for responses
 //!   --debug          Enable debug logging
 //!   --help           Show help message
 //!   --version        Show version
@@ -27,6 +28,10 @@ const VERSION = "0.1.0";
 const EchoExtra = struct {
     /// Instance identifier for load balancer testing.
     id: []const u8 = "echo-1",
+    /// Use Transfer-Encoding: chunked for responses.
+    /// Why configurable: Allows testing how clients and proxies handle
+    /// chunked vs content-length responses from backends.
+    chunked: bool = false,
 };
 
 /// Handler that echoes request details without forwarding.
@@ -35,13 +40,36 @@ const EchoHandler = struct {
     id: []const u8,
     port: u16,
     debug: bool,
+    chunked: bool,
+    /// Pre-formatted extra headers buffer. Formatted once at init.
+    extra_headers_buf: [128]u8 = std.mem.zeroes([128]u8),
+    extra_headers_len: u8 = 0,
 
-    pub fn init(id: []const u8, port: u16, debug: bool) EchoHandler {
+    pub fn init(id: []const u8, port: u16, debug: bool, chunked: bool) EchoHandler {
         // Preconditions
         std.debug.assert(id.len > 0);
         std.debug.assert(port > 0);
 
-        return .{ .id = id, .port = port, .debug = debug };
+        var self = EchoHandler{
+            .id = id,
+            .port = port,
+            .debug = debug,
+            .chunked = chunked,
+        };
+
+        // Pre-format extra headers (persists for handler lifetime)
+        const formatted = std.fmt.bufPrint(
+            &self.extra_headers_buf,
+            "X-Backend-Id: {s}\r\n",
+            .{id},
+        ) catch "";
+        self.extra_headers_len = @intCast(formatted.len);
+
+        // Postcondition: handler state is consistent
+        std.debug.assert(self.id.len > 0);
+        std.debug.assert(self.port > 0);
+
+        return self;
     }
 
     /// Required by handler interface, but never called (onRequest handles everything).
@@ -63,17 +91,11 @@ const EchoHandler = struct {
         response_buf: []u8,
     ) serval.Action {
         _ = ctx;
+        // Precondition: response buffer must be provided
+        std.debug.assert(response_buf.len > 0);
 
         // Format echo response into server-provided buffer
         const body_len = formatEchoBody(response_buf, request, self.id, self.port);
-
-        // Format extra headers (X-Backend-Id for programmatic detection)
-        var header_buf: [128]u8 = std.mem.zeroes([128]u8);
-        const extra_headers = std.fmt.bufPrint(
-            &header_buf,
-            "X-Backend-Id: {s}\r\n",
-            .{self.id},
-        ) catch "";
 
         if (self.debug) {
             std.debug.print("[{s}] {s} {s} -> 200 ({d} bytes)\n", .{
@@ -88,7 +110,8 @@ const EchoHandler = struct {
             .status = 200,
             .body = response_buf[0..body_len],
             .content_type = "text/plain",
-            .extra_headers = extra_headers,
+            .extra_headers = self.extra_headers_buf[0..self.extra_headers_len],
+            .response_mode = if (self.chunked) .chunked else .content_length,
         } };
     }
 };
@@ -105,7 +128,7 @@ fn formatEchoBody(
     std.debug.assert(buf.len > 0);
     std.debug.assert(id.len > 0);
 
-    var pos: usize = 0;
+    var position: usize = 0;
 
     // Helper to append formatted text
     const appendFmt = struct {
@@ -128,41 +151,41 @@ fn formatEchoBody(
     }.call;
 
     // Header
-    appendFmt(buf, &pos, "=== Echo Backend: {s} (port {d}) ===\n\n", .{ id, port });
+    appendFmt(buf, &position, "=== Echo Backend: {s} (port {d}) ===\n\n", .{ id, port });
 
     // Request line
-    appendFmt(buf, &pos, "Method: {s}\n", .{@tagName(request.method)});
-    appendFmt(buf, &pos, "Path: {s}\n", .{request.path});
-    appendFmt(buf, &pos, "Version: {s}\n\n", .{@tagName(request.version)});
+    appendFmt(buf, &position, "Method: {s}\n", .{@tagName(request.method)});
+    appendFmt(buf, &position, "Path: {s}\n", .{request.path});
+    appendFmt(buf, &position, "Version: {s}\n\n", .{@tagName(request.version)});
 
     // Headers
-    appendFmt(buf, &pos, "Headers:\n", .{});
+    appendFmt(buf, &position, "Headers:\n", .{});
     const headers = &request.headers;
     // TigerStyle: Bounded iteration over headers.
     var header_idx: u8 = 0;
     while (header_idx < headers.count) : (header_idx += 1) {
         const header = headers.headers[header_idx];
-        appendFmt(buf, &pos, "  {s}: {s}\n", .{ header.name, header.value });
+        appendFmt(buf, &position, "  {s}: {s}\n", .{ header.name, header.value });
     }
 
     // Body (if present)
     if (request.body) |body| {
-        appendFmt(buf, &pos, "\nBody ({d} bytes):\n", .{body.len});
+        appendFmt(buf, &position, "\nBody ({d} bytes):\n", .{body.len});
         // TigerStyle: Truncate large bodies to avoid buffer overflow.
-        const max_body_preview: usize = 1024;
+        const max_body_preview: u32 = 1024;
         const preview_len = @min(body.len, max_body_preview);
-        appendRaw(buf, &pos, body[0..preview_len]);
+        appendRaw(buf, &position, body[0..preview_len]);
         if (body.len > max_body_preview) {
-            appendFmt(buf, &pos, "\n... ({d} more bytes)\n", .{body.len - max_body_preview});
+            appendFmt(buf, &position, "\n... ({d} more bytes)\n", .{body.len - max_body_preview});
         }
     } else {
-        appendFmt(buf, &pos, "\nBody: (empty)\n", .{});
+        appendFmt(buf, &position, "\nBody: (empty)\n", .{});
     }
 
     // Postcondition: returned length is within buffer bounds.
-    std.debug.assert(pos <= buf.len);
+    std.debug.assert(position <= buf.len);
 
-    return pos;
+    return position;
 }
 
 pub fn main() !void {
@@ -178,7 +201,7 @@ pub fn main() !void {
     }
 
     // Initialize handler with config
-    var handler = EchoHandler.init(args.extra.id, args.port, args.debug);
+    var handler = EchoHandler.init(args.extra.id, args.port, args.debug, args.extra.chunked);
 
     // Initialize components (minimal - no pooling/tracing needed for echo)
     var pool = serval.SimplePool.init();
@@ -194,6 +217,7 @@ pub fn main() !void {
 
     // Print startup info
     std.debug.print("Echo backend '{s}' listening on :{d}\n", .{ args.extra.id, args.port });
+    std.debug.print("Response mode: {s}\n", .{if (args.extra.chunked) "chunked" else "content-length"});
     std.debug.print("Debug logging: {}\n", .{args.debug});
 
     // Create and run server

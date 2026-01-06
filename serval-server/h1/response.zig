@@ -152,13 +152,27 @@ pub fn send501NotImplemented(io: Io, stream: Io.net.Stream, message: []const u8)
 
 const types = @import("serval-core").types;
 const DirectResponse = types.DirectResponse;
+const ResponseMode = types.ResponseMode;
 const DIRECT_RESPONSE_HEADER_SIZE_BYTES = config.DIRECT_RESPONSE_HEADER_SIZE_BYTES;
 
 /// Send a direct response from handler without forwarding to upstream.
-/// Body is already formatted in handler-provided buffer, so headers and body
-/// are written separately to avoid copying.
+/// Dispatches to Content-Length or chunked encoding based on response_mode.
 /// TigerStyle: Standalone function with explicit parameters.
 pub fn sendDirectResponse(io: Io, stream: Io.net.Stream, resp: DirectResponse) void {
+    // Preconditions: validate response invariants before dispatch
+    assert(resp.status >= 100 and resp.status < 600);
+    assert(resp.content_type.len > 0);
+
+    switch (resp.response_mode) {
+        .content_length => sendDirectResponseContentLength(io, stream, resp),
+        .chunked => sendDirectResponseChunked(io, stream, resp),
+    }
+}
+
+/// Send direct response with Content-Length framing (RFC 9112 Section 6.2).
+/// Body length is known upfront, sent as single unit after headers.
+/// TigerStyle: Helper function keeps dispatch under 70 lines.
+fn sendDirectResponseContentLength(io: Io, stream: Io.net.Stream, resp: DirectResponse) void {
     // Preconditions
     assert(resp.status >= 100 and resp.status < 600);
     assert(resp.content_type.len > 0);
@@ -178,6 +192,46 @@ pub fn sendDirectResponse(io: Io, stream: Io.net.Stream, resp: DirectResponse) v
     var writer = stream.writer(io, &write_buf);
     writer.interface.writeAll(headers) catch return;
     writer.interface.writeAll(resp.body) catch return;
+    writer.interface.flush() catch return;
+}
+
+/// Send direct response with chunked Transfer-Encoding (RFC 9112 Section 7.1).
+/// Body is chunk-encoded: hex-length CRLF body CRLF, terminated with 0 CRLF CRLF.
+/// Why single chunk: Direct responses have complete body, no streaming benefit.
+/// TigerStyle: Helper function keeps dispatch under 70 lines.
+fn sendDirectResponseChunked(io: Io, stream: Io.net.Stream, resp: DirectResponse) void {
+    // Preconditions
+    assert(resp.status >= 100 and resp.status < 600);
+    assert(resp.content_type.len > 0);
+    // Extra headers must end with \r\n if non-empty
+    assert(resp.extra_headers.len == 0 or std.mem.endsWith(u8, resp.extra_headers, "\r\n"));
+
+    // Format headers with Transfer-Encoding: chunked instead of Content-Length
+    var header_buf: [DIRECT_RESPONSE_HEADER_SIZE_BYTES]u8 = std.mem.zeroes([DIRECT_RESPONSE_HEADER_SIZE_BYTES]u8);
+    const headers = std.fmt.bufPrint(
+        &header_buf,
+        "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nTransfer-Encoding: chunked\r\n{s}\r\n",
+        .{ resp.status, statusText(resp.status), resp.content_type, resp.extra_headers },
+    ) catch return; // TigerStyle: Headers too large, silent fail (log in production)
+
+    // Format chunk header: hex-length CRLF (max 16 hex digits + CRLF = 18 bytes)
+    var chunk_header_buf: [20]u8 = std.mem.zeroes([20]u8);
+    const chunk_header = std.fmt.bufPrint(
+        &chunk_header_buf,
+        "{x}\r\n",
+        .{resp.body.len},
+    ) catch return; // TigerStyle: Chunk header format failed
+
+    // Terminator: CRLF after body + final zero chunk + trailing CRLF
+    const chunk_terminator = "\r\n0\r\n\r\n";
+
+    // Write: headers, chunk-header, body, terminator
+    var write_buf: [WRITE_BUFFER_SIZE_BYTES]u8 = std.mem.zeroes([WRITE_BUFFER_SIZE_BYTES]u8);
+    var writer = stream.writer(io, &write_buf);
+    writer.interface.writeAll(headers) catch return;
+    writer.interface.writeAll(chunk_header) catch return;
+    writer.interface.writeAll(resp.body) catch return;
+    writer.interface.writeAll(chunk_terminator) catch return;
     writer.interface.flush() catch return;
 }
 
@@ -237,4 +291,63 @@ test "statusText returns Error for unknown codes" {
     try std.testing.expectEqualStrings("Error", statusText(305)); // Non-standard
     try std.testing.expectEqualStrings("Error", statusText(418)); // I'm a teapot
     try std.testing.expectEqualStrings("Error", statusText(599)); // Edge case (still unknown)
+}
+
+// =============================================================================
+// Chunked Response Format Tests
+// =============================================================================
+
+test "chunked encoding format - chunk header for small body" {
+    // Verify chunk header format: hex-length CRLF
+    // Body length 13 ("Hello, World!") should produce "d\r\n"
+    var buf: [20]u8 = std.mem.zeroes([20]u8);
+    const chunk_header = std.fmt.bufPrint(&buf, "{x}\r\n", .{@as(usize, 13)}) catch unreachable;
+    try std.testing.expectEqualStrings("d\r\n", chunk_header);
+}
+
+test "chunked encoding format - chunk header for zero-length body" {
+    // Empty body should produce "0\r\n" as chunk header
+    var buf: [20]u8 = std.mem.zeroes([20]u8);
+    const chunk_header = std.fmt.bufPrint(&buf, "{x}\r\n", .{@as(usize, 0)}) catch unreachable;
+    try std.testing.expectEqualStrings("0\r\n", chunk_header);
+}
+
+test "chunked encoding format - chunk header for large body" {
+    // Body length 4096 (0x1000) should produce "1000\r\n"
+    var buf: [20]u8 = std.mem.zeroes([20]u8);
+    const chunk_header = std.fmt.bufPrint(&buf, "{x}\r\n", .{@as(usize, 4096)}) catch unreachable;
+    try std.testing.expectEqualStrings("1000\r\n", chunk_header);
+}
+
+test "chunked encoding terminator format" {
+    // RFC 9112: chunked body ends with CRLF after data, then 0 CRLF CRLF
+    const terminator = "\r\n0\r\n\r\n";
+    try std.testing.expectEqual(@as(usize, 7), terminator.len);
+    try std.testing.expect(std.mem.endsWith(u8, terminator, "\r\n\r\n"));
+}
+
+test "DirectResponse with chunked mode preserves fields" {
+    const resp = DirectResponse{
+        .status = 200,
+        .body = "test body",
+        .content_type = "application/json",
+        .extra_headers = "X-Custom: value\r\n",
+        .response_mode = .chunked,
+    };
+
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqualStrings("test body", resp.body);
+    try std.testing.expectEqualStrings("application/json", resp.content_type);
+    try std.testing.expectEqualStrings("X-Custom: value\r\n", resp.extra_headers);
+    try std.testing.expect(resp.response_mode == .chunked);
+}
+
+test "DirectResponse content_length mode is default" {
+    // Backward compatibility: content_length is the default mode
+    const resp = DirectResponse{
+        .status = 200,
+        .body = "test",
+    };
+
+    try std.testing.expect(resp.response_mode == .content_length);
 }

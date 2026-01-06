@@ -17,6 +17,7 @@ pub const Header = types.Header;
 pub const HeaderMap = types.HeaderMap;
 pub const ConnectionInfo = types.ConnectionInfo;
 pub const UpstreamConnectInfo = types.UpstreamConnectInfo;
+pub const BodyFraming = types.BodyFraming;
 
 // Config
 pub const config = @import("config.zig");

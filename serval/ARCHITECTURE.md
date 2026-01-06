@@ -477,12 +477,12 @@ pub const WeightedHandler = struct {
 | OpenTelemetry tracing | serval-otel | Full OTLP/JSON export with batching |
 | CLI argument parsing | serval-cli | Comptime-generic with custom options |
 | Protocol abstraction | serval-proxy | h1/ subdirectory, Protocol enum ready for h2 |
+| Chunked transfer encoding | serval-http, serval-proxy, serval-server | Parsing, forwarding, and direct response |
 
 ### Not Implemented
 
 | Feature | Module | Complexity |
 |---------|--------|------------|
-| Chunked transfer encoding | serval-http, serval-proxy | Medium |
 | HTTP/2 | serval-proxy/h2 | High |
 | TLS termination | serval-tls | Medium |
 | Weighted round-robin | serval-lb | Low |

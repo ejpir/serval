@@ -211,31 +211,32 @@ pub fn Server(
         }
 
         /// Extract body info for request forwarding.
-        /// TigerStyle: Explicit calculation, bounded by content_length.
+        /// Uses parser's body_framing to determine Content-Length vs chunked vs none.
+        /// TigerStyle: Explicit calculation, bounded by content_length or chunk structure.
         fn buildBodyInfo(
-            request: *const Request,
+            parser: *const Parser,
             recv_buf: []const u8,
             buffer_offset: usize,
-            headers_end: usize,
             buffer_len: usize,
         ) BodyInfo {
-            const content_length_header = request.headers.get("Content-Length");
-            const content_length_value: ?u64 = if (content_length_header) |cl|
-                parseContentLengthValue(cl)
-            else
-                null;
-
+            const headers_end = parser.headers_end;
             const data_after_headers = buffer_len - buffer_offset - headers_end;
-            const body_bytes_in_buffer = if (content_length_value) |cl|
-                @min(data_after_headers, cl)
-            else
-                0;
+
+            // Calculate bytes already read based on framing mode.
+            // For Content-Length: bounded by actual length.
+            // For chunked: all data after headers is partial chunk data.
+            // For none: no body expected.
+            const body_bytes_in_buffer: u64 = switch (parser.body_framing) {
+                .content_length => |cl| @min(data_after_headers, cl),
+                .chunked => data_after_headers, // May contain partial chunk
+                .none => 0,
+            };
 
             return BodyInfo{
-                .content_length = content_length_value,
-                .bytes_already_read = @intCast(body_bytes_in_buffer),
+                .framing = parser.body_framing,
+                .bytes_already_read = body_bytes_in_buffer,
                 .initial_body = if (body_bytes_in_buffer > 0)
-                    recv_buf[buffer_offset + headers_end ..][0..body_bytes_in_buffer]
+                    recv_buf[buffer_offset + headers_end ..][0..@intCast(body_bytes_in_buffer)]
                 else
                     &[_]u8{},
             };
@@ -381,7 +382,7 @@ pub fn Server(
                 ctx.upstream = upstream;
 
                 // Extract body info and forward
-                const body_info = buildBodyInfo(&parser.request, &recv_buf, buffer_offset, parser.headers_end, buffer_len);
+                const body_info = buildBodyInfo(&parser, &recv_buf, buffer_offset, buffer_len);
                 const forward_result = forwarder.forward(io, stream, &parser.request, &upstream, body_info, span_handle);
 
                 const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);

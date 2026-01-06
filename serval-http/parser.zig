@@ -15,6 +15,7 @@ const Request = types.Request;
 const Method = types.Method;
 const Version = types.Version;
 const HeaderMap = types.HeaderMap;
+const BodyFraming = types.BodyFraming;
 const ParseError = errors.ParseError;
 
 // =============================================================================
@@ -24,6 +25,7 @@ const ParseError = errors.ParseError;
 pub const Parser = struct {
     request: Request = .{},
     headers_end: usize = 0, // byte offset after \r\n\r\n
+    body_framing: BodyFraming = .none, // determined by Transfer-Encoding or Content-Length
 
     pub fn init() Parser {
         return .{};
@@ -32,6 +34,7 @@ pub const Parser = struct {
     pub fn reset(self: *Parser) void {
         self.request = .{};
         self.headers_end = 0;
+        self.body_framing = .none;
     }
 
     /// Parse HTTP/1.1 request headers from buffer.
@@ -178,29 +181,41 @@ pub const Parser = struct {
         assert(self.request.headers.count <= config.MAX_HEADERS);
     }
 
-    /// Validates message framing after header parsing.
+    /// Validates message framing and determines body_framing after header parsing.
     /// RFC 7230 Section 3.3.3: Reject ambiguous message length indicators.
-    /// TigerStyle: Security checks as explicit validation step.
+    /// TigerStyle: Security checks as explicit validation step, ~2 assertions.
     fn validateMessageFraming(self: *Parser) ParseError!void {
-        const has_content_length = self.request.headers.getContentLength() != null;
+        const content_length_str = self.request.headers.getContentLength();
         const transfer_encoding = self.request.headers.getTransferEncoding();
-        const has_transfer_encoding = transfer_encoding != null;
 
         // CL-TE/TE-CL smuggling prevention: Both headers present is ambiguous.
         // Different intermediaries may interpret the body length differently,
         // allowing attackers to smuggle requests past security controls.
-        if (has_content_length and has_transfer_encoding) {
+        if (content_length_str != null and transfer_encoding != null) {
             return error.AmbiguousMessageLength;
         }
 
-        // Chunked Transfer-Encoding not yet implemented.
-        // Reject to prevent smuggling via malformed chunk parsing.
-        // Future: implement proper chunked parsing before removing this check.
+        // Determine body framing per RFC 9112 Section 6.
+        // Priority: Transfer-Encoding > Content-Length > none
         if (transfer_encoding) |te| {
             if (containsIgnoreCase(te, "chunked")) {
-                return error.ChunkedNotSupported;
+                self.body_framing = .chunked;
+            } else {
+                // Non-chunked Transfer-Encoding (e.g., "identity") has no body framing.
+                // Per RFC 9112 Section 6.1, "identity" is obsolete and MUST NOT be sent.
+                self.body_framing = .none;
             }
+        } else if (content_length_str) |cl_str| {
+            const content_length = parseContentLengthValue(cl_str) orelse
+                return error.InvalidContentLength;
+            self.body_framing = .{ .content_length = content_length };
+        } else {
+            self.body_framing = .none;
         }
+
+        assert(self.body_framing == .chunked or
+            self.body_framing == .none or
+            self.body_framing.hasKnownLength());
     }
 };
 
@@ -550,26 +565,29 @@ test "reject CL-TE: Content-Length and Transfer-Encoding together" {
     try std.testing.expectError(error.AmbiguousMessageLength, parser.parseHeaders(request));
 }
 
-test "reject chunked Transfer-Encoding" {
+test "accept chunked Transfer-Encoding and set body_framing" {
     var parser = Parser.init();
-    // Chunked not supported - reject to prevent smuggling via malformed chunks
+    // Chunked Transfer-Encoding is now supported
     const request =
         "POST /api HTTP/1.1\r\n" ++
         "Host: example.com\r\n" ++
         "Transfer-Encoding: chunked\r\n" ++
         "\r\n";
-    try std.testing.expectError(error.ChunkedNotSupported, parser.parseHeaders(request));
+    try parser.parseHeaders(request);
+    try std.testing.expect(parser.body_framing == .chunked);
+    try std.testing.expectEqualStrings("chunked", parser.request.headers.getTransferEncoding().?);
 }
 
-test "reject chunked Transfer-Encoding case insensitive" {
+test "accept chunked Transfer-Encoding case insensitive" {
     var parser = Parser.init();
-    // Case insensitive check for "chunked"
+    // Case insensitive detection of "chunked"
     const request =
         "POST /api HTTP/1.1\r\n" ++
         "Host: example.com\r\n" ++
         "Transfer-Encoding: CHUNKED\r\n" ++
         "\r\n";
-    try std.testing.expectError(error.ChunkedNotSupported, parser.parseHeaders(request));
+    try parser.parseHeaders(request);
+    try std.testing.expect(parser.body_framing == .chunked);
 
     parser.reset();
     const request2 =
@@ -577,7 +595,8 @@ test "reject chunked Transfer-Encoding case insensitive" {
         "Host: example.com\r\n" ++
         "Transfer-Encoding: Chunked\r\n" ++
         "\r\n";
-    try std.testing.expectError(error.ChunkedNotSupported, parser.parseHeaders(request2));
+    try parser.parseHeaders(request2);
+    try std.testing.expect(parser.body_framing == .chunked);
 }
 
 test "reject duplicate Content-Length with different values" {
@@ -650,4 +669,76 @@ test "containsIgnoreCase helper" {
     try std.testing.expect(!containsIgnoreCase("gzip", "chunked"));
     try std.testing.expect(!containsIgnoreCase("", "chunked"));
     try std.testing.expect(containsIgnoreCase("abc", ""));
+}
+
+// =============================================================================
+// Body Framing Tests
+// =============================================================================
+
+test "body_framing set to content_length for Content-Length header" {
+    var parser = Parser.init();
+    const request =
+        "POST /api HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Content-Length: 42\r\n" ++
+        "\r\n";
+    try parser.parseHeaders(request);
+    try std.testing.expect(parser.body_framing == .content_length);
+    try std.testing.expectEqual(@as(u64, 42), parser.body_framing.getContentLength().?);
+}
+
+test "body_framing set to none for GET request without body" {
+    var parser = Parser.init();
+    const request =
+        "GET /api/users HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "\r\n";
+    try parser.parseHeaders(request);
+    try std.testing.expect(parser.body_framing == .none);
+}
+
+test "body_framing set to none for identity Transfer-Encoding" {
+    var parser = Parser.init();
+    const request =
+        "POST /api HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Transfer-Encoding: identity\r\n" ++
+        "\r\n";
+    try parser.parseHeaders(request);
+    // Per RFC 9112 Section 6.1, "identity" is obsolete; treated as no body framing
+    try std.testing.expect(parser.body_framing == .none);
+}
+
+test "body_framing reset clears to none" {
+    var parser = Parser.init();
+    const request =
+        "POST /api HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Content-Length: 100\r\n" ++
+        "\r\n";
+    try parser.parseHeaders(request);
+    try std.testing.expect(parser.body_framing == .content_length);
+
+    parser.reset();
+    try std.testing.expect(parser.body_framing == .none);
+}
+
+test "reject invalid Content-Length value" {
+    var parser = Parser.init();
+    const request =
+        "POST /api HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Content-Length: abc\r\n" ++
+        "\r\n";
+    try std.testing.expectError(error.InvalidContentLength, parser.parseHeaders(request));
+}
+
+test "reject Content-Length with leading zeros" {
+    var parser = Parser.init();
+    const request =
+        "POST /api HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Content-Length: 007\r\n" ++
+        "\r\n";
+    try std.testing.expectError(error.InvalidContentLength, parser.parseHeaders(request));
 }

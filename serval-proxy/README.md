@@ -78,6 +78,7 @@ Timing fields default to 0 for backward compatibility. Use these for detailed Pi
 | `h1/request.zig` | HTTP/1.1 request building, hop-by-hop filtering |
 | `h1/response.zig` | HTTP/1.1 response receiving, header parsing |
 | `h1/body.zig` | HTTP/1.1 splice/copy body streaming |
+| `h1/chunked.zig` | Chunked transfer encoding forwarding |
 
 **Protocol Abstraction:** HTTP/1.1 specific code is isolated in `h1/` subdirectory.
 When HTTP/2 is implemented, it will go in `h2/`. The `forwarder.zig` dispatches
@@ -105,7 +106,7 @@ detection for cleartext).
 | splice() zero-copy | Complete |
 | Userspace copy fallback | Complete |
 | Content-Length bodies | Complete |
-| Chunked transfer encoding | Not implemented |
+| Chunked transfer encoding | Implemented |
 | Request body forwarding | Complete |
 | HTTP/2 upstream | Not implemented |
 

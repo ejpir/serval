@@ -259,7 +259,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             };
 
             // Stream request body if present
-            if (body_info.content_length) |content_length| {
+            if (body_info.getContentLength()) |content_length| {
                 if (content_length > config.MAX_BODY_SIZE_BYTES) {
                     self.tracer.endSpan(send_span, "RequestBodyTooLarge");
                     return ForwardError.RequestBodyTooLarge;

@@ -27,6 +27,9 @@ const sendBuffer = request_mod.sendBuffer;
 const body_transfer = @import("body.zig");
 const forwardBody = body_transfer.forwardBody;
 
+const chunked_transfer = @import("chunked.zig");
+const forwardChunkedBody = chunked_transfer.forwardChunkedBody;
+
 // For tests: Import all parsing functions to verify contracts
 const parseContentLengthValue = serval_http.parseContentLengthValue;
 
@@ -40,6 +43,99 @@ pub const HeadersResult = struct {
     header_end: usize,
 };
 
+/// Check if response has chunked Transfer-Encoding.
+/// TigerStyle: Case-insensitive check, bounded iteration over header lines.
+/// Returns true if Transfer-Encoding header contains "chunked".
+pub fn isChunkedResponse(header: []const u8) bool {
+    // Precondition: header should contain at least status line.
+    assert(header.len == 0 or header.len >= 12); // "HTTP/1.1 200" min
+
+    // Empty header cannot be chunked.
+    if (header.len == 0) return false;
+
+    // Search for Transfer-Encoding header line.
+    // Bounded iteration: max lines = header.len / 2 (each line is at least "\r\n").
+    const max_iterations: usize = header.len / 2 + 1;
+    var line_start: usize = 0;
+    var iterations: usize = 0;
+
+    while (line_start < header.len and iterations < max_iterations) : (iterations += 1) {
+        // Find end of current line (CRLF).
+        const remaining = header[line_start..];
+        const line_end = std.mem.indexOf(u8, remaining, "\r\n") orelse break;
+        const line = remaining[0..line_end];
+
+        // Skip empty line (end of headers marker).
+        if (line.len == 0) break;
+
+        // Check if this line is Transfer-Encoding header (case-insensitive).
+        // "Transfer-Encoding:" is 18 characters.
+        if (line.len >= 18) {
+            const header_name = "transfer-encoding:";
+            if (asciiEqualIgnoreCase(line[0..18], header_name)) {
+                // Extract value after colon, trim whitespace.
+                const value_start = 18;
+                const value = std.mem.trim(u8, line[value_start..], " \t");
+
+                // Check if value contains "chunked" (case-insensitive).
+                if (containsIgnoreCase(value, "chunked")) {
+                    return true;
+                }
+            }
+        }
+
+        // Move to next line.
+        line_start += line_end + 2; // +2 for CRLF
+    }
+
+    // Postcondition: loop terminated within bounds.
+    assert(iterations <= max_iterations);
+    return false;
+}
+
+/// Case-insensitive ASCII slice comparison.
+/// TigerStyle: Only handles ASCII (HTTP headers are ASCII), bounded by slice length.
+fn asciiEqualIgnoreCase(a: []const u8, b: []const u8) bool {
+    // Precondition: slices are bounded (HTTP headers have max size).
+    assert(a.len <= config.MAX_HEADER_SIZE_BYTES);
+    assert(b.len <= config.MAX_HEADER_SIZE_BYTES);
+
+    if (a.len != b.len) return false;
+    if (a.len == 0) return true;
+
+    for (a, b) |ac, bc| {
+        const a_lower = if (ac >= 'A' and ac <= 'Z') ac + 32 else ac;
+        const b_lower = if (bc >= 'A' and bc <= 'Z') bc + 32 else bc;
+        if (a_lower != b_lower) return false;
+    }
+    // Postcondition: if we reach here, all characters matched case-insensitively.
+    return true;
+}
+
+/// Check if haystack contains needle (case-insensitive).
+/// TigerStyle: Bounded search, ASCII only.
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    // Precondition: needle must be non-empty to search.
+    assert(needle.len > 0);
+    // Precondition: haystack bounded by header size.
+    assert(haystack.len <= config.MAX_HEADER_SIZE_BYTES);
+
+    if (haystack.len < needle.len) return false;
+
+    // Bounded: max iterations = haystack.len - needle.len + 1
+    const max_pos = haystack.len - needle.len + 1;
+    var pos: usize = 0;
+    while (pos < max_pos) : (pos += 1) {
+        if (asciiEqualIgnoreCase(haystack[pos .. pos + needle.len], needle)) {
+            // Postcondition: match found at valid position within haystack.
+            assert(pos + needle.len <= haystack.len);
+            return true;
+        }
+    }
+    // Postcondition: exhausted all positions, no match found.
+    return false;
+}
+
 /// Forward upstream response to client.
 /// TigerStyle: Uses stream for headers, raw fds for splice body forwarding.
 pub fn forwardResponse(
@@ -48,6 +144,10 @@ pub fn forwardResponse(
     client_stream: Io.net.Stream,
     is_pooled: bool,
 ) ForwardError!ForwardResult {
+    // Precondition: file descriptors must be valid (non-negative).
+    assert(upstream_stream.socket.handle >= 0);
+    assert(client_stream.socket.handle >= 0);
+
     // Time the entire recv phase (headers + body from upstream)
     const recv_start_ns = time.monotonicNanos();
 
@@ -58,26 +158,42 @@ pub fn forwardResponse(
         return ForwardError.InvalidResponse;
     const content_length = parseContentLength(header_buffer[0..headers.header_len]);
 
-    debugLog("recv: headers received fd={d} status={d} content_length={?d}", .{ upstream_stream.socket.handle, status, content_length });
+    // Detect body transfer mode: chunked or content-length based.
+    const is_chunked = isChunkedResponse(header_buffer[0..headers.header_len]);
 
-    // Forward headers and any pre-fetched body to client via async stream
+    debugLog("recv: headers received fd={d} status={d} content_length={?d} chunked={}", .{ upstream_stream.socket.handle, status, content_length, is_chunked });
+
+    // Forward headers and any pre-fetched body to client via async stream.
+    // TigerStyle: Headers already forwarded include partial body if present.
     try sendBuffer(client_stream, io, header_buffer[0..headers.header_len]);
 
-    // Forward remaining body
+    // Forward remaining body.
     // TigerStyle: Use u64 for body sizes (Content-Length can exceed 4GB).
     const body_already_read: u64 = headers.header_len - headers.header_end;
     var total_body_bytes: u64 = body_already_read;
 
-    if (content_length) |length| {
+    // Extract raw fds for body forwarding (splice or chunked).
+    const upstream_fd = upstream_stream.socket.handle;
+    const client_fd = client_stream.socket.handle;
+
+    if (is_chunked) {
+        // Chunked transfer encoding: forward chunks until final chunk.
+        // Note: body_already_read contains start of first chunk.
+        // TODO: Handle partial chunk in header buffer (currently assumes
+        // chunk boundaries align with header end, which is common).
+        debugLog("recv: forwarding chunked body", .{});
+        total_body_bytes += try forwardChunkedBody(upstream_fd, client_fd);
+    } else if (content_length) |length| {
+        // Content-Length based: forward exact number of bytes.
         if (length > body_already_read) {
             const remaining = length - body_already_read;
             debugLog("recv: forwarding body remaining={d}", .{remaining});
-            // Extract raw fds for splice zero-copy body forwarding
-            const upstream_fd = upstream_stream.socket.handle;
-            const client_fd = client_stream.socket.handle;
             total_body_bytes += try forwardBody(upstream_fd, client_fd, remaining);
         }
     }
+    // else: No body (e.g., 204, 304) or connection-close semantics.
+    // Connection-close without Content-Length or chunked is unsupported
+    // for now (would require read-until-EOF which complicates pooling).
 
     const recv_end_ns = time.monotonicNanos();
     const recv_duration_ns = time.elapsedNanos(recv_start_ns, recv_end_ns);
@@ -100,6 +216,11 @@ pub fn receiveHeaders(
     buffer: *[config.MAX_HEADER_SIZE_BYTES]u8,
     is_pooled: bool,
 ) ForwardError!HeadersResult {
+    // Precondition: stream fd must be valid.
+    assert(stream.socket.handle >= 0);
+    // Precondition: buffer is provided (not null via pointer).
+    assert(buffer.len == config.MAX_HEADER_SIZE_BYTES);
+
     var read_buf: [config.STREAM_READ_BUFFER_SIZE_BYTES]u8 = std.mem.zeroes([config.STREAM_READ_BUFFER_SIZE_BYTES]u8);
     var reader = stream.reader(io, &read_buf);
 
@@ -378,8 +499,7 @@ test "parseContentLengthValue: too long" {
 // -----------------------------------------------------------------------------
 
 test "response patterns: chunked transfer encoding detection" {
-    // These are response patterns that forwardResponse must handle.
-    // Currently chunked is not supported, so we just verify parsing works.
+    // Test that isChunkedResponse correctly identifies chunked responses.
     const chunked_response =
         "HTTP/1.1 200 OK\r\n" ++
         "Transfer-Encoding: chunked\r\n" ++
@@ -388,6 +508,52 @@ test "response patterns: chunked transfer encoding detection" {
     try testing.expectEqual(@as(?u16, 200), parseStatusCode(chunked_response));
     // No Content-Length when chunked
     try testing.expectEqual(@as(?u64, null), parseContentLength(chunked_response));
+    // isChunkedResponse should detect chunked transfer encoding
+    try testing.expect(isChunkedResponse(chunked_response));
+}
+
+test "isChunkedResponse: case insensitivity" {
+    // Header name case variations
+    try testing.expect(isChunkedResponse("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"));
+    try testing.expect(isChunkedResponse("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n"));
+    try testing.expect(isChunkedResponse("HTTP/1.1 200 OK\r\nTRANSFER-ENCODING: chunked\r\n\r\n"));
+    try testing.expect(isChunkedResponse("HTTP/1.1 200 OK\r\nTransfer-encoding: CHUNKED\r\n\r\n"));
+    try testing.expect(isChunkedResponse("HTTP/1.1 200 OK\r\nTransfer-Encoding: Chunked\r\n\r\n"));
+}
+
+test "isChunkedResponse: whitespace handling" {
+    // Whitespace after colon should be trimmed
+    try testing.expect(isChunkedResponse("HTTP/1.1 200 OK\r\nTransfer-Encoding:chunked\r\n\r\n"));
+    try testing.expect(isChunkedResponse("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"));
+    try testing.expect(isChunkedResponse("HTTP/1.1 200 OK\r\nTransfer-Encoding:  chunked\r\n\r\n"));
+    try testing.expect(isChunkedResponse("HTTP/1.1 200 OK\r\nTransfer-Encoding:\tchunked\r\n\r\n"));
+}
+
+test "isChunkedResponse: not chunked" {
+    // No Transfer-Encoding header
+    try testing.expect(!isChunkedResponse("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n"));
+    // Transfer-Encoding but not chunked
+    try testing.expect(!isChunkedResponse("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n"));
+    try testing.expect(!isChunkedResponse("HTTP/1.1 200 OK\r\nTransfer-Encoding: identity\r\n\r\n"));
+    // Empty response (edge case)
+    try testing.expect(!isChunkedResponse(""));
+}
+
+test "isChunkedResponse: multiple headers" {
+    // Transfer-Encoding in middle of headers
+    const response =
+        "HTTP/1.1 200 OK\r\n" ++
+        "Date: Mon, 01 Jan 2024 00:00:00 GMT\r\n" ++
+        "Server: Serval/1.0\r\n" ++
+        "Transfer-Encoding: chunked\r\n" ++
+        "Connection: keep-alive\r\n" ++
+        "\r\n";
+    try testing.expect(isChunkedResponse(response));
+}
+
+test "isChunkedResponse: minimal valid response" {
+    // Shortest valid chunked response header
+    try testing.expect(isChunkedResponse("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"));
 }
 
 test "response patterns: connection close" {

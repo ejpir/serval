@@ -31,9 +31,9 @@ pub const ParseError = error{
     // Reject requests with multiple Content-Length headers with different values
     // to prevent request smuggling via CL disagreement.
     DuplicateContentLength,
-    // Chunked Transfer-Encoding not supported - reject to prevent smuggling.
-    // Future: implement proper chunked parsing before enabling.
-    ChunkedNotSupported,
+    // Content-Length header value is not a valid non-negative integer.
+    // Reject to prevent body framing ambiguity.
+    InvalidContentLength,
     // RFC 7230 Section 5.4: HTTP/1.1 requests MUST contain Host header.
     // Missing Host header prevents virtual hosting and is often a sign of malformed requests.
     MissingHostHeader,
