@@ -1,6 +1,6 @@
 <project>
   <name>zzz-fix</name>
-  <description>High-performance HTTP reverse proxy/load balancer in Zig</description>
+  <description>HTTP server framework for Zig — backends, proxies, load balancers, API gateways, sidecars</description>
   <style>TigerStyle</style>
 </project>
 

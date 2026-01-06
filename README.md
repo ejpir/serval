@@ -1,6 +1,6 @@
 # Serval
 
-High-performance HTTP/1.1 reverse proxy library for Zig, following [TigerStyle](https://tigerstyle.dev/) principles.
+HTTP server framework for Zig — build backends, proxies, load balancers, API gateways, and sidecars. Built-in observability with metrics and OpenTelemetry tracing. Inspired by TigerBeetle and Pingora.
 
 ## Features
 
