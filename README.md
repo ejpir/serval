@@ -73,6 +73,7 @@ exe.root_module.addImport("serval-lb", serval.module("serval-lb"));
 | `serval-proxy` | Upstream forwarding |
 | `serval-server` | HTTP/1.1 server |
 | `serval-lb` | Load balancer handler (round-robin) |
+| `serval-health` | Backend health tracking (atomic bitmap) |
 | `serval-metrics` | Metrics interfaces |
 | `serval-tracing` | Distributed tracing interfaces |
 | `serval-otel` | OpenTelemetry implementation |
@@ -208,9 +209,10 @@ zig build run-echo-backend -- --help
 | Request body streaming | Complete |
 | Metrics collection | Complete |
 | OpenTelemetry tracing | Complete |
+| Health tracking | Complete |
 | HTTP/2 | Not implemented |
 | TLS termination | Not implemented |
-| Chunked encoding | Not implemented |
+| Chunked encoding | Complete |
 
 ## License
 

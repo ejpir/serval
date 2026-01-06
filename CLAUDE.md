@@ -12,6 +12,7 @@
   <build>zig build</build>
   <test-serval>zig build test-serval</test-serval>
   <test-lb>zig build test-lb</test-lb>
+  <test-health>zig build test-health</test-health>
   <run-example>zig build run-lb-example</run-example>
 </commands>
 
@@ -23,6 +24,7 @@
   <module name="serval-proxy" path="serval-proxy/">Upstream forwarding (splice zero-copy)</module>
   <module name="serval-metrics" path="serval-metrics/">Metrics interfaces</module>
   <module name="serval-tracing" path="serval-tracing/">Distributed tracing interfaces</module>
+  <module name="serval-health" path="serval-health/">Health tracking (atomic bitmap, thresholds)</module>
   <module name="serval-lb" path="serval-lb/">Load balancer handler (round-robin)</module>
 
   <design-points>
@@ -56,7 +58,7 @@
       <module status="future">serval-otel</module>
       <module status="future">serval-waf</module>
       <module status="future">serval-ratelimit</module>
-      <module status="future">serval-health</module>
+      <module>serval-health</module>
       <responsibility>Reusable infrastructure - generic, handler-agnostic</responsibility>
       <notes>
         serval-tracing: Interface for distributed tracing (span creation, context propagation)
@@ -64,7 +66,7 @@
         serval-cache: Cache storage and lookup (keys, TTL, eviction) - policy via handler hooks
         serval-waf: Rule engine for threat detection (SQLi, XSS, etc.) - blocking via handler hooks
         serval-ratelimit: Token bucket / sliding window rate limiting - keyed by IP, path, header
-        serval-health: Health checks (active probes), circuit breaker state machine, backend status
+        serval-health: Threshold-based health tracking (atomic bitmap, consecutive counters)
       </notes>
     </layer>
     <layer level="3" name="mechanics">
@@ -160,25 +162,12 @@
         Body parsing → serval-waf: form data, JSON, multipart inspection (bounded, no full buffering).
       </point>
       <point trigger="health checks">
-        Active probes → serval-health (layer 2): periodic HTTP/TCP checks to backends.
-        Probe config → interval_ms, timeout_ms, unhealthy_threshold, healthy_threshold.
-        Health state → serval-health maintains per-upstream status (healthy, unhealthy, unknown).
-        Integration → handlers (layer 4) query health before selection, skip unhealthy.
-        Passive checks → onResponse/onError update health based on real traffic (5xx = unhealthy).
-        Background task → serval-health runs probe loop independently of request handling.
-        Startup → backends start as unknown, become healthy after first successful probe.
-      </point>
-      <point trigger="circuit breaker">
-        State machine → serval-health (layer 2): closed → open → half-open → closed.
-        Closed → normal operation, track error rate per upstream.
-        Open → reject requests to upstream immediately (fail fast), return 503.
-        Half-open → after timeout, allow limited probe requests to test recovery.
-        Thresholds → config: error_rate_percent, window_size_ms, open_duration_ms, probe_count.
-        Integration → selectUpstream checks circuit state, skips open circuits.
-        Error tracking → onError/onResponse with 5xx increments failure counter.
-        Success tracking → onResponse with 2xx/3xx resets failure counter, closes circuit.
-        Metrics → circuit state changes emit events for serval-metrics/logging.
-        Separate from health → circuit breaker is reactive (based on traffic), health checks are proactive.
+        State tracking → serval-health (layer 2, implemented): atomic bitmap + threshold counters.
+        Design → Pingora-inspired: boolean health with consecutive thresholds (no circuit breaker states).
+        Passive checks → handler calls tracker.recordSuccess/recordFailure on request completion.
+        Active probes → handler layer responsibility (not in serval-health, uses config.DEFAULT_HEALTH_PATH).
+        Integration → selectUpstream uses tracker.findNthHealthy() to skip unhealthy backends.
+        Config → DEFAULT_UNHEALTHY_THRESHOLD (3), DEFAULT_HEALTHY_THRESHOLD (2).
       </point>
       <point trigger="rate limiting">
         Algorithm → serval-ratelimit (layer 2): token bucket, sliding window, or fixed window.

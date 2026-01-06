@@ -90,6 +90,15 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Health module - depends on core
+    const serval_health_module = b.addModule("serval-health", .{
+        .root_source_file = b.path("serval-health/mod.zig"),
+        .imports = &.{
+            .{ .name = "serval-core", .module = serval_core_module },
+        },
+    });
+    _ = serval_health_module; // Available for use by other modules
+
     // Load balancer handler module - depends on core
     const serval_lb_module = b.addModule("serval-lb", .{
         .root_source_file = b.path("serval-lb/mod.zig"),
@@ -157,6 +166,22 @@ pub fn build(b: *std.Build) void {
 
     const lb_test_step = b.step("test-lb", "Run serval-lb library tests");
     lb_test_step.dependOn(&run_lb_tests.step);
+
+    // Health module tests
+    const health_tests_mod = b.createModule(.{
+        .root_source_file = b.path("serval-health/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    health_tests_mod.addImport("serval-core", serval_core_module);
+    const health_tests = b.addTest(.{
+        .name = "health_tests",
+        .root_module = health_tests_mod,
+    });
+    const run_health_tests = b.addRunArtifact(health_tests);
+
+    const health_test_step = b.step("test-health", "Run serval-health library tests");
+    health_test_step.dependOn(&run_health_tests.step);
 
     // OpenTelemetry module tests
     const otel_tests_mod = b.createModule(.{

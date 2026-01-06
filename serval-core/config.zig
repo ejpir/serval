@@ -89,6 +89,28 @@ pub const MAX_UPSTREAMS: u8 = 64;
 pub const MAX_STALE_RETRIES: u8 = 2;
 
 // =============================================================================
+// Health Check Limits
+// =============================================================================
+
+/// Consecutive failures before marking backend unhealthy.
+/// TigerStyle: Small threshold catches real failures, not transient hiccups.
+pub const DEFAULT_UNHEALTHY_THRESHOLD: u8 = 3;
+
+/// Consecutive successes before marking backend healthy again.
+/// TigerStyle: Lower than unhealthy threshold - recover faster than fail.
+pub const DEFAULT_HEALTHY_THRESHOLD: u8 = 2;
+
+/// Interval between active health probe cycles in milliseconds.
+pub const DEFAULT_PROBE_INTERVAL_MS: u32 = 5000;
+
+/// Timeout for each health probe request in milliseconds.
+/// TigerStyle: Must be less than probe interval.
+pub const DEFAULT_PROBE_TIMEOUT_MS: u32 = 2000;
+
+/// Default path for HTTP health probes.
+pub const DEFAULT_HEALTH_PATH: []const u8 = "/";
+
+// =============================================================================
 // OpenTelemetry / Tracing Limits
 // =============================================================================
 

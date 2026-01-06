@@ -58,8 +58,7 @@ Currently implements simple round-robin:
 | Weighted round-robin | Not implemented |
 | Least connections | Not implemented |
 | IP hash | Not implemented |
-| Health checks | Not implemented |
-| Circuit breaker | Not implemented |
+| Health-aware selection | Available via serval-health |
 
 ## Handler Interface
 

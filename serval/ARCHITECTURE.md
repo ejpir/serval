@@ -28,6 +28,7 @@ serval (umbrella - re-exports all modules)
 ├── serval-net      # Socket utilities (TCP_NODELAY, etc.)
 ├── serval-http     # HTTP/1.1 parser
 ├── serval-pool     # Connection pooling
+├── serval-health   # Backend health tracking (atomic bitmap, thresholds)
 ├── serval-proxy    # Upstream forwarding (h1/ subdirectory)
 ├── serval-metrics  # Request metrics (real-time + Prometheus)
 ├── serval-tracing  # Distributed tracing interface
@@ -84,6 +85,8 @@ Layer 1 (Protocol):                                                │
 Layer 2 (Infrastructure):                                          │
   serval-pool ←─────────────────────────────────────────────┐      │
                                                             │      │
+  serval-health ←───────────────────────────────────────────┤      │
+                                                            │      │
   serval-metrics ───────────────────────────────────────────┤      │
                                                             │      │
   serval-tracing ───────────────────────────────────────────┤      │
@@ -112,6 +115,7 @@ Standalone:
 | serval-net | Socket configuration utilities | `setTcpNoDelay` |
 | serval-http | HTTP/1.1 parsing | `Parser` |
 | serval-pool | Connection reuse | `SimplePool`, `NoPool`, `Connection` |
+| serval-health | Backend health tracking | `SharedHealthState`, `HealthTracker`, `BackendIndex` |
 | serval-proxy | Request forwarding | `Forwarder`, `ForwardResult`, `BodyInfo`, `Protocol` |
 | serval-metrics | Observability | `NoopMetrics`, `PrometheusMetrics`, `RealTimeMetrics` |
 | serval-tracing | Distributed tracing interface | `NoopTracer`, `SpanHandle` |
@@ -487,8 +491,7 @@ pub const WeightedHandler = struct {
 | TLS termination | serval-tls | Medium |
 | Weighted round-robin | serval-lb | Low |
 | Least connections LB | serval-lb | Low |
-| Health checks | serval-health | Medium |
-| Circuit breaker | serval-health | Medium |
+| Active health probes | serval-health | Low (state tracking complete) |
 | W3C Trace Context propagation | serval-otel | Low |
 
 ### Build & Test
@@ -507,6 +510,9 @@ zig build test-lb
 
 # Run OpenTelemetry tests
 zig build test-otel
+
+# Run health module tests
+zig build test-health
 
 # Run example
 zig build run-lb-example -- --port 8080 --backends 127.0.0.1:9001,127.0.0.1:9002
