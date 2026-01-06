@@ -58,6 +58,15 @@ pub const SPLICE_CHUNK_SIZE_BYTES: u32 = 65536;
 /// Buffer size for portable copy fallback (non-Linux platforms)
 pub const COPY_CHUNK_SIZE_BYTES: u32 = 4096;
 
+/// Buffer size for direct response handlers (echo backends, health checks, etc.)
+/// Only allocated when handler implements onRequest hook.
+/// TigerStyle: Sized for typical API/debug responses, bounded.
+pub const DIRECT_RESPONSE_BUFFER_SIZE_BYTES: u32 = 8192;
+
+/// Header buffer size for direct responses (status line + standard headers + extra).
+/// TigerStyle: Explicit limit, prevents unbounded formatting.
+pub const DIRECT_RESPONSE_HEADER_SIZE_BYTES: u32 = 1024;
+
 // =============================================================================
 // Connection Pool Limits
 // =============================================================================

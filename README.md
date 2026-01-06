@@ -90,7 +90,8 @@ const MyHandler = struct {
     }
 
     // Optional hooks
-    pub fn onRequest(self: *@This(), ctx: *serval.Context, req: *serval.Request) serval.Action {
+    pub fn onRequest(self: *@This(), ctx: *serval.Context, req: *serval.Request, response_buf: []u8) serval.Action {
+        _ = response_buf;
         return .continue_request;
     }
 

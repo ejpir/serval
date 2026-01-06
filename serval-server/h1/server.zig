@@ -39,6 +39,7 @@ const ProcessResult = connection.ProcessResult;
 const clientWantsClose = connection.clientWantsClose;
 const nextConnectionId = connection.nextConnectionId;
 const sendErrorResponse = response.sendErrorResponse;
+const sendDirectResponse = response.sendDirectResponse;
 const send100Continue = response.send100Continue;
 const send501NotImplemented = response.send501NotImplemented;
 const readRequest = reader.readRequest;
@@ -62,6 +63,7 @@ const ConnectionInfo = types.ConnectionInfo;
 
 // Buffer sizes from centralized config
 const REQUEST_BUFFER_SIZE_BYTES = config.REQUEST_BUFFER_SIZE_BYTES;
+const DIRECT_RESPONSE_BUFFER_SIZE_BYTES = config.DIRECT_RESPONSE_BUFFER_SIZE_BYTES;
 
 // =============================================================================
 // Server
@@ -299,6 +301,15 @@ pub fn Server(
             var buffer_offset: usize = 0;
             var buffer_len: usize = 0;
 
+            // Direct response buffer - only allocated if handler has onRequest hook.
+            // TigerStyle: Comptime conditional eliminates overhead for pure proxy handlers.
+            const has_on_request = comptime hooks.hasHook(Handler, "onRequest");
+            const ResponseBufType = if (has_on_request) [DIRECT_RESPONSE_BUFFER_SIZE_BYTES]u8 else void;
+            var response_buf: ResponseBufType = if (has_on_request)
+                std.mem.zeroes([DIRECT_RESPONSE_BUFFER_SIZE_BYTES]u8)
+            else
+                {};
+
             while (request_count < cfg.max_requests_per_connection) {
                 request_count += 1;
                 ctx.reset();
@@ -349,12 +360,19 @@ pub fn Server(
                 ctx.span_handle = span_handle;
 
                 // Call onRequest hook if present
-                if (comptime hooks.hasHook(Handler, "onRequest")) {
-                    if (handler.onRequest(&ctx, &parser.request) == .send_response) {
-                        tracer.endSpan(span_handle, null);
-                        const body_length = getBodyLength(&parser.request);
-                        buffer_offset += parser.headers_end + body_length;
-                        continue;
+                if (comptime has_on_request) {
+                    switch (handler.onRequest(&ctx, &parser.request, &response_buf)) {
+                        .continue_request => {}, // Fall through to selectUpstream
+                        .send_response => |resp| {
+                            // Handler wants to send direct response without forwarding
+                            sendDirectResponse(io, stream, resp);
+                            const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
+                            metrics.requestEnd(resp.status, duration_ns);
+                            tracer.endSpan(span_handle, null);
+                            const body_length = getBodyLength(&parser.request);
+                            buffer_offset += parser.headers_end + body_length;
+                            continue;
+                        },
                     }
                 }
 

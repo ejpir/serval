@@ -217,6 +217,31 @@ pub fn build(b: *std.Build) void {
     const run_lb_example_step = b.step("run-lb-example", "Run load balancer example");
     run_lb_example_step.dependOn(&run_lb_example.step);
 
+    // Echo backend example (for testing load balancer)
+    const echo_backend_mod = b.createModule(.{
+        .root_source_file = b.path("examples/echo_backend.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    echo_backend_mod.addImport("serval", serval_module);
+    echo_backend_mod.addImport("serval-cli", serval_cli_module);
+    const echo_backend = b.addExecutable(.{
+        .name = "echo_backend",
+        .root_module = echo_backend_mod,
+    });
+    const build_echo_backend = b.addInstallArtifact(echo_backend, .{});
+    const run_echo_backend = b.addRunArtifact(echo_backend);
+
+    const build_echo_backend_step = b.step("build-echo-backend", "Build echo backend");
+    build_echo_backend_step.dependOn(&build_echo_backend.step);
+
+    if (b.args) |args| {
+        run_echo_backend.addArgs(args);
+    }
+
+    const run_echo_backend_step = b.step("run-echo-backend", "Run echo backend example");
+    run_echo_backend_step.dependOn(&run_echo_backend.step);
+
     // OTLP test example
     const otel_test_mod = b.createModule(.{
         .root_source_file = b.path("examples/otel_test.zig"),

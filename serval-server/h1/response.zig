@@ -147,6 +147,41 @@ pub fn send501NotImplemented(io: Io, stream: Io.net.Stream, message: []const u8)
 }
 
 // =============================================================================
+// Direct Response (for handlers that respond without forwarding)
+// =============================================================================
+
+const types = @import("serval-core").types;
+const DirectResponse = types.DirectResponse;
+const DIRECT_RESPONSE_HEADER_SIZE_BYTES = config.DIRECT_RESPONSE_HEADER_SIZE_BYTES;
+
+/// Send a direct response from handler without forwarding to upstream.
+/// Body is already formatted in handler-provided buffer, so headers and body
+/// are written separately to avoid copying.
+/// TigerStyle: Standalone function with explicit parameters.
+pub fn sendDirectResponse(io: Io, stream: Io.net.Stream, resp: DirectResponse) void {
+    // Preconditions
+    assert(resp.status >= 100 and resp.status < 600);
+    assert(resp.content_type.len > 0);
+    // Extra headers must end with \r\n if non-empty
+    assert(resp.extra_headers.len == 0 or std.mem.endsWith(u8, resp.extra_headers, "\r\n"));
+
+    // Format headers into local buffer (body is already in handler's buffer)
+    var header_buf: [DIRECT_RESPONSE_HEADER_SIZE_BYTES]u8 = std.mem.zeroes([DIRECT_RESPONSE_HEADER_SIZE_BYTES]u8);
+    const headers = std.fmt.bufPrint(
+        &header_buf,
+        "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\n{s}\r\n",
+        .{ resp.status, statusText(resp.status), resp.content_type, resp.body.len, resp.extra_headers },
+    ) catch return; // TigerStyle: Headers too large, silent fail (log in production)
+
+    // Write headers + body (write buffer batches into single syscall when possible)
+    var write_buf: [WRITE_BUFFER_SIZE_BYTES]u8 = std.mem.zeroes([WRITE_BUFFER_SIZE_BYTES]u8);
+    var writer = stream.writer(io, &write_buf);
+    writer.interface.writeAll(headers) catch return;
+    writer.interface.writeAll(resp.body) catch return;
+    writer.interface.flush() catch return;
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 

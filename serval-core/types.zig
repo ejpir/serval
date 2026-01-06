@@ -216,9 +216,28 @@ pub const Upstream = struct {
 // Action (control flow from hooks)
 // =============================================================================
 
-pub const Action = enum {
+/// Handler response for onRequest hook.
+/// TigerStyle: Tagged union with explicit variants.
+pub const Action = union(enum) {
+    /// Continue to selectUpstream and forward the request to upstream.
     continue_request,
-    send_response,
+    /// Send a direct response without forwarding.
+    /// Handler writes response body into server-provided buffer.
+    send_response: DirectResponse,
+};
+
+/// Direct response data for handlers that respond without forwarding.
+/// Body slice must point into the response_buf provided by the server.
+/// TigerStyle: Fixed-size, no allocation, explicit ownership.
+pub const DirectResponse = struct {
+    status: u16 = 200,
+    /// Response body - must be slice into server-provided response_buf.
+    body: []const u8 = "",
+    /// Content-Type header value.
+    content_type: []const u8 = "text/plain",
+    /// Additional headers as pre-formatted string (e.g., "X-Backend-Id: foo\r\n").
+    /// Handler is responsible for correct HTTP header formatting.
+    extra_headers: []const u8 = "",
 };
 
 // =============================================================================
@@ -436,4 +455,47 @@ test "HeaderMap duplicate Content-Length case insensitive" {
 
     // Different case but different value should still fail
     try std.testing.expectError(error.DuplicateContentLength, map.put("CONTENT-LENGTH", "200"));
+}
+
+// =============================================================================
+// Action and DirectResponse Tests
+// =============================================================================
+
+test "DirectResponse has sensible defaults" {
+    const resp = DirectResponse{};
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqualStrings("", resp.body);
+    try std.testing.expectEqualStrings("text/plain", resp.content_type);
+    try std.testing.expectEqualStrings("", resp.extra_headers);
+}
+
+test "DirectResponse with custom values" {
+    const body = "Hello, World!";
+    const resp = DirectResponse{
+        .status = 201,
+        .body = body,
+        .content_type = "application/json",
+        .extra_headers = "X-Custom: value\r\n",
+    };
+    try std.testing.expectEqual(@as(u16, 201), resp.status);
+    try std.testing.expectEqualStrings("Hello, World!", resp.body);
+    try std.testing.expectEqualStrings("application/json", resp.content_type);
+    try std.testing.expectEqualStrings("X-Custom: value\r\n", resp.extra_headers);
+}
+
+test "Action continue_request variant" {
+    const action: Action = .continue_request;
+    try std.testing.expect(action == .continue_request);
+}
+
+test "Action send_response variant" {
+    const resp = DirectResponse{ .status = 404, .body = "Not Found" };
+    const action: Action = .{ .send_response = resp };
+    switch (action) {
+        .continue_request => try std.testing.expect(false),
+        .send_response => |r| {
+            try std.testing.expectEqual(@as(u16, 404), r.status);
+            try std.testing.expectEqualStrings("Not Found", r.body);
+        },
+    }
 }

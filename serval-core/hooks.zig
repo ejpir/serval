@@ -13,8 +13,11 @@
 //!
 //! ### Optional Request Hooks
 //!
-//! - `onRequest(self: *Handler, ctx: *Context, request: *Request) Action`
-//!   Called before forwarding to upstream. Can modify request or short-circuit.
+//! - `onRequest(self: *Handler, ctx: *Context, request: *Request, response_buf: []u8) Action`
+//!   Called before forwarding to upstream. Can modify request or return direct response.
+//!   Return `.continue_request` to proceed to selectUpstream and forward.
+//!   Return `.{ .send_response = ... }` to send a direct response without forwarding.
+//!   Use response_buf to format response body (server provides per-connection buffer).
 //!
 //! - `onResponse(self: *Handler, ctx: *Context, response: *Response) Action`
 //!   Called after receiving upstream response. Can modify response.
@@ -64,7 +67,8 @@ pub fn verifyHandler(comptime Handler: type) void {
     verifySelectUpstream(Handler);
 
     // Verify optional request hooks if declared
-    verifyOptionalHook(Handler, "onRequest", &[_]type{ *Handler, *Context, *Request }, Action);
+    // onRequest signature: (self, ctx, request, response_buf) -> Action
+    verifyOptionalHook(Handler, "onRequest", &[_]type{ *Handler, *Context, *Request, []u8 }, Action);
     verifyOptionalHook(Handler, "onResponse", &[_]type{ *Handler, *Context, *Response }, Action);
     verifyOptionalHook(Handler, "onError", &[_]type{ *Handler, *Context, anyerror }, void);
     verifyOptionalHook(Handler, "onLog", &[_]type{ *Handler, *Context, LogEntry }, void);
@@ -187,10 +191,11 @@ const TestHandler = struct {
         return .{ .host = "127.0.0.1", .port = 8080, .idx = 0 };
     }
 
-    pub fn onRequest(self: *@This(), ctx: *Context, request: *Request) Action {
+    pub fn onRequest(self: *@This(), ctx: *Context, request: *Request, response_buf: []u8) Action {
         _ = self;
         _ = ctx;
         _ = request;
+        _ = response_buf;
         return .continue_request;
     }
 };
@@ -255,10 +260,11 @@ const TestHandlerWithAllHooks = struct {
         return .{ .host = "127.0.0.1", .port = 8080, .idx = 0 };
     }
 
-    pub fn onRequest(self: *@This(), ctx: *Context, request: *Request) Action {
+    pub fn onRequest(self: *@This(), ctx: *Context, request: *Request, response_buf: []u8) Action {
         _ = self;
         _ = ctx;
         _ = request;
+        _ = response_buf;
         return .continue_request;
     }
 

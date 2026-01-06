@@ -200,11 +200,13 @@ pub fn selectUpstream(self: *@This(), ctx: *Context, request: *const Request) Up
 
 **Optional hooks** (detected at comptime with `hasHook()`):
 ```zig
-pub fn onRequest(self: *@This(), ctx: *Context, request: *Request) Action
+pub fn onRequest(self: *@This(), ctx: *Context, request: *Request, response_buf: []u8) Action
 pub fn onResponse(self: *@This(), ctx: *Context, response: *Response) void
 pub fn onError(self: *@This(), ctx: *Context, err: ErrorContext) void
 pub fn onLog(self: *@This(), ctx: *Context, entry: LogEntry) void
 ```
+
+`onRequest` can return `.continue_request` to forward, or `.{ .send_response = DirectResponse{...} }` to respond directly.
 
 ### Pool Interface
 
@@ -282,12 +284,14 @@ const MyHandler = struct {
         return self.upstreams[1];  // Default backend
     }
 
-    pub fn onRequest(self: *@This(), ctx: *serval.Context, req: *serval.Request) serval.Action {
+    pub fn onRequest(self: *@This(), ctx: *serval.Context, req: *serval.Request, response_buf: []u8) serval.Action {
         _ = self;
+        _ = ctx;
         // Block requests without auth header
         if (req.headers.get("Authorization") == null) {
-            ctx.response_status = 401;
-            return .send_response;
+            const body = "Unauthorized";
+            @memcpy(response_buf[0..body.len], body);
+            return .{ .send_response = .{ .status = 401, .body = response_buf[0..body.len] } };
         }
         return .continue_request;
     }

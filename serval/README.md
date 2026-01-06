@@ -99,11 +99,13 @@ pub fn selectUpstream(self, ctx: *Context, request: *const Request) Upstream
 
 Optional hooks:
 ```zig
-pub fn onRequest(self, ctx: *Context, request: *Request) Action
+pub fn onRequest(self, ctx: *Context, request: *Request, response_buf: []u8) Action
 pub fn onResponse(self, ctx: *Context, response: *Response) void
 pub fn onError(self, ctx: *Context, err: ErrorContext) void
 pub fn onLog(self, ctx: *Context, entry: LogEntry) void
 ```
+
+`onRequest` can return `.continue_request` to forward, or `.{ .send_response = DirectResponse{...} }` to respond directly without forwarding (for backends, health endpoints, etc.).
 
 ## Implementation Status
 
