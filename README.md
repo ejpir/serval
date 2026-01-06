@@ -104,9 +104,91 @@ const MyHandler = struct {
 ## Building
 
 ```bash
-zig build              # Build lb_example
-zig build test         # Run all tests
-zig build run-lb-example -- --port 8080 --backends 127.0.0.1:9001,127.0.0.1:9002
+zig build                    # Build lb_example (default)
+zig build build-echo-backend # Build echo backend
+zig build test               # Run all tests
+```
+
+## Examples
+
+### Load Balancer with Echo Backends
+
+Start two echo backends, then run the load balancer:
+
+```bash
+# Terminal 1: Start backend on port 8001
+zig build run-echo-backend -- --port 8001 --id backend-1
+
+# Terminal 2: Start backend on port 8002
+zig build run-echo-backend -- --port 8002 --id backend-2
+
+# Terminal 3: Start load balancer
+zig build run-lb-example -- --port 8080 --backends 127.0.0.1:8001,127.0.0.1:8002
+
+# Terminal 4: Test round-robin
+curl http://localhost:8080/test
+curl http://localhost:8080/test
+```
+
+Each request alternates between backends. The response shows which backend handled it:
+
+```
+=== Echo Backend: backend-1 (port 8001) ===
+
+Method: GET
+Path: /test
+Version: HTTP/1.1
+
+Headers:
+  Host: 127.0.0.1:8080
+  User-Agent: curl/8.0
+  Accept: */*
+
+Body: (empty)
+```
+
+### Direct Response Handler
+
+Handlers can respond directly without forwarding using `DirectResponse`:
+
+```zig
+const HealthHandler = struct {
+    pub fn selectUpstream(self: *@This(), ctx: *serval.Context, req: *const serval.Request) serval.Upstream {
+        _ = self; _ = ctx; _ = req;
+        unreachable; // Never called - onRequest handles everything
+    }
+
+    pub fn onRequest(self: *@This(), ctx: *serval.Context, req: *serval.Request, response_buf: []u8) serval.Action {
+        _ = self; _ = ctx; _ = req;
+        const body = "OK";
+        @memcpy(response_buf[0..body.len], body);
+        return .{ .send_response = .{
+            .status = 200,
+            .body = response_buf[0..body.len],
+            .content_type = "text/plain",
+        } };
+    }
+};
+```
+
+### CLI Options
+
+Both examples support these options:
+
+```bash
+# Load balancer
+zig build run-lb-example -- --help
+  --port <PORT>       Listening port (default: 8080)
+  --backends <HOSTS>  Comma-separated backend addresses
+  --stats             Enable real-time terminal stats
+  --trace             Enable OpenTelemetry tracing
+  --debug             Enable debug logging
+
+# Echo backend
+zig build run-echo-backend -- --help
+  --port <PORT>       Listening port (default: 8001)
+  --id <ID>           Instance identifier (default: echo-1)
+  --debug             Enable debug logging
 ```
 
 ## Documentation
