@@ -53,10 +53,25 @@ pub const SharedHealthState = struct {
         std.debug.assert(MAX_UPSTREAMS <= 64);
     }
 
-    /// Initialize with all backends healthy.
-    pub fn init() Self {
+    /// Initialize with specified number of backends healthy.
+    /// Only the first `backend_count` backends are marked healthy.
+    /// TigerStyle: Explicit count prevents out-of-bounds when upstream list
+    /// is smaller than MAX_UPSTREAMS.
+    pub fn initWithCount(backend_count: u8) Self {
+        std.debug.assert(backend_count <= MAX_UPSTREAMS);
+
+        // Only set the first backend_count bits as healthy.
+        // If backend_count is 0, bitmap is 0 (none healthy).
+        // If backend_count is MAX_UPSTREAMS, bitmap is all 1s.
+        const initial_bitmap: u64 = if (backend_count == 0)
+            0
+        else if (backend_count >= MAX_UPSTREAMS)
+            std.math.maxInt(u64)
+        else
+            (@as(u64, 1) << @as(u6, @intCast(backend_count))) - 1;
+
         var self = Self{
-            .health_bitmap = std.atomic.Value(u64).init(std.math.maxInt(u64)),
+            .health_bitmap = std.atomic.Value(u64).init(initial_bitmap),
             .failure_counts = undefined,
             .success_counts = undefined,
         };
@@ -68,6 +83,12 @@ pub const SharedHealthState = struct {
         }
 
         return self;
+    }
+
+    /// Initialize with all MAX_UPSTREAMS backends healthy.
+    /// Use initWithCount() when you have fewer backends.
+    pub fn init() Self {
+        return initWithCount(MAX_UPSTREAMS);
     }
 
     /// Check if backend is healthy.
@@ -113,20 +134,24 @@ pub const SharedHealthState = struct {
         return @intCast(first);
     }
 
-    /// Find the Nth healthy backend (0-indexed).
+    /// Find the Nth healthy backend (0-indexed), wrapping around.
     /// O(popcount) - iterates through set bits.
-    /// Returns null if fewer than n+1 healthy backends.
+    /// Returns null only if NO healthy backends exist.
+    /// TigerStyle: Wraps n by healthy_count for round-robin selection.
     pub fn findNthHealthy(self: *const Self, n: u32) ?BackendIndex {
         var bitmap = self.health_bitmap.load(.acquire);
 
-        // Check if we have enough healthy backends.
+        // Check if any healthy backends exist.
         const healthy_count = @popCount(bitmap);
-        if (n >= healthy_count) {
+        if (healthy_count == 0) {
             return null;
         }
 
-        // Bounded loop: at most 64 iterations (one per possible backend).
-        var remaining = n;
+        // Wrap n to valid range for round-robin selection.
+        const target = n % healthy_count;
+
+        // Bounded loop: at most MAX_UPSTREAMS iterations (one per possible backend).
+        var remaining = target;
         var iterations: u8 = 0;
         while (bitmap != 0 and iterations < MAX_UPSTREAMS) : (iterations += 1) {
             const lowest_bit_pos: u7 = @ctz(bitmap);
@@ -242,9 +267,41 @@ test "SharedHealthState alignment" {
 
 test "SharedHealthState init starts all healthy" {
     const state = SharedHealthState.init();
-    try std.testing.expectEqual(@as(u32, 64), state.countHealthy());
+    try std.testing.expectEqual(@as(u32, MAX_UPSTREAMS), state.countHealthy());
     try std.testing.expect(state.isHealthy(0));
-    try std.testing.expect(state.isHealthy(63));
+    try std.testing.expect(state.isHealthy(MAX_UPSTREAMS - 1));
+}
+
+test "SharedHealthState initWithCount sets correct backends" {
+    // Test with 2 backends - the bug case.
+    const state2 = SharedHealthState.initWithCount(2);
+    try std.testing.expectEqual(@as(u32, 2), state2.countHealthy());
+    try std.testing.expect(state2.isHealthy(0));
+    try std.testing.expect(state2.isHealthy(1));
+    try std.testing.expect(!state2.isHealthy(2)); // This was the bug!
+    try std.testing.expect(!state2.isHealthy(63));
+
+    // findNthHealthy wraps around, only returns 0 or 1.
+    try std.testing.expectEqual(@as(?BackendIndex, 0), state2.findNthHealthy(0));
+    try std.testing.expectEqual(@as(?BackendIndex, 1), state2.findNthHealthy(1));
+    try std.testing.expectEqual(@as(?BackendIndex, 0), state2.findNthHealthy(2)); // 2 % 2 = 0
+
+    // Test with 0 backends.
+    const state0 = SharedHealthState.initWithCount(0);
+    try std.testing.expectEqual(@as(u32, 0), state0.countHealthy());
+    try std.testing.expect(!state0.isHealthy(0));
+
+    // Test with 1 backend.
+    const state1 = SharedHealthState.initWithCount(1);
+    try std.testing.expectEqual(@as(u32, 1), state1.countHealthy());
+    try std.testing.expect(state1.isHealthy(0));
+    try std.testing.expect(!state1.isHealthy(1));
+
+    // Test with MAX_UPSTREAMS backends (max).
+    const state_max = SharedHealthState.initWithCount(MAX_UPSTREAMS);
+    try std.testing.expectEqual(@as(u32, MAX_UPSTREAMS), state_max.countHealthy());
+    try std.testing.expect(state_max.isHealthy(0));
+    try std.testing.expect(state_max.isHealthy(MAX_UPSTREAMS - 1));
 }
 
 test "SharedHealthState mark unhealthy" {
@@ -266,7 +323,7 @@ test "SharedHealthState mark healthy" {
 
     state.markHealthy(5);
     try std.testing.expect(state.isHealthy(5));
-    try std.testing.expectEqual(@as(u32, 64), state.countHealthy());
+    try std.testing.expectEqual(@as(u32, MAX_UPSTREAMS), state.countHealthy());
 }
 
 test "SharedHealthState findFirstHealthy" {
@@ -313,7 +370,7 @@ test "SharedHealthState findNthHealthy" {
     try std.testing.expectEqual(@as(?BackendIndex, 6), state.findNthHealthy(3));
 }
 
-test "SharedHealthState findNthHealthy returns null for out of range" {
+test "SharedHealthState findNthHealthy wraps around" {
     var state = SharedHealthState.init();
 
     // Only keep 3 backends healthy.
@@ -325,8 +382,9 @@ test "SharedHealthState findNthHealthy returns null for out of range" {
     try std.testing.expectEqual(@as(?BackendIndex, 0), state.findNthHealthy(0));
     try std.testing.expectEqual(@as(?BackendIndex, 1), state.findNthHealthy(1));
     try std.testing.expectEqual(@as(?BackendIndex, 2), state.findNthHealthy(2));
-    try std.testing.expectEqual(@as(?BackendIndex, null), state.findNthHealthy(3));
-    try std.testing.expectEqual(@as(?BackendIndex, null), state.findNthHealthy(100));
+    // Wraps around: 3 % 3 = 0, 100 % 3 = 1
+    try std.testing.expectEqual(@as(?BackendIndex, 0), state.findNthHealthy(3));
+    try std.testing.expectEqual(@as(?BackendIndex, 1), state.findNthHealthy(100));
 }
 
 test "SharedHealthState failure counter increment" {
@@ -384,10 +442,10 @@ test "SharedHealthState reset" {
     // Reset should restore all healthy and zero counters.
     state.reset();
 
-    try std.testing.expectEqual(@as(u32, 64), state.countHealthy());
+    try std.testing.expectEqual(@as(u32, MAX_UPSTREAMS), state.countHealthy());
     try std.testing.expect(state.isHealthy(0));
     try std.testing.expect(state.isHealthy(10));
-    try std.testing.expect(state.isHealthy(63));
+    try std.testing.expect(state.isHealthy(MAX_UPSTREAMS - 1));
     try std.testing.expectEqual(@as(u8, 0), state.getFailureCount(5));
     try std.testing.expectEqual(@as(u8, 0), state.getSuccessCount(20));
 }

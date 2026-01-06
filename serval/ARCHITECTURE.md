@@ -103,7 +103,7 @@ Layer 5 (Orchestration):                                    │      │
                                                        serval (composes all)
 
 Standalone:
-  serval-core ←── serval-lb (load balancer handler)
+  serval-core ←── serval-lb (load balancer handler, also depends on serval-health, serval-net)
   serval-core ←── serval-cli (CLI utilities)
 ```
 
@@ -121,7 +121,7 @@ Standalone:
 | serval-tracing | Distributed tracing interface | `NoopTracer`, `SpanHandle` |
 | serval-otel | OpenTelemetry tracing | `Tracer`, `Span`, `OTLPExporter`, `BatchingProcessor` |
 | serval-server | HTTP/1.1 server | `Server`, `MinimalServer` |
-| serval-lb | Load balancing | `LbHandler` (round-robin with atomic counter) |
+| serval-lb | Load balancing | `LbHandler` (health-aware round-robin with background probing) |
 | serval-cli | CLI argument parsing | `Args`, `ParseResult`, comptime generics |
 
 ---
@@ -474,7 +474,7 @@ pub const WeightedHandler = struct {
 | Upstream forwarding | serval-proxy | With stale connection retry (MAX_STALE_RETRIES=2) |
 | Request body streaming | serval-proxy | splice() zero-copy on Linux |
 | Response body streaming | serval-proxy | splice() zero-copy on Linux |
-| Round-robin load balancing | serval-lb | Thread-safe with atomic counter |
+| Health-aware load balancing | serval-lb | Round-robin with background probing, onLog passive tracking |
 | Handler hooks | serval-server | onRequest, onResponse, onError, onLog, onConnectionOpen/Close |
 | Metrics interface | serval-metrics | Noop + Prometheus + RealTimeMetrics (per-upstream stats) |
 | Tracing interface | serval-tracing | NoopTracer |
@@ -491,7 +491,6 @@ pub const WeightedHandler = struct {
 | TLS termination | serval-tls | Medium |
 | Weighted round-robin | serval-lb | Low |
 | Least connections LB | serval-lb | Low |
-| Active health probes | serval-health | Low (state tracking complete) |
 | W3C Trace Context propagation | serval-otel | Low |
 
 ### Build & Test

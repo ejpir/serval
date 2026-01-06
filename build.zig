@@ -97,13 +97,14 @@ pub fn build(b: *std.Build) void {
             .{ .name = "serval-core", .module = serval_core_module },
         },
     });
-    _ = serval_health_module; // Available for use by other modules
 
-    // Load balancer handler module - depends on core
+    // Load balancer handler module - depends on core, health, net
     const serval_lb_module = b.addModule("serval-lb", .{
         .root_source_file = b.path("serval-lb/mod.zig"),
         .imports = &.{
             .{ .name = "serval-core", .module = serval_core_module },
+            .{ .name = "serval-health", .module = serval_health_module },
+            .{ .name = "serval-net", .module = serval_net_module },
         },
     });
 
@@ -158,6 +159,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     lb_tests_mod.addImport("serval-core", serval_core_module);
+    lb_tests_mod.addImport("serval-health", serval_health_module);
+    lb_tests_mod.addImport("serval-net", serval_net_module);
     const lb_tests = b.addTest(.{
         .name = "lb_tests",
         .root_module = lb_tests_mod,
@@ -227,6 +230,7 @@ pub fn build(b: *std.Build) void {
     lb_example_mod.addImport("serval-cli", serval_cli_module);
     lb_example_mod.addImport("serval-otel", serval_otel_module);
     lb_example_mod.addImport("serval-metrics", serval_metrics_module);
+    lb_example_mod.addImport("serval-health", serval_health_module);
     lb_example_mod.addImport("stats_display", stats_display_module);
     const lb_example = b.addExecutable(.{
         .name = "lb_example",

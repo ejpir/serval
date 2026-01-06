@@ -8,84 +8,92 @@ Provides atomic health state tracking with threshold-based transitions. Designed
 
 ## Exports
 
-- `SharedHealthState` - Lock-free atomic bitmap for health status
-- `HealthTracker` - Threshold-based state transitions
+Primary (use these):
+- `HealthState` - Unified health state with embedded threshold tracking (embeddable)
 - `BackendIndex` - Type alias for upstream index (u6)
+- `MAX_UPSTREAMS` - Maximum supported backends (64)
+
+Legacy (for transition):
+- `SharedHealthState` - Lock-free atomic bitmap (pointer-based)
+- `HealthTracker` - Threshold wrapper for SharedHealthState
 
 ## Usage
 
+### Recommended: HealthState (Embeddable)
+
 ```zig
 const health = @import("serval-health");
-const config = @import("serval-core").config;
 
-// Initialize shared state (all backends start healthy)
-var state = health.SharedHealthState.init();
-
-// Create tracker with thresholds
-var tracker = health.HealthTracker.init(
-    &state,
-    config.DEFAULT_UNHEALTHY_THRESHOLD,  // 3 consecutive failures
-    config.DEFAULT_HEALTHY_THRESHOLD,     // 2 consecutive successes
+// Initialize with backend count and thresholds
+var state = health.HealthState.init(
+    3,  // backend_count
+    3,  // unhealthy_threshold (consecutive failures)
+    2,  // healthy_threshold (consecutive successes)
 );
 
 // On request success
-tracker.recordSuccess(upstream_idx);
+state.recordSuccess(upstream_idx);
 
 // On request failure
-tracker.recordFailure(upstream_idx);
+state.recordFailure(upstream_idx);
 
-// Query health for upstream selection
-if (tracker.isHealthy(upstream_idx)) {
+// Query health
+if (state.isHealthy(upstream_idx)) {
     // Use this backend
-}
-
-// Find healthy backend for failover
-if (tracker.findFirstHealthy(exclude_idx)) |healthy_idx| {
-    // Use healthy_idx as failover
 }
 
 // Round-robin among healthy backends
 const n = counter.fetchAdd(1, .monotonic);
-if (tracker.findNthHealthy(n)) |idx| {
+if (state.findNthHealthy(n)) |idx| {
     return upstreams[idx];
 }
 ```
 
-## SharedHealthState
+### Legacy: SharedHealthState + HealthTracker
 
 ```zig
-pub const SharedHealthState = struct {
-    health_bitmap: std.atomic.Value(u64),  // Bit N = 1 means healthy
-    failure_counts: [MAX_UPSTREAMS]std.atomic.Value(u8),
-    success_counts: [MAX_UPSTREAMS]std.atomic.Value(u8),
+const upstream_count: u8 = 3;
+var shared = health.SharedHealthState.initWithCount(upstream_count);
+var tracker = health.HealthTracker.init(&shared, 3, 2);
 
-    pub fn init() Self
-    pub fn isHealthy(self: *const Self, idx: BackendIndex) bool
+tracker.recordSuccess(0);
+tracker.recordFailure(1);
+```
+
+## HealthState
+
+Unified health state designed for embedding in handlers (no pointers required):
+
+```zig
+pub const HealthState = struct {
+    health_bitmap: std.atomic.Value(u64) align(64),  // Cache-line aligned
+    failure_counts: [MAX_UPSTREAMS]u8,
+    success_counts: [MAX_UPSTREAMS]u8,
+    backend_count: u8,
+    unhealthy_threshold: u8,
+    healthy_threshold: u8,
+
+    pub fn init(backend_count: u8, unhealthy_threshold: u8, healthy_threshold: u8) Self
+    pub fn recordSuccess(self: *Self, idx: BackendIndex) void   // inline
+    pub fn recordFailure(self: *Self, idx: BackendIndex) void   // inline
+    pub fn isHealthy(self: *const Self, idx: BackendIndex) bool // inline
     pub fn countHealthy(self: *const Self) u32
-    pub fn findFirstHealthy(self: *const Self, exclude_idx: ?BackendIndex) ?BackendIndex
     pub fn findNthHealthy(self: *const Self, n: u32) ?BackendIndex
-    pub fn markHealthy(self: *Self, idx: BackendIndex) void
-    pub fn markUnhealthy(self: *Self, idx: BackendIndex) void
+    pub fn findFirstHealthy(self: *const Self, exclude_idx: ?BackendIndex) ?BackendIndex
     pub fn reset(self: *Self) void
 };
 ```
 
-## HealthTracker
+## File Structure
 
-```zig
-pub const HealthTracker = struct {
-    state: *SharedHealthState,
-    unhealthy_threshold: u8,
-    healthy_threshold: u8,
-
-    pub fn init(state: *SharedHealthState, unhealthy_threshold: u8, healthy_threshold: u8) Self
-    pub fn recordSuccess(self: *Self, idx: u6) void  // inline hot path
-    pub fn recordFailure(self: *Self, idx: u6) void  // inline hot path
-    pub fn isHealthy(self: *const Self, idx: u6) bool
-    pub fn countHealthy(self: *const Self) u32
-    pub fn findFirstHealthy(self: *const Self, exclude_idx: ?u6) ?u6
-    pub fn findNthHealthy(self: *const Self, n: u32) ?u6
-};
+```
+serval-health/
+├── mod.zig              # Module exports
+├── health_state.zig     # HealthState (unified, embeddable) - PREFERRED
+├── state.zig            # SharedHealthState (legacy, pointer-based)
+├── tracker.zig          # HealthTracker (legacy, wraps SharedHealthState)
+├── tests.zig            # Comprehensive tests
+└── integration_tests.zig # Integration scenarios
 ```
 
 ## Design
@@ -94,8 +102,8 @@ pub const HealthTracker = struct {
 
 Following Pingora's approach: simple boolean health with consecutive threshold counters is equally effective and simpler to reason about:
 
-- **Healthy** + N consecutive failures → **Unhealthy**
-- **Unhealthy** + M consecutive successes → **Healthy**
+- **Healthy** + N consecutive failures -> **Unhealthy**
+- **Unhealthy** + M consecutive successes -> **Healthy**
 
 No explicit open/half-open/closed states. The threshold counters prevent flapping on transient failures.
 
@@ -111,16 +119,20 @@ No explicit open/half-open/closed states. The threshold counters prevent flappin
 
 The bitmap is aligned to 64 bytes to prevent false sharing when different threads access health state concurrently.
 
+### Fast Paths
+
+`recordSuccess()` and `recordFailure()` have fast paths:
+- If already in target state, return immediately
+- No counter increments for already-healthy/already-unhealthy backends
+
 ## Configuration
 
 From `serval-core/config.zig`:
 
 ```zig
-pub const DEFAULT_UNHEALTHY_THRESHOLD: u8 = 3;   // 3 failures → unhealthy
-pub const DEFAULT_HEALTHY_THRESHOLD: u8 = 2;     // 2 successes → healthy
-pub const DEFAULT_PROBE_INTERVAL_MS: u32 = 5000; // For active probing
-pub const DEFAULT_PROBE_TIMEOUT_MS: u32 = 2000;
-pub const DEFAULT_HEALTH_PATH: []const u8 = "/";
+pub const DEFAULT_UNHEALTHY_THRESHOLD: u8 = 3;   // 3 failures -> unhealthy
+pub const DEFAULT_HEALTHY_THRESHOLD: u8 = 2;     // 2 successes -> healthy
+pub const MAX_UPSTREAMS: u8 = 64;                // Bitmap width
 ```
 
 ## Implementation Status
@@ -130,27 +142,15 @@ pub const DEFAULT_HEALTH_PATH: []const u8 = "/";
 | Atomic health bitmap | Complete |
 | Threshold-based transitions | Complete |
 | Concurrent access safety | Complete |
-| Active health probes | Not implemented (handler layer responsibility) |
-
-## Integration with serval-lb
-
-```zig
-// In handler
-pub fn selectUpstream(self: *Self, ctx: *Context, req: *const Request) ?Upstream {
-    const healthy_count = self.tracker.countHealthy();
-    if (healthy_count == 0) return null;
-
-    const n = self.counter.fetchAdd(1, .monotonic);
-    const idx = self.tracker.findNthHealthy(n) orelse return null;
-    return self.upstreams[idx];
-}
-```
+| Embeddable HealthState | Complete |
+| Active health probes | Handler responsibility (see serval-lb) |
 
 ## TigerStyle Compliance
 
-- Cache-line aligned bitmap prevents false sharing
-- All loops bounded by MAX_UPSTREAMS (64)
-- Explicit types: u6 for indices, u8 for counters, u32 for counts
-- ~2 assertions per function (preconditions on idx bounds)
-- Inline hot paths for recordSuccess/recordFailure
-- Saturating arithmetic prevents counter overflow
+- Cache-line aligned bitmap prevents false sharing (P4)
+- All loops bounded by MAX_UPSTREAMS (S4)
+- Explicit types: u6 for indices, u8 for counters, u32 for counts (S2)
+- ~2 assertions per function (S1)
+- Inline hot paths for recordSuccess/recordFailure (P4)
+- Saturating arithmetic prevents counter overflow (S5)
+- std.mem.zeroes for initialization (S5)

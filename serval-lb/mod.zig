@@ -1,17 +1,22 @@
-// lib/serval-lb/mod.zig
+// serval-lb/mod.zig
 //! Serval Load Balancer Library
 //!
-//! Standalone load balancing handlers compatible with serval HTTP/1.1 server.
-//! Like Pingora's separate crates, this library can be used independently.
+//! Health-aware load balancing with automatic background probing.
+//! Backends marked unhealthy after consecutive failures recover
+//! automatically when background probes succeed.
 //!
 //! Example:
 //!   const serval_lb = @import("serval-lb");
-//!   var handler = serval_lb.LbHandler.init(&upstreams);
-//!   var server = serval.Server(serval_lb.LbHandler, ...).init(&handler, ...);
+//!   var handler = try serval_lb.LbHandler.init(&upstreams, .{});
+//!   defer handler.deinit();
 
 pub const handler = @import("handler.zig");
+pub const prober = @import("prober.zig");
 pub const LbHandler = handler.LbHandler;
+pub const LbConfig = handler.LbConfig;
+pub const ProberContext = prober.ProberContext;
 
 test {
     _ = @import("handler.zig");
+    _ = @import("prober.zig");
 }

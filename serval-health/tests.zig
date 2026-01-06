@@ -88,7 +88,7 @@ test "markHealthy sets bit" {
 test "countHealthy uses popcount" {
     var hs = SharedHealthState.init();
 
-    // Start with all 64 healthy
+    // Start with all MAX_UPSTREAMS healthy
     try testing.expectEqual(@as(u32, MAX_UPSTREAMS), hs.countHealthy());
 
     // Mark a few unhealthy
@@ -96,14 +96,14 @@ test "countHealthy uses popcount" {
     try testing.expectEqual(@as(u32, MAX_UPSTREAMS - 1), hs.countHealthy());
 
     hs.markUnhealthy(31);
-    try testing.expectEqual(@as(u32, 62), hs.countHealthy());
+    try testing.expectEqual(@as(u32, MAX_UPSTREAMS - 2), hs.countHealthy());
 
-    hs.markUnhealthy(63);
-    try testing.expectEqual(@as(u32, 61), hs.countHealthy());
+    hs.markUnhealthy(MAX_UPSTREAMS - 1);
+    try testing.expectEqual(@as(u32, MAX_UPSTREAMS - 3), hs.countHealthy());
 
     // Mark one healthy again
     hs.markHealthy(31);
-    try testing.expectEqual(@as(u32, 62), hs.countHealthy());
+    try testing.expectEqual(@as(u32, MAX_UPSTREAMS - 2), hs.countHealthy());
 }
 
 test "findFirstHealthy skips excluded" {
@@ -353,7 +353,7 @@ test "concurrent mixed operations" {
         fn run(ctx: *Context) void {
             // Each thread operates on its own backend subset to avoid contention
             // Thread 0: backends 0-7, Thread 1: backends 8-15, etc.
-            const base_idx: BackendIndex = @intCast((ctx.thread_id * 8) % 64);
+            const base_idx: BackendIndex = @intCast((ctx.thread_id * 8) % MAX_UPSTREAMS);
 
             var iteration: u32 = 0;
             while (iteration < ITERATIONS_PER_THREAD) : (iteration += 1) {
@@ -393,9 +393,9 @@ test "concurrent mixed operations" {
         threads[joined].join();
     }
 
-    // Verify no corruption - count should be valid (0-64)
+    // Verify no corruption - count should be valid (0 to MAX_UPSTREAMS)
     const count = hs.countHealthy();
-    try testing.expect(count <= 64);
+    try testing.expect(count <= MAX_UPSTREAMS);
 
     // Verify bitmask is consistent - each bit represents valid state
     const mask = hs.health_bitmap.load(.seq_cst);
@@ -603,7 +603,7 @@ test "idx 63 works correctly" {
     try testing.expectEqual(@as(?BackendIndex, MAX_BACKEND_IDX), hs.findFirstHealthy(null));
 }
 
-test "operations on all 64 backends" {
+test "operations on all MAX_UPSTREAMS backends" {
     var hs = SharedHealthState.init();
 
     // Mark all unhealthy one by one
