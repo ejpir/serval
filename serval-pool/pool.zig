@@ -11,6 +11,7 @@ const Io = std.Io;
 
 const config = @import("serval-core").config;
 const time = @import("serval-core").time;
+const UpstreamIndex = config.UpstreamIndex;
 
 // debug
 const serval_core = @import("serval-core");
@@ -22,10 +23,10 @@ const debugLog = serval_core.debugLog;
 
 pub fn verifyPool(comptime Pool: type) void {
     if (!@hasDecl(Pool, "acquire")) {
-        @compileError("Pool must implement: pub fn acquire(self, upstream_idx: u32, io: Io) ?Connection");
+        @compileError("Pool must implement: pub fn acquire(self, upstream_idx: UpstreamIndex, io: Io) ?Connection");
     }
     if (!@hasDecl(Pool, "release")) {
-        @compileError("Pool must implement: pub fn release(self, upstream_idx: u32, conn: Connection, healthy: bool, io: Io) void");
+        @compileError("Pool must implement: pub fn release(self, upstream_idx: UpstreamIndex, conn: Connection, healthy: bool, io: Io) void");
     }
     if (!@hasDecl(Pool, "drain")) {
         @compileError("Pool must implement: pub fn drain(self, io: Io) void");
@@ -54,7 +55,7 @@ pub const PoolEvent = enum {
 /// Optional metrics callback type.
 /// Set to non-null to receive pool events.
 /// TigerStyle: Function pointer for zero-cost abstraction when null.
-pub const MetricsCallback = *const fn (upstream_idx: u32, event: PoolEvent) void;
+pub const MetricsCallback = *const fn (upstream_idx: UpstreamIndex, event: PoolEvent) void;
 
 // =============================================================================
 // Connection Handle (opaque, pool-specific)
@@ -135,11 +136,11 @@ pub const Connection = struct {
 // =============================================================================
 
 pub const NoPool = struct {
-    pub fn acquire(_: *@This(), _: u32, _: Io) ?Connection {
+    pub fn acquire(_: *@This(), _: UpstreamIndex, _: Io) ?Connection {
         return null;
     }
 
-    pub fn release(_: *@This(), _: u32, conn: Connection, _: bool, io: Io) void {
+    pub fn release(_: *@This(), _: UpstreamIndex, conn: Connection, _: bool, io: Io) void {
         var c = conn;
         c.close(io);
     }
@@ -193,7 +194,7 @@ pub const SimplePool = struct {
 
     /// Helper to emit metrics.
     /// TigerStyle: Inline check for null, zero cost when disabled.
-    fn emitMetric(self: *SimplePool, upstream_idx: u32, event: PoolEvent) void {
+    fn emitMetric(self: *SimplePool, upstream_idx: UpstreamIndex, event: PoolEvent) void {
         if (self.metrics_callback) |cb| {
             cb(upstream_idx, event);
         }
@@ -203,11 +204,11 @@ pub const SimplePool = struct {
     /// Returns null if no connections available.
     /// Skips and collects stale connections (idle timeout or max age exceeded).
     /// TigerStyle: Mutex held only for array access, I/O (close) outside lock.
-    pub fn acquire(self: *SimplePool, upstream_idx: u32, io: Io) ?Connection {
+    pub fn acquire(self: *SimplePool, upstream_idx: UpstreamIndex, io: Io) ?Connection {
         assert(upstream_idx < MAX_UPSTREAMS);
 
         const now_ns = time.monotonicNanos();
-        const idx = @as(usize, @intCast(upstream_idx));
+        const idx = @as(usize, upstream_idx);
 
         // Collect stale connections to close outside the lock.
         // TigerStyle: Bounded array, no allocation.
@@ -286,12 +287,12 @@ pub const SimplePool = struct {
     /// TigerStyle: Single lock acquisition for atomic state update, I/O outside mutex.
     /// Defense in depth with sentinel to detect double-release.
     /// self.pool.release(upstream.idx, mutable_conn, true, io);
-    pub fn release(self: *SimplePool, upstream_idx: u32, conn: Connection, healthy: bool, io: Io) void {
+    pub fn release(self: *SimplePool, upstream_idx: UpstreamIndex, conn: Connection, healthy: bool, io: Io) void {
         assert(upstream_idx < MAX_UPSTREAMS);
         // TigerStyle: Verify sentinel - must not be double-released
         assert(conn.pool_sentinel == Connection.IN_USE_SENTINEL);
 
-        const idx = @as(usize, @intCast(upstream_idx));
+        const idx = @as(usize, upstream_idx);
         var should_close = !healthy;
         var c = conn;
 

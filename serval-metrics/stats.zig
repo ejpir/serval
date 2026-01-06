@@ -19,6 +19,7 @@ const PrometheusMetrics = metrics.PrometheusMetrics;
 /// Maximum number of upstreams tracked.
 /// TigerStyle: Single source of truth from config.
 const MAX_UPSTREAMS = config.MAX_UPSTREAMS;
+const UpstreamIndex = config.UpstreamIndex;
 
 /// Error rate threshold for marking upstream as unhealthy (50% = 1/2).
 /// TigerStyle: Named constant for magic number.
@@ -203,7 +204,7 @@ pub const RealTimeMetrics = struct {
         self: *RealTimeMetrics,
         status: u16,
         duration_ns: u64,
-        upstream_idx: u8,
+        upstream_idx: UpstreamIndex,
     ) void {
         // TigerStyle: Assert valid upstream index and status.
         assert(upstream_idx < MAX_UPSTREAMS);
@@ -229,7 +230,7 @@ pub const RealTimeMetrics = struct {
         self: *RealTimeMetrics,
         status: u16,
         duration_ns: u64,
-        upstream_idx: u8,
+        upstream_idx: UpstreamIndex,
     ) void {
         // TigerStyle: Assert valid upstream index and status range.
         assert(upstream_idx < MAX_UPSTREAMS);

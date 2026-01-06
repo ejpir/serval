@@ -9,7 +9,7 @@ const config = @import("serval-core").config;
 
 const SharedHealthState = health.SharedHealthState;
 const HealthTracker = health.HealthTracker;
-const BackendIndex = health.BackendIndex;
+const UpstreamIndex = health.UpstreamIndex;
 
 /// Simulated upstream for testing.
 const TestUpstream = struct {
@@ -76,7 +76,7 @@ test "integration: wrong init causes out-of-bounds (regression test)" {
     const good_idx = state_correct.findNthHealthy(2);
     try std.testing.expect(good_idx != null);
     try std.testing.expect(good_idx.? < upstreams.len);
-    try std.testing.expectEqual(@as(?BackendIndex, 0), good_idx); // 2 % 2 = 0
+    try std.testing.expectEqual(@as(?UpstreamIndex, 0), good_idx); // 2 % 2 = 0
 }
 
 test "integration: health transitions with upstream selection" {
@@ -139,8 +139,8 @@ test "integration: all backends unhealthy graceful degradation" {
     try std.testing.expectEqual(@as(u32, 0), tracker.countHealthy());
 
     // findNthHealthy should return null when all unhealthy.
-    try std.testing.expectEqual(@as(?BackendIndex, null), tracker.findNthHealthy(0));
-    try std.testing.expectEqual(@as(?BackendIndex, null), tracker.findNthHealthy(1));
+    try std.testing.expectEqual(@as(?UpstreamIndex, null), tracker.findNthHealthy(0));
+    try std.testing.expectEqual(@as(?UpstreamIndex, null), tracker.findNthHealthy(1));
 
     // Graceful degradation: caller should fall back to round-robin.
     // This is what lb_example does.
@@ -162,7 +162,7 @@ test "integration: single backend" {
     // Only one backend, all selections should return 0.
     for (0..20) |i| {
         if (tracker.findNthHealthy(@intCast(i))) |idx| {
-            try std.testing.expectEqual(@as(BackendIndex, 0), idx);
+            try std.testing.expectEqual(@as(UpstreamIndex, 0), idx);
         }
     }
 
@@ -172,7 +172,7 @@ test "integration: single backend" {
     tracker.recordFailure(0);
 
     // Now findNthHealthy returns null.
-    try std.testing.expectEqual(@as(?BackendIndex, null), tracker.findNthHealthy(0));
+    try std.testing.expectEqual(@as(?UpstreamIndex, null), tracker.findNthHealthy(0));
 }
 
 test "integration: concurrent selection simulation" {

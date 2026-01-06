@@ -255,7 +255,8 @@ pub const Upstream = struct {
     host: []const u8,
     port: u16,
     /// Index into connection pool to retrieve/release connections for this upstream.
-    idx: u32 = 0,
+    /// TigerStyle: Uses UpstreamIndex from config for single source of truth.
+    idx: config.UpstreamIndex = 0,
 };
 
 // =============================================================================

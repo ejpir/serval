@@ -471,7 +471,17 @@ pub fn Server(
 
             ctx.response_status = result.status;
             ctx.bytes_sent = result.response_bytes;
-            metrics.requestEnd(result.status, duration_ns);
+
+            // Track per-upstream stats if metrics supports it and upstream is set
+            if (comptime @hasDecl(Metrics, "requestEndWithUpstream")) {
+                if (ctx.upstream) |up| {
+                    metrics.requestEndWithUpstream(result.status, duration_ns, up.idx);
+                } else {
+                    metrics.requestEnd(result.status, duration_ns);
+                }
+            } else {
+                metrics.requestEnd(result.status, duration_ns);
+            }
 
             if (comptime hooks.hasHook(Handler, "onLog")) {
                 const log_entry = log.LogEntry{
@@ -538,7 +548,13 @@ pub fn Server(
 
             sendErrorResponseImpl(io, stream, 502, "Bad Gateway");
             ctx.response_status = 502;
-            metrics.requestEnd(502, duration_ns);
+
+            // Track per-upstream stats if metrics supports it
+            if (comptime @hasDecl(Metrics, "requestEndWithUpstream")) {
+                metrics.requestEndWithUpstream(502, duration_ns, upstream.idx);
+            } else {
+                metrics.requestEnd(502, duration_ns);
+            }
 
             if (comptime hooks.hasHook(Handler, "onLog")) {
                 const log_entry = log.LogEntry{

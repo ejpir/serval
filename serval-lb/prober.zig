@@ -14,7 +14,7 @@ const health_mod = @import("serval-health");
 
 const Upstream = core.Upstream;
 const HealthState = health_mod.HealthState;
-const BackendIndex = health_mod.BackendIndex;
+const UpstreamIndex = core.config.UpstreamIndex;
 
 /// Context for background prober thread.
 /// TigerStyle: Explicit parameters, no implicit state.
@@ -46,7 +46,7 @@ pub fn probeLoop(ctx: ProberContext) void {
 fn probeUnhealthyBackends(ctx: ProberContext) void {
     // TigerStyle: Bounded loop over upstreams
     for (ctx.upstreams, 0..) |upstream, i| {
-        const idx: BackendIndex = @intCast(i);
+        const idx: UpstreamIndex = @intCast(i);
 
         // Only probe unhealthy backends (healthy ones get passive checks via traffic)
         if (ctx.health.isHealthy(idx)) continue;

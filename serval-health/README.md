@@ -10,7 +10,7 @@ Provides atomic health state tracking with threshold-based transitions. Designed
 
 Primary (use these):
 - `HealthState` - Unified health state with embedded threshold tracking (embeddable)
-- `BackendIndex` - Type alias for upstream index (u6)
+- `UpstreamIndex` - Type alias for upstream index (u6)
 - `MAX_UPSTREAMS` - Maximum supported backends (64)
 
 Legacy (for transition):
@@ -74,12 +74,12 @@ pub const HealthState = struct {
     healthy_threshold: u8,
 
     pub fn init(backend_count: u8, unhealthy_threshold: u8, healthy_threshold: u8) Self
-    pub fn recordSuccess(self: *Self, idx: BackendIndex) void   // inline
-    pub fn recordFailure(self: *Self, idx: BackendIndex) void   // inline
-    pub fn isHealthy(self: *const Self, idx: BackendIndex) bool // inline
+    pub fn recordSuccess(self: *Self, idx: UpstreamIndex) void   // inline
+    pub fn recordFailure(self: *Self, idx: UpstreamIndex) void   // inline
+    pub fn isHealthy(self: *const Self, idx: UpstreamIndex) bool // inline
     pub fn countHealthy(self: *const Self) u32
-    pub fn findNthHealthy(self: *const Self, n: u32) ?BackendIndex
-    pub fn findFirstHealthy(self: *const Self, exclude_idx: ?BackendIndex) ?BackendIndex
+    pub fn findNthHealthy(self: *const Self, n: u32) ?UpstreamIndex
+    pub fn findFirstHealthy(self: *const Self, exclude_idx: ?UpstreamIndex) ?UpstreamIndex
     pub fn reset(self: *Self) void
 };
 ```

@@ -12,8 +12,7 @@ const config = @import("serval-core").config;
 /// Maximum backends supported (must match config for bitmap width).
 const MAX_UPSTREAMS: u8 = config.MAX_UPSTREAMS;
 
-/// Backend index type - u6 can address 0-63, matching 64-bit bitmap.
-pub const BackendIndex = u6;
+pub const UpstreamIndex = config.UpstreamIndex;
 
 /// Cache line size on x86_64 and ARM64.
 const CACHE_LINE_BYTES: usize = 64;
@@ -93,7 +92,7 @@ pub const SharedHealthState = struct {
 
     /// Check if backend is healthy.
     /// O(1) atomic load and bit test.
-    pub fn isHealthy(self: *const Self, idx: BackendIndex) bool {
+    pub fn isHealthy(self: *const Self, idx: UpstreamIndex) bool {
         std.debug.assert(idx < MAX_UPSTREAMS);
 
         const bitmap = self.health_bitmap.load(.acquire);
@@ -111,7 +110,7 @@ pub const SharedHealthState = struct {
     /// Find first healthy backend, optionally excluding one.
     /// O(1) using hardware count-trailing-zeros instruction.
     /// Returns null if no healthy backend available.
-    pub fn findFirstHealthy(self: *const Self, exclude_idx: ?BackendIndex) ?BackendIndex {
+    pub fn findFirstHealthy(self: *const Self, exclude_idx: ?UpstreamIndex) ?UpstreamIndex {
         var bitmap = self.health_bitmap.load(.acquire);
 
         // Clear the excluded backend's bit if specified.
@@ -138,7 +137,7 @@ pub const SharedHealthState = struct {
     /// O(popcount) - iterates through set bits.
     /// Returns null only if NO healthy backends exist.
     /// TigerStyle: Wraps n by healthy_count for round-robin selection.
-    pub fn findNthHealthy(self: *const Self, n: u32) ?BackendIndex {
+    pub fn findNthHealthy(self: *const Self, n: u32) ?UpstreamIndex {
         var bitmap = self.health_bitmap.load(.acquire);
 
         // Check if any healthy backends exist.
@@ -174,7 +173,7 @@ pub const SharedHealthState = struct {
 
     /// Mark backend as healthy.
     /// Atomically sets bit in bitmap and resets failure counter.
-    pub fn markHealthy(self: *Self, idx: BackendIndex) void {
+    pub fn markHealthy(self: *Self, idx: UpstreamIndex) void {
         std.debug.assert(idx < MAX_UPSTREAMS);
 
         const mask: u64 = @as(u64, 1) << idx;
@@ -188,7 +187,7 @@ pub const SharedHealthState = struct {
 
     /// Mark backend as unhealthy.
     /// Atomically clears bit in bitmap and resets success counter.
-    pub fn markUnhealthy(self: *Self, idx: BackendIndex) void {
+    pub fn markUnhealthy(self: *Self, idx: UpstreamIndex) void {
         std.debug.assert(idx < MAX_UPSTREAMS);
 
         const mask: u64 = @as(u64, 1) << idx;
@@ -202,7 +201,7 @@ pub const SharedHealthState = struct {
 
     /// Increment failure count for backend.
     /// Returns new count (saturates at 255).
-    pub fn incrementFailureCount(self: *Self, idx: BackendIndex) u8 {
+    pub fn incrementFailureCount(self: *Self, idx: UpstreamIndex) u8 {
         std.debug.assert(idx < MAX_UPSTREAMS);
 
         // Saturating add prevents overflow - counter stays at max.
@@ -217,7 +216,7 @@ pub const SharedHealthState = struct {
 
     /// Increment success count for backend.
     /// Returns new count (saturates at 255).
-    pub fn incrementSuccessCount(self: *Self, idx: BackendIndex) u8 {
+    pub fn incrementSuccessCount(self: *Self, idx: UpstreamIndex) u8 {
         std.debug.assert(idx < MAX_UPSTREAMS);
 
         // Saturating add prevents overflow - counter stays at max.
@@ -231,13 +230,13 @@ pub const SharedHealthState = struct {
     }
 
     /// Get current failure count for backend.
-    pub fn getFailureCount(self: *const Self, idx: BackendIndex) u8 {
+    pub fn getFailureCount(self: *const Self, idx: UpstreamIndex) u8 {
         std.debug.assert(idx < MAX_UPSTREAMS);
         return self.failure_counts[idx].load(.acquire);
     }
 
     /// Get current success count for backend.
-    pub fn getSuccessCount(self: *const Self, idx: BackendIndex) u8 {
+    pub fn getSuccessCount(self: *const Self, idx: UpstreamIndex) u8 {
         std.debug.assert(idx < MAX_UPSTREAMS);
         return self.success_counts[idx].load(.acquire);
     }
@@ -282,9 +281,9 @@ test "SharedHealthState initWithCount sets correct backends" {
     try std.testing.expect(!state2.isHealthy(63));
 
     // findNthHealthy wraps around, only returns 0 or 1.
-    try std.testing.expectEqual(@as(?BackendIndex, 0), state2.findNthHealthy(0));
-    try std.testing.expectEqual(@as(?BackendIndex, 1), state2.findNthHealthy(1));
-    try std.testing.expectEqual(@as(?BackendIndex, 0), state2.findNthHealthy(2)); // 2 % 2 = 0
+    try std.testing.expectEqual(@as(?UpstreamIndex, 0), state2.findNthHealthy(0));
+    try std.testing.expectEqual(@as(?UpstreamIndex, 1), state2.findNthHealthy(1));
+    try std.testing.expectEqual(@as(?UpstreamIndex, 0), state2.findNthHealthy(2)); // 2 % 2 = 0
 
     // Test with 0 backends.
     const state0 = SharedHealthState.initWithCount(0);
@@ -330,10 +329,10 @@ test "SharedHealthState findFirstHealthy" {
     var state = SharedHealthState.init();
 
     // First healthy should be 0.
-    try std.testing.expectEqual(@as(?BackendIndex, 0), state.findFirstHealthy(null));
+    try std.testing.expectEqual(@as(?UpstreamIndex, 0), state.findFirstHealthy(null));
 
     // With 0 excluded, should be 1.
-    try std.testing.expectEqual(@as(?BackendIndex, 1), state.findFirstHealthy(0));
+    try std.testing.expectEqual(@as(?UpstreamIndex, 1), state.findFirstHealthy(0));
 
     // Mark 0-2 unhealthy.
     state.markUnhealthy(0);
@@ -341,7 +340,7 @@ test "SharedHealthState findFirstHealthy" {
     state.markUnhealthy(2);
 
     // First healthy should now be 3.
-    try std.testing.expectEqual(@as(?BackendIndex, 3), state.findFirstHealthy(null));
+    try std.testing.expectEqual(@as(?UpstreamIndex, 3), state.findFirstHealthy(null));
 }
 
 test "SharedHealthState findFirstHealthy returns null when all unhealthy" {
@@ -352,7 +351,7 @@ test "SharedHealthState findFirstHealthy returns null when all unhealthy" {
         state.markUnhealthy(@intCast(i));
     }
 
-    try std.testing.expectEqual(@as(?BackendIndex, null), state.findFirstHealthy(null));
+    try std.testing.expectEqual(@as(?UpstreamIndex, null), state.findFirstHealthy(null));
 }
 
 test "SharedHealthState findNthHealthy" {
@@ -364,10 +363,10 @@ test "SharedHealthState findNthHealthy" {
     state.markUnhealthy(4);
 
     // Healthy backends: 1, 3, 5, 6, 7, ...
-    try std.testing.expectEqual(@as(?BackendIndex, 1), state.findNthHealthy(0));
-    try std.testing.expectEqual(@as(?BackendIndex, 3), state.findNthHealthy(1));
-    try std.testing.expectEqual(@as(?BackendIndex, 5), state.findNthHealthy(2));
-    try std.testing.expectEqual(@as(?BackendIndex, 6), state.findNthHealthy(3));
+    try std.testing.expectEqual(@as(?UpstreamIndex, 1), state.findNthHealthy(0));
+    try std.testing.expectEqual(@as(?UpstreamIndex, 3), state.findNthHealthy(1));
+    try std.testing.expectEqual(@as(?UpstreamIndex, 5), state.findNthHealthy(2));
+    try std.testing.expectEqual(@as(?UpstreamIndex, 6), state.findNthHealthy(3));
 }
 
 test "SharedHealthState findNthHealthy wraps around" {
@@ -379,12 +378,12 @@ test "SharedHealthState findNthHealthy wraps around" {
     }
 
     try std.testing.expectEqual(@as(u32, 3), state.countHealthy());
-    try std.testing.expectEqual(@as(?BackendIndex, 0), state.findNthHealthy(0));
-    try std.testing.expectEqual(@as(?BackendIndex, 1), state.findNthHealthy(1));
-    try std.testing.expectEqual(@as(?BackendIndex, 2), state.findNthHealthy(2));
+    try std.testing.expectEqual(@as(?UpstreamIndex, 0), state.findNthHealthy(0));
+    try std.testing.expectEqual(@as(?UpstreamIndex, 1), state.findNthHealthy(1));
+    try std.testing.expectEqual(@as(?UpstreamIndex, 2), state.findNthHealthy(2));
     // Wraps around: 3 % 3 = 0, 100 % 3 = 1
-    try std.testing.expectEqual(@as(?BackendIndex, 0), state.findNthHealthy(3));
-    try std.testing.expectEqual(@as(?BackendIndex, 1), state.findNthHealthy(100));
+    try std.testing.expectEqual(@as(?UpstreamIndex, 0), state.findNthHealthy(3));
+    try std.testing.expectEqual(@as(?UpstreamIndex, 1), state.findNthHealthy(100));
 }
 
 test "SharedHealthState failure counter increment" {

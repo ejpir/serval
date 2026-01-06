@@ -8,7 +8,7 @@
 pub const health_state = @import("health_state.zig");
 
 pub const HealthState = health_state.HealthState;
-pub const BackendIndex = health_state.BackendIndex;
+pub const UpstreamIndex = health_state.UpstreamIndex;
 pub const MAX_UPSTREAMS = health_state.MAX_UPSTREAMS;
 
 // Keep old types for backwards compatibility during transition

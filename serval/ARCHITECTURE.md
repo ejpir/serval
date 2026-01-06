@@ -115,7 +115,7 @@ Standalone:
 | serval-net | Socket configuration utilities | `setTcpNoDelay` |
 | serval-http | HTTP/1.1 parsing | `Parser` |
 | serval-pool | Connection reuse | `SimplePool`, `NoPool`, `Connection` |
-| serval-health | Backend health tracking | `SharedHealthState`, `HealthTracker`, `BackendIndex` |
+| serval-health | Backend health tracking | `HealthState`, `UpstreamIndex`, `MAX_UPSTREAMS` |
 | serval-proxy | Request forwarding | `Forwarder`, `ForwardResult`, `BodyInfo`, `Protocol` |
 | serval-metrics | Observability | `NoopMetrics`, `PrometheusMetrics`, `RealTimeMetrics` |
 | serval-tracing | Distributed tracing interface | `NoopTracer`, `SpanHandle` |

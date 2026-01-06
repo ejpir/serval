@@ -8,7 +8,7 @@ const std = @import("std");
 const config = @import("serval-core").config;
 
 pub const MAX_UPSTREAMS: u8 = config.MAX_UPSTREAMS;
-pub const BackendIndex = u6;
+pub const UpstreamIndex = config.UpstreamIndex;
 
 const CACHE_LINE_BYTES: usize = 64;
 
@@ -66,7 +66,7 @@ pub const HealthState = struct {
     }
 
     /// Record successful request/probe for backend.
-    pub inline fn recordSuccess(self: *Self, idx: BackendIndex) void {
+    pub inline fn recordSuccess(self: *Self, idx: UpstreamIndex) void {
         std.debug.assert(idx < self.backend_count);
 
         // Reset failure counter on any success
@@ -87,7 +87,7 @@ pub const HealthState = struct {
     }
 
     /// Record failed request/probe for backend.
-    pub inline fn recordFailure(self: *Self, idx: BackendIndex) void {
+    pub inline fn recordFailure(self: *Self, idx: UpstreamIndex) void {
         std.debug.assert(idx < self.backend_count);
 
         // Reset success counter on any failure
@@ -108,7 +108,7 @@ pub const HealthState = struct {
     }
 
     /// Check if backend is healthy.
-    pub inline fn isHealthy(self: *const Self, idx: BackendIndex) bool {
+    pub inline fn isHealthy(self: *const Self, idx: UpstreamIndex) bool {
         std.debug.assert(idx < self.backend_count);
         const bitmap = self.health_bitmap.load(.acquire);
         const mask: u64 = @as(u64, 1) << idx;
@@ -128,7 +128,7 @@ pub const HealthState = struct {
 
     /// Find Nth healthy backend, wrapping around.
     /// Returns null only if NO healthy backends exist.
-    pub fn findNthHealthy(self: *const Self, n: u32) ?BackendIndex {
+    pub fn findNthHealthy(self: *const Self, n: u32) ?UpstreamIndex {
         var bitmap = self.health_bitmap.load(.acquire);
 
         // Mask to only consider configured backends
@@ -160,7 +160,7 @@ pub const HealthState = struct {
     }
 
     /// Find first healthy backend, optionally excluding one.
-    pub fn findFirstHealthy(self: *const Self, exclude_idx: ?BackendIndex) ?BackendIndex {
+    pub fn findFirstHealthy(self: *const Self, exclude_idx: ?UpstreamIndex) ?UpstreamIndex {
         var bitmap = self.health_bitmap.load(.acquire);
 
         // Mask to only consider configured backends
@@ -183,7 +183,7 @@ pub const HealthState = struct {
     }
 
     /// Mark backend as healthy (internal).
-    fn markHealthy(self: *Self, idx: BackendIndex) void {
+    fn markHealthy(self: *Self, idx: UpstreamIndex) void {
         std.debug.assert(idx < self.backend_count);
         const mask: u64 = @as(u64, 1) << idx;
         _ = self.health_bitmap.fetchOr(mask, .release);
@@ -191,7 +191,7 @@ pub const HealthState = struct {
     }
 
     /// Mark backend as unhealthy (internal).
-    fn markUnhealthy(self: *Self, idx: BackendIndex) void {
+    fn markUnhealthy(self: *Self, idx: UpstreamIndex) void {
         std.debug.assert(idx < self.backend_count);
         const mask: u64 = @as(u64, 1) << idx;
         _ = self.health_bitmap.fetchAnd(~mask, .release);
@@ -327,18 +327,18 @@ test "HealthState findNthHealthy" {
     state.recordFailure(2);
     state.recordFailure(2);
 
-    try std.testing.expectEqual(@as(?BackendIndex, 1), state.findNthHealthy(0));
-    try std.testing.expectEqual(@as(?BackendIndex, 3), state.findNthHealthy(1));
-    try std.testing.expectEqual(@as(?BackendIndex, 4), state.findNthHealthy(2));
+    try std.testing.expectEqual(@as(?UpstreamIndex, 1), state.findNthHealthy(0));
+    try std.testing.expectEqual(@as(?UpstreamIndex, 3), state.findNthHealthy(1));
+    try std.testing.expectEqual(@as(?UpstreamIndex, 4), state.findNthHealthy(2));
     // Wraps around
-    try std.testing.expectEqual(@as(?BackendIndex, 1), state.findNthHealthy(3));
+    try std.testing.expectEqual(@as(?UpstreamIndex, 1), state.findNthHealthy(3));
 }
 
 test "HealthState findFirstHealthy" {
     var state = HealthState.init(5, 3, 2);
 
-    try std.testing.expectEqual(@as(?BackendIndex, 0), state.findFirstHealthy(null));
-    try std.testing.expectEqual(@as(?BackendIndex, 1), state.findFirstHealthy(0));
+    try std.testing.expectEqual(@as(?UpstreamIndex, 0), state.findFirstHealthy(null));
+    try std.testing.expectEqual(@as(?UpstreamIndex, 1), state.findFirstHealthy(0));
 
     // Mark 0-1 unhealthy
     state.recordFailure(0);
@@ -348,7 +348,7 @@ test "HealthState findFirstHealthy" {
     state.recordFailure(1);
     state.recordFailure(1);
 
-    try std.testing.expectEqual(@as(?BackendIndex, 2), state.findFirstHealthy(null));
+    try std.testing.expectEqual(@as(?UpstreamIndex, 2), state.findFirstHealthy(null));
 }
 
 test "HealthState findFirstHealthy returns null when all unhealthy" {
@@ -362,7 +362,7 @@ test "HealthState findFirstHealthy returns null when all unhealthy" {
     state.recordFailure(1);
     state.recordFailure(1);
 
-    try std.testing.expectEqual(@as(?BackendIndex, null), state.findFirstHealthy(null));
+    try std.testing.expectEqual(@as(?UpstreamIndex, null), state.findFirstHealthy(null));
 }
 
 test "HealthState reset" {

@@ -78,6 +78,33 @@ pub const MAX_CONNS_PER_UPSTREAM: u8 = 16;
 pub const MAX_UPSTREAMS: u8 = 64;
 
 // =============================================================================
+// Type Aliases for Bounds (TigerStyle: Single source of truth)
+// =============================================================================
+
+/// Type for upstream indices (must fit MAX_UPSTREAMS).
+/// TigerStyle: u6 fits exactly 0-63, matching 64-bit bitmap in health module.
+pub const UpstreamIndex = u6;
+
+/// Type for connection counts per upstream (must fit MAX_CONNS_PER_UPSTREAM).
+pub const ConnectionCount = u8;
+
+/// Type for header indices (must fit MAX_HEADERS).
+pub const HeaderIndex = u8;
+
+// TigerStyle: Compile-time assertions - max INDEX (count-1) must fit in type
+comptime {
+    if (MAX_UPSTREAMS - 1 > std.math.maxInt(UpstreamIndex)) {
+        @compileError("MAX_UPSTREAMS-1 exceeds UpstreamIndex capacity");
+    }
+    if (MAX_CONNS_PER_UPSTREAM - 1 > std.math.maxInt(ConnectionCount)) {
+        @compileError("MAX_CONNS_PER_UPSTREAM-1 exceeds ConnectionCount capacity");
+    }
+    if (MAX_HEADERS - 1 > std.math.maxInt(HeaderIndex)) {
+        @compileError("MAX_HEADERS-1 exceeds HeaderIndex capacity");
+    }
+}
+
+// =============================================================================
 // Forwarding / Retry Limits
 // =============================================================================
 

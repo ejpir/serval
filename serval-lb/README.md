@@ -52,7 +52,7 @@ pub const LbHandler = struct {
     pub fn selectUpstream(self: *Self, ctx: *Context, request: *const Request) Upstream
     pub fn onLog(self: *Self, ctx: *Context, entry: LogEntry) void
     pub fn countHealthy(self: *const Self) u32
-    pub fn isHealthy(self: *const Self, idx: BackendIndex) bool
+    pub fn isHealthy(self: *const Self, idx: UpstreamIndex) bool
 };
 ```
 
@@ -114,7 +114,7 @@ serval-lb/
 ## Dependencies
 
 - `serval-core` - Types, config
-- `serval-health` - HealthState, BackendIndex
+- `serval-health` - HealthState, UpstreamIndex
 - `serval-net` - parseIPv4 for prober
 
 ## TigerStyle Compliance

@@ -19,7 +19,7 @@ const LogEntry = core.LogEntry;
 const config = core.config;
 
 const HealthState = health_mod.HealthState;
-const BackendIndex = health_mod.BackendIndex;
+const UpstreamIndex = config.UpstreamIndex;
 const MAX_UPSTREAMS = health_mod.MAX_UPSTREAMS;
 
 /// Load balancer configuration.
@@ -132,7 +132,7 @@ pub const LbHandler = struct {
         const upstream = entry.upstream orelse return;
 
         assert(upstream.idx < MAX_UPSTREAMS);
-        const idx: BackendIndex = @intCast(upstream.idx);
+        const idx: UpstreamIndex = @intCast(upstream.idx);
 
         if (entry.status >= 500) {
             self.health.recordFailure(idx);
@@ -147,7 +147,7 @@ pub const LbHandler = struct {
     }
 
     /// Check if specific backend is healthy.
-    pub fn isHealthy(self: *const Self, idx: BackendIndex) bool {
+    pub fn isHealthy(self: *const Self, idx: UpstreamIndex) bool {
         assert(idx < self.upstreams.len);
         return self.health.isHealthy(idx);
     }
@@ -158,7 +158,7 @@ pub const LbHandler = struct {
 // Tests
 // =============================================================================
 
-fn makeLogEntry(status: u16, upstream_idx: u32) LogEntry {
+fn makeLogEntry(status: u16, upstream_idx: UpstreamIndex) LogEntry {
     return .{
         .timestamp_s = 0,
         .start_time_ns = 0,

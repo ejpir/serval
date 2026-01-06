@@ -43,18 +43,18 @@ const LbExtra = struct {
 /// Maximum number of upstreams supported.
 const MAX_UPSTREAMS: u8 = 16;
 
+const UpstreamIndex = serval.config.UpstreamIndex;
+
 /// Parse backends string into Upstream array.
 /// Format: "host:port,host:port,..."
 /// TigerStyle: Bounded loop, count only increments on successful parse.
-fn parseBackends(backends_str: []const u8, upstreams: *[MAX_UPSTREAMS]serval.Upstream) u8 {
-    var count: u8 = 0;
+fn parseBackends(backends_str: []const u8, upstreams: *[MAX_UPSTREAMS]serval.Upstream) UpstreamIndex {
+    var count: UpstreamIndex = 0;
     var iter = std.mem.splitScalar(u8, backends_str, ',');
 
-    // Bounded iteration
-    var iterations: u8 = 0;
-    while (iterations < MAX_UPSTREAMS) : (iterations += 1) {
+    // Bounded iteration - use count directly, MAX_UPSTREAMS-1 is max valid index
+    while (count < MAX_UPSTREAMS) {
         const backend = iter.next() orelse break;
-        if (count >= MAX_UPSTREAMS) break;
 
         // Find the colon separator
         const colon_pos = std.mem.lastIndexOfScalar(u8, backend, ':') orelse {

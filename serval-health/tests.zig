@@ -13,7 +13,7 @@ const state = @import("state.zig");
 const tracker = @import("tracker.zig");
 
 const SharedHealthState = state.SharedHealthState;
-const BackendIndex = state.BackendIndex;
+const UpstreamIndex = state.UpstreamIndex;
 const HealthTracker = tracker.HealthTracker;
 
 const config = @import("serval-core").config;
@@ -34,7 +34,7 @@ const THREAD_COUNT: u32 = 8;
 const ITERATIONS_PER_THREAD: u32 = 1000;
 
 /// Maximum backend index (MAX_UPSTREAMS - 1).
-const MAX_BACKEND_IDX: BackendIndex = MAX_UPSTREAMS - 1;
+const MAX_BACKEND_IDX: UpstreamIndex = MAX_UPSTREAMS - 1;
 
 // =============================================================================
 // Basic State Tests
@@ -51,7 +51,7 @@ test "all backends start healthy" {
 
     // Every backend should be healthy (use u8 counter to avoid u6 overflow)
     for (0..MAX_UPSTREAMS) |i| {
-        const idx: BackendIndex = @intCast(i);
+        const idx: UpstreamIndex = @intCast(i);
         try testing.expect(hs.isHealthy(idx));
     }
 }
@@ -111,37 +111,37 @@ test "findFirstHealthy skips excluded" {
 
     // All healthy, exclude none - should return 0
     const first = hs.findFirstHealthy(null);
-    try testing.expectEqual(@as(?BackendIndex, 0), first);
+    try testing.expectEqual(@as(?UpstreamIndex, 0), first);
 
     // Exclude backend 0 - should return 1
     const second = hs.findFirstHealthy(0);
-    try testing.expectEqual(@as(?BackendIndex, 1), second);
+    try testing.expectEqual(@as(?UpstreamIndex, 1), second);
 
     // Mark 0 and 1 unhealthy, exclude 2 - should return 3
     hs.markUnhealthy(0);
     hs.markUnhealthy(1);
     const third = hs.findFirstHealthy(2);
-    try testing.expectEqual(@as(?BackendIndex, 3), third);
+    try testing.expectEqual(@as(?UpstreamIndex, 3), third);
 
     // Mark all unhealthy - should return null
     for (0..MAX_UPSTREAMS) |i| {
         hs.markUnhealthy(@intCast(i));
     }
     const none = hs.findFirstHealthy(null);
-    try testing.expectEqual(@as(?BackendIndex, null), none);
+    try testing.expectEqual(@as(?UpstreamIndex, null), none);
 }
 
 test "findNthHealthy wraps correctly" {
     var hs = SharedHealthState.init();
 
     // All healthy, find 0th (first healthy)
-    try testing.expectEqual(@as(?BackendIndex, 0), hs.findNthHealthy(0));
+    try testing.expectEqual(@as(?UpstreamIndex, 0), hs.findNthHealthy(0));
 
     // Find 10th healthy
-    try testing.expectEqual(@as(?BackendIndex, 10), hs.findNthHealthy(10));
+    try testing.expectEqual(@as(?UpstreamIndex, 10), hs.findNthHealthy(10));
 
     // Find 63rd healthy (last one)
-    try testing.expectEqual(@as(?BackendIndex, 63), hs.findNthHealthy(63));
+    try testing.expectEqual(@as(?UpstreamIndex, 63), hs.findNthHealthy(63));
 
     // Mark some unhealthy and test
     hs.markUnhealthy(0);
@@ -149,10 +149,10 @@ test "findNthHealthy wraps correctly" {
     hs.markUnhealthy(2);
 
     // Now 0th healthy is idx 3
-    try testing.expectEqual(@as(?BackendIndex, 3), hs.findNthHealthy(0));
+    try testing.expectEqual(@as(?UpstreamIndex, 3), hs.findNthHealthy(0));
 
     // 60th healthy would be idx 63
-    try testing.expectEqual(@as(?BackendIndex, 63), hs.findNthHealthy(60));
+    try testing.expectEqual(@as(?UpstreamIndex, 63), hs.findNthHealthy(60));
 }
 
 // =============================================================================
@@ -353,12 +353,12 @@ test "concurrent mixed operations" {
         fn run(ctx: *Context) void {
             // Each thread operates on its own backend subset to avoid contention
             // Thread 0: backends 0-7, Thread 1: backends 8-15, etc.
-            const base_idx: BackendIndex = @intCast((ctx.thread_id * 8) % MAX_UPSTREAMS);
+            const base_idx: UpstreamIndex = @intCast((ctx.thread_id * 8) % MAX_UPSTREAMS);
 
             var iteration: u32 = 0;
             while (iteration < ITERATIONS_PER_THREAD) : (iteration += 1) {
-                const offset: BackendIndex = @intCast(iteration % 8);
-                const idx: BackendIndex = base_idx +% offset;
+                const offset: UpstreamIndex = @intCast(iteration % 8);
+                const idx: UpstreamIndex = base_idx +% offset;
 
                 // Alternate between mark healthy and unhealthy
                 if (iteration % 2 == 0) {
@@ -594,13 +594,13 @@ test "idx 63 works correctly" {
     try testing.expect(hs.isHealthy(MAX_BACKEND_IDX));
 
     // Find operations work at boundary
-    var idx: BackendIndex = 0;
+    var idx: UpstreamIndex = 0;
     while (idx < MAX_BACKEND_IDX) : (idx +%= 1) {
         hs.markUnhealthy(idx);
     }
     // Only idx 63 is healthy
     try testing.expectEqual(@as(u32, 1), hs.countHealthy());
-    try testing.expectEqual(@as(?BackendIndex, MAX_BACKEND_IDX), hs.findFirstHealthy(null));
+    try testing.expectEqual(@as(?UpstreamIndex, MAX_BACKEND_IDX), hs.findFirstHealthy(null));
 }
 
 test "operations on all MAX_UPSTREAMS backends" {
@@ -633,7 +633,7 @@ test "tracker operations on all backends" {
 
     // Mark all backends unhealthy via failures
     for (0..MAX_UPSTREAMS) |i| {
-        const idx: BackendIndex = @intCast(i);
+        const idx: UpstreamIndex = @intCast(i);
         ht.recordFailure(idx);
         ht.recordFailure(idx);
     }
@@ -645,7 +645,7 @@ test "tracker operations on all backends" {
 
     // Recover all via successes
     for (0..MAX_UPSTREAMS) |i| {
-        const idx: BackendIndex = @intCast(i);
+        const idx: UpstreamIndex = @intCast(i);
         ht.recordSuccess(idx);
         ht.recordSuccess(idx);
     }
@@ -706,19 +706,19 @@ test "findFirstHealthy with single healthy backend" {
 
     // Mark all unhealthy except one
     for (0..MAX_UPSTREAMS) |i| {
-        const idx: BackendIndex = @intCast(i);
+        const idx: UpstreamIndex = @intCast(i);
         if (idx != 30) {
             hs.markUnhealthy(idx);
         }
     }
 
     // Should always find idx 30
-    try testing.expectEqual(@as(?BackendIndex, 30), hs.findFirstHealthy(null));
-    try testing.expectEqual(@as(?BackendIndex, 30), hs.findFirstHealthy(0));
-    try testing.expectEqual(@as(?BackendIndex, 30), hs.findFirstHealthy(29));
+    try testing.expectEqual(@as(?UpstreamIndex, 30), hs.findFirstHealthy(null));
+    try testing.expectEqual(@as(?UpstreamIndex, 30), hs.findFirstHealthy(0));
+    try testing.expectEqual(@as(?UpstreamIndex, 30), hs.findFirstHealthy(29));
 
     // Excluding 30 should return null
-    try testing.expectEqual(@as(?BackendIndex, null), hs.findFirstHealthy(30));
+    try testing.expectEqual(@as(?UpstreamIndex, null), hs.findFirstHealthy(30));
 }
 
 test "findNthHealthy with sparse healthy backends" {
@@ -726,7 +726,7 @@ test "findNthHealthy with sparse healthy backends" {
 
     // Only keep backends 10, 20, 30, 40 healthy
     for (0..MAX_UPSTREAMS) |i| {
-        const idx: BackendIndex = @intCast(i);
+        const idx: UpstreamIndex = @intCast(i);
         if (idx != 10 and idx != 20 and idx != 30 and idx != 40) {
             hs.markUnhealthy(idx);
         }
@@ -735,10 +735,10 @@ test "findNthHealthy with sparse healthy backends" {
     try testing.expectEqual(@as(u32, 4), hs.countHealthy());
 
     // Find nth healthy
-    try testing.expectEqual(@as(?BackendIndex, 10), hs.findNthHealthy(0));
-    try testing.expectEqual(@as(?BackendIndex, 20), hs.findNthHealthy(1));
-    try testing.expectEqual(@as(?BackendIndex, 30), hs.findNthHealthy(2));
-    try testing.expectEqual(@as(?BackendIndex, 40), hs.findNthHealthy(3));
+    try testing.expectEqual(@as(?UpstreamIndex, 10), hs.findNthHealthy(0));
+    try testing.expectEqual(@as(?UpstreamIndex, 20), hs.findNthHealthy(1));
+    try testing.expectEqual(@as(?UpstreamIndex, 30), hs.findNthHealthy(2));
+    try testing.expectEqual(@as(?UpstreamIndex, 40), hs.findNthHealthy(3));
 }
 
 test "idempotent markHealthy and markUnhealthy" {
