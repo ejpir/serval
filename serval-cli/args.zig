@@ -198,10 +198,17 @@ pub fn Args(comptime Extra: type) type {
 
         fn formatDefault(self: *const Self, comptime field: std.builtin.Type.StructField) []const u8 {
             _ = self;
+            const type_info = @typeInfo(field.type);
+
+            // Handle optional types first (check type, not value)
+            if (type_info == .optional) {
+                return "none";
+            }
+
             if (field.default_value_ptr) |ptr| {
                 const typed_ptr: *const field.type = @ptrCast(@alignCast(ptr));
                 const value = typed_ptr.*;
-                return switch (@typeInfo(field.type)) {
+                return switch (type_info) {
                     .pointer => value,
                     .@"enum" => @tagName(value),
                     .int => std.fmt.comptimePrint("{d}", .{value}),
