@@ -23,6 +23,15 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("serval-cli/mod.zig"),
     });
 
+    // TLS module - no dependencies (Layer 1 - Protocol)
+    // Note: Linking happens per compilation unit (tests, executables)
+    // Modules cannot link libraries directly in Zig build system
+    // Will be integrated with serval-server and serval-proxy in future tasks
+    _ = b.addModule("serval-tls", .{
+        .root_source_file = b.path("serval-tls/mod.zig"),
+        .link_libc = true,
+    });
+
     // Pool module - depends on core
     const serval_pool_module = b.addModule("serval-pool", .{
         .root_source_file = b.path("serval-pool/mod.zig"),
@@ -195,6 +204,25 @@ pub fn build(b: *std.Build) void {
 
     const health_test_step = b.step("test-health", "Run serval-health library tests");
     health_test_step.dependOn(&run_health_tests.step);
+
+    // TLS module tests
+    // Note: Uses system-installed OpenSSL/BoringSSL (libssl + libcrypto)
+    const tls_tests_mod = b.createModule(.{
+        .root_source_file = b.path("serval-tls/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    tls_tests_mod.linkSystemLibrary("ssl", .{});
+    tls_tests_mod.linkSystemLibrary("crypto", .{});
+    const tls_tests = b.addTest(.{
+        .name = "tls_tests",
+        .root_module = tls_tests_mod,
+    });
+    const run_tls_tests = b.addRunArtifact(tls_tests);
+
+    const tls_test_step = b.step("test-tls", "Run serval-tls library tests");
+    tls_test_step.dependOn(&run_tls_tests.step);
 
     // OpenTelemetry module tests
     const otel_tests_mod = b.createModule(.{
