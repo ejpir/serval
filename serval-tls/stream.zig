@@ -28,6 +28,7 @@ pub const TLSStream = struct {
         allocator: Allocator,
     ) !TLSStream {
         // S1: preconditions
+        std.debug.assert(@intFromPtr(ctx) != 0); // S1: precondition - ctx is valid pointer
         std.debug.assert(fd > 0); // S1: precondition
 
         const ssl_conn = ssl.SSL_new(ctx) orelse return error.SslNew;
@@ -53,24 +54,23 @@ pub const TLSStream = struct {
 
     /// Client-side TLS handshake (upstream origination) with SNI.
     /// Uses blocking SSL operations - socket timeouts handled by std.Io.
+    /// TigerStyle S5: Caller must provide null-terminated SNI to avoid runtime allocation.
     pub fn initClient(
         ctx: *ssl.SSL_CTX,
         fd: c_int,
-        sni: []const u8,
+        sni_z: [*:0]const u8,
         allocator: Allocator,
     ) !TLSStream {
         // S1: preconditions
+        std.debug.assert(@intFromPtr(ctx) != 0); // S1: precondition - ctx is valid pointer
         std.debug.assert(fd > 0); // S1: precondition
-        std.debug.assert(sni.len > 0); // S1: precondition
 
         const ssl_conn = ssl.SSL_new(ctx) orelse return error.SslNew;
         errdefer ssl.SSL_free(ssl_conn);
 
         if (ssl.SSL_set_fd(ssl_conn, fd) != 1) return error.SslSetFd;
 
-        // Set SNI (init-time allocation)
-        const sni_z = try allocator.dupeZ(u8, sni);
-        defer allocator.free(sni_z);
+        // Set SNI (caller provides null-terminated string - no allocation)
         if (ssl.SSL_set_tlsext_host_name(ssl_conn, sni_z) != 1) return error.SslSetSni;
 
         ssl.SSL_set_connect_state(ssl_conn);
