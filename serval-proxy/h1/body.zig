@@ -353,12 +353,10 @@ fn streamChunkedRequestBody(
     }
 
     // Stream remaining chunks from client to upstream.
-    // forwardChunkedBody reads chunks from first fd and writes to second.
     // Direction: client_fd (source) -> upstream_fd (destination).
-    // Note: For request bodies, we read from plaintext client and write to upstream (TLS or plaintext).
-    // The TLS write happens in sendAll, not here, so pass null for TLS stream.
-    // TODO: Request body chunked forwarding may need TLS-aware write path for upstream.
-    total_sent += try forwardChunkedBody(null, client_fd, upstream_fd);
+    // Read from plaintext client, write to upstream (TLS or plaintext).
+    const maybe_upstream_tls = if (upstream_conn.tls) |*tls| tls else null;
+    total_sent += try forwardChunkedBody(null, maybe_upstream_tls, client_fd, upstream_fd);
 
     // Postcondition: total_sent includes initial_body plus chunked stream bytes.
     // Minimum chunked body is "0\r\n\r\n" (5 bytes) if no initial_body.

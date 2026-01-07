@@ -38,19 +38,21 @@ pub const CHUNK_BUFFER_SIZE_BYTES: u32 = 8192;
 // Public API
 // =============================================================================
 
-/// Forward chunked body from upstream to client, preserving chunk format.
-/// For TLS upstreams, reads decrypted chunks via TLSStream.
-/// For plaintext upstreams, reads from raw fd.
+/// Forward chunked body preserving chunk format.
+/// Supports TLS on either end (or both):
+/// - read_tls: When reading from TLS source (response from TLS upstream)
+/// - write_tls: When writing to TLS destination (request to TLS upstream)
 /// Returns total bytes forwarded (including chunk framing).
-/// TigerStyle: Bounded main loop, explicit TLS handling.
+/// TigerStyle: Bounded main loop, explicit TLS handling for both directions.
 pub fn forwardChunkedBody(
-    maybe_tls: ?*TLSStream,
-    upstream_fd: i32,
-    client_fd: i32,
+    read_tls: ?*TLSStream,
+    write_tls: ?*TLSStream,
+    source_fd: i32,
+    dest_fd: i32,
 ) ForwardError!u64 {
     // Precondition: valid file descriptors.
-    assert(upstream_fd >= 0);
-    assert(client_fd >= 0);
+    assert(source_fd >= 0);
+    assert(dest_fd >= 0);
 
     // Zero buffer for defense-in-depth (don't leak stale data on partial reads).
     var buffer: [CHUNK_BUFFER_SIZE_BYTES]u8 = std.mem.zeroes([CHUNK_BUFFER_SIZE_BYTES]u8);
@@ -61,7 +63,7 @@ pub fn forwardChunkedBody(
     // Main loop: process one chunk per iteration (bounded).
     while (chunk_iterations < MAX_CHUNK_ITERATIONS) : (chunk_iterations += 1) {
         // Ensure buffer has enough data to parse chunk header.
-        buffer_len = try ensureBufferHasChunkHeader(maybe_tls, upstream_fd, &buffer, buffer_len);
+        buffer_len = try ensureBufferHasChunkHeader(read_tls, source_fd, &buffer, buffer_len);
 
         // Parse chunk size from buffer.
         const parse_result = parseChunkSize(buffer[0..buffer_len]) catch |err| {
@@ -71,8 +73,8 @@ pub fn forwardChunkedBody(
         const chunk_size = parse_result.size;
         const header_consumed: u32 = @intCast(parse_result.consumed);
 
-        // Forward chunk header (size + extensions + CRLF) to client.
-        try sendAll(client_fd, buffer[0..header_consumed]);
+        // Forward chunk header (size + extensions + CRLF) to destination.
+        try sendAll(write_tls, dest_fd, buffer[0..header_consumed]);
         total_forwarded += header_consumed;
 
         // Consume header from buffer.
@@ -81,12 +83,12 @@ pub fn forwardChunkedBody(
         // Check for last chunk (size 0).
         if (isLastChunk(chunk_size)) {
             // Forward trailing CRLF after last chunk.
-            total_forwarded += try forwardTrailerSection(maybe_tls, upstream_fd, client_fd, &buffer, &buffer_len);
+            total_forwarded += try forwardTrailerSection(read_tls, write_tls, source_fd, dest_fd, &buffer, &buffer_len);
             break;
         }
 
         // Forward chunk data + trailing CRLF.
-        total_forwarded += try forwardChunkData(maybe_tls, upstream_fd, client_fd, chunk_size, &buffer, &buffer_len);
+        total_forwarded += try forwardChunkData(read_tls, write_tls, source_fd, dest_fd, chunk_size, &buffer, &buffer_len);
     }
 
     // Postcondition: forwarded some bytes or detected empty chunked body.
@@ -129,19 +131,20 @@ fn ensureBufferHasChunkHeader(
     return current_len;
 }
 
-/// Forward chunk data and trailing CRLF to client.
-/// Reads from buffer first, then directly from upstream for remaining bytes.
+/// Forward chunk data and trailing CRLF to destination.
+/// Reads from buffer first, then directly from source for remaining bytes.
 /// Returns bytes forwarded (chunk_size + 2 for CRLF).
 fn forwardChunkData(
-    maybe_tls: ?*TLSStream,
-    upstream_fd: i32,
-    client_fd: i32,
+    read_tls: ?*TLSStream,
+    write_tls: ?*TLSStream,
+    source_fd: i32,
+    dest_fd: i32,
     chunk_size: u64,
     buffer: *[CHUNK_BUFFER_SIZE_BYTES]u8,
     buffer_len: *u32,
 ) ForwardError!u64 {
-    assert(upstream_fd >= 0);
-    assert(client_fd >= 0);
+    assert(source_fd >= 0);
+    assert(dest_fd >= 0);
     assert(chunk_size > 0); // Caller handles last-chunk case.
 
     var bytes_remaining = chunk_size;
@@ -150,35 +153,36 @@ fn forwardChunkData(
     // Forward any buffered data first.
     if (buffer_len.* > 0) {
         const to_send: u32 = @intCast(@min(buffer_len.*, bytes_remaining));
-        try sendAll(client_fd, buffer[0..to_send]);
+        try sendAll(write_tls, dest_fd, buffer[0..to_send]);
         forwarded += to_send;
         bytes_remaining -= to_send;
         shiftBuffer(buffer, buffer_len, to_send);
     }
 
-    // Forward remaining chunk data directly from upstream.
-    forwarded += try forwardBytes(maybe_tls, upstream_fd, client_fd, bytes_remaining, buffer);
+    // Forward remaining chunk data directly from source.
+    forwarded += try forwardBytes(read_tls, write_tls, source_fd, dest_fd, bytes_remaining, buffer);
 
     // Forward trailing CRLF after chunk data.
-    forwarded += try forwardCRLF(maybe_tls, upstream_fd, client_fd, buffer, buffer_len);
+    forwarded += try forwardCRLF(read_tls, write_tls, source_fd, dest_fd, buffer, buffer_len);
 
     assert(forwarded == chunk_size + 2);
     return forwarded;
 }
 
-/// Forward exactly byte_count bytes from upstream to client.
+/// Forward exactly byte_count bytes from source to destination.
 /// Uses buffer for intermediate storage.
-/// Reads via TLS or raw fd depending on upstream connection type.
+/// Reads via TLS or raw fd, writes via TLS or raw fd.
 /// Returns bytes forwarded.
 fn forwardBytes(
-    maybe_tls: ?*TLSStream,
-    upstream_fd: i32,
-    client_fd: i32,
+    read_tls: ?*TLSStream,
+    write_tls: ?*TLSStream,
+    source_fd: i32,
+    dest_fd: i32,
     byte_count: u64,
     buffer: *[CHUNK_BUFFER_SIZE_BYTES]u8,
 ) ForwardError!u64 {
-    assert(upstream_fd >= 0);
-    assert(client_fd >= 0);
+    assert(source_fd >= 0);
+    assert(dest_fd >= 0);
 
     var remaining = byte_count;
     var forwarded: u64 = 0;
@@ -189,18 +193,19 @@ fn forwardBytes(
         const to_read: usize = @intCast(@min(remaining, CHUNK_BUFFER_SIZE_BYTES));
 
         // Read from TLS or raw fd
-        const n = if (maybe_tls) |tls|
+        const n = if (read_tls) |tls|
             tls.read(buffer[0..to_read]) catch {
                 return ForwardError.RecvFailed;
             }
         else
-            posix.recv(upstream_fd, buffer[0..to_read], 0) catch {
+            posix.recv(source_fd, buffer[0..to_read], 0) catch {
                 return ForwardError.RecvFailed;
             };
 
         if (n == 0) return ForwardError.RecvFailed; // Unexpected EOF.
 
-        try sendAll(client_fd, buffer[0..n]);
+        // Write to TLS or raw fd
+        try sendAll(write_tls, dest_fd, buffer[0..n]);
         forwarded += n;
         remaining -= n;
     }
@@ -209,23 +214,24 @@ fn forwardBytes(
     return forwarded;
 }
 
-/// Forward CRLF sequence (reads from buffer or upstream as needed).
+/// Forward CRLF sequence (reads from buffer or source as needed).
 /// Returns 2 (bytes forwarded).
 fn forwardCRLF(
-    maybe_tls: ?*TLSStream,
-    upstream_fd: i32,
-    client_fd: i32,
+    read_tls: ?*TLSStream,
+    write_tls: ?*TLSStream,
+    source_fd: i32,
+    dest_fd: i32,
     buffer: *[CHUNK_BUFFER_SIZE_BYTES]u8,
     buffer_len: *u32,
 ) ForwardError!u64 {
-    assert(upstream_fd >= 0);
-    assert(client_fd >= 0);
+    assert(source_fd >= 0);
+    assert(dest_fd >= 0);
 
     // Ensure we have 2 bytes for CRLF.
     var iterations: u32 = 0;
     const max_iterations: u32 = 8;
     while (buffer_len.* < 2 and iterations < max_iterations) : (iterations += 1) {
-        const bytes_read = try recvToBuffer(maybe_tls, upstream_fd, buffer, buffer_len.*);
+        const bytes_read = try recvToBuffer(read_tls, source_fd, buffer, buffer_len.*);
         if (bytes_read == 0) return ForwardError.RecvFailed;
         buffer_len.* += bytes_read;
     }
@@ -237,7 +243,7 @@ fn forwardCRLF(
         return ForwardError.InvalidResponse;
     }
 
-    try sendAll(client_fd, buffer[0..2]);
+    try sendAll(write_tls, dest_fd, buffer[0..2]);
     shiftBuffer(buffer, buffer_len, 2);
 
     // Postcondition: CRLF is exactly 2 bytes.
@@ -251,14 +257,15 @@ fn forwardCRLF(
 /// We discard trailer headers but must forward the final CRLF.
 /// Returns bytes forwarded (at least 2 for final CRLF).
 fn forwardTrailerSection(
-    maybe_tls: ?*TLSStream,
-    upstream_fd: i32,
-    client_fd: i32,
+    read_tls: ?*TLSStream,
+    write_tls: ?*TLSStream,
+    source_fd: i32,
+    dest_fd: i32,
     buffer: *[CHUNK_BUFFER_SIZE_BYTES]u8,
     buffer_len: *u32,
 ) ForwardError!u64 {
-    assert(upstream_fd >= 0);
-    assert(client_fd >= 0);
+    assert(source_fd >= 0);
+    assert(dest_fd >= 0);
 
     var forwarded: u64 = 0;
     var iterations: u32 = 0;
@@ -268,7 +275,7 @@ fn forwardTrailerSection(
     while (iterations < max_iterations) : (iterations += 1) {
         // Ensure buffer has data to scan.
         if (buffer_len.* < 2) {
-            const bytes_read = try recvToBuffer(maybe_tls, upstream_fd, buffer, buffer_len.*);
+            const bytes_read = try recvToBuffer(read_tls, source_fd, buffer, buffer_len.*);
             if (bytes_read == 0) return ForwardError.RecvFailed;
             buffer_len.* += bytes_read;
         }
@@ -276,7 +283,7 @@ fn forwardTrailerSection(
         // Check for empty line (end of trailers).
         if (buffer_len.* >= 2 and buffer[0] == '\r' and buffer[1] == '\n') {
             // Forward final CRLF and done.
-            try sendAll(client_fd, buffer[0..2]);
+            try sendAll(write_tls, dest_fd, buffer[0..2]);
             shiftBuffer(buffer, buffer_len, 2);
             forwarded += 2;
             break;
@@ -290,7 +297,7 @@ fn forwardTrailerSection(
             shiftBuffer(buffer, buffer_len, to_discard);
         } else {
             // Need more data to find line end.
-            const bytes_read = try recvToBuffer(maybe_tls, upstream_fd, buffer, buffer_len.*);
+            const bytes_read = try recvToBuffer(read_tls, source_fd, buffer, buffer_len.*);
             if (bytes_read == 0) return ForwardError.RecvFailed;
             buffer_len.* += bytes_read;
         }
@@ -330,18 +337,26 @@ fn recvToBuffer(
     return @intCast(n);
 }
 
-/// Send all bytes to client (handles partial sends).
-fn sendAll(client_fd: i32, data: []const u8) ForwardError!void {
-    assert(client_fd >= 0);
+/// Send all bytes to destination (handles partial sends).
+/// Writes via TLS or raw fd depending on destination connection type.
+fn sendAll(write_tls: ?*TLSStream, dest_fd: i32, data: []const u8) ForwardError!void {
+    assert(dest_fd >= 0);
 
     var sent: usize = 0;
     var iterations: u32 = 0;
     const max_iterations: u32 = 1024;
 
     while (sent < data.len and iterations < max_iterations) : (iterations += 1) {
-        const n = posix.send(client_fd, data[sent..], 0) catch {
-            return ForwardError.SendFailed;
-        };
+        // Write to TLS or raw fd
+        const n = if (write_tls) |tls|
+            tls.write(data[sent..]) catch {
+                return ForwardError.SendFailed;
+            }
+        else
+            posix.send(dest_fd, data[sent..], 0) catch {
+                return ForwardError.SendFailed;
+            };
+
         if (n == 0) return ForwardError.SendFailed;
         sent += n;
     }

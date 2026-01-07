@@ -184,10 +184,10 @@ pub fn forwardResponse(
 
     if (is_chunked) {
         // Chunked transfer encoding: forward chunks until final chunk.
-        // For TLS upstreams, reads decrypted via TLSStream.
+        // Read from TLS upstream (if encrypted), write to plaintext client.
         // For plaintext upstreams, uses raw fd (zero-copy splice on Linux).
         debugLog("recv: forwarding chunked body", .{});
-        total_body_bytes += try forwardChunkedBody(maybe_tls, upstream_fd, client_fd);
+        total_body_bytes += try forwardChunkedBody(maybe_tls, null, upstream_fd, client_fd);
     } else if (content_length) |length| {
         // Content-Length based: forward exact number of bytes.
         if (length > body_already_read) {
