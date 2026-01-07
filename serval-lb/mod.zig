@@ -11,12 +11,9 @@
 //!   defer handler.deinit();
 
 pub const handler = @import("handler.zig");
-pub const prober = @import("prober.zig");
 pub const LbHandler = handler.LbHandler;
 pub const LbConfig = handler.LbConfig;
-pub const ProberContext = prober.ProberContext;
 
 test {
     _ = @import("handler.zig");
-    _ = @import("prober.zig");
 }

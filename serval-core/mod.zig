@@ -57,6 +57,7 @@ pub const elapsedNanos = time.elapsedNanos;
 pub const elapsedSince = time.elapsedSince;
 
 test {
+    _ = @import("header_map.zig");
     _ = @import("types.zig");
     _ = @import("errors.zig");
     _ = @import("config.zig");

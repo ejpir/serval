@@ -29,6 +29,7 @@ serval (umbrella - re-exports all modules)
 ├── serval-http     # HTTP/1.1 parser
 ├── serval-pool     # Connection pooling
 ├── serval-health   # Backend health tracking (atomic bitmap, thresholds)
+├── serval-prober   # Background health probing
 ├── serval-proxy    # Upstream forwarding (h1/ subdirectory)
 ├── serval-metrics  # Request metrics (real-time + Prometheus)
 ├── serval-tracing  # Distributed tracing interface
@@ -87,6 +88,8 @@ Layer 2 (Infrastructure):                                          │
                                                             │      │
   serval-health ←───────────────────────────────────────────┤      │
                                                             │      │
+  serval-prober ←───────────────────────────────────────────┤      │
+                                                            │      │
   serval-metrics ───────────────────────────────────────────┤      │
                                                             │      │
   serval-tracing ───────────────────────────────────────────┤      │
@@ -103,7 +106,7 @@ Layer 5 (Orchestration):                                    │      │
                                                        serval (composes all)
 
 Standalone:
-  serval-core ←── serval-lb (load balancer handler, also depends on serval-health, serval-net)
+  serval-core ←── serval-lb (load balancer handler, depends on serval-health, serval-prober)
   serval-core ←── serval-cli (CLI utilities)
 ```
 
@@ -116,6 +119,7 @@ Standalone:
 | serval-http | HTTP/1.1 parsing | `Parser` |
 | serval-pool | Connection reuse | `SimplePool`, `NoPool`, `Connection` |
 | serval-health | Backend health tracking | `HealthState`, `UpstreamIndex`, `MAX_UPSTREAMS` |
+| serval-prober | Background health probing | `ProberContext`, `probeLoop` |
 | serval-proxy | Request forwarding | `Forwarder`, `ForwardResult`, `BodyInfo`, `Protocol` |
 | serval-metrics | Observability | `NoopMetrics`, `PrometheusMetrics`, `RealTimeMetrics` |
 | serval-tracing | Distributed tracing interface | `NoopTracer`, `SpanHandle` |

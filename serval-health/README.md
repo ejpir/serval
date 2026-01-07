@@ -8,18 +8,13 @@ Provides atomic health state tracking with threshold-based transitions. Designed
 
 ## Exports
 
-Primary (use these):
 - `HealthState` - Unified health state with embedded threshold tracking (embeddable)
 - `UpstreamIndex` - Type alias for upstream index (u6)
 - `MAX_UPSTREAMS` - Maximum supported backends (64)
 
-Legacy (for transition):
-- `SharedHealthState` - Lock-free atomic bitmap (pointer-based)
-- `HealthTracker` - Threshold wrapper for SharedHealthState
-
 ## Usage
 
-### Recommended: HealthState (Embeddable)
+### HealthState (Embeddable)
 
 ```zig
 const health = @import("serval-health");
@@ -47,17 +42,6 @@ const n = counter.fetchAdd(1, .monotonic);
 if (state.findNthHealthy(n)) |idx| {
     return upstreams[idx];
 }
-```
-
-### Legacy: SharedHealthState + HealthTracker
-
-```zig
-const upstream_count: u8 = 3;
-var shared = health.SharedHealthState.initWithCount(upstream_count);
-var tracker = health.HealthTracker.init(&shared, 3, 2);
-
-tracker.recordSuccess(0);
-tracker.recordFailure(1);
 ```
 
 ## HealthState
@@ -89,9 +73,7 @@ pub const HealthState = struct {
 ```
 serval-health/
 ├── mod.zig              # Module exports
-├── health_state.zig     # HealthState (unified, embeddable) - PREFERRED
-├── state.zig            # SharedHealthState (legacy, pointer-based)
-├── tracker.zig          # HealthTracker (legacy, wraps SharedHealthState)
+├── health_state.zig     # HealthState (unified, embeddable)
 ├── tests.zig            # Comprehensive tests
 └── integration_tests.zig # Integration scenarios
 ```

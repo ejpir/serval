@@ -7,8 +7,7 @@ const std = @import("std");
 const health = @import("mod.zig");
 const config = @import("serval-core").config;
 
-const SharedHealthState = health.SharedHealthState;
-const HealthTracker = health.HealthTracker;
+const HealthState = health.HealthState;
 const UpstreamIndex = health.UpstreamIndex;
 
 /// Simulated upstream for testing.
@@ -30,10 +29,9 @@ test "integration: 2 backends with health-aware round-robin" {
     };
     const upstream_count: u8 = upstreams.len;
 
-    // CORRECT: Use initWithCount to match actual backend count.
-    var state = SharedHealthState.initWithCount(upstream_count);
-    var tracker = HealthTracker.init(
-        &state,
+    // CORRECT: Use init with backend count to match actual backend count.
+    var state = HealthState.init(
+        upstream_count,
         config.DEFAULT_UNHEALTHY_THRESHOLD,
         config.DEFAULT_HEALTHY_THRESHOLD,
     );
@@ -46,37 +44,12 @@ test "integration: 2 backends with health-aware round-robin" {
         const current = next_idx;
         next_idx +%= 1;
 
-        if (tracker.findNthHealthy(current)) |idx| {
+        if (state.findNthHealthy(current)) |idx| {
             // CRITICAL: idx must be valid for our upstream array.
             try std.testing.expect(idx < upstream_count);
             _ = upstreams[idx]; // Would panic if out of bounds.
         }
     }
-}
-
-test "integration: wrong init causes out-of-bounds (regression test)" {
-    // Demonstrates the bug: init() sets all MAX_UPSTREAMS bits healthy.
-    const upstreams = [_]TestUpstream{
-        .{ .host = "backend1", .port = 8001, .idx = 0 },
-        .{ .host = "backend2", .port = 8002, .idx = 1 },
-    };
-
-    // WRONG: Using init() with fewer than MAX_UPSTREAMS backends.
-    var state = SharedHealthState.init();
-
-    // This would return indices 0 to MAX_UPSTREAMS-1, but we only have 2 upstreams!
-    // findNthHealthy(2) returns 2, which is out of bounds.
-    const bad_idx = state.findNthHealthy(2);
-    try std.testing.expect(bad_idx != null);
-    try std.testing.expect(bad_idx.? >= upstreams.len); // Proves the bug!
-
-    // CORRECT: initWithCount limits to actual backends.
-    var state_correct = SharedHealthState.initWithCount(@intCast(upstreams.len));
-    // With 2 healthy backends, findNthHealthy wraps: 2 % 2 = 0
-    const good_idx = state_correct.findNthHealthy(2);
-    try std.testing.expect(good_idx != null);
-    try std.testing.expect(good_idx.? < upstreams.len);
-    try std.testing.expectEqual(@as(?UpstreamIndex, 0), good_idx); // 2 % 2 = 0
 }
 
 test "integration: health transitions with upstream selection" {
@@ -87,35 +60,34 @@ test "integration: health transitions with upstream selection" {
     };
     const upstream_count: u8 = upstreams.len;
 
-    var state = SharedHealthState.initWithCount(upstream_count);
-    var tracker = HealthTracker.init(&state, 3, 2); // 3 failures → unhealthy, 2 successes → healthy
+    var state = HealthState.init(upstream_count, 3, 2); // 3 failures → unhealthy, 2 successes → healthy
 
     // All 3 healthy initially.
-    try std.testing.expectEqual(@as(u32, 3), tracker.countHealthy());
+    try std.testing.expectEqual(@as(u32, 3), state.countHealthy());
 
     // Simulate backend 1 failing 3 times (threshold).
-    tracker.recordFailure(1);
-    tracker.recordFailure(1);
-    tracker.recordFailure(1);
+    state.recordFailure(1);
+    state.recordFailure(1);
+    state.recordFailure(1);
 
     // Backend 1 should now be unhealthy.
-    try std.testing.expect(!tracker.isHealthy(1));
-    try std.testing.expectEqual(@as(u32, 2), tracker.countHealthy());
+    try std.testing.expect(!state.isHealthy(1));
+    try std.testing.expectEqual(@as(u32, 2), state.countHealthy());
 
     // Selection should only return 0 or 2 now.
     for (0..50) |i| {
-        if (tracker.findNthHealthy(@intCast(i))) |idx| {
+        if (state.findNthHealthy(@intCast(i))) |idx| {
             try std.testing.expect(idx != 1); // Backend 1 is unhealthy.
             try std.testing.expect(idx < upstream_count);
         }
     }
 
     // Backend 1 recovers with 2 successes.
-    tracker.recordSuccess(1);
-    tracker.recordSuccess(1);
+    state.recordSuccess(1);
+    state.recordSuccess(1);
 
-    try std.testing.expect(tracker.isHealthy(1));
-    try std.testing.expectEqual(@as(u32, 3), tracker.countHealthy());
+    try std.testing.expect(state.isHealthy(1));
+    try std.testing.expectEqual(@as(u32, 3), state.countHealthy());
 }
 
 test "integration: all backends unhealthy graceful degradation" {
@@ -125,22 +97,21 @@ test "integration: all backends unhealthy graceful degradation" {
     };
     const upstream_count: u8 = upstreams.len;
 
-    var state = SharedHealthState.initWithCount(upstream_count);
-    var tracker = HealthTracker.init(&state, 3, 2);
+    var state = HealthState.init(upstream_count, 3, 2);
 
     // Mark all backends unhealthy.
     for (0..upstream_count) |i| {
-        const idx: u6 = @intCast(i);
-        tracker.recordFailure(idx);
-        tracker.recordFailure(idx);
-        tracker.recordFailure(idx);
+        const idx: UpstreamIndex = @intCast(i);
+        state.recordFailure(idx);
+        state.recordFailure(idx);
+        state.recordFailure(idx);
     }
 
-    try std.testing.expectEqual(@as(u32, 0), tracker.countHealthy());
+    try std.testing.expectEqual(@as(u32, 0), state.countHealthy());
 
     // findNthHealthy should return null when all unhealthy.
-    try std.testing.expectEqual(@as(?UpstreamIndex, null), tracker.findNthHealthy(0));
-    try std.testing.expectEqual(@as(?UpstreamIndex, null), tracker.findNthHealthy(1));
+    try std.testing.expectEqual(@as(?UpstreamIndex, null), state.findNthHealthy(0));
+    try std.testing.expectEqual(@as(?UpstreamIndex, null), state.findNthHealthy(1));
 
     // Graceful degradation: caller should fall back to round-robin.
     // This is what lb_example does.
@@ -156,23 +127,22 @@ test "integration: all backends unhealthy graceful degradation" {
 
 test "integration: single backend" {
     const upstream_count: u8 = 1;
-    var state = SharedHealthState.initWithCount(upstream_count);
-    var tracker = HealthTracker.init(&state, 3, 2);
+    var state = HealthState.init(upstream_count, 3, 2);
 
     // Only one backend, all selections should return 0.
     for (0..20) |i| {
-        if (tracker.findNthHealthy(@intCast(i))) |idx| {
+        if (state.findNthHealthy(@intCast(i))) |idx| {
             try std.testing.expectEqual(@as(UpstreamIndex, 0), idx);
         }
     }
 
     // Mark it unhealthy.
-    tracker.recordFailure(0);
-    tracker.recordFailure(0);
-    tracker.recordFailure(0);
+    state.recordFailure(0);
+    state.recordFailure(0);
+    state.recordFailure(0);
 
     // Now findNthHealthy returns null.
-    try std.testing.expectEqual(@as(?UpstreamIndex, null), tracker.findNthHealthy(0));
+    try std.testing.expectEqual(@as(?UpstreamIndex, null), state.findNthHealthy(0));
 }
 
 test "integration: concurrent selection simulation" {
@@ -185,7 +155,7 @@ test "integration: concurrent selection simulation" {
     };
     const upstream_count: u8 = upstreams.len;
 
-    var state = SharedHealthState.initWithCount(upstream_count);
+    const state = HealthState.init(upstream_count, 3, 2);
 
     // Use atomic counter like lb_example.
     var counter = std.atomic.Value(u32).init(0);
@@ -202,8 +172,8 @@ test "integration: concurrent selection simulation" {
 
 test "integration: max backends" {
     // Test with maximum supported backends.
-    const upstream_count = config.MAX_UPSTREAMS;
-    var state = SharedHealthState.initWithCount(upstream_count);
+    const upstream_count = health.MAX_UPSTREAMS;
+    const state = HealthState.init(upstream_count, 3, 2);
 
     try std.testing.expectEqual(@as(u32, upstream_count), state.countHealthy());
 

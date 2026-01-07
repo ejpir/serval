@@ -1,4 +1,4 @@
-// serval-lb/prober.zig
+// serval-prober/prober.zig
 //! Background Health Prober
 //!
 //! Probes unhealthy backends for recovery using HTTP GET requests.

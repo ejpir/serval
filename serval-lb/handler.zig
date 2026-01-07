@@ -10,7 +10,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const core = @import("serval-core");
 const health_mod = @import("serval-health");
-const prober = @import("prober.zig");
+const prober = @import("serval-prober");
 
 const Context = core.Context;
 const Request = core.Request;

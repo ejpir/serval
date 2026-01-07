@@ -11,16 +11,8 @@ pub const HealthState = health_state.HealthState;
 pub const UpstreamIndex = health_state.UpstreamIndex;
 pub const MAX_UPSTREAMS = health_state.MAX_UPSTREAMS;
 
-// Keep old types for backwards compatibility during transition
-pub const state = @import("state.zig");
-pub const tracker = @import("tracker.zig");
-pub const SharedHealthState = state.SharedHealthState;
-pub const HealthTracker = tracker.HealthTracker;
-
 test {
     _ = health_state;
-    _ = state;
-    _ = tracker;
     _ = @import("tests.zig");
     _ = @import("integration_tests.zig");
 }

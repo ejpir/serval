@@ -10,7 +10,6 @@ Standalone load balancing module with integrated health tracking and automatic b
 
 - `LbHandler` - Health-aware round-robin load balancer handler
 - `LbConfig` - Configuration for thresholds, probing intervals
-- `ProberContext` - Context struct for background prober
 
 ## Usage
 
@@ -86,7 +85,7 @@ pub const LbConfig = struct {
 
 ### Background Health Probing
 
-Background thread probes unhealthy backends for recovery:
+Background thread probes unhealthy backends for recovery (via `serval-prober`):
 - HTTP GET to configured health path
 - Only probes unhealthy backends (healthy ones get passive checks via traffic)
 - On 2xx response, records success toward recovery threshold
@@ -96,8 +95,7 @@ Background thread probes unhealthy backends for recovery:
 ```
 serval-lb/
 ├── mod.zig       # Module exports
-├── handler.zig   # LbHandler implementation
-└── prober.zig    # Background prober (extracted for TigerStyle)
+└── handler.zig   # LbHandler implementation
 ```
 
 ## Implementation Status
@@ -115,7 +113,7 @@ serval-lb/
 
 - `serval-core` - Types, config
 - `serval-health` - HealthState, UpstreamIndex
-- `serval-net` - parseIPv4 for prober
+- `serval-prober` - Background health probing
 
 ## TigerStyle Compliance
 

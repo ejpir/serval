@@ -98,13 +98,23 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // Load balancer handler module - depends on core, health, net
+    // Prober module - depends on core, net, health
+    const serval_prober_module = b.addModule("serval-prober", .{
+        .root_source_file = b.path("serval-prober/mod.zig"),
+        .imports = &.{
+            .{ .name = "serval-core", .module = serval_core_module },
+            .{ .name = "serval-net", .module = serval_net_module },
+            .{ .name = "serval-health", .module = serval_health_module },
+        },
+    });
+
+    // Load balancer handler module - depends on core, health, prober
     const serval_lb_module = b.addModule("serval-lb", .{
         .root_source_file = b.path("serval-lb/mod.zig"),
         .imports = &.{
             .{ .name = "serval-core", .module = serval_core_module },
             .{ .name = "serval-health", .module = serval_health_module },
-            .{ .name = "serval-net", .module = serval_net_module },
+            .{ .name = "serval-prober", .module = serval_prober_module },
         },
     });
 
@@ -160,7 +170,7 @@ pub fn build(b: *std.Build) void {
     });
     lb_tests_mod.addImport("serval-core", serval_core_module);
     lb_tests_mod.addImport("serval-health", serval_health_module);
-    lb_tests_mod.addImport("serval-net", serval_net_module);
+    lb_tests_mod.addImport("serval-prober", serval_prober_module);
     const lb_tests = b.addTest(.{
         .name = "lb_tests",
         .root_module = lb_tests_mod,
