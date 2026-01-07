@@ -16,7 +16,7 @@ const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
-pub const TlsStream = struct {
+pub const TLSStream = struct {
     fd: c_int,
     ssl: *ssl.SSL,
     allocator: Allocator,
@@ -29,7 +29,7 @@ pub const TlsStream = struct {
         io: *Io,
         timeout_ns: i64,
         allocator: Allocator,
-    ) !TlsStream {
+    ) !TLSStream {
         std.debug.assert(ctx != null); // S1: precondition
         std.debug.assert(fd > 0); // S1: precondition
         std.debug.assert(timeout_ns > 0); // S1: precondition
@@ -63,7 +63,7 @@ pub const TlsStream = struct {
         sni: []const u8,
         timeout_ns: i64,
         allocator: Allocator,
-    ) !TlsStream {
+    ) !TLSStream {
         std.debug.assert(ctx != null); // S1: precondition
         std.debug.assert(fd > 0); // S1: precondition
         std.debug.assert(sni.len > 0); // S1: precondition
@@ -98,11 +98,11 @@ pub const TlsStream = struct {
     /// Non-blocking TLS read with timeout.
     /// Returns number of bytes read, or 0 on clean shutdown.
     pub fn read(
-        self: *TlsStream,
+        self: *TLSStream,
         io: *Io,
         buf: []u8,
         timeout_ns: i64,
-    ) !usize {
+    ) !u32 {
         std.debug.assert(self.ssl != null); // S1: precondition
         std.debug.assert(buf.len > 0); // S1: precondition
         std.debug.assert(timeout_ns > 0); // S1: precondition
@@ -123,7 +123,7 @@ pub const TlsStream = struct {
 
             const ret: c_int = ssl.SSL_read(self.ssl, buf.ptr, @intCast(buf.len));
             if (ret > 0) {
-                const bytes_read: usize = @intCast(ret);
+                const bytes_read: u32 = @intCast(ret);
                 std.debug.assert(bytes_read <= buf.len); // S1: postcondition
                 return bytes_read;
             }
@@ -142,17 +142,17 @@ pub const TlsStream = struct {
     /// Non-blocking TLS write with timeout.
     /// Returns number of bytes written.
     pub fn write(
-        self: *TlsStream,
+        self: *TLSStream,
         io: *Io,
         data: []const u8,
         timeout_ns: i64,
-    ) !usize {
+    ) !u32 {
         std.debug.assert(self.ssl != null); // S1: precondition
         std.debug.assert(data.len > 0); // S1: precondition
         std.debug.assert(timeout_ns > 0); // S1: precondition
 
         const start_ns: i64 = std.time.nanoTimestamp();
-        var written: usize = 0;
+        var written: u32 = 0;
         var iteration: u32 = 0;
         const max_iterations: u32 = 10000; // S3: bounded loop
 
@@ -170,7 +170,7 @@ pub const TlsStream = struct {
 
             const ret: c_int = ssl.SSL_write(self.ssl, chunk.ptr, @intCast(chunk.len));
             if (ret > 0) {
-                const bytes_written: usize = @intCast(ret);
+                const bytes_written: u32 = @intCast(ret);
                 std.debug.assert(bytes_written <= chunk.len); // S1: postcondition
                 written += bytes_written;
                 continue;
@@ -190,7 +190,7 @@ pub const TlsStream = struct {
 
     /// Graceful TLS shutdown.
     /// Caller owns fd and is responsible for closing it.
-    pub fn close(self: *TlsStream) void {
+    pub fn close(self: *TLSStream) void {
         std.debug.assert(self.ssl != null); // S1: precondition
         _ = ssl.SSL_shutdown(self.ssl);
         ssl.SSL_free(self.ssl);
@@ -225,7 +225,10 @@ fn doHandshake(
         const remaining_ns: i64 = timeout_ns - elapsed_ns;
 
         const ret: c_int = ssl.SSL_do_handshake(ssl_conn);
-        if (ret == 1) return; // Success
+        if (ret == 1) {
+            std.debug.assert(ssl.SSL_is_init_finished(ssl_conn) == 1); // S1: postcondition
+            return; // Success
+        }
 
         const err: c_int = ssl.SSL_get_error(ssl_conn, ret);
         switch (err) { // S4: explicit error handling
@@ -239,8 +242,8 @@ fn doHandshake(
 }
 
 // Tests
-test "TlsStream compiles" {
+test "TLSStream compiles" {
     // Basic compilation test
-    _ = TlsStream;
+    _ = TLSStream;
     _ = doHandshake;
 }

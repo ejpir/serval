@@ -9,8 +9,8 @@
 // BoringSSL bindings
 pub const ssl = @import("ssl.zig");
 
-// TLS stream abstraction (will be implemented in Task 3)
-pub const TlsStream = @import("stream.zig").TlsStream;
+// TLS stream abstraction
+pub const TLSStream = @import("stream.zig").TLSStream;
 
 test {
     _ = @import("ssl.zig");
