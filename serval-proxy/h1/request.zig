@@ -18,6 +18,9 @@ const ForwardError = proxy_types.ForwardError;
 const Request = types.Request;
 const Method = types.Method;
 
+const pool_mod = @import("serval-pool").pool;
+const Connection = pool_mod.Connection;
+
 // =============================================================================
 // RFC 7230 Hop-by-Hop Header Filtering
 // =============================================================================
@@ -145,40 +148,57 @@ pub fn buildRequestBuffer(buffer: []u8, request: *const Request) ?usize {
 // Request Sending
 // =============================================================================
 
-/// Send buffer to stream using async writer.
+/// Send buffer to connection (TLS or plaintext).
 /// TigerStyle: Explicit io parameter for async I/O.
-pub fn sendBuffer(stream: Io.net.Stream, io: Io, data: []const u8) ForwardError!void {
+pub fn sendBuffer(conn: *Connection, io: Io, data: []const u8) ForwardError!void {
     assert(data.len > 0);
 
-    var write_buf: [config.STREAM_WRITE_BUFFER_SIZE_BYTES]u8 = std.mem.zeroes([config.STREAM_WRITE_BUFFER_SIZE_BYTES]u8);
-    var writer = stream.writer(io, &write_buf);
-    writer.interface.writeAll(data) catch return ForwardError.SendFailed;
-    writer.interface.flush() catch return ForwardError.SendFailed;
+    // Use TLS write if connection is encrypted
+    if (conn.tls) |*tls_stream| {
+        // TLS write - blocking operation (socket is async via std.Io)
+        var remaining = data;
+        var iteration: u32 = 0;
+        const max_iterations: u32 = 10000; // S4: explicit bound
+
+        while (remaining.len > 0 and iteration < max_iterations) {
+            iteration += 1;
+            const written = tls_stream.write(remaining) catch return ForwardError.SendFailed;
+            assert(written > 0);
+            assert(written <= remaining.len);
+            remaining = remaining[written..];
+        }
+
+        if (iteration >= max_iterations) {
+            return ForwardError.SendFailed; // TLS write exceeded max iterations
+        }
+    } else {
+        // Plain TCP write
+        var write_buf: [config.STREAM_WRITE_BUFFER_SIZE_BYTES]u8 = std.mem.zeroes([config.STREAM_WRITE_BUFFER_SIZE_BYTES]u8);
+        var writer = conn.stream.writer(io, &write_buf);
+        writer.interface.writeAll(data) catch return ForwardError.SendFailed;
+        writer.interface.flush() catch return ForwardError.SendFailed;
+    }
 }
 
-/// Send request body to stream using async writer.
+/// Send request body to connection (TLS or plaintext).
 /// TigerStyle: Explicit io parameter for async I/O.
-fn sendBody(stream: Io.net.Stream, io: Io, body: []const u8) ForwardError!void {
+fn sendBody(conn: *Connection, io: Io, body: []const u8) ForwardError!void {
     assert(body.len > 0);
-
-    var write_buf: [config.STREAM_WRITE_BUFFER_SIZE_BYTES]u8 = std.mem.zeroes([config.STREAM_WRITE_BUFFER_SIZE_BYTES]u8);
-    var writer = stream.writer(io, &write_buf);
-    writer.interface.writeAll(body) catch return ForwardError.SendFailed;
-    writer.interface.flush() catch return ForwardError.SendFailed;
+    try sendBuffer(conn, io, body);
 }
 
-/// Send complete HTTP request (headers + body) to stream.
+/// Send complete HTTP request (headers + body) to connection.
 /// TigerStyle: Explicit io parameter for async I/O.
-pub fn sendRequest(stream: Io.net.Stream, io: Io, request: *const Request) ForwardError!void {
+pub fn sendRequest(conn: *Connection, io: Io, request: *const Request) ForwardError!void {
     assert(request.path.len > 0);
 
     var buffer: [config.MAX_HEADER_SIZE_BYTES]u8 = std.mem.zeroes([config.MAX_HEADER_SIZE_BYTES]u8);
     const header_len = buildRequestBuffer(&buffer, request) orelse return ForwardError.SendFailed;
 
-    try sendBuffer(stream, io, buffer[0..header_len]);
+    try sendBuffer(conn, io, buffer[0..header_len]);
 
     if (request.body) |body| {
-        try sendBody(stream, io, body);
+        try sendBody(conn, io, body);
     }
 }
 

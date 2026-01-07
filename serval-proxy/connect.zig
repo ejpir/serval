@@ -26,6 +26,10 @@ const Protocol = types.Protocol;
 
 const Upstream = serval_core.types.Upstream;
 
+const serval_tls = @import("serval-tls");
+const ssl = serval_tls.ssl;
+const TLSStream = serval_tls.TLSStream;
+
 // =============================================================================
 // Connection Result
 // =============================================================================
@@ -40,6 +44,50 @@ pub const ConnectResult = struct {
     tcp_connect_duration_ns: u64,
     local_port: u16,
 };
+
+// =============================================================================
+// Client SSL_CTX (Global, Cached)
+// =============================================================================
+
+/// Global client SSL_CTX for upstream TLS connections.
+/// TigerStyle S5: Created once at init time, not per-connection.
+/// Null until first TLS upstream connection is needed.
+var global_client_ctx: ?*ssl.SSL_CTX = null;
+
+/// Get or create the global client SSL_CTX.
+/// TigerStyle: Lazy initialization on first use, cached thereafter.
+/// Thread-safe via atomic check (single-threaded use assumed in current design).
+///
+/// NOTE: global_client_ctx is intentionally never freed during normal operation.
+/// TigerStyle C5: Process-lifetime resources are acceptable. The SSL_CTX lives
+/// for the entire program execution and is reclaimed by the OS on process exit.
+/// freeClientCtx() is provided for explicit shutdown sequences but not required.
+fn getClientCtx() !*ssl.SSL_CTX {
+    if (global_client_ctx) |ctx| {
+        return ctx;
+    }
+
+    // Initialize BoringSSL library
+    ssl.init();
+
+    // Create client context
+    const ctx = try ssl.createClientCtx();
+    global_client_ctx = ctx;
+
+    debugLog("TLS: created global client SSL_CTX", .{});
+    return ctx;
+}
+
+/// Free the global client SSL_CTX.
+/// Should be called on shutdown. Currently not wired to any shutdown hook.
+/// TigerStyle C5: Resource cleanup paired with creation.
+pub fn freeClientCtx() void {
+    if (global_client_ctx) |ctx| {
+        ssl.SSL_CTX_free(ctx);
+        global_client_ctx = null;
+        debugLog("TLS: freed global client SSL_CTX", .{});
+    }
+}
 
 // =============================================================================
 // Port Extraction
@@ -69,13 +117,57 @@ pub fn getLocalPortFromStream(stream: Io.net.Stream) u16 {
 // TCP Connect
 // =============================================================================
 
+/// Perform TLS handshake on an established TCP connection.
+/// TigerStyle: Extract TLS logic to keep connectUpstream under 70 lines (Y1).
+fn performTlsHandshake(
+    upstream: *const Upstream,
+    stream: Io.net.Stream,
+    io: Io,
+) ForwardError!TLSStream {
+    assert(upstream.host.len > 0);
+
+    const ctx = getClientCtx() catch |err| {
+        debugLog("connect: FAILED to get client SSL_CTX err={s}", .{@errorName(err)});
+        var mut_stream = stream;
+        mut_stream.close(io);
+        return ForwardError.ConnectFailed;
+    };
+
+    // SNI requires null-terminated hostname
+    // TigerStyle S5: Stack allocation for small strings, bounded by MAX_URI_LENGTH
+    const max_sni_len = 256; // Reasonable limit for hostname
+    if (upstream.host.len >= max_sni_len) {
+        debugLog("connect: FAILED hostname too long for SNI", .{});
+        var mut_stream = stream;
+        mut_stream.close(io);
+        return ForwardError.InvalidAddress;
+    }
+
+    var sni_buf: [max_sni_len:0]u8 = std.mem.zeroes([max_sni_len:0]u8); // S5: zeroed to prevent leaks
+    @memcpy(sni_buf[0..upstream.host.len], upstream.host);
+    sni_buf[upstream.host.len] = 0;
+    const sni_z: [*:0]const u8 = @ptrCast(&sni_buf);
+
+    const fd: c_int = @intCast(stream.socket.handle);
+    const tls_stream = TLSStream.initClient(ctx, fd, sni_z, std.heap.page_allocator) catch |err| {
+        debugLog("connect: FAILED TLS handshake err={s}", .{@errorName(err)});
+        var mut_stream = stream;
+        mut_stream.close(io);
+        return ForwardError.ConnectFailed;
+    };
+
+    debugLog("connect: TLS handshake complete", .{});
+    return tls_stream;
+}
+
 /// Connect to upstream using async Io.net.
 /// TigerStyle: Explicit io parameter, timing collected at phase boundaries.
+/// Wraps connection with TLS if upstream.tls is true.
 pub fn connectUpstream(upstream: *const Upstream, io: Io) ForwardError!ConnectResult {
     assert(upstream.port > 0);
     assert(upstream.host.len > 0);
 
-    debugLog("connect: start {s}:{d}", .{ upstream.host, upstream.port });
+    debugLog("connect: start {s}:{d} tls={}", .{ upstream.host, upstream.port, upstream.tls });
 
     // Parse IP address (DNS resolution not yet supported)
     const addr = Io.net.IpAddress.parse(upstream.host, upstream.port) catch {
@@ -102,10 +194,17 @@ pub fn connectUpstream(upstream: *const Upstream, io: Io) ForwardError!ConnectRe
 
     const local_port = getLocalPortFromStream(stream);
 
+    // Wrap with TLS if upstream requires it
+    const maybe_tls: ?TLSStream = if (upstream.tls)
+        try performTlsHandshake(upstream, stream, io)
+    else
+        null;
+
     return .{
         .conn = .{
             .stream = stream,
             .created_ns = connect_end_ns,
+            .tls = maybe_tls,
         },
         .protocol = .h1, // Future: negotiate via ALPN or detect h2c preface
         .tcp_connect_duration_ns = time.elapsedNanos(connect_start_ns, connect_end_ns),
