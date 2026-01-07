@@ -27,6 +27,7 @@ serval (umbrella - re-exports all modules)
 ├── serval-core     # Types, config, errors, context, hooks
 ├── serval-net      # Socket utilities (TCP_NODELAY, etc.)
 ├── serval-http     # HTTP/1.1 parser
+├── serval-tls      # TLS termination and origination (OpenSSL)
 ├── serval-pool     # Connection pooling
 ├── serval-health   # Backend health tracking (atomic bitmap, thresholds)
 ├── serval-prober   # Background health probing
@@ -83,6 +84,8 @@ Layer 1 (Protocol):                                                │
        │                                                           │
   serval-http ─────────────────────────────────────────────────────┤
                                                                    │
+  serval-tls ──────────────────────────────────────────────────────┤
+                                                                   │
 Layer 2 (Infrastructure):                                          │
   serval-pool ←─────────────────────────────────────────────┐      │
                                                             │      │
@@ -119,7 +122,7 @@ Standalone:
 | serval-http | HTTP/1.1 parsing | `Parser` |
 | serval-pool | Connection reuse | `SimplePool`, `NoPool`, `Connection` |
 | serval-health | Backend health tracking | `HealthState`, `UpstreamIndex`, `MAX_UPSTREAMS` |
-| serval-prober | Background health probing | `ProberContext`, `probeLoop` |
+| serval-prober | Background health probing (HTTP/HTTPS) | `ProberContext`, `probeLoop`, `freeClientCtx` |
 | serval-proxy | Request forwarding | `Forwarder`, `ForwardResult`, `BodyInfo`, `Protocol` |
 | serval-metrics | Observability | `NoopMetrics`, `PrometheusMetrics`, `RealTimeMetrics` |
 | serval-tracing | Distributed tracing interface | `NoopTracer`, `SpanHandle` |
@@ -486,13 +489,13 @@ pub const WeightedHandler = struct {
 | CLI argument parsing | serval-cli | Comptime-generic with custom options |
 | Protocol abstraction | serval-proxy | h1/ subdirectory, Protocol enum ready for h2 |
 | Chunked transfer encoding | serval-http, serval-proxy, serval-server | Parsing, forwarding, and direct response |
+| TLS termination | serval-tls, serval-server | Client TLS (server-side), upstream TLS (client-side) |
 
 ### Not Implemented
 
 | Feature | Module | Complexity |
 |---------|--------|------------|
 | HTTP/2 | serval-proxy/h2 | High |
-| TLS termination | serval-tls | Medium |
 | Weighted round-robin | serval-lb | Low |
 | Least connections LB | serval-lb | Low |
 | W3C Trace Context propagation | serval-otel | Low |

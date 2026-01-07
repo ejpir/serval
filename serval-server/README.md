@@ -127,6 +127,7 @@ The mod.zig would dispatch based on negotiated protocol (via ALPN or h2c preface
 - serval-proxy: upstream forwarding
 - serval-metrics: metrics interface
 - serval-tracing: tracing interface
+- serval-tls: TLS termination for client connections
 
 ## Implementation Status
 
@@ -138,6 +139,8 @@ The mod.zig would dispatch based on negotiated protocol (via ALPN or h2c preface
 | Concurrent connections (io_uring) | ✅ Complete |
 | Handler hooks | ✅ Complete |
 | Modular h1/ structure | ✅ Complete |
+| TLS termination | ✅ Complete |
+| TLS response forwarding | ✅ Complete |
 | HTTP/2 | ⏳ Planned (h2/ structure) |
 | Daemon mode | ❌ Not implemented |
 | Hot reload | ❌ Not implemented |

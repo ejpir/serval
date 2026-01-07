@@ -19,12 +19,15 @@ Handles request forwarding to backend servers using async `Io.net.Stream` I/O in
 ```zig
 const proxy = @import("serval-proxy");
 const pool_mod = @import("serval-pool");
+const tracing = @import("serval-tracing");
 
 var pool = pool_mod.SimplePool.init();
-var forwarder = proxy.Forwarder(pool_mod.SimplePool).init(&pool);
+var tracer = tracing.NoopTracer{};
+var forwarder = proxy.Forwarder(pool_mod.SimplePool, tracing.NoopTracer).init(&pool, &tracer, true);
 
 // Forward using async stream I/O
-const result = forwarder.forward(io, client_stream, &request, &upstream, body_info) catch |err| {
+// client_tls: pass TLS stream for encrypted client connections, null for plaintext
+const result = forwarder.forward(io, client_stream, client_tls, &request, &upstream, body_info, span) catch |err| {
     // Handle ForwardError
 };
 // result.status, result.response_bytes, result.connection_reused
@@ -89,10 +92,11 @@ detection for cleartext).
 
 - **Async I/O** - Uses `Io.net.Stream` for non-blocking upstream connections
 - **io_uring integration** - Connect, send, and receive via io_uring batch submission
+- **TLS support** - Client-side TLS for encrypted responses, upstream TLS for backend connections
 - Connection pooling integration
 - Stale connection retry (Pingora-style)
-- Zero-copy with splice() when available (extracts raw fd from stream)
-- Userspace copy fallback
+- Zero-copy with splice() when available (plaintext only, extracts raw fd from stream)
+- Userspace copy for TLS paths (both client and upstream)
 - Content-Length body forwarding
 - Response streaming to client
 
@@ -106,8 +110,10 @@ detection for cleartext).
 | splice() zero-copy | Complete |
 | Userspace copy fallback | Complete |
 | Content-Length bodies | Complete |
-| Chunked transfer encoding | Implemented |
+| Chunked transfer encoding | Complete |
 | Request body forwarding | Complete |
+| Client TLS responses | Complete |
+| Upstream TLS | Complete |
 | HTTP/2 upstream | Not implemented |
 
 ## TigerStyle Compliance

@@ -108,13 +108,16 @@ pub fn Server(
             assert(@intFromPtr(metrics) != 0);
             assert(@intFromPtr(tracer) != 0);
 
+            // Get verify_upstream setting from TlsConfig (default: true)
+            const verify_upstream = if (cfg.tls) |tls_cfg| tls_cfg.verify_upstream else true;
+
             return .{
                 .handler = handler,
                 .pool = pool,
                 .metrics = metrics,
                 .tracer = tracer,
                 .config = cfg,
-                .forwarder = forwarder_mod.Forwarder(Pool, Tracer).init(pool, tracer),
+                .forwarder = forwarder_mod.Forwarder(Pool, Tracer).init(pool, tracer, verify_upstream),
             };
         }
 
@@ -523,8 +526,9 @@ pub fn Server(
             // Mutable io for TLS operations (io is passed by value)
             var io_mut = io;
 
-            // Get pointer to TLS stream for I/O operations (if TLS is active)
-            const maybe_tls_ptr: ?*const TLSStream = if (maybe_tls_stream) |*tls| tls else null;
+            // Get mutable pointer to TLS stream for I/O operations (if TLS is active)
+            // TigerStyle: Mutable pointer needed for forwarder to write TLS responses.
+            const maybe_tls_ptr: ?*TLSStream = if (maybe_tls_stream) |*tls| tls else null;
 
             // Request processing state
             var parser = Parser.init();
@@ -539,8 +543,7 @@ pub fn Server(
             const ResponseBufType = if (has_on_request) [DIRECT_RESPONSE_BUFFER_SIZE_BYTES]u8 else void;
             var response_buf: ResponseBufType = if (has_on_request)
                 std.mem.zeroes([DIRECT_RESPONSE_BUFFER_SIZE_BYTES]u8)
-            else
-                {};
+            else {};
 
             while (request_count < cfg.max_requests_per_connection) {
                 request_count += 1;
@@ -614,7 +617,7 @@ pub fn Server(
 
                 // Extract body info and forward
                 const body_info = buildBodyInfo(&parser, &recv_buf, buffer_offset, buffer_len);
-                const forward_result = forwarder.forward(io, stream, &parser.request, &upstream, body_info, span_handle);
+                const forward_result = forwarder.forward(io, stream, maybe_tls_ptr, &parser.request, &upstream, body_info, span_handle);
 
                 const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
                 ctx.duration_ns = duration_ns;

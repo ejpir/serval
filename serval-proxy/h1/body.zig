@@ -46,11 +46,13 @@ const SPLICE_F_MORE: u32 = 4;
 // =============================================================================
 
 /// Forward response body using zero-copy splice (Linux) or buffered copy.
-/// For TLS upstreams, reads decrypted data via TLSStream and writes to client fd.
-/// For plaintext upstreams, uses zero-copy splice (Linux) or buffered copy.
+/// Supports TLS on either end:
+/// - maybe_upstream_tls: When reading from TLS upstream (decrypts)
+/// - maybe_client_tls: When writing to TLS client (encrypts)
 /// TigerStyle: Explicit TLS handling, no implicit encryption bypass.
 pub fn forwardBody(
-    maybe_tls: ?*TLSStream,
+    maybe_upstream_tls: ?*TLSStream,
+    maybe_client_tls: ?*TLSStream,
     upstream_fd: i32,
     client_fd: i32,
     length_bytes: u64,
@@ -58,9 +60,9 @@ pub fn forwardBody(
     assert(upstream_fd >= 0);
     assert(client_fd >= 0);
 
-    // TLS path: read decrypted via TLSStream, write plaintext to client
-    if (maybe_tls) |tls| {
-        const result = try forwardBodyTLS(tls, client_fd, length_bytes);
+    // TLS path: any TLS on either end requires userspace copy
+    if (maybe_upstream_tls != null or maybe_client_tls != null) {
+        const result = try forwardBodyWithTLS(maybe_upstream_tls, maybe_client_tls, upstream_fd, client_fd, length_bytes);
         assert(result <= length_bytes);
         return result;
     }
@@ -192,10 +194,17 @@ fn forwardBodyCopy(upstream_fd: i32, client_fd: i32, length_bytes: u64) ForwardE
 // TLS Body Forwarding
 // =============================================================================
 
-/// Forward body from TLS upstream to plaintext client.
-/// Reads decrypted data via TLSStream and writes to client fd.
+/// Forward body with optional TLS on read and/or write side.
+/// Supports: TLS->plaintext, plaintext->TLS, TLS->TLS, or plaintext->plaintext.
 /// TigerStyle: Bounded loop, fixed buffer size, explicit error handling.
-fn forwardBodyTLS(tls: *TLSStream, client_fd: i32, length_bytes: u64) ForwardError!u64 {
+fn forwardBodyWithTLS(
+    maybe_upstream_tls: ?*TLSStream,
+    maybe_client_tls: ?*TLSStream,
+    upstream_fd: i32,
+    client_fd: i32,
+    length_bytes: u64,
+) ForwardError!u64 {
+    assert(upstream_fd >= 0);
     assert(client_fd >= 0);
 
     var buffer: [COPY_CHUNK_SIZE_BYTES]u8 = std.mem.zeroes([COPY_CHUNK_SIZE_BYTES]u8);
@@ -207,20 +216,38 @@ fn forwardBodyTLS(tls: *TLSStream, client_fd: i32, length_bytes: u64) ForwardErr
         const remaining = length_bytes - forwarded;
         const to_read: usize = @intCast(@min(remaining, buffer.len));
 
-        const n = tls.read(buffer[0..to_read]) catch {
-            return ForwardError.RecvFailed;
+        // Read from upstream (TLS or plaintext)
+        const n: usize = if (maybe_upstream_tls) |tls| blk: {
+            const bytes_read = tls.read(buffer[0..to_read]) catch {
+                return ForwardError.RecvFailed;
+            };
+            break :blk bytes_read;
+        } else blk: {
+            const bytes_read = posix.recv(upstream_fd, buffer[0..to_read], 0) catch {
+                return ForwardError.RecvFailed;
+            };
+            break :blk bytes_read;
         };
         if (n == 0) break; // Clean shutdown or EOF
 
+        // Write to client (TLS or plaintext)
         var sent: usize = 0;
         var send_iterations: u32 = 0;
         const max_send_iterations: u32 = 1024;
         while (sent < n and send_iterations < max_send_iterations) : (send_iterations += 1) {
-            const s = posix.send(client_fd, buffer[sent..n], 0) catch {
-                return ForwardError.SendFailed;
-            };
-            if (s == 0) return ForwardError.SendFailed;
-            sent += s;
+            if (maybe_client_tls) |tls| {
+                const s = tls.write(buffer[sent..n]) catch {
+                    return ForwardError.SendFailed;
+                };
+                if (s == 0) return ForwardError.SendFailed;
+                sent += s;
+            } else {
+                const s = posix.send(client_fd, buffer[sent..n], 0) catch {
+                    return ForwardError.SendFailed;
+                };
+                if (s == 0) return ForwardError.SendFailed;
+                sent += s;
+            }
         }
 
         forwarded += n;

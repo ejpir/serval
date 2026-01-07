@@ -40,6 +40,9 @@ const eqlIgnoreCase = h1.eqlIgnoreCase;
 const streamRequestBody = h1.streamRequestBody;
 const forwardResponse = h1.forwardResponse;
 
+const serval_tls = @import("serval-tls");
+const TLSStream = serval_tls.TLSStream;
+
 const Request = types.Request;
 const Upstream = types.Upstream;
 const Method = types.Method;
@@ -58,9 +61,14 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
 
         pool: *Pool,
         tracer: *Tracer,
+        verify_upstream_tls: bool,
 
-        pub fn init(p: *Pool, t: *Tracer) Self {
-            return .{ .pool = p, .tracer = t };
+        pub fn init(p: *Pool, t: *Tracer, verify_upstream_tls: bool) Self {
+            return .{
+                .pool = p,
+                .tracer = t,
+                .verify_upstream_tls = verify_upstream_tls,
+            };
         }
 
         /// Maximum stale connection retries - imported from config.
@@ -71,11 +79,13 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
         /// Auto-retries up to MAX_STALE_RETRIES on stale pooled connections.
         /// body_info contains metadata for streaming request body from client.
         /// parent_span is the root request span for creating child trace spans.
+        /// client_tls is the TLS stream for client connection (for encrypted responses).
         /// TigerStyle: Takes client stream for async I/O, bounded retries.
         pub fn forward(
             self: *Self,
             io: Io,
             client_stream: Io.net.Stream,
+            client_tls: ?*TLSStream,
             request: *const Request,
             upstream: *const Upstream,
             body_info: BodyInfo,
@@ -126,6 +136,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
                     const result = self.forwardWithConnection(
                         io,
                         client_stream,
+                        client_tls,
                         request,
                         upstream,
                         pooled_conn,
@@ -171,7 +182,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
 
             // No pooled connection or all stale, create fresh
             debugLog("forward: pool MISS or exhausted stale, connecting fresh", .{});
-            const result = try self.forwardFresh(io, client_stream, request, upstream, body_info, pool_wait_ns, forward_span);
+            const result = try self.forwardFresh(io, client_stream, client_tls, request, upstream, body_info, pool_wait_ns, forward_span);
             self.tracer.endSpan(forward_span, null);
             return result;
         }
@@ -180,6 +191,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             self: *Self,
             io: Io,
             client_stream: Io.net.Stream,
+            client_tls: ?*TLSStream,
             request: *const Request,
             upstream: *const Upstream,
             body_info: BodyInfo,
@@ -190,7 +202,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
 
             // TCP connect phase with span
             const connect_span = self.tracer.startSpan("tcp_connect", forward_span);
-            const connect_result = connectUpstream(upstream, io) catch |err| {
+            const connect_result = connectUpstream(upstream, io, self.verify_upstream_tls) catch |err| {
                 self.tracer.endSpan(connect_span, @errorName(err));
                 return err;
             };
@@ -201,6 +213,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             return self.forwardWithConnection(
                 io,
                 client_stream,
+                client_tls,
                 request,
                 upstream,
                 connect_result.conn,
@@ -219,6 +232,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             self: *Self,
             io: Io,
             client_stream: Io.net.Stream,
+            client_tls: ?*TLSStream,
             request: *const Request,
             upstream: *const Upstream,
             conn: Connection,
@@ -282,7 +296,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             // Recv phase span (response headers + body)
             const recv_span = self.tracer.startSpan("recv_response", forward_span);
             debugLog("recv: awaiting response headers", .{});
-            var result = forwardResponse(io, &mutable_conn, client_stream, is_pooled) catch |err| {
+            var result = forwardResponse(io, &mutable_conn, client_stream, client_tls, is_pooled) catch |err| {
                 self.tracer.endSpan(recv_span, @errorName(err));
                 return err;
             };
@@ -317,14 +331,14 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
 test "Forwarder init with NoPool" {
     var no_pool = pool_mod.NoPool{};
     var tracer = serval_tracing.NoopTracer{};
-    const forwarder = Forwarder(pool_mod.NoPool, serval_tracing.NoopTracer).init(&no_pool, &tracer);
+    const forwarder = Forwarder(pool_mod.NoPool, serval_tracing.NoopTracer).init(&no_pool, &tracer, true);
     _ = forwarder;
 }
 
 test "Forwarder init with SimplePool" {
     var simple_pool = pool_mod.SimplePool.init();
     var tracer = serval_tracing.NoopTracer{};
-    const forwarder = Forwarder(pool_mod.SimplePool, serval_tracing.NoopTracer).init(&simple_pool, &tracer);
+    const forwarder = Forwarder(pool_mod.SimplePool, serval_tracing.NoopTracer).init(&simple_pool, &tracer, true);
     _ = forwarder;
 }
 

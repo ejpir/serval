@@ -33,6 +33,9 @@ const forwardChunkedBody = chunked_transfer.forwardChunkedBody;
 const pool_mod = @import("serval-pool").pool;
 const Connection = pool_mod.Connection;
 
+const serval_tls = @import("serval-tls");
+const TLSStream = serval_tls.TLSStream;
+
 // For tests: Import all parsing functions to verify contracts
 const parseContentLengthValue = serval_http.parseContentLengthValue;
 
@@ -141,10 +144,12 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
 
 /// Forward upstream response to client.
 /// TigerStyle: Uses stream for headers, raw fds for splice body forwarding.
+/// client_tls is the TLS stream for client connection (for encrypted responses).
 pub fn forwardResponse(
     io: Io,
     upstream_conn: *Connection,
     client_stream: Io.net.Stream,
+    client_tls: ?*TLSStream,
     is_pooled: bool,
 ) ForwardError!ForwardResult {
     // Precondition: file descriptors must be valid (non-negative).
@@ -167,9 +172,8 @@ pub fn forwardResponse(
     debugLog("recv: headers received fd={d} status={d} content_length={?d} chunked={}", .{ upstream_conn.stream.socket.handle, status, content_length, is_chunked });
 
     // Forward headers and any pre-fetched body to client via async stream.
-    // TigerStyle: Headers already forwarded include partial body if present.
-    // Note: Client connection is plaintext (server-side TLS not yet implemented).
-    var client_conn = Connection{ .stream = client_stream };
+    // TigerStyle: Use TLS for client if available, otherwise plaintext.
+    var client_conn = Connection{ .stream = client_stream, .tls = if (client_tls) |tls| tls.* else null };
     try sendBuffer(&client_conn, io, header_buffer[0..headers.header_len]);
 
     // Forward remaining body.
@@ -177,25 +181,23 @@ pub fn forwardResponse(
     const body_already_read: u64 = headers.header_len - headers.header_end;
     var total_body_bytes: u64 = body_already_read;
 
-    // Extract raw fds and optional TLS stream for body forwarding.
+    // Extract raw fds and optional TLS streams for body forwarding.
     const upstream_fd = upstream_conn.stream.socket.handle;
     const client_fd = client_stream.socket.handle;
-    const maybe_tls = if (upstream_conn.tls) |*tls| tls else null;
+    const maybe_upstream_tls = if (upstream_conn.tls) |*tls| tls else null;
 
     if (is_chunked) {
         // Chunked transfer encoding: forward chunks until final chunk.
-        // Read from TLS upstream (if encrypted), write to plaintext client.
-        // For plaintext upstreams, uses raw fd (zero-copy splice on Linux).
+        // TigerStyle: Pass client_tls for encrypted client responses.
         debugLog("recv: forwarding chunked body", .{});
-        total_body_bytes += try forwardChunkedBody(maybe_tls, null, upstream_fd, client_fd);
+        total_body_bytes += try forwardChunkedBody(maybe_upstream_tls, client_tls, upstream_fd, client_fd);
     } else if (content_length) |length| {
         // Content-Length based: forward exact number of bytes.
         if (length > body_already_read) {
             const remaining = length - body_already_read;
             debugLog("recv: forwarding body remaining={d}", .{remaining});
-            // For TLS upstreams, reads decrypted via TLSStream.
-            // For plaintext upstreams, uses zero-copy splice on Linux.
-            total_body_bytes += try forwardBody(maybe_tls, upstream_fd, client_fd, remaining);
+            // TigerStyle: Pass client_tls for encrypted client responses.
+            total_body_bytes += try forwardBody(maybe_upstream_tls, client_tls, upstream_fd, client_fd, remaining);
         }
     }
     // else: No body (e.g., 204, 304) or connection-close semantics.
