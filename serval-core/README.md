@@ -11,7 +11,7 @@ Zero-dependency foundation module containing shared types, errors, configuration
 ### Types
 - `Request` - HTTP request representation (method, path, headers)
 - `Response` - HTTP response representation
-- `Upstream` - Backend server target (host, port, pool index)
+- `Upstream` - Backend server target (host, port, pool index, tls flag)
 - `HeaderMap` - Fixed-size header storage (64 headers max) with O(1) cached lookups
 - `Method` - HTTP methods enum
 - `Version` - HTTP version enum
@@ -42,6 +42,7 @@ const custom = headers.get("X-Custom");    // ?[]const u8
 
 ### Configuration
 - `Config` - Server configuration (port, timeouts, limits)
+- `TlsConfig` - TLS configuration (cert paths, verification, timeouts)
 - `DEBUG_LOGGING` - Comptime flag (true in Debug builds)
 - `MAX_HEADERS` - 64
 - `MAX_HEADER_SIZE_BYTES` - 8192

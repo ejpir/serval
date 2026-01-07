@@ -117,6 +117,9 @@ pub const Upstream = struct {
     /// Index into connection pool to retrieve/release connections for this upstream.
     /// TigerStyle: Uses UpstreamIndex from config for single source of truth.
     idx: config.UpstreamIndex = 0,
+    /// Enable TLS for connections to this upstream.
+    /// TigerStyle: Explicit boolean, false means plaintext TCP.
+    tls: bool = false,
 };
 
 // =============================================================================

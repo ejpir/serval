@@ -215,6 +215,31 @@ pub const Config = struct {
     send_buffer_size_bytes: u32 = 4096,
 };
 
+/// TLS configuration for client termination and upstream origination.
+/// TigerStyle: Optional fields use null for unset, explicit defaults for all fields.
+pub const TlsConfig = struct {
+    // Server (client termination)
+    /// Path to server certificate file (PEM format).
+    cert_path: ?[]const u8 = null,
+    /// Path to server private key file (PEM format).
+    key_path: ?[]const u8 = null,
+
+    // Client (upstream origination)
+    /// Path to CA bundle for verifying upstream certificates (PEM format).
+    ca_path: ?[]const u8 = null,
+    /// Verify upstream certificates against CA bundle.
+    /// TigerStyle: Explicit boolean, no implicit behavior.
+    verify_upstream: bool = true,
+
+    // Timeouts
+    /// TLS handshake timeout in nanoseconds.
+    /// Default: 10 seconds (typical handshake completes in <1s, allows retry).
+    handshake_timeout_ns: u64 = 10 * std.time.ns_per_s,
+    /// I/O operation timeout in nanoseconds.
+    /// Default: 30 seconds (read/write operations during TLS session).
+    io_timeout_ns: u64 = 30 * std.time.ns_per_s,
+};
+
 test "Config has sensible defaults" {
     const cfg = Config{};
     try std.testing.expectEqual(@as(u16, 8080), cfg.port);
