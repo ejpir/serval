@@ -42,6 +42,8 @@ Handlers remain unchanged - TLS is transparent at the strategy layer.
 
 ## Async Handshake Design
 
+Reference: secsock (`~/repos/secsock/src/bearssl/`) shows the vtable pattern and initialization order working with Tardy. Same pattern applies to BoringSSL with different API calls.
+
 BoringSSL's `SSL_do_handshake()` is blocking by default. We use memory BIOs to make it async:
 
 ```
@@ -77,6 +79,58 @@ const HandshakeState = enum {
 ```
 
 Timeout: `handshake_timeout_ms` (default 10s). Fail connection if exceeded.
+
+### Critical Initialization Order (from secsock learnings)
+
+The order matters — getting this wrong causes subtle failures:
+
+```zig
+// 1. Create SSL_CTX (once at startup)
+const ctx = SSL_CTX_new(TLS_method());
+SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
+
+// 2. Load certificates (server) or CA bundle (client)
+SSL_CTX_use_certificate_chain_file(ctx, cert_path);
+SSL_CTX_use_PrivateKey_file(ctx, key_path);
+// or for client: SSL_CTX_load_verify_locations(ctx, ca_path)
+
+// 3. Create SSL object per connection
+const ssl = SSL_new(ctx);
+
+// 4. Create memory BIOs (not socket BIOs - we do our own I/O)
+const read_bio = BIO_new(BIO_s_mem());   // we write received data here
+const write_bio = BIO_new(BIO_s_mem());  // SSL writes encrypted data here
+SSL_set_bio(ssl, read_bio, write_bio);   // ownership transferred
+
+// 5. Set SNI for client connections
+SSL_set_tlsext_host_name(ssl, server_name);
+
+// 6. Set connect state (client) or accept state (server)
+SSL_set_connect_state(ssl);  // client
+// or: SSL_set_accept_state(ssl);  // server
+
+// 7. Run handshake loop (async via memory BIOs)
+while (!SSL_is_init_finished(ssl)) {
+    const ret = SSL_do_handshake(ssl);
+    // handle SSL_ERROR_WANT_READ/WANT_WRITE
+    // shuttle bytes between BIOs and io_uring
+}
+
+// 8. After handshake: attempt kTLS offload
+// Extract keys, call setsockopt(SOL_TLS, ...)
+```
+
+**BearSSL → BoringSSL mapping:**
+
+| BearSSL | BoringSSL |
+|---------|-----------|
+| `br_ssl_client_init_full()` | `SSL_CTX_new()` + `SSL_new()` |
+| `br_x509_minimal_init_full()` | `SSL_CTX_load_verify_locations()` |
+| `br_ssl_engine_set_buffer()` | `SSL_set_bio()` with memory BIOs |
+| `br_ssl_client_reset(sni)` | `SSL_set_tlsext_host_name()` + `SSL_set_connect_state()` |
+| `br_sslio_init(recv_cb, send_cb)` | Memory BIO + manual shuttle |
+| `br_sslio_write("", 0) + flush` | `SSL_do_handshake()` loop |
 
 ## kTLS Transition
 
