@@ -266,6 +266,24 @@ pub fn Args(comptime Extra: type) type {
                     }
                     return false;
                 },
+                .optional => |opt| {
+                    // Handle optional types like ?[]const u8
+                    switch (@typeInfo(opt.child)) {
+                        .pointer => |ptr| {
+                            if (ptr.child == u8) {
+                                // ?[]const u8 - optional string value
+                                const value = self.args_iter.next() orelse {
+                                    self.err_msg = "--" ++ field.name ++ " requires a value";
+                                    return true;
+                                };
+                                @field(self.extra, field.name) = value;
+                                return true;
+                            }
+                            return false;
+                        },
+                        else => return false,
+                    }
+                },
                 .@"enum" => {
                     const value = self.args_iter.next() orelse {
                         self.err_msg = "--" ++ field.name ++ " requires a value";
