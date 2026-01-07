@@ -21,13 +21,16 @@ Add TLS support to Serval with kTLS acceleration and BoringSSL for handshakes.
 ```
 serval-tls/
 ├── mod.zig          # Public exports
-├── c.zig            # BoringSSL C bindings
-├── bio.zig          # Custom memory BIO wrapper
-├── handshake.zig    # Async TLS handshake state machine
-├── ktls.zig         # kTLS setup (setsockopt SO_TLS)
+├── c.zig            # BoringSSL C bindings (@cImport)
+├── context.zig      # SSL_CTX lifecycle (one per config)
+├── session.zig      # SSL session per connection
+├── handshake.zig    # Async handshake (poll + SSL_do_handshake loop)
 ├── stream.zig       # TlsStream unified interface
-└── config.zig       # Cert loading, cipher config
+├── ktls.zig         # kTLS setup (setsockopt SO_TLS) - optional
+└── ext.zig          # Extension functions (from Pingora ext.rs)
 ```
+
+**Note:** No `bio.zig` — we use socket BIOs directly, not memory BIOs.
 
 ### Integration Points
 
@@ -42,9 +45,23 @@ Handlers remain unchanged - TLS is transparent at the strategy layer.
 
 ## Async Handshake Design
 
-Reference: secsock (`~/repos/secsock/src/bearssl/`) shows the vtable pattern and initialization order working with Tardy. Same pattern applies to BoringSSL with different API calls.
+### Reference Implementations
+- **secsock** (`~/repos/secsock/src/bearssl/`) — BearSSL vtable pattern with Tardy
+- **Pingora** (`pingora-boringssl/src/boring_tokio.rs`) — BoringSSL async wrapper
 
-BoringSSL's `SSL_do_handshake()` is blocking by default. We use memory BIOs to make it async:
+### Approach: Socket BIO + Non-blocking fd (Pingora's way)
+
+**Why not Memory BIO:** Memory BIOs are incompatible with proactor-style I/O (io_uring). We'd have to block waiting for completions anyway, defeating async benefits.
+
+**Socket BIO approach:**
+1. Set socket to non-blocking
+2. `SSL_set_fd(ssl, fd)` — BoringSSL uses socket directly
+3. `SSL_do_handshake()` returns `WANT_READ`/`WANT_WRITE`
+4. Use io_uring to **poll** socket readiness (not do I/O)
+5. When ready, call `SSL_do_handshake()` again
+6. Repeat until handshake completes
+
+BoringSSL does the actual I/O internally when we call it:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -296,18 +313,93 @@ zig build test-tls          # Unit tests (no network)
 zig build test-tls-integ    # Integration tests (requires certs)
 ```
 
+## Pingora Patterns → Zig
+
+### Error Mapping (from boring_tokio.rs)
+
+```zig
+// Pingora's cvt_ossl translated to Zig
+fn mapSslError(err: c.SSL_get_error(...)) HandshakeResult {
+    return switch (err) {
+        c.SSL_ERROR_WANT_READ => .want_read,
+        c.SSL_ERROR_WANT_WRITE => .want_write,
+        c.SSL_ERROR_NONE => .complete,
+        else => .failed,
+    };
+}
+```
+
+### Key BoringSSL Calls (from ext.rs)
+
+```zig
+// c.zig will expose these
+extern fn SSL_CTX_new(method: *const SSL_METHOD) ?*SSL_CTX;
+extern fn SSL_new(ctx: *SSL_CTX) ?*SSL;
+extern fn SSL_set_fd(ssl: *SSL, fd: c_int) c_int;
+extern fn SSL_set_connect_state(ssl: *SSL) void;
+extern fn SSL_set_accept_state(ssl: *SSL) void;
+extern fn SSL_do_handshake(ssl: *SSL) c_int;
+extern fn SSL_get_error(ssl: *SSL, ret: c_int) c_int;
+extern fn SSL_read(ssl: *SSL, buf: [*]u8, len: c_int) c_int;
+extern fn SSL_write(ssl: *SSL, buf: [*]const u8, len: c_int) c_int;
+extern fn SSL_shutdown(ssl: *SSL) c_int;
+extern fn SSL_free(ssl: *SSL) void;
+extern fn SSL_CTX_free(ctx: *SSL_CTX) void;
+
+// Certificate loading
+extern fn SSL_use_certificate(ssl: *SSL, cert: *X509) c_int;
+extern fn SSL_use_PrivateKey(ssl: *SSL, key: *EVP_PKEY) c_int;
+extern fn SSL_CTX_use_certificate_chain_file(ctx: *SSL_CTX, path: [*:0]const u8) c_int;
+extern fn SSL_CTX_use_PrivateKey_file(ctx: *SSL_CTX, path: [*:0]const u8, type: c_int) c_int;
+extern fn SSL_CTX_load_verify_locations(ctx: *SSL_CTX, ca_file: ?[*:0]const u8, ca_path: ?[*:0]const u8) c_int;
+
+// SNI and verification
+extern fn SSL_set_tlsext_host_name(ssl: *SSL, name: [*:0]const u8) c_int;
+extern fn X509_VERIFY_PARAM_add1_host(param: *X509_VERIFY_PARAM, name: [*]const u8, len: usize) c_int;
+extern fn SSL_set1_verify_cert_store(ssl: *SSL, store: *X509_STORE) c_int;
+
+// Protocol versions
+extern fn SSL_CTX_set_min_proto_version(ctx: *SSL_CTX, version: u16) c_int;
+extern fn SSL_CTX_set_max_proto_version(ctx: *SSL_CTX, version: u16) c_int;
+```
+
+### Handshake Loop Pattern
+
+```zig
+pub fn doHandshake(self: *TlsSession, io: *Io) !void {
+    while (true) {
+        const ret = c.SSL_do_handshake(self.ssl);
+        if (ret == 1) return; // Success
+
+        const err = c.SSL_get_error(self.ssl, ret);
+        switch (err) {
+            c.SSL_ERROR_WANT_READ => {
+                // Poll socket for readability via io_uring
+                try io.pollIn(self.fd);
+            },
+            c.SSL_ERROR_WANT_WRITE => {
+                // Poll socket for writability via io_uring
+                try io.pollOut(self.fd);
+            },
+            else => return error.HandshakeFailed,
+        }
+    }
+}
+```
+
 ## Implementation Order
 
-1. BoringSSL C bindings (`c.zig`)
-2. Memory BIO wrapper (`bio.zig`)
-3. Async handshake FSM (`handshake.zig`)
-4. kTLS setup (`ktls.zig`)
-5. `TlsStream` interface (`stream.zig`)
-6. Config types in serval-core
-7. serval-server integration
-8. serval-proxy integration
-9. serval-pool integration
-10. Tests
+1. BoringSSL C bindings (`c.zig`) — @cImport + function declarations
+2. SSL_CTX wrapper (`context.zig`) — one per config, shared across connections
+3. SSL session wrapper (`session.zig`) — one per connection
+4. Async handshake (`handshake.zig`) — poll + SSL_do_handshake loop
+5. TlsStream interface (`stream.zig`) — read/write/close
+6. Extension functions (`ext.zig`) — cert loading, SNI, verification
+7. kTLS setup (`ktls.zig`) — optional optimization
+8. Config types in serval-core
+9. serval-server integration
+10. serval-proxy integration
+11. Tests
 
 ## Observability
 
