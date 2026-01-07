@@ -28,6 +28,9 @@ const serval_http = @import("serval-http");
 const parser_mod = serval_http.parser;
 const parseContentLengthValue = serval_http.parseContentLengthValue;
 const forwarder_mod = @import("serval-proxy").forwarder;
+const serval_tls = @import("serval-tls");
+const ssl = serval_tls.ssl;
+const TLSStream = serval_tls.TLSStream;
 
 // Local h1 modules
 const connection = @import("connection.zig");
@@ -129,6 +132,38 @@ pub fn Server(
             }) catch return error.ListenFailed;
             defer tcp_server.deinit(io);
 
+            // TLS: Initialize SSL_CTX if TLS is configured
+            // TigerStyle: C5 - Resource grouping with immediate defer
+            const tls_ctx: ?*ssl.SSL_CTX = if (self.config.tls) |tls_cfg| blk: {
+                ssl.init();
+                const ctx = try ssl.createServerCtx();
+                // S1: postcondition - ctx is non-null (verified in createServerCtx)
+
+                // TigerStyle: Use c_allocator for long-lived TLS resources (already linking libc)
+                const allocator = std.heap.c_allocator;
+
+                // Load certificate chain
+                const cert_z = try allocator.dupeZ(u8, tls_cfg.cert_path.?);
+                defer allocator.free(cert_z);
+                assert(cert_z.len > 0); // S1: precondition
+                if (ssl.SSL_CTX_use_certificate_chain_file(ctx, cert_z) != 1) {
+                    ssl.printErrors();
+                    return error.LoadCertFailed;
+                }
+
+                // Load private key
+                const key_z = try allocator.dupeZ(u8, tls_cfg.key_path.?);
+                defer allocator.free(key_z);
+                assert(key_z.len > 0); // S1: precondition
+                if (ssl.SSL_CTX_use_PrivateKey_file(ctx, key_z, ssl.SSL_FILETYPE_PEM) != 1) {
+                    ssl.printErrors();
+                    return error.LoadKeyFailed;
+                }
+
+                break :blk ctx;
+            } else null;
+            defer if (tls_ctx) |ctx| ssl.SSL_CTX_free(ctx);
+
             var group: Io.Group = .init;
             defer group.cancel(io);
 
@@ -145,12 +180,76 @@ pub fn Server(
                     self.metrics,
                     self.tracer,
                     self.config,
+                    tls_ctx,
                     io,
                     stream,
                 }) catch |err| {
                     std.log.err("Failed to spawn handler: {s}", .{@errorName(err)});
                     stream.close(io);
                 };
+            }
+        }
+
+        // =========================================================================
+        // I/O Wrapper Functions (TLS or Plain)
+        // TigerStyle: Abstract TLS vs plain socket I/O
+        // =========================================================================
+
+        /// Read from connection (TLS or plain).
+        /// TigerStyle: Runtime dispatch based on TLS availability.
+        fn connectionRead(
+            maybe_tls: ?*const TLSStream,
+            io: *Io,
+            stream: Io.net.Stream,
+            buf: []u8,
+        ) ?usize {
+            assert(buf.len > 0); // S1: precondition
+
+            if (maybe_tls) |tls| {
+                // TLS read (blocking - std.Io handles socket-level async)
+                var mutable_tls = tls.*;
+                const n = mutable_tls.read(buf) catch |err| {
+                    debugLog("TLS read error: {s}", .{@errorName(err)});
+                    return null;
+                };
+                return n;
+            } else {
+                // Plain socket read
+                var reader_buf: [1]u8 = std.mem.zeroes([1]u8);
+                var stream_reader = stream.reader(io.*, &reader_buf);
+                var bufs: [1][]u8 = .{buf};
+                const n = stream_reader.interface.readVec(&bufs) catch |err| {
+                    if (err != error.EndOfStream) {
+                        debugLog("Read error: {s}", .{@errorName(err)});
+                    }
+                    return null;
+                };
+                if (n == 0) return null; // S1: postcondition
+                return n;
+            }
+        }
+
+        /// Write to connection (TLS or plain).
+        /// TigerStyle: Runtime dispatch based on TLS availability.
+        fn connectionWrite(
+            maybe_tls: ?*const TLSStream,
+            io: *Io,
+            stream: Io.net.Stream,
+            data: []const u8,
+        ) !void {
+            assert(data.len > 0); // S1: precondition
+
+            if (maybe_tls) |tls| {
+                // TLS write (blocking - std.Io handles socket-level async)
+                var mutable_tls = tls.*;
+                _ = try mutable_tls.write(data);
+            } else {
+                // Plain socket write
+                var write_buf: [config.SERVER_WRITE_BUFFER_SIZE_BYTES]u8 =
+                    std.mem.zeroes([config.SERVER_WRITE_BUFFER_SIZE_BYTES]u8);
+                var writer = stream.writer(io.*, &write_buf);
+                try writer.interface.writeAll(data);
+                try writer.interface.flush();
             }
         }
 
@@ -163,31 +262,139 @@ pub fn Server(
         /// Returns true if headers complete, false on error (already sent error response).
         /// TigerStyle: Bounded loop with explicit iteration limit.
         fn accumulateHeaders(
-            io: Io,
+            maybe_tls: ?*const TLSStream,
+            io: *Io,
             stream: Io.net.Stream,
             recv_buf: *[REQUEST_BUFFER_SIZE_BYTES]u8,
             buffer_offset: usize,
             buffer_len: *usize,
+            cfg: Config,
         ) bool {
             // TigerStyle: Bounded loop - max 16 iterations to receive complete headers
             const max_read_iterations: u32 = 16;
             var read_iterations: u32 = 0;
+            _ = cfg; // Unused after removing timeout logic
 
             while (std.mem.indexOf(u8, recv_buf[buffer_offset..buffer_len.*], "\r\n\r\n") == null) {
                 read_iterations += 1;
                 if (read_iterations >= max_read_iterations) {
-                    sendErrorResponse(io, stream, 400, "Bad Request");
+                    sendErrorResponseTls(maybe_tls, io, stream, 400, "Bad Request");
                     return false;
                 }
                 if (buffer_len.* >= recv_buf.len) {
-                    sendErrorResponse(io, stream, 431, "Request Header Fields Too Large");
+                    sendErrorResponseTls(maybe_tls, io, stream, 431, "Request Header Fields Too Large");
                     return false;
                 }
-                const n = readMoreData(io, stream, recv_buf[buffer_len.*..]) orelse return false;
+                const n = connectionRead(maybe_tls, io, stream, recv_buf[buffer_len.*..]) orelse return false;
                 if (n == 0) return false;
                 buffer_len.* += n;
             }
             return true;
+        }
+
+        /// Send error response (TLS-aware).
+        /// TigerStyle: Wrapper for response.sendErrorResponse with TLS support.
+        fn sendErrorResponseTls(
+            maybe_tls: ?*const TLSStream,
+            io: *Io,
+            stream: Io.net.Stream,
+            status: u16,
+            message: []const u8,
+        ) void {
+            assert(status >= 400 and status < 600); // S1: precondition
+            assert(message.len > 0); // S1: precondition
+
+            // Format error response
+            var response_buf: [config.RESPONSE_BUFFER_SIZE_BYTES]u8 = std.mem.zeroes([config.RESPONSE_BUFFER_SIZE_BYTES]u8);
+            const response_text = std.fmt.bufPrint(
+                &response_buf,
+                "HTTP/1.1 {d} {s}\r\nContent-Type: text/plain\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+                .{ status, response.statusText(status), message.len, message },
+            ) catch return;
+
+            connectionWrite(maybe_tls, io, stream, response_text) catch return;
+        }
+
+        /// Send 100 Continue response (TLS-aware).
+        /// TigerStyle: Wrapper for response.send100Continue with TLS support.
+        fn send100ContinueTls(
+            maybe_tls: ?*const TLSStream,
+            io: *Io,
+            stream: Io.net.Stream,
+        ) void {
+            const response_text = "HTTP/1.1 100 Continue\r\n\r\n";
+            assert(std.mem.endsWith(u8, response_text, "\r\n\r\n")); // S2: postcondition
+            connectionWrite(maybe_tls, io, stream, response_text) catch return;
+        }
+
+        /// Send 501 Not Implemented response (TLS-aware).
+        /// TigerStyle: Wrapper for response.send501NotImplemented with TLS support.
+        fn send501NotImplementedTls(
+            maybe_tls: ?*const TLSStream,
+            io: *Io,
+            stream: Io.net.Stream,
+            message: []const u8,
+        ) void {
+            assert(message.len > 0); // S1: precondition
+
+            var response_buf: [config.RESPONSE_BUFFER_SIZE_BYTES]u8 = std.mem.zeroes([config.RESPONSE_BUFFER_SIZE_BYTES]u8);
+            const response_text = std.fmt.bufPrint(
+                &response_buf,
+                "HTTP/1.1 501 {s}\r\nContent-Type: text/plain\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+                .{ response.statusText(501), message.len, message },
+            ) catch return;
+
+            connectionWrite(maybe_tls, io, stream, response_text) catch return;
+        }
+
+        /// Send direct response from handler (TLS-aware).
+        /// TigerStyle: Wrapper for response.sendDirectResponse with TLS support.
+        fn sendDirectResponseTls(
+            maybe_tls: ?*const TLSStream,
+            io: *Io,
+            stream: Io.net.Stream,
+            resp: types.DirectResponse,
+        ) void {
+            assert(resp.status >= 100 and resp.status < 600); // S1: precondition
+            assert(resp.content_type.len > 0); // S1: precondition
+
+            // Format headers
+            var header_buf: [config.DIRECT_RESPONSE_HEADER_SIZE_BYTES]u8 =
+                std.mem.zeroes([config.DIRECT_RESPONSE_HEADER_SIZE_BYTES]u8);
+
+            const headers = switch (resp.response_mode) {
+                .content_length => std.fmt.bufPrint(
+                    &header_buf,
+                    "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\n{s}\r\n",
+                    .{ resp.status, response.statusText(resp.status), resp.content_type, resp.body.len, resp.extra_headers },
+                ) catch return,
+                .chunked => blk: {
+                    // Format chunk header for chunked encoding
+                    var chunk_header_buf: [20]u8 = std.mem.zeroes([20]u8);
+                    const chunk_header = std.fmt.bufPrint(
+                        &chunk_header_buf,
+                        "{x}\r\n",
+                        .{resp.body.len},
+                    ) catch return;
+
+                    const headers_text = std.fmt.bufPrint(
+                        &header_buf,
+                        "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nTransfer-Encoding: chunked\r\n{s}\r\n{s}",
+                        .{ resp.status, response.statusText(resp.status), resp.content_type, resp.extra_headers, chunk_header },
+                    ) catch return;
+                    break :blk headers_text;
+                },
+            };
+
+            // Write headers and body
+            connectionWrite(maybe_tls, io, stream, headers) catch return;
+            connectionWrite(maybe_tls, io, stream, resp.body) catch return;
+
+            // Add chunk terminator for chunked encoding
+            if (resp.response_mode == .chunked) {
+                const terminator = "\r\n0\r\n\r\n";
+                connectionWrite(maybe_tls, io, stream, terminator) catch return;
+            }
         }
 
         /// Build tracing span name from request method and path.
@@ -245,7 +452,7 @@ pub fn Server(
         /// Handle HTTP/1.1 connection with keep-alive and pipelining support.
         /// Processes multiple requests until: client sends Connection: close,
         /// max requests reached, or error occurs.
-        /// TigerStyle: All 7 dependencies explicit at call site, no hidden state.
+        /// TigerStyle: All 8 dependencies explicit at call site, no hidden state.
         /// Supports HTTP pipelining: multiple requests in single TCP read are processed.
         fn handleConnectionImpl(
             handler: *Handler,
@@ -253,6 +460,7 @@ pub fn Server(
             metrics: *Metrics,
             tracer: *Tracer,
             cfg: Config,
+            tls_ctx: ?*ssl.SSL_CTX,
             io: Io,
             stream: Io.net.Stream,
         ) void {
@@ -270,6 +478,23 @@ pub fn Server(
             defer stream.close(io);
             metrics.connectionOpened();
             defer metrics.connectionClosed();
+
+            // TLS: Perform handshake if TLS is configured
+            // TigerStyle: Blocking handshake - std.Io handles socket-level async
+            var maybe_tls_stream: ?TLSStream = if (tls_ctx) |ctx| blk: {
+                // S1: precondition - ctx is non-null (enforced by if guard above)
+                const allocator = std.heap.c_allocator;
+                const tls_stream = TLSStream.initServer(
+                    ctx,
+                    @intCast(stream.socket.handle),
+                    allocator,
+                ) catch |err| {
+                    std.log.err("TLS handshake failed: {s}", .{@errorName(err)});
+                    return;
+                };
+                break :blk tls_stream;
+            } else null;
+            defer if (maybe_tls_stream) |*tls_stream| tls_stream.close();
 
             // Initialize context with connection-scoped fields
             var ctx = Context.init();
@@ -295,6 +520,12 @@ pub fn Server(
                 }
             }
 
+            // Mutable io for TLS operations (io is passed by value)
+            var io_mut = io;
+
+            // Get pointer to TLS stream for I/O operations (if TLS is active)
+            const maybe_tls_ptr: ?*const TLSStream = if (maybe_tls_stream) |*tls| tls else null;
+
             // Request processing state
             var parser = Parser.init();
             var recv_buf: [REQUEST_BUFFER_SIZE_BYTES]u8 = std.mem.zeroes([REQUEST_BUFFER_SIZE_BYTES]u8);
@@ -318,13 +549,13 @@ pub fn Server(
 
                 // Pipelining: reuse leftover data or read new data
                 if (buffer_offset >= buffer_len) {
-                    const n = readRequest(io, stream, &recv_buf) orelse return;
+                    const n = connectionRead(maybe_tls_ptr, &io_mut, stream, &recv_buf) orelse return;
                     buffer_len = n;
                     buffer_offset = 0;
                 }
 
                 // Accumulate reads until complete headers received
-                if (!accumulateHeaders(io, stream, &recv_buf, buffer_offset, &buffer_len)) return;
+                if (!accumulateHeaders(maybe_tls_ptr, &io_mut, stream, &recv_buf, buffer_offset, &buffer_len, cfg)) return;
 
                 ctx.bytes_received = @intCast(buffer_len - buffer_offset);
                 metrics.requestStart();
@@ -332,7 +563,7 @@ pub fn Server(
                 // Parse headers
                 const parse_start = realtimeNanos();
                 parser.parseHeaders(recv_buf[buffer_offset..buffer_len]) catch {
-                    sendErrorResponse(io, stream, 400, "Bad Request");
+                    sendErrorResponseTls(maybe_tls_ptr, &io_mut, stream, 400, "Bad Request");
                     metrics.requestEnd(400, @intCast(realtimeNanos() - ctx.start_time_ns));
                     return;
                 };
@@ -340,7 +571,7 @@ pub fn Server(
 
                 // RFC 7231: CONNECT is a forward proxy feature, not reverse proxy
                 if (parser.request.method == .CONNECT) {
-                    send501NotImplemented(io, stream, "CONNECT method not supported");
+                    send501NotImplementedTls(maybe_tls_ptr, &io_mut, stream, "CONNECT method not supported");
                     metrics.requestEnd(501, @intCast(realtimeNanos() - ctx.start_time_ns));
                     const body_length = getBodyLength(&parser.request);
                     buffer_offset += parser.headers_end + body_length;
@@ -350,7 +581,7 @@ pub fn Server(
                 // RFC 7231 Section 5.1.1: Handle Expect: 100-continue
                 if (parser.request.headers.get("Expect")) |expect| {
                     if (std.ascii.eqlIgnoreCase(expect, "100-continue")) {
-                        send100Continue(io, stream);
+                        send100ContinueTls(maybe_tls_ptr, &io_mut, stream);
                     }
                 }
 
@@ -366,7 +597,7 @@ pub fn Server(
                         .continue_request => {}, // Fall through to selectUpstream
                         .send_response => |resp| {
                             // Handler wants to send direct response without forwarding
-                            sendDirectResponse(io, stream, resp);
+                            sendDirectResponseTls(maybe_tls_ptr, &io_mut, stream, resp);
                             const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
                             metrics.requestEnd(resp.status, duration_ns);
                             tracer.endSpan(span_handle, null);
@@ -402,7 +633,7 @@ pub fn Server(
 
                     break :blk if (should_close) .close_connection else .keep_alive;
                 } else |err| blk: {
-                    handleForwardErrorImpl(handler, metrics, io, stream, &ctx, &parser.request, upstream, err, duration_ns);
+                    handleForwardErrorImpl(handler, metrics, maybe_tls_ptr, &io_mut, stream, &ctx, &parser.request, upstream, err, duration_ns);
                     tracer.endSpan(span_handle, @errorName(err));
                     break :blk .fatal_error;
                 };
@@ -477,7 +708,8 @@ pub fn Server(
         fn handleForwardErrorImpl(
             handler: *Handler,
             metrics: *Metrics,
-            io: Io,
+            maybe_tls: ?*const TLSStream,
+            io: *Io,
             stream: Io.net.Stream,
             ctx: *Context,
             request: *const Request,
@@ -500,7 +732,7 @@ pub fn Server(
                 handler.onError(ctx, error_ctx);
             }
 
-            sendErrorResponse(io, stream, 502, "Bad Gateway");
+            sendErrorResponseTls(maybe_tls, io, stream, 502, "Bad Gateway");
             ctx.response_status = 502;
 
             // Track per-upstream stats if metrics supports it

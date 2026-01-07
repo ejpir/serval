@@ -213,6 +213,9 @@ pub const Config = struct {
 
     /// Send buffer size in bytes
     send_buffer_size_bytes: u32 = 4096,
+
+    /// TLS configuration (optional - null means plaintext HTTP)
+    tls: ?TlsConfig = null,
 };
 
 /// TLS configuration for client termination and upstream origination.

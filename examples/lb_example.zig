@@ -10,6 +10,8 @@
 //! Options:
 //!   --port <PORT>       Listening port (default: 8080)
 //!   --backends <HOSTS>  Comma-separated backend addresses (default: 127.0.0.1:8001,127.0.0.1:8002)
+//!   --cert <PATH>       Server certificate file (PEM format, enables TLS)
+//!   --key <PATH>        Server private key file (PEM format, required with --cert)
 //!   --stats             Enable real-time terminal stats display
 //!   --debug             Enable debug logging
 //!   --help              Show help message
@@ -34,6 +36,10 @@ const VERSION = "0.1.0";
 const LbExtra = struct {
     /// Comma-separated list of backend addresses (host:port,host:port,...)
     backends: []const u8 = "127.0.0.1:8001,127.0.0.1:8002",
+    /// Server certificate file path (PEM format) for TLS termination
+    cert: ?[]const u8 = null,
+    /// Server private key file path (PEM format) for TLS termination
+    key: ?[]const u8 = null,
     /// Enable real-time terminal stats display
     stats: bool = false,
     /// Enable OpenTelemetry tracing (requires collector at localhost:4318)
@@ -103,6 +109,21 @@ pub fn main() !void {
 
     const upstreams = upstreams_buf[0..upstream_count];
 
+    // Validate TLS configuration
+    const tls_config: ?serval.config.TlsConfig = if (args.extra.cert) |cert_path| blk: {
+        if (args.extra.key == null) {
+            std.debug.print("Error: --key is required when --cert is specified\n", .{});
+            return error.MissingTlsKey;
+        }
+        break :blk .{
+            .cert_path = cert_path,
+            .key_path = args.extra.key,
+        };
+    } else if (args.extra.key) |_| {
+        std.debug.print("Error: --cert is required when --key is specified\n", .{});
+        return error.MissingTlsCert;
+    } else null;
+
     // Initialize connection pool
     var pool = serval.SimplePool.init();
 
@@ -133,7 +154,10 @@ pub fn main() !void {
     var shutdown = std.atomic.Value(bool).init(false);
 
     // Print startup info
-    std.debug.print("Load balancer listening on :{d}\n", .{args.port});
+    std.debug.print("Load balancer listening on :{d} ({s})\n", .{ args.port, if (tls_config != null) "HTTPS" else "HTTP" });
+    if (tls_config) |tls_cfg| {
+        std.debug.print("TLS: enabled (cert={s}, key={s})\n", .{ tls_cfg.cert_path.?, tls_cfg.key_path.? });
+    }
     std.debug.print("Health tracking: enabled (unhealthy after {d} failures, healthy after {d} successes)\n", .{
         serval.config.DEFAULT_UNHEALTHY_THRESHOLD,
         serval.config.DEFAULT_HEALTHY_THRESHOLD,
@@ -184,6 +208,7 @@ pub fn main() !void {
         );
         var server = OtelServerType.init(&handler, &pool, &metrics, &tracer, .{
             .port = args.port,
+            .tls = tls_config,
         });
 
         server.run(io, &shutdown) catch |err| {
@@ -202,6 +227,7 @@ pub fn main() !void {
         );
         var server = NoopServerType.init(&handler, &pool, &metrics, &tracer, .{
             .port = args.port,
+            .tls = tls_config,
         });
 
         server.run(io, &shutdown) catch |err| {

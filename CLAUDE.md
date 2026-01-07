@@ -4,13 +4,218 @@
   <style>TigerStyle</style>
 </project>
 
+<quality-standards>
+  <CRITICAL priority="HIGHEST">
+    This is PRODUCTION-GRADE code. We are building infrastructure software that must operate with space shuttle-level reliability.
+  </CRITICAL>
+
+  <principles>
+    <principle name="production-quality">
+      We are NOT building prototypes or POCs anymore. Every line of code must be production-ready.
+      Code that goes into serval-* modules will be used in real systems handling real traffic.
+    </principle>
+
+    <principle name="space-shuttle-testing">
+      Testing must be exhaustive and thorough like NASA's space shuttle software development:
+      - Test all code paths (happy path, error paths, edge cases)
+      - Test boundary conditions (zero, max, overflow)
+      - Test resource exhaustion (OOM, fd limits, timeouts)
+      - Test concurrent access (race conditions, deadlocks)
+      - Test failure recovery (crash recovery, rollback, cleanup)
+      - Integration tests for all major features
+      - Stress tests to validate performance claims
+    </principle>
+
+    <principle name="follow-specs">
+      Strictly follow specifications:
+      - RFC compliance (HTTP/1.1, TLS, etc.)
+      - Architecture layer rules (no sideways dependencies)
+      - TigerStyle rules (ALL rules, NO exceptions)
+      - API contracts (function signatures, error handling)
+      - Performance requirements (latency targets, memory bounds)
+    </principle>
+
+    <principle name="mandatory-tigerstyle">
+      ALWAYS run /tigerstyle validation:
+      - Before writing new code (to understand requirements)
+      - During implementation (to validate approach)
+      - After writing code (to verify compliance)
+      - Before committing (final check)
+
+      TigerStyle is NOT optional. It is a requirement for ALL code.
+      Check EVERY rule (S1-S7, P1-P4, C1-C5, Y1-Y6) individually.
+    </principle>
+
+    <principle name="verify-all-decisions">
+      Validate architectural and implementation decisions:
+      - Use /tigerstyle to check if design follows TigerStyle principles
+      - Reference RFC specs for protocol decisions
+      - Check layer architecture rules for module placement
+      - Verify against implementation plans in docs/plans/
+      - Cross-reference with existing code patterns in codebase
+    </principle>
+
+    <principle name="no-shortcuts">
+      NO SHORTCUTS. NO "TODO" comments. NO "will fix later."
+      - Every function has proper error handling
+      - Every resource has cleanup (defer, errdefer)
+      - Every assumption has an assertion
+      - Every timeout has a bound
+      - Every loop has an exit condition
+      - Every allocation has a corresponding free
+    </principle>
+  </principles>
+
+  <development-process>
+    <step order="1">
+      Read and understand specs (RFCs, plans, TigerStyle docs)
+    </step>
+    <step order="2">
+      Design implementation (validate with /tigerstyle)
+    </step>
+    <step order="3">
+      Write code with inline assertions and error handling
+    </step>
+    <step order="4">
+      Run /tigerstyle validation on code
+    </step>
+    <step order="5">
+      Write comprehensive tests (unit, integration, edge cases)
+    </step>
+    <step order="6">
+      Run all tests and verify they pass
+    </step>
+    <step order="7">
+      Update documentation (README.md, ARCHITECTURE.md)
+    </step>
+    <step order="8">
+      Final /tigerstyle check before commit
+    </step>
+  </development-process>
+
+  <testing-requirements>
+    <requirement category="unit-tests">
+      Every function with logic must have unit tests:
+      - Test success cases with valid inputs
+      - Test all error paths with invalid inputs
+      - Test boundary conditions (0, 1, max, max+1)
+      - Test resource cleanup (defer, errdefer)
+    </requirement>
+
+    <requirement category="integration-tests">
+      Every module must have integration tests:
+      - Test module initialization and cleanup
+      - Test integration with dependencies
+      - Test concurrency (if applicable)
+      - Test resource limits (memory, fds, timeouts)
+    </requirement>
+
+    <requirement category="property-tests">
+      For parsers and state machines:
+      - Fuzz testing with random inputs
+      - Property-based testing (invariants hold)
+      - State transition coverage
+    </requirement>
+
+    <requirement category="performance-tests">
+      For performance-critical code:
+      - Benchmark against targets (p50, p99 latency)
+      - Stress test under load
+      - Memory usage profiling
+      - CPU profiling to identify bottlenecks
+    </requirement>
+  </testing-requirements>
+
+  <code-quality-checklist>
+    <check>✓ All TigerStyle rules pass (/tigerstyle validation)</check>
+    <check>✓ All tests pass (unit, integration)</check>
+    <check>✓ No memory leaks (valgrind or similar)</check>
+    <check>✓ No undefined behavior (ubsan)</check>
+    <check>✓ All error paths tested</check>
+    <check>✓ All resources properly cleaned up</check>
+    <check>✓ Documentation updated</check>
+    <check>✓ Specs followed (RFCs, plans)</check>
+    <check>✓ Architecture rules followed (layers, deps)</check>
+    <check>✓ Performance targets met (if applicable)</check>
+  </code-quality-checklist>
+
+  <rejection-criteria>
+    <CRITICAL>Reject code that has ANY of these:</CRITICAL>
+    <reject>Missing error handling (catch {}, unchecked errors)</reject>
+    <reject>Unbounded loops (no timeout, no max iterations)</reject>
+    <reject>Resource leaks (missing defer, missing free)</reject>
+    <reject>Missing assertions (no precondition/postcondition checks)</reject>
+    <reject>TigerStyle violations (any rule S1-S7, P1-P4, C1-C5, Y1-Y6)</reject>
+    <reject>Missing tests (no test coverage for new code)</reject>
+    <reject>Spec violations (RFC non-compliance, layer violations)</reject>
+    <reject>TODO comments (finish it now, not later)</reject>
+    <reject>Magic numbers (use named constants with units)</reject>
+    <reject>Implicit behavior (make all defaults explicit)</reject>
+  </rejection-criteria>
+
+  <examples>
+    <bad-example>
+      // BAD: Missing timeout, no assertions, catch {}
+      fn do_handshake(ssl: *SSL) !void {
+          while (true) {
+              _ = c.SSL_do_handshake(ssl) catch {};
+          }
+      }
+    </bad-example>
+
+    <good-example>
+      // GOOD: Bounded loop, assertions, explicit error handling, timeout
+      fn do_handshake(
+          ssl: *SSL,
+          fd: c_int,
+          io: *Io,
+          timeout_ns: i64,
+      ) !void {
+          assert(ssl != null); // S1: precondition
+          assert(fd > 0); // S1: precondition
+          assert(timeout_ns > 0); // S1: precondition
+
+          const start_ns: i64 = std.time.nanoTimestamp();
+          var iteration: u32 = 0;
+          const max_iterations: u32 = 1000; // S3: bounded loop
+
+          while (iteration < max_iterations) { // S3: explicit bound
+              iteration += 1;
+
+              const now_ns: i64 = std.time.nanoTimestamp();
+              const elapsed_ns: i64 = now_ns - start_ns;
+              assert(elapsed_ns >= 0); // S1: monotonic clock invariant
+              if (elapsed_ns > timeout_ns) return error.HandshakeTimeout;
+
+              const remaining_ns: i64 = timeout_ns - elapsed_ns;
+
+              const ret = c.SSL_do_handshake(ssl);
+              if (ret == 1) {
+                  assert(c.SSL_is_init_finished(ssl)); // S2: postcondition
+                  return; // Success
+              }
+
+              const err = c.SSL_get_error(ssl, ret);
+              switch (err) { // S4: explicit error handling
+                  c.SSL_ERROR_WANT_READ => try io.pollIn(fd, remaining_ns),
+                  c.SSL_ERROR_WANT_WRITE => try io.pollOut(fd, remaining_ns),
+                  else => return error.HandshakeFailed,
+              }
+          }
+
+          return error.HandshakeMaxIterations; // S3: bounded loop exit
+      }
+    </good-example>
+  </examples>
+</quality-standards>
+
 <compiler>
-  <path>/usr/local/zig-x86_64-linux-0.16.0-dev.1859+212968c57/zig</path>
+  <path>/usr/local/zig-x86_64-linux-0.16.0-dev.1912+0cbaaa5eb/zig</path>
 </compiler>
 
 <commands>
   <build>zig build</build>
-  <test-serval>zig build test-serval</test-serval>
+  <test>zig build test</test>
   <test-lb>zig build test-lb</test-lb>
   <test-health>zig build test-health</test-health>
   <run-example>zig build run-lb-example</run-example>

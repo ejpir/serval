@@ -1,9 +1,5 @@
-// lib/serval-tls/ssl.zig
-//! Manual BoringSSL bindings
-//!
-//! Avoids @cImport issues with complex macros.
-//! Only includes functions needed for TLS support.
-//! Based on validated POC in experiments/tls-poc/.
+// Manual BoringSSL bindings - only what we need
+// Avoids @cImport issues with complex macros
 
 const std = @import("std");
 
@@ -67,7 +63,6 @@ pub extern fn SSL_set_accept_state(ssl: *SSL) void;
 pub extern fn SSL_connect(ssl: *SSL) c_int;
 pub extern fn SSL_accept(ssl: *SSL) c_int;
 pub extern fn SSL_do_handshake(ssl: *SSL) c_int;
-pub extern fn SSL_is_init_finished(ssl: *const SSL) c_int;
 pub extern fn SSL_read(ssl: *SSL, buf: [*]u8, num: c_int) c_int;
 pub extern fn SSL_write(ssl: *SSL, buf: [*]const u8, num: c_int) c_int;
 pub extern fn SSL_shutdown(ssl: *SSL) c_int;
@@ -94,42 +89,31 @@ pub fn init() void {
 pub fn createClientCtx() !*SSL_CTX {
     const method = TLS_client_method() orelse return error.NoTlsMethod;
     const ctx = SSL_CTX_new(method) orelse return error.SslCtxNew;
-    // NOTE: SSL_CTX_set_min_proto_version is BoringSSL-specific, not in OpenSSL
-    // TODO: Use OpenSSL-compatible SSL_CTX_set_options with SSL_OP_NO_TLSv1 etc
-    // _ = SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    _ = SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
     return ctx;
 }
 
 pub fn createServerCtx() !*SSL_CTX {
     const method = TLS_server_method() orelse return error.NoTlsMethod;
     const ctx = SSL_CTX_new(method) orelse return error.SslCtxNew;
-    // NOTE: SSL_CTX_set_min_proto_version is BoringSSL-specific, not in OpenSSL
-    // TODO: Use OpenSSL-compatible SSL_CTX_set_options with SSL_OP_NO_TLSv1 etc
-    // _ = SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    _ = SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
     return ctx;
 }
 
 pub fn createSsl(ctx: *SSL_CTX) !*SSL {
-    // S1: precondition - ctx pointer must be valid (enforced by type system)
-    const ssl = SSL_new(ctx) orelse return error.SslNew;
-    // S1: postcondition - ssl is non-null (verified by orelse above)
-    return ssl;
+    return SSL_new(ctx) orelse error.SslNew;
 }
 
 pub fn getErrorString(err: c_ulong) []const u8 {
-    var buf = std.mem.zeroes([256]u8); // S5: zeroed to prevent information leaks
+    var buf: [256]u8 = undefined;
     ERR_error_string_n(err, &buf, buf.len);
     return std.mem.sliceTo(&buf, 0);
 }
 
 pub fn printErrors() void {
-    var err: c_ulong = ERR_get_error(); // S2: explicit type
-    var iteration: u32 = 0;
-    const max_errors: u32 = 100; // S4: explicit bound
-
-    while (err != 0 and iteration < max_errors) { // S4: bounded loop
-        iteration += 1;
-        var buf = std.mem.zeroes([256]u8); // S5: zeroed to prevent information leaks
+    var err = ERR_get_error();
+    while (err != 0) {
+        var buf: [256]u8 = undefined;
         ERR_error_string_n(err, &buf, buf.len);
         std.log.err("SSL: {s}", .{std.mem.sliceTo(&buf, 0)});
         err = ERR_get_error();

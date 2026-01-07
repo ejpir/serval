@@ -4,17 +4,16 @@
 //! Provides unified interface for TLS I/O operations.
 //! Phase 1: Userspace-only implementation (kTLS deferred).
 //!
-//! This module implements async TLS I/O using BoringSSL with io_uring integration.
+//! This module uses blocking SSL operations. The underlying socket is managed
+//! by std.Io's async layer, so SSL can safely use blocking calls.
 //! - initServer: Server-side TLS termination (client connections)
 //! - initClient: Client-side TLS origination (upstream connections) with SNI
-//! - read/write: Non-blocking TLS I/O with timeouts
+//! - read/write: Blocking TLS I/O (socket-level timeouts via std.Io)
 //! - close: Graceful TLS shutdown
 
 const std = @import("std");
 const ssl = @import("ssl.zig");
-const posix = std.posix;
 const Allocator = std.mem.Allocator;
-const Io = std.Io;
 
 pub const TLSStream = struct {
     fd: c_int,
@@ -22,31 +21,29 @@ pub const TLSStream = struct {
     allocator: Allocator,
 
     /// Server-side TLS handshake (client termination).
-    /// Sets up non-blocking TLS socket and performs handshake with timeout.
+    /// Uses blocking SSL operations - socket timeouts handled by std.Io.
     pub fn initServer(
         ctx: *ssl.SSL_CTX,
         fd: c_int,
-        io: *Io,
-        timeout_ns: i64,
         allocator: Allocator,
     ) !TLSStream {
-        std.debug.assert(ctx != null); // S1: precondition
+        // S1: preconditions
         std.debug.assert(fd > 0); // S1: precondition
-        std.debug.assert(timeout_ns > 0); // S1: precondition
 
         const ssl_conn = ssl.SSL_new(ctx) orelse return error.SslNew;
         errdefer ssl.SSL_free(ssl_conn);
 
-        // Set non-blocking mode
-        const flags: u32 = @intCast(try posix.fcntl(fd, posix.F.GETFL, 0));
-        _ = try posix.fcntl(fd, posix.F.SETFL, flags | posix.O.NONBLOCK);
-
         if (ssl.SSL_set_fd(ssl_conn, fd) != 1) return error.SslSetFd;
         ssl.SSL_set_accept_state(ssl_conn);
 
-        try doHandshake(ssl_conn, fd, io, timeout_ns);
+        // Blocking handshake - std.Io handles socket-level async
+        const ret = ssl.SSL_accept(ssl_conn);
+        if (ret != 1) {
+            ssl.printErrors();
+            return error.HandshakeFailed;
+        }
 
-        std.debug.assert(ssl_conn != null); // S1: postcondition
+        std.debug.assert(ssl.SSL_is_init_finished(ssl_conn) == 1); // S1: postcondition
         return .{
             .fd = fd,
             .ssl = ssl_conn,
@@ -55,26 +52,19 @@ pub const TLSStream = struct {
     }
 
     /// Client-side TLS handshake (upstream origination) with SNI.
-    /// Sets up non-blocking TLS socket and performs handshake with timeout.
+    /// Uses blocking SSL operations - socket timeouts handled by std.Io.
     pub fn initClient(
         ctx: *ssl.SSL_CTX,
         fd: c_int,
-        io: *Io,
         sni: []const u8,
-        timeout_ns: i64,
         allocator: Allocator,
     ) !TLSStream {
-        std.debug.assert(ctx != null); // S1: precondition
+        // S1: preconditions
         std.debug.assert(fd > 0); // S1: precondition
         std.debug.assert(sni.len > 0); // S1: precondition
-        std.debug.assert(timeout_ns > 0); // S1: precondition
 
         const ssl_conn = ssl.SSL_new(ctx) orelse return error.SslNew;
         errdefer ssl.SSL_free(ssl_conn);
-
-        // Set non-blocking mode
-        const flags: u32 = @intCast(try posix.fcntl(fd, posix.F.GETFL, 0));
-        _ = try posix.fcntl(fd, posix.F.SETFL, flags | posix.O.NONBLOCK);
 
         if (ssl.SSL_set_fd(ssl_conn, fd) != 1) return error.SslSetFd;
 
@@ -85,9 +75,14 @@ pub const TLSStream = struct {
 
         ssl.SSL_set_connect_state(ssl_conn);
 
-        try doHandshake(ssl_conn, fd, io, timeout_ns);
+        // Blocking handshake - std.Io handles socket-level async
+        const ret = ssl.SSL_connect(ssl_conn);
+        if (ret != 1) {
+            ssl.printErrors();
+            return error.HandshakeFailed;
+        }
 
-        std.debug.assert(ssl_conn != null); // S1: postcondition
+        std.debug.assert(ssl.SSL_is_init_finished(ssl_conn) == 1); // S1: postcondition
         return .{
             .fd = fd,
             .ssl = ssl_conn,
@@ -95,155 +90,46 @@ pub const TLSStream = struct {
         };
     }
 
-    /// Non-blocking TLS read with timeout.
+    /// Blocking TLS read.
     /// Returns number of bytes read, or 0 on clean shutdown.
-    pub fn read(
-        self: *TLSStream,
-        io: *Io,
-        buf: []u8,
-        timeout_ns: i64,
-    ) !u32 {
-        std.debug.assert(self.ssl != null); // S1: precondition
+    pub fn read(self: *TLSStream, buf: []u8) !u32 {
         std.debug.assert(buf.len > 0); // S1: precondition
-        std.debug.assert(timeout_ns > 0); // S1: precondition
 
-        const start_ns: i64 = std.time.nanoTimestamp();
-        var iteration: u32 = 0;
-        const max_iterations: u32 = 10000; // S3: bounded loop
-
-        while (iteration < max_iterations) { // S3: explicit bound
-            iteration += 1;
-
-            const now_ns: i64 = std.time.nanoTimestamp();
-            const elapsed_ns: i64 = now_ns - start_ns;
-            std.debug.assert(elapsed_ns >= 0); // S1: monotonic clock invariant
-            if (elapsed_ns > timeout_ns) return error.Timeout;
-
-            const remaining_ns: i64 = timeout_ns - elapsed_ns;
-
-            const ret: c_int = ssl.SSL_read(self.ssl, buf.ptr, @intCast(buf.len));
-            if (ret > 0) {
-                const bytes_read: u32 = @intCast(ret);
-                std.debug.assert(bytes_read <= buf.len); // S1: postcondition
-                return bytes_read;
-            }
-
-            const err: c_int = ssl.SSL_get_error(self.ssl, ret);
-            switch (err) { // S4: explicit error handling
-                ssl.SSL_ERROR_WANT_READ => try io.pollIn(self.fd, remaining_ns),
-                ssl.SSL_ERROR_ZERO_RETURN => return 0, // Clean shutdown
-                else => return error.SslRead,
-            }
+        const n = ssl.SSL_read(self.ssl, buf.ptr, @intCast(buf.len));
+        if (n <= 0) {
+            const err = ssl.SSL_get_error(self.ssl, n);
+            if (err == ssl.SSL_ERROR_ZERO_RETURN) return 0; // Clean shutdown
+            return error.SslRead;
         }
-
-        return error.ReadMaxIterations; // S3: bounded loop exit
+        const bytes_read: u32 = @intCast(n);
+        std.debug.assert(bytes_read <= buf.len); // S1: postcondition
+        return bytes_read;
     }
 
-    /// Non-blocking TLS write with timeout.
+    /// Blocking TLS write.
     /// Returns number of bytes written.
-    pub fn write(
-        self: *TLSStream,
-        io: *Io,
-        data: []const u8,
-        timeout_ns: i64,
-    ) !u32 {
-        std.debug.assert(self.ssl != null); // S1: precondition
+    pub fn write(self: *TLSStream, data: []const u8) !u32 {
         std.debug.assert(data.len > 0); // S1: precondition
-        std.debug.assert(timeout_ns > 0); // S1: precondition
 
-        const start_ns: i64 = std.time.nanoTimestamp();
-        var written: u32 = 0;
-        var iteration: u32 = 0;
-        const max_iterations: u32 = 10000; // S3: bounded loop
+        const n = ssl.SSL_write(self.ssl, data.ptr, @intCast(data.len));
+        if (n <= 0) return error.SslWrite;
 
-        while (written < data.len and iteration < max_iterations) { // S3: explicit bound
-            iteration += 1;
-
-            const now_ns: i64 = std.time.nanoTimestamp();
-            const elapsed_ns: i64 = now_ns - start_ns;
-            std.debug.assert(elapsed_ns >= 0); // S1: monotonic clock invariant
-            if (elapsed_ns > timeout_ns) return error.Timeout;
-
-            const remaining_ns: i64 = timeout_ns - elapsed_ns;
-            const chunk = data[written..];
-            std.debug.assert(chunk.len > 0); // S1: invariant
-
-            const ret: c_int = ssl.SSL_write(self.ssl, chunk.ptr, @intCast(chunk.len));
-            if (ret > 0) {
-                const bytes_written: u32 = @intCast(ret);
-                std.debug.assert(bytes_written <= chunk.len); // S1: postcondition
-                written += bytes_written;
-                continue;
-            }
-
-            const err: c_int = ssl.SSL_get_error(self.ssl, ret);
-            switch (err) { // S4: explicit error handling
-                ssl.SSL_ERROR_WANT_WRITE => try io.pollOut(self.fd, remaining_ns),
-                else => return error.SslWrite,
-            }
-        }
-
-        if (written < data.len) return error.WriteMaxIterations; // S3: bounded loop exit
-        std.debug.assert(written == data.len); // S1: postcondition
-        return written;
+        const bytes_written: u32 = @intCast(n);
+        std.debug.assert(bytes_written <= data.len); // S1: postcondition
+        return bytes_written;
     }
 
     /// Graceful TLS shutdown.
     /// Caller owns fd and is responsible for closing it.
     pub fn close(self: *TLSStream) void {
-        std.debug.assert(self.ssl != null); // S1: precondition
         _ = ssl.SSL_shutdown(self.ssl);
         ssl.SSL_free(self.ssl);
         // Caller owns fd, don't close it here
     }
 };
 
-/// Private helper for async TLS handshake with timeout.
-/// Used by both initServer and initClient.
-fn doHandshake(
-    ssl_conn: *ssl.SSL,
-    fd: c_int,
-    io: *Io,
-    timeout_ns: i64,
-) !void {
-    std.debug.assert(ssl_conn != null); // S1: precondition
-    std.debug.assert(fd > 0); // S1: precondition
-    std.debug.assert(timeout_ns > 0); // S1: precondition
-
-    const start_ns: i64 = std.time.nanoTimestamp();
-    var iteration: u32 = 0;
-    const max_iterations: u32 = 1000; // S3: bounded loop
-
-    while (iteration < max_iterations) { // S3: explicit bound
-        iteration += 1;
-
-        const now_ns: i64 = std.time.nanoTimestamp();
-        const elapsed_ns: i64 = now_ns - start_ns;
-        std.debug.assert(elapsed_ns >= 0); // S1: monotonic clock invariant
-        if (elapsed_ns > timeout_ns) return error.HandshakeTimeout;
-
-        const remaining_ns: i64 = timeout_ns - elapsed_ns;
-
-        const ret: c_int = ssl.SSL_do_handshake(ssl_conn);
-        if (ret == 1) {
-            std.debug.assert(ssl.SSL_is_init_finished(ssl_conn) == 1); // S1: postcondition
-            return; // Success
-        }
-
-        const err: c_int = ssl.SSL_get_error(ssl_conn, ret);
-        switch (err) { // S4: explicit error handling
-            ssl.SSL_ERROR_WANT_READ => try io.pollIn(fd, remaining_ns),
-            ssl.SSL_ERROR_WANT_WRITE => try io.pollOut(fd, remaining_ns),
-            else => return error.HandshakeFailed,
-        }
-    }
-
-    return error.HandshakeMaxIterations; // S3: bounded loop exit
-}
-
 // Tests
 test "TLSStream compiles" {
     // Basic compilation test
     _ = TLSStream;
-    _ = doHandshake;
 }

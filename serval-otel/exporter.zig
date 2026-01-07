@@ -10,6 +10,7 @@ const debugLog = core.debugLog;
 const span_mod = @import("span.zig");
 const types = @import("types.zig");
 const processor = @import("processor.zig");
+const json = @import("json.zig");
 
 const Span = span_mod.Span;
 const SpanExporter = processor.SpanExporter;
@@ -78,6 +79,8 @@ pub const Config = struct {
 // =============================================================================
 // OTLP HTTP/JSON Exporter
 // =============================================================================
+
+const JsonWriter = json.JsonWriter(FixedBufferWriter);
 
 /// Exports spans to an OTLP collector using HTTP/JSON.
 pub const OTLPExporter = struct {
@@ -173,112 +176,52 @@ pub const OTLPExporter = struct {
         // No cleanup needed
     }
 
-    /// Write spans as OTLP JSON format
+    /// Write spans as OTLP JSON format.
     pub fn writeOTLPJson(self: *Self, writer: *FixedBufferWriter, spans: []const Span) !void {
-        try writer.writeAll("{\"resourceSpans\":[{");
+        var j = JsonWriter.init(writer);
+
+        try j.beginObject();
+        try j.field("resourceSpans");
+        try j.beginArray();
+        try j.beginObject();
 
         // Resource attributes
-        try writer.writeAll("\"resource\":{\"attributes\":[");
-        try writer.writeAll("{\"key\":\"service.name\",\"value\":{\"stringValue\":\"");
-        try writer.writeAll(self.config.service_name);
-        try writer.writeAll("\"}},{\"key\":\"service.version\",\"value\":{\"stringValue\":\"");
-        try writer.writeAll(self.config.service_version);
-        try writer.writeAll("\"}},{\"key\":\"telemetry.sdk.name\",\"value\":{\"stringValue\":\"serval-otel\"}}");
-        try writer.writeAll("]},");
+        try j.field("resource");
+        try j.beginObject();
+        try j.field("attributes");
+        try j.beginArray();
+        try j.otlpStringAttr("service.name", self.config.service_name);
+        try j.otlpStringAttr("service.version", self.config.service_version);
+        try j.otlpStringAttr("telemetry.sdk.name", "serval-otel");
+        try j.endArray();
+        try j.endObject();
 
         // Scope spans
-        try writer.writeAll("\"scopeSpans\":[{");
-        try writer.writeAll("\"scope\":{\"name\":\"serval\",\"version\":\"1.0.0\"},");
-        try writer.writeAll("\"spans\":[");
+        try j.field("scopeSpans");
+        try j.beginArray();
+        try j.beginObject();
 
-        // Write each span
+        try j.field("scope");
+        try j.beginObject();
+        try j.field("name");
+        try j.string("serval");
+        try j.field("version");
+        try j.string("1.0.0");
+        try j.endObject();
+
+        try j.field("spans");
+        try j.beginArray();
         for (spans) |*span| {
-            if (span != &spans[0]) try writer.writeAll(",");
-            try self.writeSpan(writer, span);
+            try writeSpan(&j, span);
         }
+        try j.endArray();
 
-        try writer.writeAll("]}]}]}");
-    }
+        try j.endObject();
+        try j.endArray();
 
-    fn writeSpan(self: *Self, writer: *FixedBufferWriter, span: *const Span) !void {
-        _ = self;
-
-        try writer.writeAll("{");
-
-        // Trace ID (hex encoded)
-        try writer.writeAll("\"traceId\":\"");
-        var trace_buf: [32]u8 = undefined;
-        try writer.writeAll(span.span_context.trace_id.toHex(&trace_buf));
-        try writer.writeAll("\",");
-
-        // Span ID (hex encoded)
-        try writer.writeAll("\"spanId\":\"");
-        var span_buf: [16]u8 = undefined;
-        try writer.writeAll(span.span_context.span_id.toHex(&span_buf));
-        try writer.writeAll("\",");
-
-        // Parent Span ID (optional)
-        if (span.parent_span_id) |parent_id| {
-            try writer.writeAll("\"parentSpanId\":\"");
-            var parent_buf: [16]u8 = undefined;
-            try writer.writeAll(parent_id.toHex(&parent_buf));
-            try writer.writeAll("\",");
-        }
-
-        // Name
-        try writer.writeAll("\"name\":\"");
-        try writeJsonString(writer, span.getName());
-        try writer.writeAll("\",");
-
-        // Kind
-        try writer.writeAll("\"kind\":");
-        try writer.print("{}", .{@as(u8, @intFromEnum(span.kind)) + 1}); // OTLP uses 1-indexed
-        try writer.writeAll(",");
-
-        // Timestamps
-        try writer.writeAll("\"startTimeUnixNano\":\"");
-        try writer.print("{}", .{span.start_time_ns});
-        try writer.writeAll("\",\"endTimeUnixNano\":\"");
-        try writer.print("{}", .{span.end_time_ns});
-        try writer.writeAll("\",");
-
-        // Attributes
-        try writer.writeAll("\"attributes\":[");
-        for (0..span.attribute_count) |i| {
-            if (i > 0) try writer.writeAll(",");
-            const attr = &span.attributes[i];
-            try writer.writeAll("{\"key\":\"");
-            try writeJsonString(writer, attr.getKey());
-            try writer.writeAll("\",\"value\":");
-            try writeAttributeValue(writer, attr.value);
-            try writer.writeAll("}");
-        }
-        try writer.writeAll("],");
-
-        // Events
-        try writer.writeAll("\"events\":[");
-        for (0..span.event_count) |i| {
-            if (i > 0) try writer.writeAll(",");
-            const event = &span.events[i];
-            try writer.writeAll("{\"name\":\"");
-            try writeJsonString(writer, event.getName());
-            try writer.writeAll("\",\"timeUnixNano\":\"");
-            try writer.print("{}", .{event.timestamp_ns});
-            try writer.writeAll("\"}");
-        }
-        try writer.writeAll("],");
-
-        // Status
-        try writer.writeAll("\"status\":{\"code\":");
-        try writer.print("{}", .{@intFromEnum(span.status.code)});
-        if (span.status.code == .Error and span.status.description_len > 0) {
-            try writer.writeAll(",\"message\":\"");
-            try writeJsonString(writer, span.status.getDescription());
-            try writer.writeAll("\"");
-        }
-        try writer.writeAll("}");
-
-        try writer.writeAll("}");
+        try j.endObject();
+        try j.endArray();
+        try j.endObject();
     }
 
     fn sendHttp(self: *Self, body: []const u8) !void {
@@ -305,51 +248,87 @@ pub const OTLPExporter = struct {
 };
 
 // =============================================================================
-// JSON Helpers
+// Span Serialization
 // =============================================================================
 
-/// Write a JSON-escaped string
-fn writeJsonString(writer: *FixedBufferWriter, str: []const u8) !void {
-    for (str) |c| {
-        switch (c) {
-            '"' => try writer.writeAll("\\\""),
-            '\\' => try writer.writeAll("\\\\"),
-            '\n' => try writer.writeAll("\\n"),
-            '\r' => try writer.writeAll("\\r"),
-            '\t' => try writer.writeAll("\\t"),
-            else => {
-                if (c < 0x20) {
-                    try writer.print("\\u{x:0>4}", .{c});
-                } else {
-                    try writer.writeByte(c);
-                }
-            },
-        }
+fn writeSpan(j: *JsonWriter, span: *const Span) !void {
+    var trace_buf: [32]u8 = undefined;
+    var span_buf: [16]u8 = undefined;
+
+    try j.beginObject();
+
+    // Trace ID (hex encoded)
+    try j.field("traceId");
+    try j.stringHexRaw(span.span_context.trace_id.toHex(&trace_buf));
+
+    // Span ID (hex encoded)
+    try j.field("spanId");
+    try j.stringHexRaw(span.span_context.span_id.toHex(&span_buf));
+
+    // Parent Span ID (optional)
+    if (span.parent_span_id) |parent_id| {
+        var parent_buf: [16]u8 = undefined;
+        try j.field("parentSpanId");
+        try j.stringHexRaw(parent_id.toHex(&parent_buf));
     }
+
+    // Name
+    try j.field("name");
+    try j.string(span.getName());
+
+    // Kind (OTLP uses 1-indexed)
+    try j.field("kind");
+    try j.int(@as(u8, @intFromEnum(span.kind)) + 1);
+
+    // Timestamps
+    try j.field("startTimeUnixNano");
+    try j.intString(span.start_time_ns);
+    try j.field("endTimeUnixNano");
+    try j.intString(span.end_time_ns);
+
+    // Attributes
+    try j.field("attributes");
+    try j.beginArray();
+    for (0..span.attribute_count) |i| {
+        const attr = &span.attributes[i];
+        try writeAttribute(j, attr);
+    }
+    try j.endArray();
+
+    // Events
+    try j.field("events");
+    try j.beginArray();
+    for (0..span.event_count) |i| {
+        const event = &span.events[i];
+        try j.beginObject();
+        try j.field("name");
+        try j.string(event.getName());
+        try j.field("timeUnixNano");
+        try j.intString(event.timestamp_ns);
+        try j.endObject();
+    }
+    try j.endArray();
+
+    // Status
+    try j.field("status");
+    try j.beginObject();
+    try j.field("code");
+    try j.int(@intFromEnum(span.status.code));
+    if (span.status.code == .Error and span.status.description_len > 0) {
+        try j.field("message");
+        try j.string(span.status.getDescription());
+    }
+    try j.endObject();
+
+    try j.endObject();
 }
 
-fn writeAttributeValue(writer: *FixedBufferWriter, value: span_mod.AttributeValue) !void {
-    switch (value) {
-        .bool_val => |v| {
-            try writer.writeAll("{\"boolValue\":");
-            try writer.writeAll(if (v) "true" else "false");
-            try writer.writeAll("}");
-        },
-        .int_val => |v| {
-            try writer.writeAll("{\"intValue\":\"");
-            try writer.print("{}", .{v});
-            try writer.writeAll("\"}");
-        },
-        .double_val => |v| {
-            try writer.writeAll("{\"doubleValue\":");
-            try writer.print("{d}", .{v});
-            try writer.writeAll("}");
-        },
-        .string_val => |s| {
-            try writer.writeAll("{\"stringValue\":\"");
-            try writeJsonString(writer, s.data[0..s.len]);
-            try writer.writeAll("\"}");
-        },
+fn writeAttribute(j: *JsonWriter, attr: *const span_mod.Attribute) !void {
+    switch (attr.value) {
+        .bool_val => |v| try j.otlpBoolAttr(attr.getKey(), v),
+        .int_val => |v| try j.otlpIntAttr(attr.getKey(), v),
+        .double_val => |v| try j.otlpDoubleAttr(attr.getKey(), v),
+        .string_val => |s| try j.otlpStringAttr(attr.getKey(), s.data[0..s.len]),
     }
 }
 
@@ -392,24 +371,14 @@ test "OTLPExporter JSON encoding" {
     const spans = [_]Span{span};
     try exporter.writeOTLPJson(&writer, &spans);
 
-    const json = writer.getWritten();
+    const json_out = writer.getWritten();
 
     // Verify basic structure
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"resourceSpans\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"test-service\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"test-operation\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json_out, "\"resourceSpans\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json_out, "\"test-service\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json_out, "\"test-operation\"") != null);
     // Check for attributes (they should be present since attribute_count > 0)
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"attributes\"") != null);
-}
-
-test "writeJsonString escapes special characters" {
-    var buf: [256]u8 = undefined;
-    var writer = FixedBufferWriter.init(&buf);
-
-    try writeJsonString(&writer, "hello\"world\\test\nnewline");
-
-    const result = writer.getWritten();
-    try std.testing.expectEqualStrings("hello\\\"world\\\\test\\nnewline", result);
+    try std.testing.expect(std.mem.indexOf(u8, json_out, "\"attributes\"") != null);
 }
 
 test "FixedBufferWriter basic operations" {

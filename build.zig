@@ -26,8 +26,7 @@ pub fn build(b: *std.Build) void {
     // TLS module - no dependencies (Layer 1 - Protocol)
     // Note: Linking happens per compilation unit (tests, executables)
     // Modules cannot link libraries directly in Zig build system
-    // Will be integrated with serval-server and serval-proxy in future tasks
-    _ = b.addModule("serval-tls", .{
+    const serval_tls_module = b.addModule("serval-tls", .{
         .root_source_file = b.path("serval-tls/mod.zig"),
         .link_libc = true,
     });
@@ -85,7 +84,7 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // Server module - composes core, net, http, pool, proxy, metrics, tracing
+    // Server module - composes core, net, http, pool, proxy, metrics, tracing, tls
     const serval_server_module = b.addModule("serval-server", .{
         .root_source_file = b.path("serval-server/mod.zig"),
         .imports = &.{
@@ -96,6 +95,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "serval-proxy", .module = serval_proxy_module },
             .{ .name = "serval-metrics", .module = serval_metrics_module },
             .{ .name = "serval-tracing", .module = serval_tracing_module },
+            .{ .name = "serval-tls", .module = serval_tls_module },
         },
     });
 
@@ -148,11 +148,15 @@ pub fn build(b: *std.Build) void {
     // =========================================================================
 
     // Serval library tests (full integration)
+    // Note: Links SSL libraries since serval-server now depends on serval-tls
     const serval_tests_mod = b.createModule(.{
         .root_source_file = b.path("serval/mod.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
+    serval_tests_mod.linkSystemLibrary("ssl", .{});
+    serval_tests_mod.linkSystemLibrary("crypto", .{});
     serval_tests_mod.addImport("serval-core", serval_core_module);
     serval_tests_mod.addImport("serval-net", serval_net_module);
     serval_tests_mod.addImport("serval-http", serval_http_module);
@@ -258,11 +262,15 @@ pub fn build(b: *std.Build) void {
     });
 
     // Load balancer example
+    // Note: Links SSL libraries since serval depends on serval-server which depends on serval-tls
     const lb_example_mod = b.createModule(.{
         .root_source_file = b.path("examples/lb_example.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
+    lb_example_mod.linkSystemLibrary("ssl", .{});
+    lb_example_mod.linkSystemLibrary("crypto", .{});
     lb_example_mod.addImport("serval", serval_module);
     lb_example_mod.addImport("serval-lb", serval_lb_module);
     lb_example_mod.addImport("serval-cli", serval_cli_module);
@@ -285,11 +293,15 @@ pub fn build(b: *std.Build) void {
     run_lb_example_step.dependOn(&run_lb_example.step);
 
     // Echo backend example (for testing load balancer)
+    // Note: Links SSL libraries since serval depends on serval-server which depends on serval-tls
     const echo_backend_mod = b.createModule(.{
         .root_source_file = b.path("examples/echo_backend.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
+    echo_backend_mod.linkSystemLibrary("ssl", .{});
+    echo_backend_mod.linkSystemLibrary("crypto", .{});
     echo_backend_mod.addImport("serval", serval_module);
     echo_backend_mod.addImport("serval-cli", serval_cli_module);
     const echo_backend = b.addExecutable(.{

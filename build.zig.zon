@@ -3,7 +3,12 @@
     .fingerprint = 0xc40e2d91affc74b4,
     .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .boring_tls = .{
+            .url = "https://github.com/Thomvanoorschot/boring_tls/archive/main.tar.gz",
+            .hash = "boring_tls-0.0.1-QM_9thFoAACIlp-uVSmoePInIrh7Rd1RPLHs_eTNBTyo",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

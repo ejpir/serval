@@ -1,0 +1,16 @@
+.{
+    .name = .tls_poc,
+    .version = "0.0.1",
+    .fingerprint = 0xb54e4e56ff4fa18d,
+    .dependencies = .{
+        .boring_tls = .{
+            .url = "https://github.com/Thomvanoorschot/boring_tls/archive/main.tar.gz",
+            .hash = "boring_tls-0.0.1-QM_9thFoAACIlp-uVSmoePInIrh7Rd1RPLHs_eTNBTyo",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

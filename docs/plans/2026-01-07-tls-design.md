@@ -414,3 +414,481 @@ tls_mode: enum { none, ktls, userspace }
 - System-installed BoringSSL or OpenSSL 3.x
 - Linux kernel with `tls` module for kTLS (`modprobe tls`)
 - Kernel 6.14+ for full key rotation support (optional)
+
+---
+
+## POC Validation (experiments/tls-poc)
+
+### What Works
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| Manual bindings | ✅ Working | `ssl.zig` avoids @cImport macro issues |
+| Socket BIO | ✅ Working | `SSL_set_fd()` simpler than Memory BIO |
+| Server handshake | ✅ Working | `SSL_accept()` completes successfully |
+| Client handshake | ✅ Working | `SSL_connect()` with SNI works |
+| Certificate loading | ✅ Working | `SSL_CTX_use_certificate_chain_file()` |
+| TLS I/O | ✅ Working | `SSL_read()` / `SSL_write()` functional |
+| Error handling | ✅ Working | `ERR_get_error()` / `ERR_error_string_n()` |
+| Build integration | ✅ Working | Static link `libssl.a` + `libcrypto.a` |
+
+### Key Learnings
+
+1. **Manual bindings > @cImport**: BoringSSL macros cause issues. Explicit `extern` declarations work better.
+2. **Socket BIO simplicity**: Direct `SSL_set_fd()` avoids Memory BIO shuttle complexity.
+3. **Blocking handshakes**: POC handshakes block. Need async wrapper for production.
+4. **std.Io integration**: POC uses `std.Io.Threaded` — async will use `std.Io.Group`.
+
+### POC → Production Gap Analysis
+
+| Gap | POC State | Production Requirement |
+|-----|-----------|------------------------|
+| Async handshake | Blocking `SSL_accept()` | Non-blocking with io_uring poll |
+| Error recovery | `continue` on error | Proper error propagation |
+| Connection lifecycle | One connection then exit | Per-connection TlsSession struct |
+| Resource cleanup | defer statements | Pool integration (reuse SSL_CTX) |
+| kTLS offload | Not implemented | Optional post-handshake optimization |
+| Config management | Hardcoded paths | TlsConfig from serval-core |
+| Stream abstraction | Raw SSL calls | TlsStream interface |
+| Memory allocation | GPA in main | Pass allocator to init functions |
+
+## Async Handshake Implementation
+
+### Problem: SSL_do_handshake() Blocks on I/O
+
+BoringSSL's `SSL_accept()` / `SSL_connect()` internally call `read()` / `write()` on the socket BIO. With a blocking fd, this stalls the thread.
+
+### Solution: Non-blocking fd + io_uring Poll
+
+```zig
+// 1. Set socket to non-blocking
+const flags = try posix.fcntl(fd, posix.F.GETFL, 0);
+try posix.fcntl(fd, posix.F.SETFL, flags | posix.O.NONBLOCK);
+
+// 2. Set fd in SSL
+_ = c.SSL_set_fd(ssl, fd);
+
+// 3. Handshake loop
+while (true) {
+    const ret = c.SSL_do_handshake(ssl);
+    if (ret == 1) break; // Success
+
+    const err = c.SSL_get_error(ssl, ret);
+    switch (err) {
+        c.SSL_ERROR_WANT_READ => {
+            // Socket needs data from peer
+            try io.pollIn(fd, timeout_ns);
+        },
+        c.SSL_ERROR_WANT_WRITE => {
+            // Socket ready to send data to peer
+            try io.pollOut(fd, timeout_ns);
+        },
+        c.SSL_ERROR_SYSCALL => {
+            // Check errno
+            return error.HandshakeSyscallError;
+        },
+        else => {
+            c.printErrors();
+            return error.HandshakeFailed;
+        },
+    }
+}
+```
+
+**io_uring integration:**
+- `io.pollIn()` → `IORING_OP_POLL_ADD` with `POLLIN`
+- `io.pollOut()` → `IORING_OP_POLL_ADD` with `POLLOUT`
+- Does NOT read/write — just waits for fd readiness
+- BoringSSL does actual I/O when we call `SSL_do_handshake()` again
+
+### Handshake Timeout
+
+```zig
+pub fn doHandshake(
+    ssl: *SSL,
+    fd: c_int,
+    io: *Io,
+    timeout_ns: u64,
+) !void {
+    const start = std.time.nanoTimestamp();
+
+    while (true) {
+        const elapsed_ns = std.time.nanoTimestamp() - start;
+        if (elapsed_ns > timeout_ns) return error.HandshakeTimeout;
+
+        const remaining_ns = timeout_ns - elapsed_ns;
+
+        const ret = c.SSL_do_handshake(ssl);
+        if (ret == 1) return; // Success
+
+        const err = c.SSL_get_error(ssl, ret);
+        switch (err) {
+            c.SSL_ERROR_WANT_READ => {
+                try io.pollIn(fd, remaining_ns);
+            },
+            c.SSL_ERROR_WANT_WRITE => {
+                try io.pollOut(fd, remaining_ns);
+            },
+            else => return error.HandshakeFailed,
+        }
+    }
+}
+```
+
+## TlsStream: Userspace-Only First
+
+Defer kTLS to Phase 2. Initial implementation uses userspace crypto only.
+
+```zig
+pub const TlsStream = struct {
+    fd: c_int,
+    ssl: *SSL,
+    allocator: Allocator,
+
+    pub fn initServer(
+        ctx: *SSL_CTX,
+        fd: c_int,
+        io: *Io,
+        timeout_ns: u64,
+        allocator: Allocator,
+    ) !TlsStream {
+        const ssl = c.SSL_new(ctx) orelse return error.SslNew;
+        errdefer c.SSL_free(ssl);
+
+        // Non-blocking
+        const flags = try posix.fcntl(fd, posix.F.GETFL, 0);
+        try posix.fcntl(fd, posix.F.SETFL, flags | posix.O.NONBLOCK);
+
+        if (c.SSL_set_fd(ssl, fd) != 1) return error.SslSetFd;
+        c.SSL_set_accept_state(ssl);
+
+        try doHandshake(ssl, fd, io, timeout_ns);
+
+        return .{
+            .fd = fd,
+            .ssl = ssl,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn initClient(
+        ctx: *SSL_CTX,
+        fd: c_int,
+        io: *Io,
+        sni: []const u8,
+        timeout_ns: u64,
+        allocator: Allocator,
+    ) !TlsStream {
+        const ssl = c.SSL_new(ctx) orelse return error.SslNew;
+        errdefer c.SSL_free(ssl);
+
+        // Non-blocking
+        const flags = try posix.fcntl(fd, posix.F.GETFL, 0);
+        try posix.fcntl(fd, posix.F.SETFL, flags | posix.O.NONBLOCK);
+
+        if (c.SSL_set_fd(ssl, fd) != 1) return error.SslSetFd;
+
+        // SNI
+        const sni_z = try allocator.dupeZ(u8, sni);
+        defer allocator.free(sni_z);
+        if (c.SSL_set_tlsext_host_name(ssl, sni_z) != 1) return error.SslSetSni;
+
+        c.SSL_set_connect_state(ssl);
+
+        try doHandshake(ssl, fd, io, timeout_ns);
+
+        return .{
+            .fd = fd,
+            .ssl = ssl,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn read(self: *TlsStream, io: *Io, buf: []u8, timeout_ns: u64) !usize {
+        const start = std.time.nanoTimestamp();
+
+        while (true) {
+            const elapsed_ns = std.time.nanoTimestamp() - start;
+            if (elapsed_ns > timeout_ns) return error.Timeout;
+
+            const remaining_ns = timeout_ns - elapsed_ns;
+
+            const ret = c.SSL_read(self.ssl, buf.ptr, @intCast(buf.len));
+            if (ret > 0) return @intCast(ret);
+
+            const err = c.SSL_get_error(self.ssl, ret);
+            switch (err) {
+                c.SSL_ERROR_WANT_READ => {
+                    try io.pollIn(self.fd, remaining_ns);
+                },
+                c.SSL_ERROR_ZERO_RETURN => return 0, // Clean shutdown
+                else => return error.SslRead,
+            }
+        }
+    }
+
+    pub fn write(self: *TlsStream, io: *Io, data: []const u8, timeout_ns: u64) !usize {
+        const start = std.time.nanoTimestamp();
+        var written: usize = 0;
+
+        while (written < data.len) {
+            const elapsed_ns = std.time.nanoTimestamp() - start;
+            if (elapsed_ns > timeout_ns) return error.Timeout;
+
+            const remaining_ns = timeout_ns - elapsed_ns;
+            const chunk = data[written..];
+
+            const ret = c.SSL_write(self.ssl, chunk.ptr, @intCast(chunk.len));
+            if (ret > 0) {
+                written += @intCast(ret);
+                continue;
+            }
+
+            const err = c.SSL_get_error(self.ssl, ret);
+            switch (err) {
+                c.SSL_ERROR_WANT_WRITE => {
+                    try io.pollOut(self.fd, remaining_ns);
+                },
+                else => return error.SslWrite,
+            }
+        }
+
+        return written;
+    }
+
+    pub fn close(self: *TlsStream, io: *Io) void {
+        // Graceful shutdown
+        _ = c.SSL_shutdown(self.ssl);
+        c.SSL_free(self.ssl);
+        // Caller owns fd, don't close it here
+    }
+};
+```
+
+## Integration Steps
+
+### 1. serval-tls Module Structure
+
+```
+serval-tls/
+├── mod.zig          # pub const ssl = @import("ssl.zig");
+│                    # pub const TlsStream = @import("stream.zig").TlsStream;
+├── ssl.zig          # BoringSSL bindings (copy from POC)
+├── stream.zig       # TlsStream implementation
+└── README.md        # Module documentation
+```
+
+### 2. serval-core Changes
+
+```zig
+// config.zig
+pub const TlsConfig = struct {
+    // Server (client termination)
+    cert_path: ?[]const u8 = null,
+    key_path: ?[]const u8 = null,
+
+    // Client (upstream origination)
+    ca_path: ?[]const u8 = null,
+    verify_upstream: bool = true,
+
+    // Timeouts
+    handshake_timeout_ns: u64 = 10 * std.time.ns_per_s,
+    io_timeout_ns: u64 = 30 * std.time.ns_per_s,
+};
+
+// types.zig
+pub const Upstream = struct {
+    host: []const u8,
+    port: u16,
+    idx: u32,
+    health: Health = .healthy,
+    tls: bool = false,  // NEW: Enable TLS to this upstream
+};
+```
+
+### 3. serval-server Integration
+
+```zig
+// serval-server/http1.zig - serve() function
+
+pub fn serve(config: Config, handler: anytype, io: *Io) !void {
+    // ...existing accept loop setup...
+
+    // NEW: Initialize SSL_CTX if TLS configured
+    const tls_ctx: ?*ssl.SSL_CTX = if (config.tls) |tls_cfg| blk: {
+        ssl.init();
+        const ctx = try ssl.createServerCtx();
+
+        const cert_z = try allocator.dupeZ(u8, tls_cfg.cert_path.?);
+        defer allocator.free(cert_z);
+        const key_z = try allocator.dupeZ(u8, tls_cfg.key_path.?);
+        defer allocator.free(key_z);
+
+        if (ssl.SSL_CTX_use_certificate_chain_file(ctx, cert_z) != 1) {
+            return error.LoadCertFailed;
+        }
+        if (ssl.SSL_CTX_use_PrivateKey_file(ctx, key_z, ssl.SSL_FILETYPE_PEM) != 1) {
+            return error.LoadKeyFailed;
+        }
+
+        break :blk ctx;
+    } else null;
+    defer if (tls_ctx) |ctx| ssl.SSL_CTX_free(ctx);
+
+    while (true) {
+        const stream = try server.accept(io);
+
+        // NEW: Wrap with TLS if configured
+        const maybe_tls = if (tls_ctx) |ctx| blk: {
+            const tls_stream = try TlsStream.initServer(
+                ctx,
+                @intCast(stream.socket.handle),
+                io,
+                config.tls.?.handshake_timeout_ns,
+                allocator,
+            );
+            break :blk tls_stream;
+        } else null;
+
+        // Pass to handleConnection (signature changes)
+        try handleConnection(stream, maybe_tls, handler, io, config);
+    }
+}
+```
+
+### 4. serval-proxy Integration
+
+```zig
+// serval-proxy/forwarder.zig - connectUpstream() function
+
+pub fn connectUpstream(
+    upstream: Upstream,
+    io: *Io,
+    config: Config,
+) !Connection {
+    const addr = std.Io.net.IpAddress{ .ip4 = .{
+        .bytes = try resolveIp(upstream.host),
+        .port = upstream.port,
+    }};
+
+    const stream = try addr.connect(io, .{ .mode = .stream });
+    const fd: c_int = @intCast(stream.socket.handle);
+
+    // NEW: Wrap with TLS if upstream requires it
+    const maybe_tls = if (upstream.tls) blk: {
+        const ctx = try getClientCtx(config); // Cache this globally
+        const tls_stream = try TlsStream.initClient(
+            ctx,
+            fd,
+            io,
+            upstream.host,
+            config.tls.?.handshake_timeout_ns,
+            config.allocator,
+        );
+        break :blk tls_stream;
+    } else null;
+
+    return Connection{
+        .stream = stream,
+        .tls = maybe_tls,
+        .upstream_idx = upstream.idx,
+    };
+}
+```
+
+## Testing Plan
+
+### Unit Tests (serval-tls)
+
+```bash
+# Test bindings compile
+zig build test-tls-bindings
+
+# Test TlsStream with mock (no network)
+zig build test-tls-stream
+```
+
+### Integration Tests
+
+```bash
+# Requires certs in /tmp/test-certs/
+# Start test backend: python3 -m http.server 8080
+
+# Test client termination
+zig build test-tls-server
+
+# Test upstream origination
+zig build test-tls-client
+
+# Full proxy flow (TLS → upstream TLS)
+zig build test-tls-proxy
+```
+
+### TigerStyle Validation
+
+Before any commit, run:
+
+```bash
+/tigerstyle
+```
+
+Check:
+- S1: Preconditions (assert fd > 0, ssl != null)
+- S2: Postconditions (assert handshake completed)
+- S3: No unbounded loops (handshake has timeout)
+- S4: Explicit error handling (no catch {})
+- P1: Non-blocking I/O (io_uring poll, not blocking read)
+- C1: Functions < 70 lines (split TlsStream.read if needed)
+- C2: Units in names (timeout_ns, not timeout)
+
+## Phase 1 Deliverables
+
+- [ ] serval-tls module created
+- [ ] ssl.zig bindings (from POC)
+- [ ] TlsStream.initServer() (async handshake)
+- [ ] TlsStream.initClient() (async handshake + SNI)
+- [ ] TlsStream.read() (non-blocking)
+- [ ] TlsStream.write() (non-blocking)
+- [ ] TlsConfig in serval-core
+- [ ] serval-server TLS termination
+- [ ] serval-proxy upstream TLS
+- [ ] Integration tests pass
+- [ ] TigerStyle review complete
+
+## Phase 2: kTLS Optimization (Future)
+
+After Phase 1 is stable, add kTLS offload:
+
+1. Extend TlsStream.Mode to union(ktls, userspace)
+2. After handshake, try `setsockopt(SOL_TLS, ...)`
+3. Extract keys via `SSL_export_keying_material()`
+4. If successful, switch to ktls mode
+5. In ktls mode, `read()`/`write()` go directly to fd (no SSL_*)
+6. Metrics: track ktls success rate
+
+## Open Questions
+
+1. **Connection pooling:** Does serval-pool need TLS-aware state?
+   - **Answer:** Yes. Pool key should include `(host, port, tls)`. Separate pools for TLS vs plain.
+
+2. **Certificate reload:** How to reload certs without restart?
+   - **Answer:** Defer to Phase 2. Create new SSL_CTX, atomic swap pointer, defer-free old one.
+
+3. **ALPN negotiation:** Needed for HTTP/2 later?
+   - **Answer:** Yes, but not in Phase 1. Add `SSL_CTX_set_alpn_protos()` when adding serval-h2.
+
+4. **Session resumption:** Worth implementing?
+   - **Answer:** Yes for performance. Use `SSL_CTX_sess_set_cache_size()`. Track via metrics.
+
+5. **Certificate validation errors:** Return 502 or 503?
+   - **Answer:** 502 Bad Gateway (upstream issue, not service unavailable).
+
+## Success Metrics
+
+| Metric | Target |
+|--------|--------|
+| Handshake latency (p50) | < 50ms |
+| Handshake latency (p99) | < 200ms |
+| Handshake failure rate | < 0.1% |
+| CPU overhead (vs plain) | < 10% with kTLS |
+| Memory per connection | < 32KB |
