@@ -210,11 +210,9 @@ pub fn Server(
 
             if (maybe_tls) |tls| {
                 // TLS read (blocking - std.Io handles socket-level async)
+                // SslRead error includes normal client disconnect, don't log as error.
                 var mutable_tls = tls.*;
-                const n = mutable_tls.read(buf) catch |err| {
-                    debugLog("TLS read error: {s}", .{@errorName(err)});
-                    return null;
-                };
+                const n = mutable_tls.read(buf) catch return null;
                 return n;
             } else {
                 // Plain socket read

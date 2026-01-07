@@ -237,10 +237,10 @@ pub fn receiveHeaders(
     // Different read path for TLS vs plaintext
     if (conn.tls) |*tls_stream| {
         // TLS path: use TLS read
+        // SslRead error includes normal connection close, no debug log needed.
         while (header_len < buffer.len and iterations < max_iterations) : (iterations += 1) {
             const remaining = buffer[header_len..];
-            const n = tls_stream.read(remaining) catch |err| {
-                debugLog("TLS read error: {s}", .{@errorName(err)});
+            const n = tls_stream.read(remaining) catch {
                 if (is_pooled and header_len == 0) return ForwardError.StaleConnection;
                 return ForwardError.RecvFailed;
             };

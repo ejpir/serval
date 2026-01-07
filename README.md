@@ -6,6 +6,7 @@ HTTP server framework for Zig — build backends, proxies, load balancers, API g
 
 - **Modular architecture** — Use the full server or individual components (parser, pool, forwarder)
 - **Compile-time composition** — Generic interfaces verified at build time, zero runtime dispatch
+- **TLS support** — Client-side termination and upstream HTTPS (OpenSSL)
 - **Zero-copy forwarding** — Linux splice() for body transfer when available
 - **Connection pooling** — Reuse upstream connections across requests
 - **Pluggable components** — Custom handlers, metrics, and tracing implementations
@@ -19,7 +20,7 @@ const serval_lb = @import("serval-lb");
 
 const upstreams = [_]serval.Upstream{
     .{ .host = "127.0.0.1", .port = 8001, .idx = 0 },
-    .{ .host = "127.0.0.1", .port = 8002, .idx = 1 },
+    .{ .host = "127.0.0.1", .port = 8002, .idx = 1, .tls = true }, // HTTPS backend
 };
 
 var handler = serval_lb.LbHandler.init(&upstreams);
@@ -32,7 +33,11 @@ var server = serval.Server(
     serval.SimplePool,
     serval.NoopMetrics,
     serval.NoopTracer,
-).init(&handler, &pool, &metrics, &tracer, .{ .port = 8080 });
+).init(&handler, &pool, &metrics, &tracer, .{
+    .port = 8080,
+    // Optional: TLS termination for client connections
+    // .tls = .{ .cert_path = "cert.pem", .key_path = "key.pem" },
+});
 
 var shutdown = std.atomic.Value(bool).init(false);
 try server.run(io, &shutdown);
@@ -69,6 +74,7 @@ exe.root_module.addImport("serval-lb", serval.module("serval-lb"));
 | `serval` | Umbrella module — re-exports everything |
 | `serval-core` | Types, config, errors, context |
 | `serval-http` | HTTP/1.1 request parser |
+| `serval-tls` | TLS termination and origination (OpenSSL) |
 | `serval-pool` | Connection pooling |
 | `serval-proxy` | Upstream forwarding |
 | `serval-server` | HTTP/1.1 server |
@@ -148,6 +154,38 @@ Headers:
 Body: (empty)
 ```
 
+### Load Balancer with HTTPS Backends
+
+Health probes automatically use HTTPS when backends are marked with `--upstream-tls`:
+
+```bash
+# Terminal 1: Start HTTP backend
+zig build run-echo-backend -- --port 8001 --id backend-1
+
+# Terminal 2: Start HTTPS backend (requires cert/key)
+zig build run-echo-backend -- --port 8002 --id backend-2 \
+  --cert experiments/tls-poc/cert.pem \
+  --key experiments/tls-poc/key.pem
+
+# Terminal 3: Start load balancer with mixed backends
+# Note: Use --insecure-skip-verify for self-signed certificates (testing only)
+zig build run-lb-example -- --port 8080 \
+  --backends 127.0.0.1:8001,127.0.0.1:8002 \
+  --upstream-tls 127.0.0.1:8002 \
+  --insecure-skip-verify
+
+# The load balancer will:
+# - Forward requests to both backends via HTTP
+# - Send healthcheck probes to :8001 via HTTP
+# - Send healthcheck probes to :8002 via HTTPS (with TLS handshake, skipping cert verification)
+```
+
+**Security Note:** The `--insecure-skip-verify` flag disables TLS certificate verification for:
+- Health probe connections (prober → backends)
+- Request forwarding connections (proxy → backends)
+
+Only use this flag for testing with self-signed certificates. In production, use properly signed certificates and omit this flag.
+
 ### Direct Response Handler
 
 Handlers can respond directly without forwarding using `DirectResponse`:
@@ -179,16 +217,23 @@ Both examples support these options:
 ```bash
 # Load balancer
 zig build run-lb-example -- --help
-  --port <PORT>       Listening port (default: 8080)
-  --backends <HOSTS>  Comma-separated backend addresses
-  --stats             Enable real-time terminal stats
-  --trace             Enable OpenTelemetry tracing
-  --debug             Enable debug logging
+  --port <PORT>                Listening port (default: 8080)
+  --backends <HOSTS>           Comma-separated backend addresses (default: 127.0.0.1:8001,127.0.0.1:8002)
+  --upstream-tls <HOSTS>       Comma-separated TLS backend addresses (enables HTTPS)
+  --insecure-skip-verify       Skip TLS certificate verification for upstream connections (insecure, for testing only)
+  --cert <PATH>                Server certificate file (PEM format, enables TLS termination)
+  --key <PATH>                 Server private key file (PEM format, required with --cert)
+  --stats                      Enable real-time terminal stats
+  --trace                      Enable OpenTelemetry tracing
+  --debug                      Enable debug logging
 
 # Echo backend
 zig build run-echo-backend -- --help
   --port <PORT>       Listening port (default: 8001)
   --id <ID>           Instance identifier (default: echo-1)
+  --cert <PATH>       Server certificate file (PEM format, enables HTTPS)
+  --key <PATH>        Server private key file (PEM format, required with --cert)
+  --chunked           Use Transfer-Encoding: chunked for responses
   --debug             Enable debug logging
 ```
 
@@ -210,9 +255,11 @@ zig build run-echo-backend -- --help
 | Metrics collection | Complete |
 | OpenTelemetry tracing | Complete |
 | Health tracking | Complete |
-| HTTP/2 | Not implemented |
-| TLS termination | Not implemented |
+| Active health probing (HTTP/HTTPS) | Complete |
+| TLS termination (server-side) | Complete |
+| TLS origination (upstream HTTPS) | Complete |
 | Chunked encoding | Complete |
+| HTTP/2 | Not implemented |
 
 ## License
 
