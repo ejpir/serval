@@ -10,6 +10,8 @@
 //! Options:
 //!   --port <PORT>    Listening port (default: 8001)
 //!   --id <ID>        Instance identifier (default: "echo-1")
+//!   --cert <PATH>    Server certificate file (PEM format, enables TLS)
+//!   --key <PATH>     Server private key file (PEM format, required with --cert)
 //!   --chunked        Use Transfer-Encoding: chunked for responses
 //!   --debug          Enable debug logging
 //!   --help           Show help message
@@ -28,6 +30,10 @@ const VERSION = "0.1.0";
 const EchoExtra = struct {
     /// Instance identifier for load balancer testing.
     id: []const u8 = "echo-1",
+    /// Server certificate file path (PEM format) for TLS termination
+    cert: ?[]const u8 = null,
+    /// Server private key file path (PEM format) for TLS termination
+    key: ?[]const u8 = null,
     /// Use Transfer-Encoding: chunked for responses.
     /// Why configurable: Allows testing how clients and proxies handle
     /// chunked vs content-length responses from backends.
@@ -200,6 +206,21 @@ pub fn main() !void {
         },
     }
 
+    // Validate TLS configuration
+    const tls_config: ?serval.config.TlsConfig = if (args.extra.cert) |cert_path| blk: {
+        if (args.extra.key == null) {
+            std.debug.print("Error: --key is required when --cert is specified\n", .{});
+            return error.MissingTlsKey;
+        }
+        break :blk .{
+            .cert_path = cert_path,
+            .key_path = args.extra.key,
+        };
+    } else if (args.extra.key) |_| {
+        std.debug.print("Error: --cert is required when --key is specified\n", .{});
+        return error.MissingTlsCert;
+    } else null;
+
     // Initialize handler with config
     var handler = EchoHandler.init(args.extra.id, args.port, args.debug, args.extra.chunked);
 
@@ -216,7 +237,10 @@ pub fn main() !void {
     var shutdown = std.atomic.Value(bool).init(false);
 
     // Print startup info
-    std.debug.print("Echo backend '{s}' listening on :{d}\n", .{ args.extra.id, args.port });
+    std.debug.print("Echo backend '{s}' listening on :{d} ({s})\n", .{ args.extra.id, args.port, if (tls_config != null) "HTTPS" else "HTTP" });
+    if (tls_config) |tls_cfg| {
+        std.debug.print("TLS: enabled (cert={s}, key={s})\n", .{ tls_cfg.cert_path.?, tls_cfg.key_path.? });
+    }
     std.debug.print("Response mode: {s}\n", .{if (args.extra.chunked) "chunked" else "content-length"});
     std.debug.print("Debug logging: {}\n", .{args.debug});
 
@@ -229,6 +253,7 @@ pub fn main() !void {
     );
     var server = ServerType.init(&handler, &pool, &metrics, &tracer, .{
         .port = args.port,
+        .tls = tls_config,
     });
 
     server.run(io, &shutdown) catch |err| {
