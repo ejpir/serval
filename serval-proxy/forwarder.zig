@@ -248,8 +248,8 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             const send_start_ns = time.monotonicNanos();
             debugLog("send: start headers", .{});
 
-            // Send request headers to upstream via async stream
-            sendRequest(mutable_conn.stream, io, request) catch |err| {
+            // Send request headers to upstream via connection (TLS or plaintext)
+            sendRequest(&mutable_conn, io, request) catch |err| {
                 debugLog("send: FAILED err={s}", .{@errorName(err)});
                 self.tracer.endSpan(send_span, @errorName(err));
                 if (is_pooled and err == ForwardError.SendFailed) {
@@ -265,9 +265,9 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
                     return ForwardError.RequestBodyTooLarge;
                 }
                 debugLog("send: streaming body content_length={d}", .{content_length});
-                // Extract raw fd for splice, use stream for initial bytes
+                // Extract raw fd for splice (plaintext) or userspace copy (TLS)
                 const client_fd = client_stream.socket.handle;
-                _ = streamRequestBody(client_fd, mutable_conn.stream, io, body_info) catch |err| {
+                _ = streamRequestBody(client_fd, &mutable_conn, io, body_info) catch |err| {
                     self.tracer.endSpan(send_span, @errorName(err));
                     return err;
                 };
@@ -282,7 +282,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             // Recv phase span (response headers + body)
             const recv_span = self.tracer.startSpan("recv_response", forward_span);
             debugLog("recv: awaiting response headers", .{});
-            var result = forwardResponse(io, mutable_conn.stream, client_stream, is_pooled) catch |err| {
+            var result = forwardResponse(io, &mutable_conn, client_stream, is_pooled) catch |err| {
                 self.tracer.endSpan(recv_span, @errorName(err));
                 return err;
             };

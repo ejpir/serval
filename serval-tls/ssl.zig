@@ -75,8 +75,18 @@ pub extern fn SSL_get_error(ssl: *const SSL, ret: c_int) c_int;
 pub extern fn SSL_get_version(ssl: *const SSL) ?[*:0]const u8;
 pub extern fn SSL_get_current_cipher(ssl: *const SSL) ?*const SSL_CIPHER;
 
-// SNI
-pub extern fn SSL_set_tlsext_host_name(ssl: *SSL, name: [*:0]const u8) c_int;
+// SNI - SSL_set_tlsext_host_name is a macro, use SSL_ctrl directly
+pub extern fn SSL_ctrl(ssl: *SSL, cmd: c_int, larg: c_long, parg: ?*anyopaque) c_long;
+
+// SSL_CTRL_SET_TLSEXT_HOSTNAME constant (from openssl/tls1.h)
+pub const SSL_CTRL_SET_TLSEXT_HOSTNAME = 55;
+pub const TLSEXT_NAMETYPE_host_name = 0;
+
+/// Set SNI hostname for TLS connection
+pub fn SSL_set_tlsext_host_name(ssl: *SSL, name: [*:0]const u8) c_int {
+    const result = SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, @constCast(@ptrCast(name)));
+    return if (result == 1) 1 else 0;
+}
 
 // Cipher functions
 pub extern fn SSL_CIPHER_get_name(cipher: *const SSL_CIPHER) ?[*:0]const u8;

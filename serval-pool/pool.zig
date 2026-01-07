@@ -17,6 +17,9 @@ const UpstreamIndex = config.UpstreamIndex;
 const serval_core = @import("serval-core");
 const debugLog = serval_core.debugLog;
 
+const serval_tls = @import("serval-tls");
+const TLSStream = serval_tls.TLSStream;
+
 // =============================================================================
 // Pool Interface Verification
 // =============================================================================
@@ -77,6 +80,10 @@ pub const Connection = struct {
     /// Sentinel to detect double-release. Set to magic value when in pool.
     /// TigerStyle: Defense in depth against use-after-release bugs.
     pool_sentinel: u32 = IN_USE_SENTINEL,
+    /// Optional TLS stream for encrypted connections.
+    /// When non-null, I/O operations must use TLS read/write instead of raw socket.
+    /// TigerStyle: Explicit null means plaintext connection.
+    tls: ?TLSStream = null,
 
     const IN_POOL_SENTINEL: u32 = 0xDEAD_BEEF;
     const IN_USE_SENTINEL: u32 = 0xCAFE_BABE;
@@ -84,6 +91,9 @@ pub const Connection = struct {
     /// Close the connection stream.
     /// TigerStyle: Explicit io parameter for async close.
     pub fn close(self: *Connection, io: Io) void {
+        if (self.tls) |*tls_stream| {
+            tls_stream.close();
+        }
         self.stream.close(io);
     }
 

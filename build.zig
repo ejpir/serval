@@ -31,11 +31,12 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
-    // Pool module - depends on core
+    // Pool module - depends on core and tls
     const serval_pool_module = b.addModule("serval-pool", .{
         .root_source_file = b.path("serval-pool/mod.zig"),
         .imports = &.{
             .{ .name = "serval-core", .module = serval_core_module },
+            .{ .name = "serval-tls", .module = serval_tls_module },
         },
     });
 
@@ -72,7 +73,7 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // Proxy module - depends on core, net, pool, tracing, http
+    // Proxy module - depends on core, net, pool, tracing, http, tls
     const serval_proxy_module = b.addModule("serval-proxy", .{
         .root_source_file = b.path("serval-proxy/mod.zig"),
         .imports = &.{
@@ -81,6 +82,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "serval-pool", .module = serval_pool_module },
             .{ .name = "serval-tracing", .module = serval_tracing_module },
             .{ .name = "serval-http", .module = serval_http_module },
+            .{ .name = "serval-tls", .module = serval_tls_module },
         },
     });
 

@@ -8,14 +8,15 @@
 //!   lb_example [OPTIONS]
 //!
 //! Options:
-//!   --port <PORT>       Listening port (default: 8080)
-//!   --backends <HOSTS>  Comma-separated backend addresses (default: 127.0.0.1:8001,127.0.0.1:8002)
-//!   --cert <PATH>       Server certificate file (PEM format, enables TLS)
-//!   --key <PATH>        Server private key file (PEM format, required with --cert)
-//!   --stats             Enable real-time terminal stats display
-//!   --debug             Enable debug logging
-//!   --help              Show help message
-//!   --version           Show version
+//!   --port <PORT>           Listening port (default: 8080)
+//!   --backends <HOSTS>      Comma-separated backend addresses (default: 127.0.0.1:8001,127.0.0.1:8002)
+//!   --cert <PATH>           Server certificate file (PEM format, enables TLS)
+//!   --key <PATH>            Server private key file (PEM format, required with --cert)
+//!   --upstream-tls <HOSTS>  Comma-separated TLS backend addresses (enables HTTPS to those backends)
+//!   --stats                 Enable real-time terminal stats display
+//!   --debug                 Enable debug logging
+//!   --help                  Show help message
+//!   --version               Show version
 
 const std = @import("std");
 const serval = @import("serval");
@@ -44,6 +45,9 @@ const LbExtra = struct {
     stats: bool = false,
     /// Enable OpenTelemetry tracing (requires collector at localhost:4318)
     trace: bool = false,
+    /// Comma-separated list of TLS-enabled backend addresses (host:port,host:port,...)
+    /// Backends in this list will use HTTPS instead of HTTP
+    @"upstream-tls": ?[]const u8 = null,
 };
 
 /// Maximum number of upstreams supported.
@@ -53,8 +57,13 @@ const UpstreamIndex = serval.config.UpstreamIndex;
 
 /// Parse backends string into Upstream array.
 /// Format: "host:port,host:port,..."
+/// If tls_backends_str is provided, mark those backends as TLS-enabled.
 /// TigerStyle: Bounded loop, count only increments on successful parse.
-fn parseBackends(backends_str: []const u8, upstreams: *[MAX_UPSTREAMS]serval.Upstream) UpstreamIndex {
+fn parseBackends(
+    backends_str: []const u8,
+    upstreams: *[MAX_UPSTREAMS]serval.Upstream,
+    tls_backends_str: ?[]const u8,
+) UpstreamIndex {
     var count: UpstreamIndex = 0;
     var iter = std.mem.splitScalar(u8, backends_str, ',');
 
@@ -75,10 +84,22 @@ fn parseBackends(backends_str: []const u8, upstreams: *[MAX_UPSTREAMS]serval.Ups
             continue;
         };
 
+        // Check if this backend is in the TLS list
+        const is_tls = if (tls_backends_str) |tls_str| blk: {
+            var tls_iter = std.mem.splitScalar(u8, tls_str, ',');
+            while (tls_iter.next()) |tls_backend| {
+                if (std.mem.eql(u8, backend, tls_backend)) {
+                    break :blk true;
+                }
+            }
+            break :blk false;
+        } else false;
+
         upstreams[count] = .{
             .host = host,
             .port = port,
             .idx = count,
+            .tls = is_tls,
         };
         count += 1;
     }
@@ -100,7 +121,7 @@ pub fn main() !void {
 
     // Parse backends string into upstream array
     var upstreams_buf: [MAX_UPSTREAMS]serval.Upstream = std.mem.zeroes([MAX_UPSTREAMS]serval.Upstream);
-    const upstream_count = parseBackends(args.extra.backends, &upstreams_buf);
+    const upstream_count = parseBackends(args.extra.backends, &upstreams_buf, args.extra.@"upstream-tls");
 
     if (upstream_count == 0) {
         std.debug.print("Error: no valid backends specified\n", .{});
@@ -169,7 +190,8 @@ pub fn main() !void {
     std.debug.print("Forwarding to: ", .{});
     for (upstreams, 0..) |upstream, i| {
         if (i > 0) std.debug.print(", ", .{});
-        std.debug.print("{s}:{d}", .{ upstream.host, upstream.port });
+        const protocol = if (upstream.tls) "https" else "http";
+        std.debug.print("{s}://{s}:{d}", .{ protocol, upstream.host, upstream.port });
     }
     std.debug.print("\n", .{});
 
