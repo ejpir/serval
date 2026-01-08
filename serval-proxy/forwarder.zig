@@ -42,6 +42,7 @@ const forwardResponse = h1.forwardResponse;
 
 const serval_tls = @import("serval-tls");
 const TLSStream = serval_tls.TLSStream;
+const HandshakeInfo = serval_tls.HandshakeInfo;
 
 const Request = types.Request;
 const Upstream = types.Upstream;
@@ -209,6 +210,28 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             self.tracer.setIntAttribute(connect_span, "duration_ns", @intCast(connect_result.tcp_connect_duration_ns));
             self.tracer.setIntAttribute(connect_span, "port", connect_result.local_port);
             self.tracer.endSpan(connect_span, null);
+
+            // TLS handshake span (if TLS was used)
+            if (connect_result.conn.tls) |tls_stream| {
+                const tls_span = self.tracer.startSpan("tls.handshake.client", forward_span);
+                const info = &tls_stream.info;
+                self.tracer.setStringAttribute(tls_span, "tls.version", info.version());
+                self.tracer.setStringAttribute(tls_span, "tls.cipher", info.cipher());
+                self.tracer.setIntAttribute(tls_span, "tls.handshake_duration_ns", @intCast(info.handshake_duration_ns));
+                self.tracer.setStringAttribute(tls_span, "tls.resumed", if (info.resumed) "true" else "false");
+                self.tracer.setStringAttribute(tls_span, "tls.client_mode", "true");
+                self.tracer.setStringAttribute(tls_span, "tls.sni_hostname", upstream.host);
+                if (info.alpn()) |alpn_proto| {
+                    self.tracer.setStringAttribute(tls_span, "tls.alpn_protocol", alpn_proto);
+                }
+                if (info.certSubject()) |subj| {
+                    self.tracer.setStringAttribute(tls_span, "tls.peer_cert.subject", subj);
+                }
+                if (info.certIssuer()) |issuer| {
+                    self.tracer.setStringAttribute(tls_span, "tls.peer_cert.issuer", issuer);
+                }
+                self.tracer.endSpan(tls_span, null);
+            }
 
             return self.forwardWithConnection(
                 io,

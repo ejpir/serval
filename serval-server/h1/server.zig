@@ -31,6 +31,7 @@ const forwarder_mod = @import("serval-proxy").forwarder;
 const serval_tls = @import("serval-tls");
 const ssl = serval_tls.ssl;
 const TLSStream = serval_tls.TLSStream;
+const HandshakeInfo = serval_tls.HandshakeInfo;
 
 // Local h1 modules
 const connection = @import("connection.zig");
@@ -485,14 +486,39 @@ pub fn Server(
             var maybe_tls_stream: ?TLSStream = if (tls_ctx) |ctx| blk: {
                 // S1: precondition - ctx is non-null (enforced by if guard above)
                 const allocator = std.heap.c_allocator;
+
+                // Start TLS handshake span for tracing
+                const tls_span = tracer.startSpan("tls.handshake.server", null);
+
                 const tls_stream = TLSStream.initServer(
                     ctx,
                     @intCast(stream.socket.handle),
                     allocator,
                 ) catch |err| {
+                    // End span with error
+                    tracer.endSpan(tls_span, @errorName(err));
                     std.log.err("TLS handshake failed: {s}", .{@errorName(err)});
                     return;
                 };
+
+                // Add handshake attributes to span
+                const info = &tls_stream.info;
+                tracer.setStringAttribute(tls_span, "tls.version", info.version());
+                tracer.setStringAttribute(tls_span, "tls.cipher", info.cipher());
+                tracer.setIntAttribute(tls_span, "tls.handshake_duration_ns", @intCast(info.handshake_duration_ns));
+                tracer.setStringAttribute(tls_span, "tls.resumed", if (info.resumed) "true" else "false");
+                tracer.setStringAttribute(tls_span, "tls.client_mode", "false");
+                if (info.alpn()) |alpn_proto| {
+                    tracer.setStringAttribute(tls_span, "tls.alpn_protocol", alpn_proto);
+                }
+                if (info.certSubject()) |subj| {
+                    tracer.setStringAttribute(tls_span, "tls.peer_cert.subject", subj);
+                }
+                if (info.certIssuer()) |issuer| {
+                    tracer.setStringAttribute(tls_span, "tls.peer_cert.issuer", issuer);
+                }
+                tracer.endSpan(tls_span, null);
+
                 break :blk tls_stream;
             } else null;
             defer if (maybe_tls_stream) |*tls_stream| tls_stream.close();

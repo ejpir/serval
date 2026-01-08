@@ -10,9 +10,12 @@
 pub const ssl = @import("ssl.zig");
 
 // TLS stream abstraction
-pub const TLSStream = @import("stream.zig").TLSStream;
+const stream = @import("stream.zig");
+pub const TLSStream = stream.TLSStream;
+pub const HandshakeInfo = stream.HandshakeInfo;
 
 test {
     _ = @import("ssl.zig");
     _ = @import("stream.zig");
+    _ = @import("handshake_info.zig");
 }

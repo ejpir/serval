@@ -142,9 +142,10 @@ pub const DEFAULT_HEALTH_PATH: []const u8 = "/";
 // =============================================================================
 
 /// Maximum concurrent active spans in OtelTracer pool.
-/// With ~7 spans per request, 128 supports ~18 concurrent requests.
+/// NOTE: Keep small - each span is ~12KB due to fixed-size attribute buffers.
+/// 16 spans = ~200KB, which is safe for stack allocation.
 /// TigerStyle: Fixed at compile time, no runtime allocation.
-pub const OTEL_MAX_ACTIVE_SPANS: u32 = 128;
+pub const OTEL_MAX_ACTIVE_SPANS: u32 = 16;
 
 /// Maximum attributes per span
 pub const OTEL_MAX_ATTRIBUTES: u32 = 32;

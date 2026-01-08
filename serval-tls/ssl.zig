@@ -15,6 +15,7 @@ pub const SSL_CIPHER = opaque {};
 pub const BIO = opaque {};
 pub const X509 = opaque {};
 pub const EVP_PKEY = opaque {};
+pub const X509_NAME = opaque {};
 
 // Error codes
 pub const SSL_ERROR_NONE = 0;
@@ -84,12 +85,27 @@ pub const TLSEXT_NAMETYPE_host_name = 0;
 
 /// Set SNI hostname for TLS connection
 pub fn SSL_set_tlsext_host_name(ssl: *SSL, name: [*:0]const u8) c_int {
-    const result = SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, @constCast(@ptrCast(name)));
+    const result = SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, @ptrCast(@constCast(name)));
     return if (result == 1) 1 else 0;
 }
 
 // Cipher functions
 pub extern fn SSL_CIPHER_get_name(cipher: *const SSL_CIPHER) ?[*:0]const u8;
+
+// Session resumption
+pub extern fn SSL_session_reused(ssl: *const SSL) c_int;
+
+// ALPN - returns pointer to selected protocol and length
+// Note: data is set to NULL if no ALPN was negotiated
+pub extern fn SSL_get0_alpn_selected(ssl: *const SSL, data: *?[*]const u8, len: *c_uint) void;
+
+// Certificate inspection
+// Note: OpenSSL 3.x renamed SSL_get_peer_certificate to SSL_get1_peer_certificate
+pub extern fn SSL_get1_peer_certificate(ssl: *const SSL) ?*X509;
+pub extern fn X509_free(x509: *X509) void;
+pub extern fn X509_get_subject_name(x509: *const X509) ?*X509_NAME;
+pub extern fn X509_get_issuer_name(x509: *const X509) ?*X509_NAME;
+pub extern fn X509_NAME_oneline(name: *const X509_NAME, buf: [*]u8, size: c_int) ?[*:0]u8;
 
 // Error functions
 pub extern fn ERR_get_error() c_ulong;
