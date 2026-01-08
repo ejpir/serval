@@ -29,6 +29,7 @@ serval (umbrella - re-exports all modules)
 ├── serval-http     # HTTP/1.1 parser
 ├── serval-tls      # TLS termination and origination (OpenSSL)
 ├── serval-pool     # Connection pooling
+├── serval-client   # HTTP/1.1 client (connect, send, receive)
 ├── serval-health   # Backend health tracking (atomic bitmap, thresholds)
 ├── serval-prober   # Background health probing
 ├── serval-proxy    # Upstream forwarding (h1/ subdirectory)
@@ -40,6 +41,7 @@ serval (umbrella - re-exports all modules)
 Standalone modules:
 ├── serval-lb       # Load balancer handler (round-robin)
 ├── serval-router   # Content-based router (host/path matching, per-pool LB)
+├── serval-gateway  # Kubernetes Gateway API controller (ingress controller)
 └── serval-cli      # CLI argument parsing utilities
 ```
 
@@ -90,9 +92,11 @@ Layer 1 (Protocol):                                                │
 Layer 2 (Infrastructure):                                          │
   serval-pool ←─────────────────────────────────────────────┐      │
                                                             │      │
+  serval-client (depends on core, net, tls, http, pool) ←───┤      │
+                                                            │      │
   serval-health ←───────────────────────────────────────────┤      │
                                                             │      │
-  serval-prober ←───────────────────────────────────────────┤      │
+  serval-prober (depends on serval-client) ←────────────────┤      │
                                                             │      │
   serval-metrics ───────────────────────────────────────────┤      │
                                                             │      │
@@ -101,7 +105,7 @@ Layer 2 (Infrastructure):                                          │
   serval-otel (implements serval-tracing interface) ────────┤      │
                                                             │      │
 Layer 3 (Mechanics):                                        │      │
-  serval-proxy ─────────────────────────────────────────────┤      │
+  serval-proxy (depends on serval-client) ──────────────────┤      │
        ↑                                                    │      │
        │                                                    │      │
 Layer 5 (Orchestration):                                    │      │
@@ -112,6 +116,7 @@ Layer 5 (Orchestration):                                    │      │
 Standalone:
   serval-core ←── serval-lb (load balancer handler, depends on serval-health, serval-prober)
   serval-core ←── serval-router (content-based router, depends on serval-lb, serval-health, serval-prober)
+  serval-core ←── serval-gateway (K8s Gateway API controller, depends on serval-router)
   serval-core ←── serval-cli (CLI utilities)
 ```
 
@@ -123,6 +128,7 @@ Standalone:
 | serval-net | Socket configuration utilities | `Socket`, `SocketError`, `setTcpNoDelay` |
 | serval-http | HTTP/1.1 parsing | `Parser` |
 | serval-pool | Connection reuse (wraps Socket) | `SimplePool`, `NoPool`, `Connection` |
+| serval-client | HTTP/1.1 client for upstream requests | `Client`, `ClientError`, `ResponseHeaders`, `sendRequest`, `readResponseHeaders` |
 | serval-health | Backend health tracking | `HealthState`, `UpstreamIndex`, `MAX_UPSTREAMS` |
 | serval-prober | Background health probing (HTTP/HTTPS) | `ProberContext`, `probeLoop` |
 | serval-proxy | Request forwarding | `Forwarder`, `ForwardResult`, `BodyInfo`, `Protocol` |
@@ -132,6 +138,7 @@ Standalone:
 | serval-server | HTTP/1.1 server | `Server`, `MinimalServer` |
 | serval-lb | Load balancing | `LbHandler` (health-aware round-robin with background probing) |
 | serval-router | Content-based routing | `Router`, `Route`, `RouteMatcher`, `PathMatch`, `PoolConfig` |
+| serval-gateway | K8s Gateway API controller | `Gateway`, `k8s.Client`, `k8s.Watcher`, `GatewayConfig` |
 | serval-cli | CLI argument parsing | `Args`, `ParseResult`, comptime generics |
 
 ---
@@ -592,6 +599,13 @@ pub const WeightedHandler = struct {
 | Chunked transfer encoding | serval-http, serval-proxy, serval-server | Parsing, forwarding, and direct response |
 | TLS termination | serval-tls, serval-server | Client TLS (server-side), upstream TLS (client-side) |
 | kTLS kernel offload | serval-tls | OpenSSL native + BoringSSL manual, automatic fallback |
+| HTTP/1.1 client | serval-client | DNS, TCP, TLS, request/response |
+
+### In Progress
+
+| Feature | Module | Status |
+|---------|--------|--------|
+| Gateway API controller | serval-gateway | K8s watch working, data plane integration pending |
 
 ### Not Implemented
 
@@ -630,4 +644,10 @@ zig build run-lb-example -- --port 8080 --backends 127.0.0.1:9001,127.0.0.1:9002
 
 # Run router example (content-based routing)
 zig build run-router-example -- --port 8080 --api-backends 127.0.0.1:8001 --static-backends 127.0.0.1:8002
+
+# Build gateway example (K8s ingress controller)
+zig build build-gateway-example
+
+# Deploy to k3s (builds, creates Docker images, deploys)
+./deploy/deploy-k3s.sh
 ```

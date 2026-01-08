@@ -80,10 +80,20 @@ Timing fields default to 0 for backward compatibility. Use these for detailed Pi
 | `forwarder.zig` | Forwarder struct, pool coordination, timing |
 | `connect.zig` | TCP connect, socket options, protocol negotiation |
 | `h1/mod.zig` | HTTP/1.1 module exports |
-| `h1/request.zig` | HTTP/1.1 request building, hop-by-hop filtering |
+| `h1/request.zig` | HTTP/1.1 request adapter (delegates to serval-client) |
 | `h1/response.zig` | HTTP/1.1 response receiving, header parsing |
 | `h1/body.zig` | HTTP/1.1 splice/copy body streaming |
 | `h1/chunked.zig` | Chunked transfer encoding forwarding |
+
+## Dependencies
+
+- `serval-core` - Core types, config, logging
+- `serval-net` - Socket abstraction, DNS resolver
+- `serval-pool` - Connection pooling
+- `serval-tracing` - Distributed tracing interface
+- `serval-http` - HTTP/1.1 parser
+- `serval-tls` - TLS termination/origination
+- `serval-client` - HTTP/1.1 client request building (shared implementation)
 
 **Protocol Abstraction:** HTTP/1.1 specific code is isolated in `h1/` subdirectory.
 When HTTP/2 is implemented, it will go in `h2/`. The `forwarder.zig` dispatches

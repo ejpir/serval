@@ -175,8 +175,9 @@ pub fn main() !void {
     };
 
     // Initialize router
+    // TigerStyle: dns_resolver is null since probing is disabled for all pools
     var router: Router = undefined;
-    try router.init(&routes, default_route, &pool_configs, null);
+    try router.init(&routes, default_route, &pool_configs, null, null);
     defer router.deinit();
 
     // Initialize connection pool

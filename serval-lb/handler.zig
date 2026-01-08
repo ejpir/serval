@@ -9,6 +9,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const core = @import("serval-core");
+const net = @import("serval-net");
 const health_mod = @import("serval-health");
 const prober = @import("serval-prober");
 const ssl = @import("serval-tls").ssl;
@@ -18,6 +19,7 @@ const Request = core.Request;
 const Upstream = core.Upstream;
 const LogEntry = core.LogEntry;
 const config = core.config;
+const DnsResolver = net.DnsResolver;
 
 const HealthState = health_mod.HealthState;
 const UpstreamIndex = config.UpstreamIndex;
@@ -65,16 +67,21 @@ pub const LbHandler = struct {
     /// client_ctx: SSL_CTX for TLS health probes (required if any upstream has tls=true).
     ///             Caller is responsible for creating and freeing the context.
     ///             Pass null if all upstreams are plain HTTP.
+    /// dns_resolver: DNS resolver for hostname resolution in health probes.
+    ///               Required if probing is enabled. Caller owns lifetime.
     pub fn init(
         self: *Self,
         upstreams: []const Upstream,
         lb_config: LbConfig,
         client_ctx: ?*ssl.SSL_CTX,
+        dns_resolver: ?*DnsResolver,
     ) !void {
         assert(upstreams.len > 0);
         assert(upstreams.len <= MAX_UPSTREAMS);
         assert(lb_config.probe_interval_ms > 0);
         assert(lb_config.probe_timeout_ms > 0);
+        // S1: if probing enabled, dns_resolver must be provided
+        assert(!lb_config.enable_probing or dns_resolver != null);
 
         self.* = .{
             .upstreams = upstreams,
@@ -100,6 +107,7 @@ pub const LbHandler = struct {
                 .probe_timeout_ms = lb_config.probe_timeout_ms,
                 .health_path = lb_config.health_path,
                 .client_ctx = client_ctx,
+                .dns_resolver = dns_resolver.?,
             };
             self.probe_thread = try std.Thread.spawn(.{}, prober.probeLoop, .{ctx});
         }
@@ -197,7 +205,7 @@ test "LbHandler init and deinit" {
 
     // Disable probing for tests (no real backends)
     var handler: LbHandler = undefined;
-    try handler.init(&upstreams, .{ .enable_probing = false }, null);
+    try handler.init(&upstreams, .{ .enable_probing = false }, null, null);
     defer handler.deinit();
 
     try std.testing.expect(!handler.probe_running.load(.acquire));
@@ -212,7 +220,7 @@ test "LbHandler selectUpstream round-robin" {
     };
 
     var handler: LbHandler = undefined;
-    try handler.init(&upstreams, .{ .enable_probing = false }, null);
+    try handler.init(&upstreams, .{ .enable_probing = false }, null, null);
     defer handler.deinit();
 
     var ctx = Context.init();
@@ -246,7 +254,7 @@ test "LbHandler skips unhealthy backends" {
         .enable_probing = false,
         .unhealthy_threshold = 2,
         .healthy_threshold = 2,
-    }, null);
+    }, null, null);
     defer handler.deinit();
 
     var ctx = Context.init();
@@ -278,7 +286,7 @@ test "LbHandler fallback when all unhealthy" {
         .enable_probing = false,
         .unhealthy_threshold = 1,
         .healthy_threshold = 1,
-    }, null);
+    }, null, null);
     defer handler.deinit();
 
     var ctx = Context.init();
@@ -308,7 +316,7 @@ test "LbHandler onLog updates health" {
         .enable_probing = false,
         .unhealthy_threshold = 3,
         .healthy_threshold = 2,
-    }, null);
+    }, null, null);
     defer handler.deinit();
 
     var ctx = Context.init();

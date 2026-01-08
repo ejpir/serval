@@ -1,0 +1,21 @@
+# serval-router container image
+# Build: docker build -f deploy/Dockerfile.router -t serval-router:latest .
+FROM debian:bookworm-slim
+
+# Install OpenSSL runtime (required by serval TLS)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libssl3 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy the pre-built binary (built with zig build run-router-example)
+COPY zig-out/bin/router_example /usr/local/bin/serval-router
+
+# Run as non-root
+RUN useradd -u 1000 -m serval
+USER serval
+
+# Data plane port
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/local/bin/serval-router"]

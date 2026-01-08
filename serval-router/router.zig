@@ -15,6 +15,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const core = @import("serval-core");
+const net = @import("serval-net");
 const lb = @import("serval-lb");
 const ssl_mod = @import("serval-tls");
 const types = @import("types.zig");
@@ -25,6 +26,7 @@ const Upstream = core.Upstream;
 const LogEntry = core.LogEntry;
 const LbHandler = lb.LbHandler;
 const LbConfig = lb.LbConfig;
+const DnsResolver = net.DnsResolver;
 const ssl = ssl_mod.ssl;
 
 const Route = types.Route;
@@ -77,6 +79,8 @@ pub const Router = struct {
     ///   default_route: Fallback route when no match found.
     ///   pool_configs: Backend pool configurations (one per pool_idx).
     ///   client_ctx: SSL_CTX for TLS health probes (null if all upstreams are plaintext).
+    ///   dns_resolver: DNS resolver for hostname resolution in health probes.
+    ///                 Required if any pool has probing enabled. Caller owns lifetime.
     ///
     /// Errors:
     ///   error.TooManyPools: pool_configs.len > MAX_POOLS
@@ -90,6 +94,7 @@ pub const Router = struct {
         default_route: Route,
         pool_configs: []const PoolConfig,
         client_ctx: ?*ssl.SSL_CTX,
+        dns_resolver: ?*DnsResolver,
     ) !void {
         // Preconditions
         assert(pool_configs.len > 0); // S1: At least one pool required
@@ -141,6 +146,7 @@ pub const Router = struct {
                 cfg.upstreams,
                 cfg.lb_config,
                 client_ctx,
+                dns_resolver,
             );
             initialized_count += 1;
         }
@@ -347,7 +353,7 @@ test "Router findRoute matches first route" {
     };
 
     var router: Router = undefined;
-    try router.init(&routes, default_route, &pool_configs, null);
+    try router.init(&routes, default_route, &pool_configs, null, null);
     defer router.deinit();
 
     // Request that matches both routes
@@ -382,7 +388,7 @@ test "Router findRoute returns default when no match" {
     };
 
     var router: Router = undefined;
-    try router.init(&routes, default_route, &pool_configs, null);
+    try router.init(&routes, default_route, &pool_configs, null, null);
     defer router.deinit();
 
     // Request that doesn't match (wrong host)
@@ -418,7 +424,7 @@ test "Router rewritePath strips prefix" {
     };
 
     var router: Router = undefined;
-    try router.init(&routes, default_route, &pool_configs, null);
+    try router.init(&routes, default_route, &pool_configs, null, null);
     defer router.deinit();
 
     // Test: "/api/users" -> "/users"
@@ -452,7 +458,7 @@ test "Router rewritePath returns root for exact prefix match" {
     };
 
     var router: Router = undefined;
-    try router.init(&routes, default_route, &pool_configs, null);
+    try router.init(&routes, default_route, &pool_configs, null, null);
     defer router.deinit();
 
     // Test: "/api/" -> "/"
@@ -486,7 +492,7 @@ test "Router rewritePath returns null when strip_prefix is false" {
     };
 
     var router: Router = undefined;
-    try router.init(&routes, default_route, &pool_configs, null);
+    try router.init(&routes, default_route, &pool_configs, null, null);
     defer router.deinit();
 
     const route = &routes[0];
@@ -519,7 +525,7 @@ test "Router rewritePath returns null for exact match" {
     };
 
     var router: Router = undefined;
-    try router.init(&routes, default_route, &pool_configs, null);
+    try router.init(&routes, default_route, &pool_configs, null, null);
     defer router.deinit();
 
     const route = &routes[0];
@@ -551,7 +557,7 @@ test "Router init validates pool index" {
     };
 
     var router: Router = undefined;
-    const result = router.init(&routes, default_route, &pool_configs, null);
+    const result = router.init(&routes, default_route, &pool_configs, null, null);
     try std.testing.expectError(error.InvalidPoolIndex, result);
 }
 
@@ -573,7 +579,7 @@ test "Router init validates default route pool index" {
     };
 
     var router: Router = undefined;
-    const result = router.init(&routes, default_route, &pool_configs, null);
+    const result = router.init(&routes, default_route, &pool_configs, null, null);
     try std.testing.expectError(error.InvalidPoolIndex, result);
 }
 
@@ -602,7 +608,7 @@ test "Router selectUpstream sets rewritten_path" {
     };
 
     var router: Router = undefined;
-    try router.init(&routes, default_route, &pool_configs, null);
+    try router.init(&routes, default_route, &pool_configs, null, null);
     defer router.deinit();
 
     var ctx = Context.init();
@@ -649,7 +655,7 @@ test "Router selectUpstream delegates to pool LbHandler" {
     };
 
     var router: Router = undefined;
-    try router.init(&routes, default_route, &pool_configs, null);
+    try router.init(&routes, default_route, &pool_configs, null, null);
     defer router.deinit();
 
     var ctx = Context.init();
@@ -690,7 +696,7 @@ test "Router countTotalHealthy" {
     };
 
     var router: Router = undefined;
-    try router.init(&routes, default_route, &pool_configs, null);
+    try router.init(&routes, default_route, &pool_configs, null, null);
     defer router.deinit();
 
     // All 3 backends should start healthy
@@ -716,7 +722,7 @@ test "Router getPool returns pool by index" {
     };
 
     var router: Router = undefined;
-    try router.init(&routes, default_route, &pool_configs, null);
+    try router.init(&routes, default_route, &pool_configs, null, null);
     defer router.deinit();
 
     const pool = router.getPool(0);

@@ -2,7 +2,7 @@
 //! Background Health Prober
 //!
 //! Probes unhealthy backends for recovery using HTTP GET requests.
-//! Supports both IP addresses and hostnames via optional DNS resolution.
+//! Uses serval-client for HTTP communication, supporting both plain TCP and TLS.
 //! TigerStyle: Blocking sockets with explicit timeouts, bounded operations.
 
 const std = @import("std");
@@ -14,12 +14,14 @@ const core = @import("serval-core");
 const net = @import("serval-net");
 const health_mod = @import("serval-health");
 const ssl = @import("serval-tls").ssl;
+const serval_client = @import("serval-client");
 
 const Upstream = core.Upstream;
 const HealthState = health_mod.HealthState;
 const UpstreamIndex = core.config.UpstreamIndex;
-const Socket = net.Socket;
 const DnsResolver = net.DnsResolver;
+const Client = serval_client.Client;
+const Request = core.types.Request;
 
 // =============================================================================
 // Prober Context
@@ -39,45 +41,51 @@ pub const ProberContext = struct {
     /// Set to null if no TLS upstreams need probing (plain HTTP only).
     /// Verification settings are configured in the SSL_CTX by the caller.
     client_ctx: ?*ssl.SSL_CTX,
-    /// Optional DNS resolver for hostname resolution.
+    /// DNS resolver for hostname resolution.
     /// TigerStyle: Shared resolver with TTL caching, caller owns lifetime.
-    /// If null, only numeric IP addresses are supported (hostnames will fail probe).
-    dns_resolver: ?*DnsResolver = null,
-    /// Allocator for Io runtime (required if dns_resolver is set).
+    /// Required for hostname-based upstreams.
+    dns_resolver: *DnsResolver,
+    /// Allocator for Io runtime.
     /// TigerStyle: Explicit dependency, caller owns lifetime.
     allocator: std.mem.Allocator = std.heap.page_allocator,
 };
 
 /// Background probe loop - probes unhealthy backends for recovery.
 /// Runs until probe_running is set to false.
-/// TigerStyle: Creates Io runtime only if DNS resolver is configured.
+/// TigerStyle: Creates Io runtime for HTTP client, single-threaded blocking I/O.
 pub fn probeLoop(ctx: ProberContext) void {
-    assert(ctx.probe_interval_ms > 0);
-    assert(ctx.probe_timeout_ms > 0);
+    assert(ctx.probe_interval_ms > 0); // S1: precondition
+    assert(ctx.probe_timeout_ms > 0); // S1: precondition
 
     const interval_s: u64 = ctx.probe_interval_ms / 1000;
     const interval_ns: u64 = (@as(u64, ctx.probe_interval_ms) % 1000) * 1_000_000;
 
-    // Initialize Io runtime for DNS resolution if resolver is configured.
+    // Initialize Io runtime for HTTP client.
     // TigerStyle: One-time initialization at thread start, no allocation in probe loop.
-    var io_runtime: ?Io.Threaded = if (ctx.dns_resolver != null)
-        Io.Threaded.init(ctx.allocator, .{})
-    else
-        null;
-    defer if (io_runtime) |*runtime| runtime.deinit();
+    var io_runtime = Io.Threaded.init(ctx.allocator, .{});
+    defer io_runtime.deinit();
 
-    // Get Io handle for DNS resolution (null if no resolver).
-    const io: ?Io = if (io_runtime) |*runtime| runtime.io() else null;
+    const io = io_runtime.io();
+
+    // Create HTTP client for probing.
+    // TigerStyle: Shared client instance for all probes, no per-probe allocation.
+    var client = Client.init(
+        ctx.allocator,
+        ctx.dns_resolver,
+        ctx.client_ctx,
+        false, // verify_tls: prober typically doesn't verify (internal backends)
+    );
+    defer client.deinit();
 
     while (ctx.probe_running.load(.acquire)) {
-        probeUnhealthyBackends(ctx, io);
+        probeUnhealthyBackends(ctx, &client, io);
         posix.nanosleep(interval_s, interval_ns);
     }
 }
 
 /// Probe all unhealthy backends.
-/// TigerStyle: Accepts optional Io for DNS resolution.
-fn probeUnhealthyBackends(ctx: ProberContext, io: ?Io) void {
+/// TigerStyle: Uses serval-client for HTTP requests.
+fn probeUnhealthyBackends(ctx: ProberContext, client: *Client, io: Io) void {
     assert(ctx.upstreams.len > 0); // S1: precondition
 
     // TigerStyle: Bounded loop over upstreams
@@ -87,14 +95,7 @@ fn probeUnhealthyBackends(ctx: ProberContext, io: ?Io) void {
         // Only probe unhealthy backends (healthy ones get passive checks via traffic)
         if (ctx.health.isHealthy(idx)) continue;
 
-        const success = probeBackend(
-            upstream,
-            ctx.probe_timeout_ms,
-            ctx.health_path,
-            ctx.client_ctx,
-            ctx.dns_resolver,
-            io,
-        );
+        const success = probeBackend(client, upstream, ctx.health_path, io);
         if (success) {
             ctx.health.recordSuccess(idx);
         }
@@ -102,205 +103,76 @@ fn probeUnhealthyBackends(ctx: ProberContext, io: ?Io) void {
     }
 }
 
-/// Probe a single backend with TCP connect + HTTP GET.
+/// Probe a single backend using serval-client HTTP request.
 /// Returns true if probe succeeds (2xx response).
-/// TigerStyle: Uses blocking sockets with timeouts for background thread.
-/// Supports both IPv4 addresses and hostnames (via DNS resolver).
+/// TigerStyle: Uses serval-client for DNS, TCP, TLS, and HTTP.
 fn probeBackend(
+    client: *Client,
     upstream: Upstream,
-    timeout_ms: u32,
     health_path: []const u8,
-    client_ctx: ?*ssl.SSL_CTX,
-    dns_resolver: ?*DnsResolver,
-    io: ?Io,
+    io: Io,
 ) bool {
-    assert(timeout_ms > 0); // S1: precondition
     assert(upstream.host.len > 0); // S1: precondition
+    assert(health_path.len > 0); // S1: precondition
 
-    // Resolve address: try IPv4 first, then DNS if resolver available.
-    // TigerStyle: Explicit fallback chain, no implicit behavior.
-    const resolved = resolveAddress(upstream.host, upstream.port, dns_resolver, io) orelse {
-        std.log.debug("prober: failed to resolve {s}:{d}", .{ upstream.host, upstream.port });
+    // Build health check request.
+    // TigerStyle: Stack-allocated request with minimal headers.
+    var request = Request{
+        .method = .GET,
+        .path = health_path,
+        .version = .@"HTTP/1.1",
+        .headers = .{},
+    };
+
+    // Add required headers.
+    // TigerStyle: Connection: close for one-shot probe.
+    request.headers.put("Host", upstream.host) catch {
+        std.log.debug("prober: failed to add Host header for {s}:{d}", .{ upstream.host, upstream.port });
+        return false;
+    };
+    request.headers.put("Connection", "close") catch {
+        std.log.debug("prober: failed to add Connection header for {s}:{d}", .{ upstream.host, upstream.port });
+        return false;
+    };
+    request.headers.put("User-Agent", "serval-prober/1.0") catch {
+        std.log.debug("prober: failed to add User-Agent header for {s}:{d}", .{ upstream.host, upstream.port });
         return false;
     };
 
-    // Create socket with appropriate address family.
-    const fd = posix.socket(
-        resolved.family,
-        posix.SOCK.STREAM,
-        posix.IPPROTO.TCP,
-    ) catch return false;
+    // Response header buffer (small - we only need status line).
+    // TigerStyle: Stack-allocated, fixed size.
+    var header_buf: [1024]u8 = std.mem.zeroes([1024]u8);
 
-    // Set timeouts (non-critical, probe still works without them)
-    const timeout_timeval = posix.timeval{
-        .sec = @intCast(timeout_ms / 1000),
-        .usec = @intCast((timeout_ms % 1000) * 1000),
-    };
-    // TigerStyle: Timeout is optimization, connect will timeout eventually via kernel defaults.
-    // Failures logged at debug level - non-fatal for probe functionality.
-    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout_timeval)) catch |err| {
-        std.log.debug("prober: SO_RCVTIMEO failed: {s}", .{@errorName(err)});
-    };
-    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&timeout_timeval)) catch |err| {
-        std.log.debug("prober: SO_SNDTIMEO failed: {s}", .{@errorName(err)});
-    };
-
-    // Connect using resolved address.
-    // TigerStyle: Cast storage to sockaddr pointer for connect() syscall.
-    const sockaddr_ptr: *const posix.sockaddr = @ptrCast(&resolved.addr);
-    posix.connect(fd, sockaddr_ptr, resolved.addrlen) catch {
-        posix.close(fd);
+    // Perform HTTP request using serval-client.
+    // TigerStyle: One-shot request, connection closed after response.
+    var result = client.request(upstream, &request, &header_buf, io) catch |err| {
+        std.log.debug("prober: HTTP request failed for {s}:{d}: {s}", .{
+            upstream.host,
+            upstream.port,
+            @errorName(err),
+        });
         return false;
     };
 
-    // Create Socket wrapper and probe
-    if (upstream.tls) {
-        const ctx = client_ctx orelse {
-            std.log.debug("prober: TLS upstream but no client_ctx provided", .{});
-            posix.close(fd);
-            return false;
-        };
-        var socket = Socket.TLS.TLSSocket.initClient(fd, ctx, upstream.host) catch {
-            std.log.debug("prober: TLS handshake failed for {s}:{d}", .{ upstream.host, upstream.port });
-            posix.close(fd);
-            return false;
-        };
-        defer socket.close();
-        return probeWithSocket(&socket, upstream, health_path);
-    } else {
-        var socket = Socket.Plain.initClient(fd);
-        defer socket.close();
-        return probeWithSocket(&socket, upstream, health_path);
-    }
-}
+    // Close connection immediately (Connection: close).
+    // TigerStyle: Explicit cleanup, no connection reuse for probes.
+    result.conn.socket.close();
 
-/// Resolved address result for connect().
-/// TigerStyle: Explicit struct to handle both IPv4 and IPv6.
-/// Uses sockaddr.storage for IPv6 compatibility (128 bytes).
-const ResolvedAddress = struct {
-    addr: posix.sockaddr.storage,
-    addrlen: posix.socklen_t,
-    family: u32, // AF_INET or AF_INET6 as u32 for posix.socket()
-};
+    // Check for 2xx success status.
+    // TigerStyle: Simple range check, no parsing.
+    const status = result.response.status;
+    const success = status >= 200 and status < 300;
 
-/// Resolve hostname to address for connect().
-/// Returns null if resolution fails.
-/// TigerStyle: Try IPv4 parse first (fast path), then DNS resolution.
-fn resolveAddress(
-    host: []const u8,
-    port: u16,
-    dns_resolver: ?*DnsResolver,
-    io: ?Io,
-) ?ResolvedAddress {
-    assert(host.len > 0); // S1: precondition
-    assert(port > 0); // S1: precondition
-
-    // Fast path: try parsing as IPv4 address (no DNS needed).
-    if (net.parseIPv4(host)) |ipv4_addr| {
-        return makeIPv4Result(ipv4_addr, port);
+    if (!success) {
+        std.log.debug("prober: non-2xx status {d} for {s}:{d}{s}", .{
+            status,
+            upstream.host,
+            upstream.port,
+            health_path,
+        });
     }
 
-    // Slow path: DNS resolution (if resolver available).
-    const resolver = dns_resolver orelse return null;
-    const io_handle = io orelse return null;
-
-    const result = resolver.resolve(host, port, io_handle) catch |err| {
-        std.log.debug("prober: DNS resolution failed for {s}: {s}", .{ host, @errorName(err) });
-        return null;
-    };
-
-    // Convert Io.net.IpAddress to posix.sockaddr.
-    // TigerStyle: Handle both IPv4 and IPv6 explicitly.
-    switch (result.address) {
-        .ip4 => |ip4| {
-            return makeIPv4Result(@bitCast(ip4.bytes), ip4.port);
-        },
-        .ip6 => |ip6| {
-            return makeIPv6Result(ip6.bytes, ip6.port, ip6.flow, ip6.interface.index);
-        },
-    }
-}
-
-/// Create IPv4 ResolvedAddress from address and port.
-/// TigerStyle: Helper to avoid code duplication.
-fn makeIPv4Result(addr: u32, port: u16) ResolvedAddress {
-    // Initialize storage to zeros, then overlay IPv4 address.
-    // TigerStyle: Zero initialization prevents information leaks.
-    var storage: posix.sockaddr.storage = .{
-        .family = posix.AF.INET,
-        .padding = std.mem.zeroes([126]u8),
-    };
-
-    // Overlay IPv4 address onto storage.
-    const in_ptr: *posix.sockaddr.in = @ptrCast(&storage);
-    in_ptr.* = .{
-        .family = posix.AF.INET,
-        .port = std.mem.nativeToBig(u16, port),
-        .addr = addr,
-    };
-
-    return .{
-        .addr = storage,
-        .addrlen = @sizeOf(posix.sockaddr.in),
-        .family = posix.AF.INET,
-    };
-}
-
-/// Create IPv6 ResolvedAddress from address components.
-/// TigerStyle: Helper to avoid code duplication.
-fn makeIPv6Result(addr: [16]u8, port: u16, flowinfo: u32, scope_id: u32) ResolvedAddress {
-    // Initialize storage to zeros, then overlay IPv6 address.
-    var storage: posix.sockaddr.storage = .{
-        .family = posix.AF.INET6,
-        .padding = std.mem.zeroes([126]u8),
-    };
-
-    // Overlay IPv6 address onto storage.
-    const in6_ptr: *posix.sockaddr.in6 = @ptrCast(&storage);
-    in6_ptr.* = .{
-        .family = posix.AF.INET6,
-        .port = std.mem.nativeToBig(u16, port),
-        .flowinfo = flowinfo,
-        .addr = addr,
-        .scope_id = scope_id,
-    };
-
-    return .{
-        .addr = storage,
-        .addrlen = @sizeOf(posix.sockaddr.in6),
-        .family = posix.AF.INET6,
-    };
-}
-
-/// Probe backend using Socket abstraction.
-/// TigerStyle: Unified probe logic for both plain and TLS sockets.
-fn probeWithSocket(socket: *Socket, upstream: Upstream, health_path: []const u8) bool {
-    assert(upstream.host.len > 0); // S1: precondition
-
-    // Send HTTP GET request
-    var request_buf: [256]u8 = std.mem.zeroes([256]u8); // S5: zeroed to prevent leaks
-    const request = std.fmt.bufPrint(&request_buf, "GET {s} HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\n\r\n", .{
-        health_path,
-        upstream.host,
-    }) catch return false;
-
-    _ = socket.write(request) catch return false;
-
-    // Read response status line
-    var response_buf: [128]u8 = std.mem.zeroes([128]u8); // S5: zeroed to prevent leaks
-    const bytes_read = socket.read(&response_buf) catch return false;
-    if (bytes_read < 12) return false; // Minimum: "HTTP/1.1 200"
-
-    // Parse status code
-    const response = response_buf[0..bytes_read];
-    if (!std.mem.startsWith(u8, response, "HTTP/1.")) return false;
-    if (response.len < 12) return false;
-
-    const status_str = response[9..12];
-    const status = std.fmt.parseInt(u16, status_str, 10) catch return false;
-
-    // 2xx = success
-    return status >= 200 and status < 300;
+    return success;
 }
 
 // =============================================================================
@@ -367,7 +239,8 @@ test "isSuccessStatus - 2xx range check" {
 }
 
 test "ProberContext - field validation" {
-    // ProberContext requires all fields to be set (except optional dns_resolver and allocator)
+    // ProberContext requires all fields to be set
+    var dns_resolver = DnsResolver.init(.{});
     const ctx = ProberContext{
         .upstreams = &[_]Upstream{},
         .health = undefined,
@@ -376,7 +249,7 @@ test "ProberContext - field validation" {
         .probe_timeout_ms = 2000,
         .health_path = "/health",
         .client_ctx = null, // TLS context is optional (null = plain HTTP only)
-        // dns_resolver defaults to null (only IP addresses supported)
+        .dns_resolver = &dns_resolver,
         // allocator defaults to page_allocator
     };
 
@@ -384,7 +257,6 @@ test "ProberContext - field validation" {
     try std.testing.expectEqual(@as(u32, 2000), ctx.probe_timeout_ms);
     try std.testing.expectEqualStrings("/health", ctx.health_path);
     try std.testing.expect(ctx.client_ctx == null);
-    try std.testing.expect(ctx.dns_resolver == null);
 }
 
 test "interval calculation" {
@@ -418,62 +290,60 @@ test "interval calculation" {
     try std.testing.expectEqual(@as(u64, 1_000_000), result.ns);
 }
 
-test "resolveAddress - IPv4 fast path" {
-    // IPv4 addresses should resolve without DNS (fast path)
-    const result = resolveAddress("127.0.0.1", 8080, null, null);
-    try std.testing.expect(result != null);
-
-    const resolved = result.?;
-    try std.testing.expectEqual(@as(u32, posix.AF.INET), resolved.family);
-    try std.testing.expectEqual(@as(posix.socklen_t, @sizeOf(posix.sockaddr.in)), resolved.addrlen);
-
-    // Verify address bytes (network byte order)
-    const addr: *const posix.sockaddr.in = @ptrCast(&resolved.addr);
-    try std.testing.expectEqual(posix.AF.INET, addr.family);
-    try std.testing.expectEqual(std.mem.nativeToBig(u16, 8080), addr.port);
-}
-
-test "resolveAddress - IPv4 boundary addresses" {
-    // Test various valid IPv4 addresses
-    const test_cases = [_]struct { host: []const u8, expected_addr: u32 }{
-        .{ .host = "0.0.0.0", .expected_addr = 0x00000000 },
-        .{ .host = "255.255.255.255", .expected_addr = 0xFFFFFFFF },
-        .{ .host = "192.168.1.1", .expected_addr = 0x0101A8C0 }, // Network byte order
+test "Request struct creation for probe" {
+    // Test that we can create the request struct as used in probeBackend
+    var request = Request{
+        .method = .GET,
+        .path = "/health",
+        .version = .@"HTTP/1.1",
+        .headers = .{},
     };
 
-    for (test_cases) |tc| {
-        const result = resolveAddress(tc.host, 80, null, null);
-        try std.testing.expect(result != null);
+    try request.headers.put("Host", "backend1.example.com");
+    try request.headers.put("Connection", "close");
+    try request.headers.put("User-Agent", "serval-prober/1.0");
 
-        const resolved = result.?;
-        const addr: *const posix.sockaddr.in = @ptrCast(&resolved.addr);
-        try std.testing.expectEqual(tc.expected_addr, addr.addr);
-    }
+    try std.testing.expectEqual(core.types.Method.GET, request.method);
+    try std.testing.expectEqualStrings("/health", request.path);
+    try std.testing.expectEqual(@as(usize, 3), request.headers.count);
+
+    // Verify headers can be retrieved
+    const host = request.headers.get("Host");
+    try std.testing.expect(host != null);
+    try std.testing.expectEqualStrings("backend1.example.com", host.?);
 }
 
-test "resolveAddress - hostname without resolver returns null" {
-    // Hostnames should fail when no DNS resolver is provided
-    const result = resolveAddress("example.com", 80, null, null);
-    try std.testing.expect(result == null);
-}
-
-test "resolveAddress - invalid IPv4 returns null without resolver" {
-    // Invalid addresses that aren't parseable as IPv4 should fail
-    const test_cases = [_][]const u8{
-        "256.0.0.1", // Invalid octet
-        "127.0.0", // Missing octet
-        "abc.def.ghi.jkl", // Non-numeric
+test "Upstream struct with TLS flag" {
+    // Test upstream configuration with TLS enabled
+    const upstream_tls = Upstream{
+        .host = "secure.example.com",
+        .port = 443,
+        .tls = true,
+        .idx = 0,
     };
 
-    for (test_cases) |host| {
-        const result = resolveAddress(host, 80, null, null);
-        try std.testing.expect(result == null);
-    }
+    try std.testing.expectEqualStrings("secure.example.com", upstream_tls.host);
+    try std.testing.expectEqual(@as(u16, 443), upstream_tls.port);
+    try std.testing.expect(upstream_tls.tls);
+
+    // Test upstream configuration with plaintext
+    const upstream_plain = Upstream{
+        .host = "backend.local",
+        .port = 8080,
+        .tls = false,
+        .idx = 1,
+    };
+
+    try std.testing.expectEqualStrings("backend.local", upstream_plain.host);
+    try std.testing.expectEqual(@as(u16, 8080), upstream_plain.port);
+    try std.testing.expect(!upstream_plain.tls);
 }
 
-test "ResolvedAddress - struct size" {
-    // TigerStyle: Verify struct is reasonably sized for stack allocation.
-    // Uses sockaddr.storage (128 bytes) for IPv6 compatibility.
-    const size = @sizeOf(ResolvedAddress);
-    try std.testing.expect(size <= 144); // 128 (storage) + addrlen + family + padding
+test "header buffer size is reasonable" {
+    // Verify the header buffer size used in probeBackend is adequate
+    // Response status line: "HTTP/1.1 200 OK\r\n" = ~17 bytes
+    // Minimal headers for health check response should fit in 1024 bytes
+    const header_buf_size: usize = 1024;
+    try std.testing.expect(header_buf_size >= 256); // Minimum for status + basic headers
+    try std.testing.expect(header_buf_size <= 8192); // Upper bound for stack allocation
 }

@@ -194,11 +194,15 @@ pub fn main() !void {
     } else null;
     defer if (probe_ctx) |ctx| ssl.SSL_CTX_free(ctx);
 
+    // Create DNS resolver for health probes
+    // TigerStyle: Resolver uses default TTL (60s) and timeout (5s)
+    var dns_resolver = serval_net.DnsResolver.init(.{});
+
     // Initialize load balancer with automatic health tracking and probing
     var handler: LbHandler = undefined;
     try handler.init(upstreams, .{
         .probe_interval_ms = 5000, // Probe every 5 seconds
-    }, probe_ctx);
+    }, probe_ctx, &dns_resolver);
     defer handler.deinit();
 
     // Initialize stats display if enabled

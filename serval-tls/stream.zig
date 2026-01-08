@@ -187,6 +187,7 @@ pub const TLSStream = struct {
         fd: c_int,
         sni_z: [*:0]const u8,
         allocator: Allocator,
+        enable_ktls: bool,
     ) !TLSStream {
         // S1: preconditions
         std.debug.assert(@intFromPtr(ctx) != 0); // S1: precondition - ctx is valid pointer
@@ -197,8 +198,10 @@ pub const TLSStream = struct {
 
         if (ssl.SSL_set_fd(ssl_conn, fd) != 1) return error.SslSetFd;
 
-        // Enable kTLS before handshake - OpenSSL will attempt kTLS setup automatically
-        _ = ssl.SSL_set_options(ssl_conn, ssl.SSL_OP_ENABLE_KTLS);
+        // Enable kTLS before handshake if requested
+        if (enable_ktls) {
+            _ = ssl.SSL_set_options(ssl_conn, ssl.SSL_OP_ENABLE_KTLS);
+        }
 
         // Set SNI (caller provides null-terminated string - no allocation)
         if (ssl.SSL_set_tlsext_host_name(ssl_conn, sni_z) != 1) return error.SslSetSni;
@@ -226,9 +229,11 @@ pub const TLSStream = struct {
         info.handshake_duration_ns = @intCast(end_ns - start_ns);
         populateHandshakeInfo(ssl_conn, &info);
 
-        // Setup kTLS and get appropriate mode
-        const mode = setupKtlsAfterHandshake(ssl_conn, fd, &info);
-        logKtlsStatus(&info, false);
+        // Setup kTLS and get appropriate mode (only if enabled)
+        const mode = if (enable_ktls) setupKtlsAfterHandshake(ssl_conn, fd, &info) else Mode{ .userspace = ssl_conn };
+        if (enable_ktls) {
+            logKtlsStatus(&info, false);
+        }
 
         return .{
             .fd = fd,

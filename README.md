@@ -76,12 +76,14 @@ exe.root_module.addImport("serval-lb", serval.module("serval-lb"));
 | `serval` | Umbrella module — re-exports everything |
 | `serval-core` | Types, config, errors, context |
 | `serval-http` | HTTP/1.1 request parser |
+| `serval-client` | HTTP/1.1 client library for upstream connections |
 | `serval-tls` | TLS termination/origination with kTLS offload |
 | `serval-pool` | Connection pooling |
 | `serval-proxy` | Upstream forwarding |
 | `serval-server` | HTTP/1.1 server |
 | `serval-lb` | Load balancer handler (round-robin) |
 | `serval-router` | Content-based routing (host/path matching, path rewriting) |
+| `serval-gateway` | Kubernetes Gateway API controller |
 | `serval-health` | Backend health tracking (atomic bitmap) |
 | `serval-metrics` | Metrics interfaces |
 | `serval-tracing` | Distributed tracing interfaces |
@@ -114,9 +116,11 @@ const MyHandler = struct {
 ## Building
 
 ```bash
-zig build                    # Build lb_example (default)
-zig build build-echo-backend # Build echo backend
-zig build test               # Run all tests
+zig build                       # Build lb_example (default)
+zig build build-echo-backend    # Build echo backend
+zig build build-router-example  # Build router example
+zig build build-gateway-example # Build gateway example (K8s controller)
+zig build test                  # Run all tests
 ```
 
 ## Examples
@@ -215,6 +219,70 @@ The router strips path prefixes before forwarding:
 - `/api/users` → api-pool receives `/users`
 - `/static/image.png` → static-pool receives `/image.png`
 
+### Kubernetes Gateway API (serval-gateway)
+
+serval-gateway is an ingress controller that implements the [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io/). It watches Gateway API resources and configures serval-router for traffic routing.
+
+```
+┌─────────────┐       ┌─────────────────┐       ┌───────────────┐
+│  K8s API    │──────▶│ serval-gateway  │──────▶│ Backend Pods  │
+│  (watch)    │       │ (data plane)    │       │               │
+└─────────────┘       └─────────────────┘       └───────────────┘
+      │
+      ▼
+ Gateway API Resources:
+ - GatewayClass (defines controller)
+ - Gateway (defines listeners/ports)
+ - HTTPRoute (defines routing rules)
+```
+
+**Deploy to k3s:**
+
+```bash
+# Install Gateway API CRDs
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.0.0/standard-install.yaml
+
+# Deploy serval-gateway (builds binaries, images, deploys to k3s)
+./deploy/deploy-k3s.sh
+```
+
+**Example Gateway and HTTPRoute:**
+
+```yaml
+# Gateway - defines a listener on port 80
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: my-gateway
+spec:
+  gatewayClassName: serval
+  listeners:
+    - name: http
+      port: 80
+      protocol: HTTP
+---
+# HTTPRoute - routes traffic to backend service
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: my-route
+spec:
+  parentRefs:
+    - name: my-gateway
+  hostnames:
+    - "api.example.com"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api
+      backendRefs:
+        - name: api-service
+          port: 8080
+```
+
+See [serval-gateway/README.md](serval-gateway/README.md) for full documentation.
+
 ### Direct Response Handler
 
 Handlers can respond directly without forwarding using `DirectResponse`:
@@ -291,6 +359,7 @@ zig build run-echo-backend -- --help
 | Chunked encoding | Complete |
 | Content-based routing | Complete |
 | Path rewriting | Complete |
+| Gateway API controller | In progress |
 | HTTP/2 | Not implemented |
 
 ## License

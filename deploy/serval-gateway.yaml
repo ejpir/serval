@@ -1,0 +1,100 @@
+# serval-gateway Kubernetes Deployment
+#
+# Prerequisites:
+#   kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.0.0/standard-install.yaml
+#
+# Deploy:
+#   kubectl apply -f deploy/serval-gateway.yaml
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: serval-gateway
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: serval-gateway
+rules:
+  # Gateway API resources
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gatewayclasses", "gateways", "httproutes"]
+    verbs: ["get", "list", "watch"]
+  # Core resources for resolution
+  - apiGroups: [""]
+    resources: ["services", "endpoints", "secrets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: serval-gateway
+subjects:
+  - kind: ServiceAccount
+    name: serval-gateway
+    namespace: default
+roleRef:
+  kind: ClusterRole
+  name: serval-gateway
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: serval
+spec:
+  controllerName: serval.dev/gateway-controller
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: serval-gateway
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: serval-gateway
+  template:
+    metadata:
+      labels:
+        app: serval-gateway
+    spec:
+      serviceAccountName: serval-gateway
+      containers:
+        - name: serval-gateway
+          image: serval-gateway:latest  # Build with: docker build -t serval-gateway .
+          imagePullPolicy: Never  # Use local image
+          ports:
+            - containerPort: 8080
+              name: http
+            - containerPort: 8443
+              name: https
+            - containerPort: 9901
+              name: admin
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: serval-gateway
+  namespace: default
+spec:
+  type: LoadBalancer
+  selector:
+    app: serval-gateway
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+    - name: https
+      port: 443
+      targetPort: 8443

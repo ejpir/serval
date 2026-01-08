@@ -1,8 +1,11 @@
 // lib/serval-proxy/h1/request.zig
-//! HTTP/1.1 Request Serialization
+//! HTTP/1.1 Request Serialization for Proxy
 //!
 //! Builds and sends HTTP/1.1 requests to upstream servers.
-//! TigerStyle: Bounded iteration, RFC 7230 hop-by-hop filtering.
+//! This module delegates to serval-client for request building and adds
+//! proxy-specific adapters for Connection-based sending.
+//!
+//! TigerStyle: Reuses serval-client, thin adapter layer.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -24,165 +27,63 @@ const Connection = pool_mod.Connection;
 const net = @import("serval-net");
 const Socket = net.Socket;
 
+// Import serval-client request module for shared functionality
+const client_request = @import("serval-client").request;
+
 // =============================================================================
-// RFC 7230 Hop-by-Hop Header Filtering
+// Re-export from serval-client
 // =============================================================================
 
 /// RFC 7230 Section 6.1: Hop-by-hop headers MUST NOT be forwarded to upstream.
 /// These headers are meaningful only for a single transport-level connection.
-pub const HOP_BY_HOP_HEADERS = [_][]const u8{
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-};
+pub const HOP_BY_HOP_HEADERS = client_request.HOP_BY_HOP_HEADERS;
 
 /// Check if a header is a hop-by-hop header per RFC 7230 Section 6.1.
 /// TigerStyle: Bounded iteration over fixed-size array.
-pub fn isHopByHopHeader(name: []const u8) bool {
-    assert(name.len > 0);
-
-    // Check against standard hop-by-hop headers
-    for (HOP_BY_HOP_HEADERS) |hop_header| {
-        if (eqlIgnoreCase(name, hop_header)) return true;
-    }
-    return false;
-}
+pub const isHopByHopHeader = client_request.isHopByHopHeader;
 
 /// Case-insensitive string comparison for header names.
 /// TigerStyle: Bounded loop over string length.
-pub fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |ac, bc| {
-        const lower_a = if (ac >= 'A' and ac <= 'Z') ac + 32 else ac;
-        const lower_b = if (bc >= 'A' and bc <= 'Z') bc + 32 else bc;
-        if (lower_a != lower_b) return false;
-    }
-    return true;
-}
-
-// =============================================================================
-// Request Building
-// =============================================================================
+pub const eqlIgnoreCase = client_request.eqlIgnoreCase;
 
 /// Via header value per RFC 7230 Section 5.7.1.
 /// Format: protocol-version pseudonym (e.g., "1.1 serval").
-pub const VIA_HEADER = "Via: 1.1 serval\r\n";
+pub const VIA_HEADER = client_request.VIA_HEADER;
 
 /// Convert Method enum to string representation.
-pub fn methodToString(method: Method) []const u8 {
-    return switch (method) {
-        .GET => "GET",
-        .HEAD => "HEAD",
-        .POST => "POST",
-        .PUT => "PUT",
-        .DELETE => "DELETE",
-        .CONNECT => "CONNECT",
-        .OPTIONS => "OPTIONS",
-        .TRACE => "TRACE",
-        .PATCH => "PATCH",
-    };
-}
+pub const methodToString = client_request.methodToString;
 
 /// Build HTTP/1.1 request into buffer. Returns length or null if buffer too small.
 /// RFC 7230: Filters hop-by-hop headers and adds Via header.
 /// effective_path: If set, use this path instead of request.path (for path rewriting).
 /// TigerStyle: Bounded iteration, ~2 assertions.
-pub fn buildRequestBuffer(buffer: []u8, request: *const Request, effective_path: ?[]const u8) ?usize {
-    // Use effective_path if provided (path rewriting), otherwise use request.path
-    const path = effective_path orelse request.path;
-    assert(path.len > 0); // S1: precondition - path must not be empty
-
-    var pos: usize = 0;
-
-    // Request line: "METHOD /path HTTP/1.1\r\n"
-    const method_str = methodToString(request.method);
-    const version_str = " HTTP/1.1\r\n";
-    const line_len = method_str.len + 1 + path.len + version_str.len;
-    if (pos + line_len > buffer.len) return null;
-
-    @memcpy(buffer[pos..][0..method_str.len], method_str);
-    pos += method_str.len;
-    buffer[pos] = ' ';
-    pos += 1;
-    @memcpy(buffer[pos..][0..path.len], path);
-    pos += path.len;
-    @memcpy(buffer[pos..][0..version_str.len], version_str);
-    pos += version_str.len;
-
-    // Headers - filter hop-by-hop headers per RFC 7230 Section 6.1
-    const max_headers: usize = config.MAX_HEADERS;
-    for (request.headers.headers[0..@min(request.headers.count, max_headers)]) |header| {
-        // RFC 7230 Section 6.1: Do not forward hop-by-hop headers
-        if (isHopByHopHeader(header.name)) continue;
-
-        const needed = header.name.len + 2 + header.value.len + 2;
-        if (pos + needed > buffer.len) return null;
-
-        @memcpy(buffer[pos..][0..header.name.len], header.name);
-        pos += header.name.len;
-        @memcpy(buffer[pos..][0..2], ": ");
-        pos += 2;
-        @memcpy(buffer[pos..][0..header.value.len], header.value);
-        pos += header.value.len;
-        @memcpy(buffer[pos..][0..2], "\r\n");
-        pos += 2;
-    }
-
-    // RFC 7230 Section 5.7.1: Add Via header to indicate proxy hop
-    if (pos + VIA_HEADER.len > buffer.len) return null;
-    @memcpy(buffer[pos..][0..VIA_HEADER.len], VIA_HEADER);
-    pos += VIA_HEADER.len;
-
-    // TODO: Add X-Forwarded-For header with client IP once client address
-    // is passed to the forwarder. Currently not available in Request type.
-
-    // End of headers
-    if (pos + 2 > buffer.len) return null;
-    @memcpy(buffer[pos..][0..2], "\r\n");
-    pos += 2;
-
-    assert(pos <= buffer.len);
-    return pos;
-}
+pub const buildRequestBuffer = client_request.buildRequestBuffer;
 
 // =============================================================================
-// Request Sending
+// Proxy-specific Request Sending (adapts Connection to Socket)
 // =============================================================================
 
 /// Send buffer to connection using Socket abstraction.
 /// Handles both TLS and plaintext transparently.
-/// TigerStyle: Explicit io parameter for async I/O.
+/// TigerStyle: Explicit io parameter for async I/O (unused - Socket handles I/O).
 pub fn sendBuffer(conn: *Connection, io: Io, data: []const u8) ForwardError!void {
     _ = io; // Unused - Socket handles I/O internally
-    assert(data.len > 0);
+    assert(data.len > 0); // S1: precondition - data must not be empty
 
-    var remaining = data;
-    var iteration: u32 = 0;
-    const max_iterations: u32 = 10000; // S4: explicit bound
-
-    // Use Socket abstraction for unified TLS/plaintext handling.
-    while (remaining.len > 0 and iteration < max_iterations) {
-        iteration += 1;
-        const written = conn.socket.write(remaining) catch return ForwardError.SendFailed;
-        if (written == 0) return ForwardError.SendFailed;
-        assert(written <= remaining.len);
-        remaining = remaining[written..];
-    }
-
-    if (iteration >= max_iterations) {
-        return ForwardError.SendFailed; // Write exceeded max iterations
-    }
+    // Delegate to serval-client's sendBuffer, mapping errors
+    client_request.sendBufferToSocket(&conn.socket, data) catch |err| {
+        return switch (err) {
+            client_request.ClientError.SendFailed => ForwardError.SendFailed,
+            client_request.ClientError.SendTimeout => ForwardError.SendFailed,
+            client_request.ClientError.BufferTooSmall => ForwardError.SendFailed,
+        };
+    };
 }
 
 /// Send request body to connection (TLS or plaintext).
 /// TigerStyle: Explicit io parameter for async I/O.
 fn sendBody(conn: *Connection, io: Io, body: []const u8) ForwardError!void {
-    assert(body.len > 0);
+    assert(body.len > 0); // S1: precondition - body must not be empty
     try sendBuffer(conn, io, body);
 }
 
@@ -197,6 +98,7 @@ pub fn sendRequest(conn: *Connection, io: Io, request: *const Request, effective
     var buffer: [config.MAX_HEADER_SIZE_BYTES]u8 = std.mem.zeroes([config.MAX_HEADER_SIZE_BYTES]u8);
     const header_len = buildRequestBuffer(&buffer, request, effective_path) orelse return ForwardError.SendFailed;
 
+    assert(header_len > 0); // S2: postcondition - built valid request
     try sendBuffer(conn, io, buffer[0..header_len]);
 
     if (request.body) |body| {
@@ -422,41 +324,6 @@ test "buildRequestBuffer - path with query string" {
     try std.testing.expect(std.mem.indexOf(u8, buffer[0..len], "/search?q=hello%20world&page=1&sort=desc HTTP/1.1\r\n") != null);
 }
 
-test "buildRequestBuffer - path with special characters" {
-    var buffer: [1024]u8 = undefined;
-
-    var request = Request{
-        .method = .GET,
-        .path = "/api/v1/users/123?filter=%7B%22name%22%3A%22test%22%7D",
-        .version = .@"HTTP/1.1",
-        .headers = .{},
-    };
-    try request.headers.put("Host", "api.example.com");
-
-    const len = buildRequestBuffer(&buffer, &request, null).?;
-
-    // Path with URL-encoded JSON should be preserved
-    try std.testing.expect(std.mem.indexOf(u8, buffer[0..len], "/api/v1/users/123?filter=%7B%22name%22%3A%22test%22%7D") != null);
-}
-
-test "buildRequestBuffer - header with empty value" {
-    var buffer: [1024]u8 = undefined;
-
-    var request = Request{
-        .method = .GET,
-        .path = "/test",
-        .version = .@"HTTP/1.1",
-        .headers = .{},
-    };
-    try request.headers.put("Host", "example.com");
-    try request.headers.put("X-Empty", "");
-
-    const len = buildRequestBuffer(&buffer, &request, null).?;
-
-    // Empty header value should be preserved
-    try std.testing.expect(std.mem.indexOf(u8, buffer[0..len], "X-Empty: \r\n") != null);
-}
-
 test "buildRequestBuffer - buffer too small returns null" {
     // Buffer too small for request line
     var tiny_buffer: [10]u8 = undefined;
@@ -495,195 +362,6 @@ test "buildRequestBuffer - buffer exactly fits" {
     try std.testing.expect(len != null);
     try std.testing.expectEqual(expected.len, len.?);
     try std.testing.expectEqualStrings(expected, buffer[0..len.?]);
-}
-
-test "buildRequestBuffer - buffer one byte short returns null" {
-    // Calculate exact size needed
-    const expected =
-        "GET / HTTP/1.1\r\n" ++
-        "Via: 1.1 serval\r\n" ++
-        "\r\n";
-
-    // One byte short
-    var buffer: [expected.len - 1]u8 = undefined;
-
-    const request = Request{
-        .method = .GET,
-        .path = "/",
-        .version = .@"HTTP/1.1",
-        .headers = .{},
-    };
-
-    const result = buildRequestBuffer(&buffer, &request, null);
-
-    // TigerStyle: Boundary condition - one byte short should fail
-    try std.testing.expect(result == null);
-}
-
-test "buildRequestBuffer - many headers" {
-    var buffer: [4096]u8 = undefined;
-
-    var request = Request{
-        .method = .GET,
-        .path = "/test",
-        .version = .@"HTTP/1.1",
-        .headers = .{},
-    };
-
-    // Add many headers
-    try request.headers.put("Host", "example.com");
-    try request.headers.put("Accept", "application/json");
-    try request.headers.put("Accept-Language", "en-US");
-    try request.headers.put("Accept-Encoding", "gzip, deflate");
-    try request.headers.put("Cache-Control", "no-cache");
-    try request.headers.put("Content-Type", "application/json");
-    try request.headers.put("User-Agent", "serval-test/1.0");
-    try request.headers.put("X-Request-Id", "abc-123-def-456");
-    try request.headers.put("Authorization", "Bearer token12345");
-    try request.headers.put("X-Forwarded-For", "192.168.1.1");
-
-    const len = buildRequestBuffer(&buffer, &request, null).?;
-
-    // Verify all headers are present
-    const output = buffer[0..len];
-    try std.testing.expect(std.mem.indexOf(u8, output, "Host: example.com\r\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "Accept: application/json\r\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "User-Agent: serval-test/1.0\r\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "Authorization: Bearer token12345\r\n") != null);
-
-    // Verify proper termination
-    try std.testing.expect(std.mem.endsWith(u8, output, "\r\n\r\n"));
-}
-
-test "buildRequestBuffer - long header value" {
-    var buffer: [2048]u8 = undefined;
-
-    var request = Request{
-        .method = .GET,
-        .path = "/test",
-        .version = .@"HTTP/1.1",
-        .headers = .{},
-    };
-
-    const long_value = "x" ** 500; // 500 character value
-    try request.headers.put("Host", "example.com");
-    try request.headers.put("X-Long-Value", long_value);
-
-    const len = buildRequestBuffer(&buffer, &request, null).?;
-
-    // Verify long value is preserved
-    const output = buffer[0..len];
-    try std.testing.expect(std.mem.indexOf(u8, output, long_value) != null);
-}
-
-test "buildRequestBuffer - OPTIONS * request" {
-    var buffer: [512]u8 = undefined;
-
-    var request = Request{
-        .method = .OPTIONS,
-        .path = "*",
-        .version = .@"HTTP/1.1",
-        .headers = .{},
-    };
-    try request.headers.put("Host", "example.com");
-
-    const len = buildRequestBuffer(&buffer, &request, null).?;
-
-    // OPTIONS * HTTP/1.1 is valid (asterisk-form)
-    try std.testing.expect(std.mem.indexOf(u8, buffer[0..len], "OPTIONS * HTTP/1.1\r\n") != null);
-}
-
-test "buildRequestBuffer - CRLF termination" {
-    var buffer: [1024]u8 = undefined;
-
-    var request = Request{
-        .method = .GET,
-        .path = "/test",
-        .version = .@"HTTP/1.1",
-        .headers = .{},
-    };
-    try request.headers.put("Host", "example.com");
-    try request.headers.put("Accept", "text/html");
-
-    const len = buildRequestBuffer(&buffer, &request, null).?;
-    const output = buffer[0..len];
-
-    // Each line ends with CRLF
-    var line_count: u32 = 0;
-    var i: usize = 0;
-    while (i + 1 < output.len) : (i += 1) {
-        if (output[i] == '\r' and output[i + 1] == '\n') {
-            line_count += 1;
-            i += 1; // Skip the \n
-        }
-    }
-
-    // Request line + 2 headers + Via header + empty line terminator = 5 CRLFs
-    try std.testing.expectEqual(@as(u32, 5), line_count);
-
-    // Ends with double CRLF
-    try std.testing.expect(std.mem.endsWith(u8, output, "\r\n\r\n"));
-}
-
-test "buildRequestBuffer - Via header always added" {
-    var buffer: [1024]u8 = undefined;
-
-    const methods = [_]Method{ .GET, .POST, .PUT, .DELETE, .PATCH };
-
-    for (methods) |method| {
-        var request = Request{
-            .method = method,
-            .path = "/test",
-            .version = .@"HTTP/1.1",
-            .headers = .{},
-        };
-        try request.headers.put("Host", "example.com");
-
-        const len = buildRequestBuffer(&buffer, &request, null).?;
-
-        // Via header should always be present
-        try std.testing.expect(std.mem.indexOf(u8, buffer[0..len], "Via: 1.1 serval\r\n") != null);
-
-        // Reset headers for next iteration
-        request.headers.reset();
-    }
-}
-
-test "buildRequestBuffer - preserves header order except hop-by-hop" {
-    var buffer: [2048]u8 = undefined;
-
-    var request = Request{
-        .method = .GET,
-        .path = "/test",
-        .version = .@"HTTP/1.1",
-        .headers = .{},
-    };
-    try request.headers.put("Host", "example.com");
-    try request.headers.put("Connection", "keep-alive"); // filtered
-    try request.headers.put("Accept", "text/html");
-    try request.headers.put("User-Agent", "test");
-    try request.headers.put("Transfer-Encoding", "chunked"); // filtered
-
-    const len = buildRequestBuffer(&buffer, &request, null).?;
-    const output = buffer[0..len];
-
-    // Find positions of preserved headers
-    const host_pos = std.mem.indexOf(u8, output, "Host:").?;
-    const accept_pos = std.mem.indexOf(u8, output, "Accept:").?;
-    const user_agent_pos = std.mem.indexOf(u8, output, "User-Agent:").?;
-
-    // Order should be preserved: Host < Accept < User-Agent
-    try std.testing.expect(host_pos < accept_pos);
-    try std.testing.expect(accept_pos < user_agent_pos);
-
-    // Via header comes after all request headers
-    const via_pos = std.mem.indexOf(u8, output, "Via:").?;
-    try std.testing.expect(user_agent_pos < via_pos);
-}
-
-test "VIA_HEADER constant format" {
-    // Verify Via header format per RFC 7230 Section 5.7.1
-    try std.testing.expectEqualStrings("Via: 1.1 serval\r\n", VIA_HEADER);
 }
 
 test "buildRequestBuffer - effective_path overrides request.path" {
@@ -727,4 +405,9 @@ test "buildRequestBuffer - null effective_path uses request.path" {
 
     // Verify original path is used
     try std.testing.expect(std.mem.indexOf(u8, buffer[0..len], "GET /original/path HTTP/1.1\r\n") != null);
+}
+
+test "VIA_HEADER constant format" {
+    // Verify Via header format per RFC 7230 Section 5.7.1
+    try std.testing.expectEqualStrings("Via: 1.1 serval\r\n", VIA_HEADER);
 }

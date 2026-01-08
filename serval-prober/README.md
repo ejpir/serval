@@ -4,7 +4,7 @@ Background health probing for backend upstreams.
 
 ## Purpose
 
-Active health checking module that runs HTTP/HTTPS GET probes against unhealthy backends in a background thread. Supports both plain HTTP and TLS-encrypted HTTPS backends. Used by load balancers and routers to detect when failed backends recover.
+Active health checking module that runs HTTP/HTTPS GET probes against unhealthy backends in a background thread. Uses serval-client for HTTP/HTTPS health probes. Supports both plain HTTP and TLS-encrypted HTTPS backends. Used by load balancers and routers to detect when failed backends recover.
 
 ## Exports
 
@@ -76,22 +76,18 @@ Active probing only targets unhealthy backends - healthy ones get passive checks
 
 ### Probe Protocol
 
-**Plain HTTP (upstream.tls = false):**
-1. TCP connect with timeout
-2. Send `GET {health_path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n`
-3. Read response, check for `2xx` status
+The prober uses `serval-client.Client` for HTTP requests. DNS resolution, TCP connection, and TLS handshake are all handled by serval-client. The prober simply:
+
+1. Build a `Request` struct with the health path and Host header
+2. Call `client.request()` to perform the probe
+3. Check for `2xx` status in the response
 4. On success, call `health.recordSuccess(idx)`
 
-**HTTPS (upstream.tls = true):**
-1. TCP connect with timeout
-2. TLS handshake with SNI (Server Name Indication) set to upstream.host
-3. Send `GET {health_path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n` over TLS
-4. Read TLS-encrypted response, check for `2xx` status
-5. On success, call `health.recordSuccess(idx)`
+For HTTPS upstreams (upstream.tls = true), serval-client automatically performs TLS handshake with SNI set to the upstream host.
 
 ### Blocking I/O
 
-Uses blocking sockets with `SO_RCVTIMEO`/`SO_SNDTIMEO` timeouts. This is intentional:
+Uses blocking I/O via serval-client. This is intentional:
 - Background thread, not on hot path
 - Simple, predictable behavior
 - No async machinery needed
@@ -106,12 +102,13 @@ serval-prober/
 
 ## Dependencies
 
-- `serval-core` - Upstream type, config
-- `serval-net` - Socket abstraction for TCP connections
-- `serval-health` - HealthState for recording results
-- `serval-tls` - TLS client handshake for HTTPS probes
+| Module | Purpose |
+|--------|---------|
+| serval-core | Upstream type, config |
+| serval-client | HTTP/1.1 client for probes |
+| serval-health | HealthState for recording results |
 
-**Note:** Requires linking OpenSSL/LibreSSL (`-lssl -lcrypto`).
+**Note:** serval-client handles DNS resolution, TCP connections, and TLS handshakes internally. Requires linking OpenSSL/LibreSSL (`-lssl -lcrypto`) for TLS support.
 
 ## TigerStyle Compliance
 

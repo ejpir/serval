@@ -196,6 +196,40 @@ serval-router/
 └── types.zig   # Route, RouteMatcher, PathMatch, PoolConfig
 ```
 
+## Kubernetes Deployment
+
+Deploy as a standalone data plane with hardcoded routes:
+
+```bash
+# Build and deploy
+zig build build-router-example
+./deploy/build-and-load.sh router
+sudo kubectl apply -f deploy/serval-router.yaml
+
+# Check status
+sudo kubectl get pods -l app=serval-router
+sudo kubectl logs -l app=serval-router
+
+# Test routing (NodePort)
+curl http://localhost:31588/api/users    # -> /users (stripped)
+curl http://localhost:31588/static/img   # -> /img (stripped)
+curl http://localhost:31588/other        # -> /other (default)
+```
+
+Configure backends via CLI args in `deploy/serval-router.yaml`:
+
+```yaml
+args:
+  - "--port"
+  - "8080"
+  - "--api-backends"
+  - "my-api-service:8080"
+  - "--static-backends"
+  - "my-static-service:8080"
+```
+
+See `deploy/README.md` for full deployment commands.
+
 ## Implementation Status
 
 | Feature | Status |
@@ -238,3 +272,43 @@ serval-router/
 - **Regex path matching**: Full regex support for complex path patterns
 - **Method matching**: Route based on HTTP method (GET, POST, etc.)
 - **Priority/weight**: Explicit route priority instead of first-match
+
+
+Commits made (7 total):
+
+1. feat(serval-core): add rewritten_path field to Context
+2. docs: add serval-router design plan
+3. docs: add Gateway API alignment section
+4. feat(serval-router): add content-based routing module
+5. feat(serval-proxy): add path rewriting support via effective_path
+6. fix(serval-router): fix onLog index mismatch for health tracking
+7. feat(examples): add router_example demonstrating content-based routing
+
+Testing:
+
+zig build test-router     # 23 unit tests pass
+zig build run-router-example  # Integration test verified
+
+How to test manually:
+
+# Terminal 1: Start API backend
+zig build run-echo-backend -- --port 8001 --id "api"
+
+# Terminal 2: Start static backend
+zig build run-echo-backend -- --port 8002 --id "static"
+
+# Terminal 3: Start router
+zig build run-router-example -- --port 8080
+
+# Terminal 4: Test routing
+curl http://localhost:8080/api/users      # -> api:8001, path: /users
+curl http://localhost:8080/static/img.png # -> static:8002, path: /img.png
+curl http://localhost:8080/other          # -> api:8001, path: /other
+
+Ready for serval-gateway
+
+The router provides the foundation needed for Kubernetes Gateway API integration:
+- Path prefix/exact matching ✅
+- Host matching ✅
+- Path rewriting (strip prefix) ✅
+- Per-pool health-aware load balancing ✅

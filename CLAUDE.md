@@ -236,6 +236,7 @@
   <module name="serval-otel" path="serval-otel/">OpenTelemetry implementation (OTLP/JSON export)</module>
   <module name="serval-health" path="serval-health/">Health tracking (atomic bitmap, thresholds)</module>
   <module name="serval-prober" path="serval-prober/">Background health probing (HTTP/HTTPS)</module>
+  <module name="serval-client" path="serval-client/">HTTP/1.1 client (DNS, TCP, TLS, request/response)</module>
   <module name="serval-lb" path="serval-lb/">Load balancer handler (round-robin)</module>
   <module name="serval-router" path="serval-router/">Content-based routing with per-pool load balancing</module>
   <module name="serval-server" path="serval-server/">HTTP server with connection handling and hooks</module>
@@ -272,6 +273,7 @@
       <module>serval-otel</module>
       <module>serval-health</module>
       <module>serval-prober</module>
+      <module>serval-client</module>
       <module status="future">serval-cache</module>
       <module status="future">serval-waf</module>
       <module status="future">serval-ratelimit</module>
@@ -282,7 +284,8 @@
         serval-tracing: Interface for distributed tracing (implemented)
         serval-otel: OpenTelemetry with OTLP/JSON export and batching (implemented)
         serval-health: Threshold-based health tracking with atomic bitmap (implemented)
-        serval-prober: Background HTTP/HTTPS health probing for unhealthy backends (implemented)
+        serval-prober: Background HTTP/HTTPS health probing using serval-client (implemented)
+        serval-client: HTTP/1.1 client for upstream connections (implemented)
         serval-cache: Cache storage and lookup (keys, TTL, eviction) - policy via handler hooks (future)
         serval-waf: Rule engine for threat detection (SQLi, XSS, etc.) - blocking via handler hooks (future)
         serval-ratelimit: Token bucket / sliding window rate limiting - keyed by IP, path, header (future)
@@ -292,7 +295,7 @@
       <module>serval-proxy</module>
       <responsibility>HOW to forward - network I/O, connection mgmt, timing</responsibility>
       <notes>
-        serval-proxy: Async upstream forwarding with splice zero-copy, TLS support (implemented)
+        serval-proxy: Async upstream forwarding with splice zero-copy, delegates to serval-client for HTTP (implemented)
       </notes>
     </layer>
     <layer level="4" name="strategy">

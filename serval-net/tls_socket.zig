@@ -43,6 +43,17 @@ pub const TLSSocket = struct {
         ctx: *ssl.SSL_CTX,
         host: []const u8,
     ) SocketError!Socket {
+        return initClientWithOptions(fd, ctx, host, true);
+    }
+
+    /// Create client TLS socket with SNI and kTLS control.
+    /// enable_ktls: If true, attempt kernel TLS offload (default). If false, use userspace TLS.
+    pub fn initClientWithOptions(
+        fd: i32,
+        ctx: *ssl.SSL_CTX,
+        host: []const u8,
+        enable_ktls: bool,
+    ) SocketError!Socket {
         // S1: preconditions
         assert(fd >= 0); // S1: valid fd
         assert(@intFromPtr(ctx) != 0); // S1: valid ctx pointer
@@ -65,6 +76,7 @@ pub const TLSSocket = struct {
             fd,
             sni_z,
             std.heap.page_allocator,
+            enable_ktls,
         ) catch |err| {
             return mapTlsError(err);
         };

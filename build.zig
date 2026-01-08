@@ -77,7 +77,28 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // Proxy module - depends on core, net, pool, tracing, http, tls
+    // Health module - depends on core
+    const serval_health_module = b.addModule("serval-health", .{
+        .root_source_file = b.path("serval-health/mod.zig"),
+        .imports = &.{
+            .{ .name = "serval-core", .module = serval_core_module },
+        },
+    });
+
+    // Client module - depends on core, http, net, pool, tls (Layer 3 - Mechanics)
+    // HTTP/1.1 client for making requests to upstream servers
+    const serval_client_module = b.addModule("serval-client", .{
+        .root_source_file = b.path("serval-client/mod.zig"),
+        .imports = &.{
+            .{ .name = "serval-core", .module = serval_core_module },
+            .{ .name = "serval-http", .module = serval_http_module },
+            .{ .name = "serval-net", .module = serval_net_module },
+            .{ .name = "serval-pool", .module = serval_pool_module },
+            .{ .name = "serval-tls", .module = serval_tls_module },
+        },
+    });
+
+    // Proxy module - depends on core, net, pool, tracing, http, tls, client
     const serval_proxy_module = b.addModule("serval-proxy", .{
         .root_source_file = b.path("serval-proxy/mod.zig"),
         .imports = &.{
@@ -87,6 +108,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "serval-tracing", .module = serval_tracing_module },
             .{ .name = "serval-http", .module = serval_http_module },
             .{ .name = "serval-tls", .module = serval_tls_module },
+            .{ .name = "serval-client", .module = serval_client_module },
         },
     });
 
@@ -105,15 +127,7 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // Health module - depends on core
-    const serval_health_module = b.addModule("serval-health", .{
-        .root_source_file = b.path("serval-health/mod.zig"),
-        .imports = &.{
-            .{ .name = "serval-core", .module = serval_core_module },
-        },
-    });
-
-    // Prober module - depends on core, net, health, tls
+    // Prober module - depends on core, net, health, tls, client
     const serval_prober_module = b.addModule("serval-prober", .{
         .root_source_file = b.path("serval-prober/mod.zig"),
         .imports = &.{
@@ -121,30 +135,47 @@ pub fn build(b: *std.Build) void {
             .{ .name = "serval-net", .module = serval_net_module },
             .{ .name = "serval-health", .module = serval_health_module },
             .{ .name = "serval-tls", .module = serval_tls_module },
+            .{ .name = "serval-client", .module = serval_client_module },
         },
     });
 
-    // Load balancer handler module - depends on core, health, prober, tls
+    // Load balancer handler module - depends on core, health, prober, tls, net
     const serval_lb_module = b.addModule("serval-lb", .{
         .root_source_file = b.path("serval-lb/mod.zig"),
         .imports = &.{
             .{ .name = "serval-core", .module = serval_core_module },
+            .{ .name = "serval-net", .module = serval_net_module },
             .{ .name = "serval-health", .module = serval_health_module },
             .{ .name = "serval-prober", .module = serval_prober_module },
             .{ .name = "serval-tls", .module = serval_tls_module },
         },
     });
 
-    // Router module - depends on core, lb, health, prober, tls (Layer 4 - Strategy)
+    // Router module - depends on core, lb, health, prober, tls, net (Layer 4 - Strategy)
     // Note: Not yet added to umbrella module - will be integrated when feature is complete
     const serval_router_module = b.addModule("serval-router", .{
         .root_source_file = b.path("serval-router/mod.zig"),
         .imports = &.{
             .{ .name = "serval-core", .module = serval_core_module },
+            .{ .name = "serval-net", .module = serval_net_module },
             .{ .name = "serval-lb", .module = serval_lb_module },
             .{ .name = "serval-health", .module = serval_health_module },
             .{ .name = "serval-prober", .module = serval_prober_module },
             .{ .name = "serval-tls", .module = serval_tls_module },
+        },
+    });
+
+    // Gateway module - depends on router, core, server, net, tls, client, pool (Layer 5 - Orchestration)
+    const serval_gateway_module = b.addModule("serval-gateway", .{
+        .root_source_file = b.path("serval-gateway/mod.zig"),
+        .imports = &.{
+            .{ .name = "serval-core", .module = serval_core_module },
+            .{ .name = "serval-router", .module = serval_router_module },
+            .{ .name = "serval-server", .module = serval_server_module },
+            .{ .name = "serval-net", .module = serval_net_module },
+            .{ .name = "serval-tls", .module = serval_tls_module },
+            .{ .name = "serval-client", .module = serval_client_module },
+            .{ .name = "serval-pool", .module = serval_pool_module },
         },
     });
 
@@ -187,6 +218,7 @@ pub fn build(b: *std.Build) void {
     serval_tests_mod.addImport("serval-tracing", serval_tracing_module);
     serval_tests_mod.addImport("serval-otel", serval_otel_module);
     serval_tests_mod.addImport("serval-server", serval_server_module);
+    serval_tests_mod.addImport("serval-client", serval_client_module);
     const serval_tests = b.addTest(.{
         .name = "serval_tests",
         .root_module = serval_tests_mod,
@@ -198,6 +230,7 @@ pub fn build(b: *std.Build) void {
 
     // Load balancer handler tests
     // Note: Links SSL libraries since serval-prober and serval-lb now depend on serval-tls
+    // serval-prober depends on serval-client which depends on http, pool
     const lb_tests_mod = b.createModule(.{
         .root_source_file = b.path("serval-lb/mod.zig"),
         .target = target,
@@ -210,6 +243,10 @@ pub fn build(b: *std.Build) void {
     lb_tests_mod.addImport("serval-health", serval_health_module);
     lb_tests_mod.addImport("serval-prober", serval_prober_module);
     lb_tests_mod.addImport("serval-tls", serval_tls_module);
+    lb_tests_mod.addImport("serval-http", serval_http_module);
+    lb_tests_mod.addImport("serval-pool", serval_pool_module);
+    lb_tests_mod.addImport("serval-net", serval_net_module);
+    lb_tests_mod.addImport("serval-client", serval_client_module);
     const lb_tests = b.addTest(.{
         .name = "lb_tests",
         .root_module = lb_tests_mod,
@@ -221,6 +258,7 @@ pub fn build(b: *std.Build) void {
 
     // Router module tests
     // Note: Links SSL libraries since serval-router depends on serval-lb/prober which depend on serval-tls
+    // serval-prober depends on serval-client which depends on http, pool
     const router_tests_mod = b.createModule(.{
         .root_source_file = b.path("serval-router/mod.zig"),
         .target = target,
@@ -234,6 +272,10 @@ pub fn build(b: *std.Build) void {
     router_tests_mod.addImport("serval-health", serval_health_module);
     router_tests_mod.addImport("serval-prober", serval_prober_module);
     router_tests_mod.addImport("serval-tls", serval_tls_module);
+    router_tests_mod.addImport("serval-http", serval_http_module);
+    router_tests_mod.addImport("serval-pool", serval_pool_module);
+    router_tests_mod.addImport("serval-net", serval_net_module);
+    router_tests_mod.addImport("serval-client", serval_client_module);
     const router_tests = b.addTest(.{
         .name = "router_tests",
         .root_module = router_tests_mod,
@@ -242,6 +284,37 @@ pub fn build(b: *std.Build) void {
 
     const router_test_step = b.step("test-router", "Run serval-router library tests");
     router_test_step.dependOn(&run_router_tests.step);
+
+    // Gateway module tests
+    // Note: Links SSL libraries since serval-gateway depends on serval-server/router which depend on serval-tls
+    // serval-router -> serval-prober -> serval-client dependencies
+    const gateway_tests_mod = b.createModule(.{
+        .root_source_file = b.path("serval-gateway/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    gateway_tests_mod.linkSystemLibrary("ssl", .{});
+    gateway_tests_mod.linkSystemLibrary("crypto", .{});
+    gateway_tests_mod.addImport("serval-core", serval_core_module);
+    gateway_tests_mod.addImport("serval-router", serval_router_module);
+    gateway_tests_mod.addImport("serval-server", serval_server_module);
+    gateway_tests_mod.addImport("serval-tls", serval_tls_module);
+    gateway_tests_mod.addImport("serval-http", serval_http_module);
+    gateway_tests_mod.addImport("serval-pool", serval_pool_module);
+    gateway_tests_mod.addImport("serval-net", serval_net_module);
+    gateway_tests_mod.addImport("serval-client", serval_client_module);
+    gateway_tests_mod.addImport("serval-lb", serval_lb_module);
+    gateway_tests_mod.addImport("serval-health", serval_health_module);
+    gateway_tests_mod.addImport("serval-prober", serval_prober_module);
+    const gateway_tests = b.addTest(.{
+        .name = "gateway_tests",
+        .root_module = gateway_tests_mod,
+    });
+    const run_gateway_tests = b.addRunArtifact(gateway_tests);
+
+    const gateway_test_step = b.step("test-gateway", "Run serval-gateway library tests");
+    gateway_test_step.dependOn(&run_gateway_tests.step);
 
     // Health module tests
     const health_tests_mod = b.createModule(.{
@@ -318,6 +391,30 @@ pub fn build(b: *std.Build) void {
     const otel_test_step = b.step("test-otel", "Run serval-otel library tests");
     otel_test_step.dependOn(&run_otel_tests.step);
 
+    // Client module tests
+    // Note: Links SSL libraries since serval-client depends on serval-tls
+    const client_tests_mod = b.createModule(.{
+        .root_source_file = b.path("serval-client/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    client_tests_mod.linkSystemLibrary("ssl", .{});
+    client_tests_mod.linkSystemLibrary("crypto", .{});
+    client_tests_mod.addImport("serval-core", serval_core_module);
+    client_tests_mod.addImport("serval-http", serval_http_module);
+    client_tests_mod.addImport("serval-net", serval_net_module);
+    client_tests_mod.addImport("serval-pool", serval_pool_module);
+    client_tests_mod.addImport("serval-tls", serval_tls_module);
+    const client_tests = b.addTest(.{
+        .name = "client_tests",
+        .root_module = client_tests_mod,
+    });
+    const run_client_tests = b.addRunArtifact(client_tests);
+
+    const client_test_step = b.step("test-client", "Run serval-client library tests");
+    client_test_step.dependOn(&run_client_tests.step);
+
     // =========================================================================
     // Examples
     // =========================================================================
@@ -384,15 +481,46 @@ pub fn build(b: *std.Build) void {
         .root_module = router_example_mod,
     });
     const build_router_example = b.addInstallArtifact(router_example, .{});
-    _ = build_router_example;
     const run_router_example = b.addRunArtifact(router_example);
 
     if (b.args) |args| {
         run_router_example.addArgs(args);
     }
 
+    const build_router_example_step = b.step("build-router-example", "Build router example");
+    build_router_example_step.dependOn(&build_router_example.step);
+
     const run_router_example_step = b.step("run-router-example", "Run router example");
     run_router_example_step.dependOn(&run_router_example.step);
+
+    // Gateway example (Kubernetes Gateway API controller)
+    // Note: Links SSL libraries since serval-gateway depends on serval-server which depends on serval-tls
+    const gateway_example_mod = b.createModule(.{
+        .root_source_file = b.path("examples/gateway_example.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    gateway_example_mod.linkSystemLibrary("ssl", .{});
+    gateway_example_mod.linkSystemLibrary("crypto", .{});
+    gateway_example_mod.addImport("serval-gateway", serval_gateway_module);
+    gateway_example_mod.addImport("serval-cli", serval_cli_module);
+    const gateway_example = b.addExecutable(.{
+        .name = "gateway_example",
+        .root_module = gateway_example_mod,
+    });
+    const build_gateway_example = b.addInstallArtifact(gateway_example, .{});
+    const run_gateway_example = b.addRunArtifact(gateway_example);
+
+    if (b.args) |args| {
+        run_gateway_example.addArgs(args);
+    }
+
+    const build_gateway_example_step = b.step("build-gateway-example", "Build gateway example");
+    build_gateway_example_step.dependOn(&build_gateway_example.step);
+
+    const run_gateway_example_step = b.step("run-gateway-example", "Run gateway example");
+    run_gateway_example_step.dependOn(&run_gateway_example.step);
 
     // Echo backend example (for testing load balancer)
     // Note: Links SSL libraries since serval depends on serval-server which depends on serval-tls

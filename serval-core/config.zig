@@ -214,6 +214,22 @@ pub const DNS_DEFAULT_TTL_NS: u64 = 60 * std.time.ns_per_s;
 pub const DNS_TIMEOUT_NS: u64 = 5 * std.time.ns_per_s;
 
 // =============================================================================
+// HTTP Client
+// =============================================================================
+
+/// Client connection timeout in nanoseconds.
+/// TigerStyle: u64 nanoseconds, 5 seconds default.
+pub const CLIENT_CONNECT_TIMEOUT_NS: u64 = 5 * std.time.ns_per_s;
+
+/// Client read timeout in nanoseconds.
+/// TigerStyle: u64 nanoseconds, 30 seconds default.
+pub const CLIENT_READ_TIMEOUT_NS: u64 = 30 * std.time.ns_per_s;
+
+/// Client write timeout in nanoseconds.
+/// TigerStyle: u64 nanoseconds, 30 seconds default.
+pub const CLIENT_WRITE_TIMEOUT_NS: u64 = 30 * std.time.ns_per_s;
+
+// =============================================================================
 // Runtime Configuration
 // =============================================================================
 

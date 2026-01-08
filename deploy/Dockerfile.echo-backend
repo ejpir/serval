@@ -1,0 +1,21 @@
+# Echo backend container image
+# Build: docker build -f deploy/Dockerfile.echo-backend -t echo-backend:latest .
+FROM debian:bookworm-slim
+
+# Install OpenSSL runtime (required by serval TLS)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libssl3 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy the pre-built binary (built with zig build build-echo-backend)
+COPY zig-out/bin/echo_backend /usr/local/bin/echo_backend
+
+# Run as non-root
+RUN useradd -u 1000 -m serval
+USER serval
+
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/local/bin/echo_backend"]
+CMD ["--port", "8080"]
