@@ -39,6 +39,7 @@ serval (umbrella - re-exports all modules)
 
 Standalone modules:
 ├── serval-lb       # Load balancer handler (round-robin)
+├── serval-router   # Content-based router (host/path matching, per-pool LB)
 └── serval-cli      # CLI argument parsing utilities
 ```
 
@@ -110,6 +111,7 @@ Layer 5 (Orchestration):                                    │      │
 
 Standalone:
   serval-core ←── serval-lb (load balancer handler, depends on serval-health, serval-prober)
+  serval-core ←── serval-router (content-based router, depends on serval-lb, serval-health, serval-prober)
   serval-core ←── serval-cli (CLI utilities)
 ```
 
@@ -129,6 +131,7 @@ Standalone:
 | serval-otel | OpenTelemetry tracing | `Tracer`, `Span`, `OTLPExporter`, `BatchingProcessor` |
 | serval-server | HTTP/1.1 server | `Server`, `MinimalServer` |
 | serval-lb | Load balancing | `LbHandler` (health-aware round-robin with background probing) |
+| serval-router | Content-based routing | `Router`, `Route`, `RouteMatcher`, `PathMatch`, `PoolConfig` |
 | serval-cli | CLI argument parsing | `Args`, `ParseResult`, comptime generics |
 
 ---
@@ -324,6 +327,54 @@ var server = serval.Server(
 
 var shutdown = std.atomic.Value(bool).init(false);
 try server.run(io, &shutdown);
+```
+
+### Content-Based Routing with Multiple Pools
+
+```zig
+const serval = @import("serval");
+const serval_router = @import("serval-router");
+const serval_net = @import("serval-net");
+
+const Router = serval_router.Router;
+const Route = serval_router.Route;
+const PoolConfig = serval_router.PoolConfig;
+
+// Define upstreams for each pool
+const api_upstreams = [_]serval.Upstream{
+    .{ .host = "api-1", .port = 8001, .idx = 0 },
+    .{ .host = "api-2", .port = 8002, .idx = 1 },
+};
+const static_upstreams = [_]serval.Upstream{
+    .{ .host = "static-1", .port = 9001, .idx = 2 },
+};
+
+// Define routes (first match wins)
+const routes = [_]Route{
+    .{ .name = "api", .matcher = .{ .path = .{ .prefix = "/api/" } }, .pool_idx = 0, .strip_prefix = true },
+    .{ .name = "static", .matcher = .{ .path = .{ .prefix = "/static/" } }, .pool_idx = 1, .strip_prefix = true },
+};
+
+// Required default route
+const default_route = Route{
+    .name = "default",
+    .matcher = .{ .path = .{ .prefix = "/" } },
+    .pool_idx = 0,
+};
+
+// Pool configurations
+const pool_configs = [_]PoolConfig{
+    .{ .name = "api-pool", .upstreams = &api_upstreams, .lb_config = .{ .enable_probing = false } },
+    .{ .name = "static-pool", .upstreams = &static_upstreams, .lb_config = .{ .enable_probing = false } },
+};
+
+var router: Router = undefined;
+try router.init(&routes, default_route, &pool_configs, null);
+defer router.deinit();
+
+// Use router as handler with Server
+var server = serval.Server(Router, serval.SimplePool, serval.NoopMetrics, serval.NoopTracer)
+    .init(&router, &pool, &metrics, &tracer, .{ .port = 8080 }, null, serval_net.DnsConfig{});
 ```
 
 ### Custom Handler with Hooks
@@ -531,6 +582,7 @@ pub const WeightedHandler = struct {
 | Request body streaming | serval-proxy | splice() zero-copy on Linux |
 | Response body streaming | serval-proxy | splice() zero-copy on Linux |
 | Health-aware load balancing | serval-lb | Round-robin with background probing, onLog passive tracking |
+| Content-based routing | serval-router | Host/path matching (exact, prefix), path rewriting (strip prefix), per-pool LbHandler |
 | Handler hooks | serval-server | 10 lifecycle hooks: request phase (onRequest, onRequestBody), upstream phase (onUpstreamRequest, onUpstreamConnect), response phase (onResponse, onResponseBody), error/completion (onError, onLog), connection lifecycle (onConnectionOpen, onConnectionClose) |
 | Metrics interface | serval-metrics | Noop + Prometheus + RealTimeMetrics (per-upstream stats) |
 | Tracing interface | serval-tracing | NoopTracer |
@@ -570,6 +622,12 @@ zig build test-otel
 # Run health module tests
 zig build test-health
 
-# Run example
+# Run router tests
+zig build test-router
+
+# Run load balancer example
 zig build run-lb-example -- --port 8080 --backends 127.0.0.1:9001,127.0.0.1:9002
+
+# Run router example (content-based routing)
+zig build run-router-example -- --port 8080 --api-backends 127.0.0.1:8001 --static-backends 127.0.0.1:8002
 ```

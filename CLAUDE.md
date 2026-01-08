@@ -217,8 +217,10 @@
   <build>zig build</build>
   <test>zig build test</test>
   <test-lb>zig build test-lb</test-lb>
+  <test-router>zig build test-router</test-router>
   <test-health>zig build test-health</test-health>
-  <run-example>zig build run-lb-example</run-example>
+  <run-lb-example>zig build run-lb-example</run-lb-example>
+  <run-router-example>zig build run-router-example</run-router-example>
 </commands>
 
 <architecture>
@@ -235,6 +237,7 @@
   <module name="serval-health" path="serval-health/">Health tracking (atomic bitmap, thresholds)</module>
   <module name="serval-prober" path="serval-prober/">Background health probing (HTTP/HTTPS)</module>
   <module name="serval-lb" path="serval-lb/">Load balancer handler (round-robin)</module>
+  <module name="serval-router" path="serval-router/">Content-based routing with per-pool load balancing</module>
   <module name="serval-server" path="serval-server/">HTTP server with connection handling and hooks</module>
   <module name="serval-cli" path="serval-cli/">CLI argument parsing utilities</module>
 
@@ -294,13 +297,13 @@
     </layer>
     <layer level="4" name="strategy">
       <module>serval-lb</module>
+      <module>serval-router</module>
       <module status="future">serval-forward</module>
-      <module status="future">serval-router</module>
       <responsibility>WHERE/WHICH to forward - routing decisions, upstream selection</responsibility>
       <notes>
         serval-lb: Health-aware round-robin with background probing (implemented)
+        serval-router: Content-based routing with host/path matching, path rewriting, per-pool LB (implemented)
         serval-forward: Simple forwarding handler (future)
-        serval-router: Content-based routing / API gateway (future)
       </notes>
     </layer>
     <layer level="5" name="orchestration">
@@ -372,14 +375,15 @@
         Fallback → if no ALPN, default to HTTP/1.1.
         h2c (cleartext h2) → serval-http detects "PRI * HTTP/2.0" preface, hands off to serval-h2.
       </point>
-      <point trigger="content-based routing / API gateway">
-        Route matching → serval-router (layer 4): path prefix, regex, headers, host, method.
-        Per-pool LB → serval-router composes serval-lb internally for each backend pool.
-        Route config → runtime config or serval-core: route table definition.
-        Fallback route → required (TigerStyle: no implicit behavior, explicit default).
-        Path rewriting → serval-router: strip prefix, add prefix before forwarding.
-        Rate limiting → serval-router or separate serval-ratelimit (layer 2) + handler hook.
-        Auth routing → route to auth service, or reject if auth header missing.
+      <point trigger="content-based routing / API gateway" status="implemented">
+        Route matching → serval-router (layer 4, implemented): path prefix, exact, host matching.
+        Per-pool LB → serval-router composes LbHandler internally for each backend pool (implemented).
+        Route config → compile-time routes (implemented), runtime mutable (future).
+        Fallback route → required default route (implemented, TigerStyle: explicit default).
+        Path rewriting → strip prefix before forwarding (implemented), replace prefix (future).
+        Additional matchers → headers, query params, method, regex (future).
+        Rate limiting → serval-ratelimit (layer 2) + handler hook (future).
+        Auth routing → route to auth service, or reject if auth header missing (future).
       </point>
       <point trigger="WAF / Web Application Firewall">
         Rule engine → serval-waf (layer 2): pattern matching, rule evaluation, threat scoring.
