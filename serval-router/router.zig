@@ -193,9 +193,18 @@ pub const Router = struct {
         // TigerStyle S3: Bounded outer loop (MAX_POOLS)
         for (self.pools) |*pool| {
             // TigerStyle S3: Bounded inner loop (MAX_UPSTREAMS per pool)
-            for (pool.lb_handler.upstreams) |u| {
+            for (pool.lb_handler.upstreams, 0..) |u, local_idx| {
                 if (u.idx == upstream.idx) {
-                    pool.lb_handler.onLog(ctx, entry);
+                    // Create modified entry with local pool index for health tracking.
+                    // The LbHandler uses upstream.idx as the health state index, which
+                    // must be within the pool's backend_count (0..upstreams.len-1).
+                    var local_upstream = u;
+                    local_upstream.idx = @intCast(local_idx);
+
+                    var local_entry = entry;
+                    local_entry.upstream = local_upstream;
+
+                    pool.lb_handler.onLog(ctx, local_entry);
                     return;
                 }
             }
