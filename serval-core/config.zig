@@ -78,6 +78,22 @@ pub const MAX_CONNS_PER_UPSTREAM: u8 = 16;
 pub const MAX_UPSTREAMS: u8 = 64;
 
 // =============================================================================
+// Routing Limits
+// =============================================================================
+
+/// Maximum number of backend pools in Router.
+/// TigerStyle: Bounded array, explicit limit.
+pub const MAX_POOLS: u8 = 64;
+
+/// Maximum number of routes in Router (excluding default route).
+/// TigerStyle: Bounded array, explicit limit.
+pub const MAX_ROUTES: u8 = 128;
+
+/// Maximum upstreams per pool.
+/// TigerStyle: Bounded array per pool.
+pub const MAX_UPSTREAMS_PER_POOL: u8 = 64;
+
+// =============================================================================
 // Type Aliases for Bounds (TigerStyle: Single source of truth)
 // =============================================================================
 

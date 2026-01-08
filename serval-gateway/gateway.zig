@@ -15,7 +15,9 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const posix = std.posix;
-const config = @import("config.zig");
+const core = @import("serval-core");
+const core_config = core.config;
+const gateway_config = @import("config.zig");
 const resolver_mod = @import("resolver.zig");
 const Resolver = resolver_mod.Resolver;
 
@@ -48,14 +50,10 @@ const MAX_ACCEPT_ITERATIONS: u32 = 100;
 /// Allows in-flight requests using old config to complete.
 const CONFIG_SWAP_GRACE_MS: u64 = 1000;
 
-/// Maximum number of routes in translated config.
-pub const MAX_ROUTES: u8 = 128;
-
-/// Maximum number of pools in translated config.
-pub const MAX_POOLS: u8 = 64;
-
-/// Maximum upstreams per pool.
-pub const MAX_UPSTREAMS_PER_POOL: u8 = 64;
+// Re-export routing limits from core config (single source of truth).
+pub const MAX_ROUTES = core_config.MAX_ROUTES;
+pub const MAX_POOLS = core_config.MAX_POOLS;
+pub const MAX_UPSTREAMS_PER_POOL = core_config.MAX_UPSTREAMS_PER_POOL;
 
 // ============================================================================
 // Error Types
@@ -250,7 +248,7 @@ pub const Gateway = struct {
     ///
     /// Performs atomic swap - old config cleaned up after grace period.
     /// Thread-safe: can be called from watcher thread while admin serves requests.
-    pub fn updateConfig(self: *Self, gateway_config: *const config.GatewayConfig) GatewayError!void {
+    pub fn updateConfig(self: *Self, gateway_config: *const gateway_config.GatewayConfig) GatewayError!void {
         // Preconditions
         assert(gateway_config.gateways.len > 0 or gateway_config.http_routes.len > 0);
 
@@ -571,14 +569,14 @@ fn http405() []const u8 {
 ///
 /// TigerStyle: Bounded loops, explicit error handling, no allocation.
 pub fn translateToRoutes(
-    gateway_config: *const config.GatewayConfig,
+    gateway_config: *const gateway_config.GatewayConfig,
     resolver: *const Resolver,
     out: *TranslatedConfig,
     generation: u64,
 ) GatewayError!void {
     // Preconditions
-    assert(gateway_config.gateways.len <= config.MAX_GATEWAYS);
-    assert(gateway_config.http_routes.len <= config.MAX_HTTP_ROUTES);
+    assert(gateway_config.gateways.len <= gateway_config.MAX_GATEWAYS);
+    assert(gateway_config.http_routes.len <= gateway_config.MAX_HTTP_ROUTES);
 
     // Initialize output
     out.route_count = 0;
@@ -613,7 +611,7 @@ pub fn translateToRoutes(
 ///
 /// Returns updated route_idx after processing all rules and matches.
 fn processHTTPRoute(
-    http_route: config.HTTPRoute,
+    http_route: gateway_config.HTTPRoute,
     resolver: *const Resolver,
     out: *TranslatedConfig,
     start_route_idx: u8,
@@ -667,7 +665,7 @@ fn processHTTPRoute(
 /// Populates out.upstream_storage[pool_idx] with resolved endpoints.
 /// Returns the number of upstreams added.
 fn resolveBackendRefs(
-    backend_refs: []const config.BackendRef,
+    backend_refs: []const gateway_config.BackendRef,
     resolver: *const Resolver,
     out: *TranslatedConfig,
     pool_idx: u8,
@@ -691,7 +689,7 @@ fn resolveBackendRefs(
         }
 
         // Get endpoints from resolver
-        var endpoints: [resolver_mod.MAX_ENDPOINTS_PER_SERVICE]config.ResolvedEndpoint = undefined;
+        var endpoints: [resolver_mod.MAX_ENDPOINTS_PER_SERVICE]gateway_config.ResolvedEndpoint = undefined;
         const ep_count = resolver.getServiceEndpoints(
             backend_ref.name,
             backend_ref.namespace,
@@ -722,8 +720,8 @@ fn resolveBackendRefs(
 /// Creates one route per match, or a catch-all if no matches defined.
 /// Returns updated route_idx after processing.
 fn createRoutesFromMatches(
-    http_route: config.HTTPRoute,
-    rule: config.HTTPRouteRule,
+    http_route: gateway_config.HTTPRoute,
+    rule: gateway_gateway_config.HTTPRouteRule,
     out: *TranslatedConfig,
     pool_idx: u8,
     start_route_idx: u8,
@@ -767,7 +765,7 @@ fn createRoutesFromMatches(
 fn createRouteFromMatch(
     name: []const u8,
     host: ?[]const u8,
-    match: config.HTTPRouteMatch,
+    match: gateway_gateway_config.HTTPRouteMatch,
     pool_idx: u8,
     strip_prefix: bool,
 ) Route {
@@ -786,7 +784,7 @@ fn createRouteFromMatch(
 }
 
 /// Check if any filter has a URL rewrite path configured.
-fn hasUrlRewriteFilter(filters: []const config.HTTPRouteFilter) bool {
+fn hasUrlRewriteFilter(filters: []const gateway_gateway_config.HTTPRouteFilter) bool {
     for (filters) |filter| {
         if (filter.type == .URLRewrite) {
             if (filter.url_rewrite) |rewrite| {
@@ -861,7 +859,7 @@ test "TranslatedConfig getPools" {
 }
 
 test "translateToRoutes empty config" {
-    const gateway_config = config.GatewayConfig{
+    const gateway_config = gateway_config.GatewayConfig{
         .gateways = &.{},
         .http_routes = &.{},
     };
@@ -878,20 +876,20 @@ test "translateToRoutes empty config" {
 
 test "translateToRoutes with HTTPRoute no backends" {
     // HTTPRoute with rules but no resolvable backends
-    var matches = [_]config.HTTPRouteMatch{
+    var matches = [_]gateway_gateway_config.HTTPRouteMatch{
         .{ .path = .{ .type = .PathPrefix, .value = "/api/" } },
     };
-    var backend_refs = [_]config.BackendRef{
+    var backend_refs = [_]gateway_config.BackendRef{
         .{ .name = "nonexistent", .namespace = "default", .port = 8080 },
     };
-    var rules = [_]config.HTTPRouteRule{
+    var rules = [_]gateway_gateway_config.HTTPRouteRule{
         .{
             .matches = &matches,
             .filters = &.{},
             .backend_refs = &backend_refs,
         },
     };
-    var http_routes = [_]config.HTTPRoute{
+    var http_routes = [_]gateway_config.HTTPRoute{
         .{
             .name = "test-route",
             .namespace = "default",
@@ -900,7 +898,7 @@ test "translateToRoutes with HTTPRoute no backends" {
         },
     };
 
-    const gateway_config = config.GatewayConfig{
+    const gateway_config = gateway_config.GatewayConfig{
         .gateways = &.{},
         .http_routes = &http_routes,
     };

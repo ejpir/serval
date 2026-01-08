@@ -20,6 +20,7 @@ const lb = @import("serval-lb");
 const ssl_mod = @import("serval-tls");
 const types = @import("types.zig");
 
+const config = core.config;
 const Context = core.Context;
 const Request = core.Request;
 const Upstream = core.Upstream;
@@ -34,13 +35,9 @@ const RouteMatcher = types.RouteMatcher;
 const PathMatch = types.PathMatch;
 const PoolConfig = types.PoolConfig;
 
-/// Maximum number of backend pools.
-/// TigerStyle: Bounded array, explicit limit.
-pub const MAX_POOLS: u8 = 64;
-
-/// Maximum number of routes (excluding default).
-/// TigerStyle: Bounded array, explicit limit.
-pub const MAX_ROUTES: u8 = 128;
+// Re-export routing limits from config (single source of truth).
+pub const MAX_POOLS = config.MAX_POOLS;
+pub const MAX_ROUTES = config.MAX_ROUTES;
 
 /// Content-based router with per-pool load balancing.
 ///
