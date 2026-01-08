@@ -26,6 +26,11 @@ pub const Context = struct {
     // Set after selectUpstream
     upstream: ?Upstream = null,
 
+    // Set by router when route matches with strip_prefix=true.
+    // Points to slice of original request path (zero-copy).
+    // If null, forwarder uses original request path.
+    rewritten_path: ?[]const u8 = null,
+
     // Metrics (updated by server)
     bytes_received: u64 = 0,
     bytes_sent: u64 = 0,
@@ -116,6 +121,7 @@ test "Context reset preserves connection-scoped fields" {
     ctx.bytes_received = 1000;
     ctx.parse_duration_ns = 500;
     ctx.response_status = 200;
+    ctx.rewritten_path = "/api/users";
 
     // Reset for new request
     ctx.reset();
@@ -135,6 +141,7 @@ test "Context reset preserves connection-scoped fields" {
     try std.testing.expectEqual(@as(u64, 0), ctx.bytes_received);
     try std.testing.expectEqual(@as(u64, 0), ctx.parse_duration_ns);
     try std.testing.expectEqual(@as(u16, 0), ctx.response_status);
+    try std.testing.expectEqual(@as(?[]const u8, null), ctx.rewritten_path);
 
     // Start time should be refreshed
     try std.testing.expect(ctx.start_time_ns > 0);
