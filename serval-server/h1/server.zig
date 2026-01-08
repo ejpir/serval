@@ -651,6 +651,16 @@ pub fn Server(
                             buffer_offset += parser.headers_end + body_length;
                             continue;
                         },
+                        .reject => |reject| {
+                            // Handler wants to reject request (WAF, rate limiting, auth)
+                            sendErrorResponseTls(maybe_tls_ptr, &io_mut, stream, reject.status, reject.reason);
+                            const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
+                            metrics.requestEnd(reject.status, duration_ns);
+                            tracer.endSpan(span_handle, reject.reason);
+                            const body_length = getBodyLength(&parser.request);
+                            buffer_offset += parser.headers_end + body_length;
+                            continue;
+                        },
                     }
                 }
 
@@ -659,8 +669,9 @@ pub fn Server(
                 ctx.upstream = upstream;
 
                 // Extract body info and forward
+                // Pass ctx.rewritten_path for path rewriting support (e.g., strip_prefix in router)
                 const body_info = buildBodyInfo(&parser, &recv_buf, buffer_offset, buffer_len);
-                const forward_result = forwarder.forward(io, stream, maybe_tls_ptr, &parser.request, &upstream, body_info, span_handle);
+                const forward_result = forwarder.forward(io, stream, maybe_tls_ptr, &parser.request, &upstream, body_info, span_handle, ctx.rewritten_path);
 
                 const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
                 ctx.duration_ns = duration_ns;

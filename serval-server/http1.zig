@@ -447,7 +447,8 @@ pub fn Server(
                 // Forward using async stream I/O (creates child spans for pool/connect/send/recv)
                 // Note: client_tls is null for now - plaintext client connections
                 // TLS client connections would need to pass the TLSStream here
-                const forward_result = forwarder.forward(io, stream, null, &parser.request, &upstream, body_info, span_handle);
+                // Pass ctx.rewritten_path for path rewriting support (e.g., strip_prefix in router)
+                const forward_result = forwarder.forward(io, stream, null, &parser.request, &upstream, body_info, span_handle, ctx.rewritten_path);
 
                 const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
                 ctx.duration_ns = duration_ns;

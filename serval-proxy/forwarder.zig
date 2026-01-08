@@ -108,6 +108,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
         /// body_info contains metadata for streaming request body from client.
         /// parent_span is the root request span for creating child trace spans.
         /// client_tls is the TLS stream for client connection (for encrypted responses).
+        /// effective_path: If set, use this path instead of request.path (for path rewriting).
         /// TigerStyle: Takes client stream for async I/O, bounded retries.
         pub fn forward(
             self: *Self,
@@ -118,9 +119,12 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             upstream: *const Upstream,
             body_info: BodyInfo,
             parent_span: SpanHandle,
+            effective_path: ?[]const u8,
         ) ForwardError!ForwardResult {
             assert(upstream.port > 0);
-            assert(request.path.len > 0);
+            // S1: precondition - path must not be empty (use effective_path if provided)
+            const path = effective_path orelse request.path;
+            assert(path.len > 0);
 
             // Create forward span as child of request span
             const forward_span = self.tracer.startSpan("forward_to_upstream", parent_span);
@@ -128,7 +132,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
 
             debugLog("forward: start {s} {s} upstream={s}:{d}", .{
                 methodToString(request.method),
-                request.path,
+                path,
                 upstream.host,
                 upstream.port,
             });
@@ -175,6 +179,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
                         local_port,
                         pool_wait_ns,
                         forward_span,
+                        effective_path,
                     ) catch |err| {
                         if (err == ForwardError.StaleConnection and stale_retries + 1 < MAX_STALE_RETRIES) {
                             debugLog("forward: StaleConnection during send (retry {d}/{d})", .{ stale_retries + 1, MAX_STALE_RETRIES });
@@ -211,7 +216,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
 
             // No pooled connection or all stale, create fresh
             debugLog("forward: pool MISS or exhausted stale, connecting fresh", .{});
-            const result = try self.forwardFresh(io, client_stream, client_tls, request, upstream, body_info, pool_wait_ns, forward_span);
+            const result = try self.forwardFresh(io, client_stream, client_tls, request, upstream, body_info, pool_wait_ns, forward_span, effective_path);
             self.tracer.endSpan(forward_span, null);
             return result;
         }
@@ -226,6 +231,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             body_info: BodyInfo,
             pool_wait_ns: u64,
             forward_span: SpanHandle,
+            effective_path: ?[]const u8,
         ) ForwardError!ForwardResult {
             assert(upstream.port > 0);
 
@@ -289,10 +295,12 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
                 connect_result.local_port,
                 pool_wait_ns,
                 forward_span,
+                effective_path,
             );
         }
 
         /// Forward request using an established upstream connection.
+        /// effective_path: If set, use this path instead of request.path (for path rewriting).
         /// TigerStyle: Explicit io parameter, streams for async I/O.
         fn forwardWithConnection(
             self: *Self,
@@ -309,6 +317,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             local_port: u16,
             pool_wait_ns: u64,
             forward_span: SpanHandle,
+            effective_path: ?[]const u8,
         ) ForwardError!ForwardResult {
             var mutable_conn = conn;
             errdefer {
@@ -330,7 +339,8 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             debugLog("send: start headers", .{});
 
             // Send request headers to upstream via connection (TLS or plaintext)
-            sendRequest(&mutable_conn, io, request) catch |err| {
+            // Pass effective_path for path rewriting support
+            sendRequest(&mutable_conn, io, request, effective_path) catch |err| {
                 debugLog("send: FAILED err={s}", .{@errorName(err)});
                 self.tracer.endSpan(send_span, @errorName(err));
                 if (is_pooled and err == ForwardError.SendFailed) {
