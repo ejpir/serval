@@ -25,6 +25,69 @@ Handles accept loop, connection lifecycle, request parsing, and forwarding orche
 
 Protocol implementations are isolated in subdirectories (h1/, h2/) to prepare for multi-protocol support while maintaining backwards-compatible top-level exports.
 
+## Handler Hooks
+
+The server calls handler hooks at specific points in the request lifecycle. All hooks except `selectUpstream` are optional (detected at comptime).
+
+### Request Lifecycle
+
+```
+┌─ TCP Accept
+│
+├─ onConnectionOpen(info)           ← Connection accepted
+│
+├─ Loop: for each request
+│  │
+│  ├─ Parse headers
+│  │
+│  ├─ onRequest(ctx, request, response_buf) → Action
+│  │    └─ .continue_request | .send_response | .reject
+│  │
+│  ├─ onRequestBody(ctx, chunk, is_last) → BodyAction
+│  │    └─ .continue_body | .reject
+│  │
+│  ├─ selectUpstream(ctx, request) → Upstream     [REQUIRED]
+│  │
+│  ├─ onUpstreamRequest(ctx, request)             ← Path rewriting
+│  │
+│  ├─ Forward to upstream...
+│  │
+│  ├─ onUpstreamConnect(ctx, info)                ← TLS cipher logging
+│  │
+│  ├─ onResponse(ctx, response) → Action
+│  │
+│  ├─ onResponseBody(ctx, chunk, is_last) → BodyAction
+│  │
+│  ├─ (on error) onError(ctx, err_ctx) → ErrorAction
+│  │    └─ .default | .send_response | .retry
+│  │
+│  └─ onLog(ctx, entry)                           ← Access logging
+│
+└─ onConnectionClose(conn_id, req_count, duration_ns)
+```
+
+### Hook Reference
+
+| Hook | Signature | Purpose |
+|------|-----------|---------|
+| `selectUpstream` | `(ctx, request) → Upstream` | Select backend (required) |
+| `onRequest` | `(ctx, request, response_buf) → Action` | Request validation, direct responses |
+| `onRequestBody` | `(ctx, chunk, is_last) → BodyAction` | WAF body inspection |
+| `onUpstreamRequest` | `(ctx, request) → void` | Path rewriting, header injection |
+| `onUpstreamConnect` | `(ctx, info) → void` | TLS cipher logging, observability |
+| `onResponse` | `(ctx, response) → Action` | Response modification |
+| `onResponseBody` | `(ctx, chunk, is_last) → BodyAction` | Data leak detection |
+| `onError` | `(ctx, err_ctx) → ErrorAction` | Custom error handling |
+| `onLog` | `(ctx, entry) → void` | Access logging |
+| `onConnectionOpen` | `(info) → void` | Connection metrics |
+| `onConnectionClose` | `(conn_id, req_count, duration_ns) → void` | Connection cleanup |
+
+### Return Types
+
+- **Action**: `.continue_request` (proceed), `.send_response` (direct response), `.reject` (block with status)
+- **BodyAction**: `.continue_body` (proceed), `.reject` (block with status)
+- **ErrorAction**: `.default` (502), `.send_response` (custom error), `.retry` (try different upstream)
+
 ## Design Rationale
 
 The h1/ subdirectory structure follows TigerStyle modular design principles:

@@ -141,6 +141,7 @@ A request flows through these stages:
 Client                                                     Upstream
   │                                                           │
   │  1. TCP accept                                            │
+  │     └─► onConnectionOpen() [optional]                     │
   ▼                                                           │
 ┌─────────────────────────────────────────────────────────────┴───┐
 │ Server.handleConnection()                                       │
@@ -152,24 +153,38 @@ Client                                                     Upstream
 │                          └─► Request { method, path, headers }  │
 │                                                                 │
 │  4. onRequest hook  ──►  Handler.onRequest() [optional]         │
-│                          └─► Action.continue or .send_response  │
+│                          └─► Action: .continue_request,         │
+│                                      .send_response, .reject    │
 │                                                                 │
 │  5. Select upstream ──►  Handler.selectUpstream()               │
 │                          └─► Upstream { host, port, idx }       │
 │                                                                 │
-│  6. Build BodyInfo  ──►  Parse Content-Length, track buffered   │
+│  6. onUpstreamRequest ─► Handler.onUpstreamRequest() [optional] │
+│                          └─► Modify request before forwarding   │
+│                                                                 │
+│  7. Build BodyInfo  ──►  Parse Content-Length, track buffered   │
 │                          └─► BodyInfo { content_length, ... }   │
 │                                                                 │
-│  7. Forward         ──►  Forwarder.forward()                    │
+│  8. Forward         ──►  Forwarder.forward()                    │
 │     a. Get/create connection (Pool or Io.net.IpAddress.connect) │
+│        └─► onUpstreamConnect() [optional]                       │
 │     b. Send request headers (async stream.writer)               │
 │     c. Stream request body (splice/copy)  ─────────────────►    │
+│        └─► onRequestBody() per chunk [optional]                 │
 │     d. Receive response headers (async stream.reader) ◄─────    │
+│        └─► onResponse() [optional]                              │
 │     e. Stream response body to client (splice)  ◄───────────    │
+│        └─► onResponseBody() per chunk [optional]                │
 │                                                                 │
-│  8. onLog hook      ──►  Handler.onLog() [optional]             │
+│  9. On error        ──►  Handler.onError() [optional]           │
+│                          └─► ErrorAction: .default,             │
+│                                           .send_response, .retry│
 │                                                                 │
-│  9. Keep-alive?     ──►  Loop to step 2, or close               │
+│ 10. onLog hook      ──►  Handler.onLog() [optional]             │
+│                                                                 │
+│ 11. Keep-alive?     ──►  Loop to step 2, or close               │
+│                                                                 │
+│ 12. Connection close ─►  onConnectionClose() [optional]         │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -210,12 +225,41 @@ pub fn selectUpstream(self: *@This(), ctx: *Context, request: *const Request) Up
 ```
 
 **Optional hooks** (detected at comptime with `hasHook()`):
+
+Request Phase:
 ```zig
 pub fn onRequest(self: *@This(), ctx: *Context, request: *Request, response_buf: []u8) Action
-pub fn onResponse(self: *@This(), ctx: *Context, response: *Response) void
-pub fn onError(self: *@This(), ctx: *Context, err: ErrorContext) void
+pub fn onRequestBody(self: *@This(), ctx: *Context, chunk: []const u8, is_last: bool) BodyAction
+```
+
+Upstream Phase:
+```zig
+pub fn onUpstreamRequest(self: *@This(), ctx: *Context, request: *Request) void
+pub fn onUpstreamConnect(self: *@This(), ctx: *Context, info: *const UpstreamConnectInfo) void
+```
+
+Response Phase:
+```zig
+pub fn onResponse(self: *@This(), ctx: *Context, response: *Response) Action
+pub fn onResponseBody(self: *@This(), ctx: *Context, chunk: []const u8, is_last: bool) BodyAction
+```
+
+Error/Completion Phase:
+```zig
+pub fn onError(self: *@This(), ctx: *Context, err_ctx: *const ErrorContext) ErrorAction
 pub fn onLog(self: *@This(), ctx: *Context, entry: LogEntry) void
 ```
+
+Connection Lifecycle:
+```zig
+pub fn onConnectionOpen(self: *@This(), info: *const ConnectionInfo) void
+pub fn onConnectionClose(self: *@This(), connection_id: u64, request_count: u32, duration_ns: u64) void
+```
+
+**Return types:**
+- `Action`: `.continue_request`, `.send_response`, `.reject`
+- `BodyAction`: `.continue_body`, `.reject`
+- `ErrorAction`: `.default`, `.send_response`, `.retry`
 
 `onRequest` can return `.continue_request` to forward, or `.{ .send_response = DirectResponse{...} }` to respond directly.
 
@@ -347,14 +391,18 @@ Serval provides comprehensive observability through handler hooks and timing ins
 
 Handlers can implement optional hooks (detected at comptime):
 
-| Hook | Purpose |
-|------|---------|
-| `onRequest` | Inspect/modify request before forwarding |
-| `onResponse` | Inspect response after receiving from upstream |
-| `onError` | Handle errors with structured context |
-| `onLog` | Receive complete request log with timing |
-| `onConnectionOpen` | Connection accepted (for metrics, rate limiting) |
-| `onConnectionClose` | Connection ended (with request count, duration) |
+| Hook | Phase | Purpose | Return Type |
+|------|-------|---------|-------------|
+| `onRequest` | Request | Inspect/modify request before forwarding | `Action` |
+| `onRequestBody` | Request | Inspect/transform request body chunks | `BodyAction` |
+| `onUpstreamRequest` | Upstream | Modify request before sending to upstream | `void` |
+| `onUpstreamConnect` | Upstream | Observe upstream connection establishment | `void` |
+| `onResponse` | Response | Inspect/modify response from upstream | `Action` |
+| `onResponseBody` | Response | Inspect/transform response body chunks | `BodyAction` |
+| `onError` | Error | Handle errors with structured context | `ErrorAction` |
+| `onLog` | Completion | Receive complete request log with timing | `void` |
+| `onConnectionOpen` | Connection | Connection accepted (for metrics, rate limiting) | `void` |
+| `onConnectionClose` | Connection | Connection ended (with request count, duration) | `void` |
 
 ### Timing Collection
 
@@ -482,7 +530,7 @@ pub const WeightedHandler = struct {
 | Request body streaming | serval-proxy | splice() zero-copy on Linux |
 | Response body streaming | serval-proxy | splice() zero-copy on Linux |
 | Health-aware load balancing | serval-lb | Round-robin with background probing, onLog passive tracking |
-| Handler hooks | serval-server | onRequest, onResponse, onError, onLog, onConnectionOpen/Close |
+| Handler hooks | serval-server | 10 lifecycle hooks: request phase (onRequest, onRequestBody), upstream phase (onUpstreamRequest, onUpstreamConnect), response phase (onResponse, onResponseBody), error/completion (onError, onLog), connection lifecycle (onConnectionOpen, onConnectionClose) |
 | Metrics interface | serval-metrics | Noop + Prometheus + RealTimeMetrics (per-upstream stats) |
 | Tracing interface | serval-tracing | NoopTracer |
 | OpenTelemetry tracing | serval-otel | Full OTLP/JSON export with batching |

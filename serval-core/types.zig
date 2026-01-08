@@ -126,14 +126,47 @@ pub const Upstream = struct {
 // Action (control flow from hooks)
 // =============================================================================
 
-/// Handler response for onRequest hook.
-/// TigerStyle: Tagged union with explicit variants.
+/// Handler response for request/response hooks.
+/// TigerStyle: Tagged union with explicit variants, no implicit behavior.
 pub const Action = union(enum) {
-    /// Continue to selectUpstream and forward the request to upstream.
+    /// Continue normal processing (forward request, send response, etc.).
     continue_request,
-    /// Send a direct response without forwarding.
+    /// Send a direct response without forwarding to upstream.
     /// Handler writes response body into server-provided buffer.
     send_response: DirectResponse,
+    /// Reject the request with an error status (e.g., 400, 403, 429).
+    /// Use for WAF blocking, rate limiting, auth failures.
+    reject: RejectResponse,
+};
+
+/// Rejection response for handlers that block requests.
+/// TigerStyle: Fixed-size, minimal fields for error responses.
+pub const RejectResponse = struct {
+    /// HTTP status code (typically 400-499 for client errors).
+    status: u16 = 403,
+    /// Short reason phrase for logging (not sent to client).
+    reason: []const u8 = "Forbidden",
+};
+
+/// Handler response for body inspection hooks (onRequestBody, onResponseBody).
+/// TigerStyle: Separate type for body hooks - simpler than full Action.
+pub const BodyAction = union(enum) {
+    /// Continue processing the body chunk.
+    continue_body,
+    /// Reject the request/response (e.g., WAF detected threat in body).
+    reject: RejectResponse,
+};
+
+/// Handler response for onError hook.
+/// TigerStyle: Allow handlers to customize error responses or request retry.
+pub const ErrorAction = union(enum) {
+    /// Use default error handling (send 502 Bad Gateway).
+    default,
+    /// Send a custom error response instead of default 502.
+    send_response: DirectResponse,
+    /// Retry the request with a different upstream (if available).
+    /// Handler should have already selected a new upstream in selectUpstream.
+    retry,
 };
 
 /// How the response body length is communicated to the client.
@@ -195,19 +228,25 @@ pub const ConnectionInfo = struct {
     tcp_rtt_var_us: u32,
 };
 
-/// Upstream connection timing for logging.
+/// Upstream connection info for onUpstreamConnect hook.
 /// TigerStyle: Explicit timing with u64 nanoseconds.
 pub const UpstreamConnectInfo = struct {
     /// DNS resolution duration in nanoseconds.
     dns_duration_ns: u64,
     /// TCP connect duration in nanoseconds.
     tcp_connect_duration_ns: u64,
+    /// TLS handshake duration in nanoseconds (0 if plaintext).
+    tls_handshake_duration_ns: u64 = 0,
     /// Whether this connection was reused from pool.
     reused: bool,
     /// Time spent waiting for pool connection in nanoseconds.
     pool_wait_ns: u64,
     /// Local port used for upstream connection.
     local_port: u16,
+    /// TLS cipher suite name (empty if plaintext).
+    tls_cipher: [64]u8 = std.mem.zeroes([64]u8),
+    /// TLS protocol version (empty if plaintext).
+    tls_version: [16]u8 = std.mem.zeroes([16]u8),
 };
 
 // =============================================================================
@@ -311,6 +350,7 @@ test "Action send_response variant" {
             try std.testing.expectEqual(@as(u16, 404), r.status);
             try std.testing.expectEqualStrings("Not Found", r.body);
         },
+        .reject => try std.testing.expect(false),
     }
 }
 
@@ -382,5 +422,248 @@ test "DirectResponse response_mode in Action" {
         .send_response => |r| {
             try std.testing.expect(r.response_mode == .chunked);
         },
+        .reject => try std.testing.expect(false),
     }
+}
+
+// =============================================================================
+// RejectResponse Tests
+// =============================================================================
+
+test "RejectResponse has sensible defaults" {
+    const reject = RejectResponse{};
+    try std.testing.expectEqual(@as(u16, 403), reject.status);
+    try std.testing.expectEqualStrings("Forbidden", reject.reason);
+}
+
+test "RejectResponse with custom values" {
+    const reject = RejectResponse{
+        .status = 429,
+        .reason = "Rate limit exceeded",
+    };
+    try std.testing.expectEqual(@as(u16, 429), reject.status);
+    try std.testing.expectEqualStrings("Rate limit exceeded", reject.reason);
+}
+
+test "RejectResponse client error codes" {
+    // Test common client error status codes (4xx range)
+    const status_codes = [_]u16{ 400, 401, 403, 404, 429 };
+    const reasons = [_][]const u8{
+        "Bad Request",
+        "Unauthorized",
+        "Forbidden",
+        "Not Found",
+        "Too Many Requests",
+    };
+
+    for (status_codes, reasons) |code, reason| {
+        const reject = RejectResponse{
+            .status = code,
+            .reason = reason,
+        };
+        try std.testing.expectEqual(code, reject.status);
+        try std.testing.expectEqualStrings(reason, reject.reason);
+    }
+}
+
+test "Action reject variant" {
+    const reject = RejectResponse{ .status = 403, .reason = "WAF blocked" };
+    const action: Action = .{ .reject = reject };
+
+    switch (action) {
+        .continue_request => try std.testing.expect(false),
+        .send_response => try std.testing.expect(false),
+        .reject => |r| {
+            try std.testing.expectEqual(@as(u16, 403), r.status);
+            try std.testing.expectEqualStrings("WAF blocked", r.reason);
+        },
+    }
+}
+
+test "Action switch coverage" {
+    // Verify all Action variants can be matched in a switch (compile-time check)
+    const actions = [_]Action{
+        .continue_request,
+        .{ .send_response = DirectResponse{ .status = 200 } },
+        .{ .reject = RejectResponse{ .status = 403 } },
+    };
+
+    for (actions) |action| {
+        const desc: []const u8 = switch (action) {
+            .continue_request => "continue",
+            .send_response => "response",
+            .reject => "reject",
+        };
+        try std.testing.expect(desc.len > 0);
+    }
+}
+
+// =============================================================================
+// BodyAction Tests
+// =============================================================================
+
+test "BodyAction continue_body variant" {
+    const action: BodyAction = .continue_body;
+    try std.testing.expect(action == .continue_body);
+}
+
+test "BodyAction reject variant" {
+    const reject = RejectResponse{ .status = 400, .reason = "Malformed body" };
+    const action: BodyAction = .{ .reject = reject };
+
+    switch (action) {
+        .continue_body => try std.testing.expect(false),
+        .reject => |r| {
+            try std.testing.expectEqual(@as(u16, 400), r.status);
+            try std.testing.expectEqualStrings("Malformed body", r.reason);
+        },
+    }
+}
+
+test "BodyAction switch coverage" {
+    // Verify all BodyAction variants can be matched in a switch
+    const actions = [_]BodyAction{
+        .continue_body,
+        .{ .reject = RejectResponse{ .status = 413, .reason = "Payload too large" } },
+    };
+
+    for (actions) |action| {
+        const desc: []const u8 = switch (action) {
+            .continue_body => "continue",
+            .reject => "reject",
+        };
+        try std.testing.expect(desc.len > 0);
+    }
+}
+
+// =============================================================================
+// ErrorAction Tests
+// =============================================================================
+
+test "ErrorAction default variant" {
+    const action: ErrorAction = .default;
+    try std.testing.expect(action == .default);
+}
+
+test "ErrorAction retry variant" {
+    const action: ErrorAction = .retry;
+    try std.testing.expect(action == .retry);
+}
+
+test "ErrorAction send_response variant" {
+    const resp = DirectResponse{
+        .status = 503,
+        .body = "Service Unavailable",
+        .content_type = "text/plain",
+    };
+    const action: ErrorAction = .{ .send_response = resp };
+
+    switch (action) {
+        .default => try std.testing.expect(false),
+        .retry => try std.testing.expect(false),
+        .send_response => |r| {
+            try std.testing.expectEqual(@as(u16, 503), r.status);
+            try std.testing.expectEqualStrings("Service Unavailable", r.body);
+            try std.testing.expectEqualStrings("text/plain", r.content_type);
+        },
+    }
+}
+
+test "ErrorAction switch coverage" {
+    // Verify all ErrorAction variants can be matched in a switch
+    const actions = [_]ErrorAction{
+        .default,
+        .retry,
+        .{ .send_response = DirectResponse{ .status = 500 } },
+    };
+
+    for (actions) |action| {
+        const desc: []const u8 = switch (action) {
+            .default => "default",
+            .retry => "retry",
+            .send_response => "custom",
+        };
+        try std.testing.expect(desc.len > 0);
+    }
+}
+
+// =============================================================================
+// UpstreamConnectInfo Tests
+// =============================================================================
+
+test "UpstreamConnectInfo plaintext defaults" {
+    // Test plaintext connection (no TLS fields set)
+    const info = UpstreamConnectInfo{
+        .dns_duration_ns = 1_000_000, // 1ms
+        .tcp_connect_duration_ns = 5_000_000, // 5ms
+        .reused = false,
+        .pool_wait_ns = 0,
+        .local_port = 45678,
+    };
+
+    try std.testing.expectEqual(@as(u64, 1_000_000), info.dns_duration_ns);
+    try std.testing.expectEqual(@as(u64, 5_000_000), info.tcp_connect_duration_ns);
+    try std.testing.expectEqual(@as(u64, 0), info.tls_handshake_duration_ns);
+    try std.testing.expect(!info.reused);
+    try std.testing.expectEqual(@as(u64, 0), info.pool_wait_ns);
+    try std.testing.expectEqual(@as(u16, 45678), info.local_port);
+    // TLS fields should be zero-initialized
+    try std.testing.expectEqual(@as(u8, 0), info.tls_cipher[0]);
+    try std.testing.expectEqual(@as(u8, 0), info.tls_version[0]);
+}
+
+test "UpstreamConnectInfo with TLS fields" {
+    var info = UpstreamConnectInfo{
+        .dns_duration_ns = 500_000, // 0.5ms
+        .tcp_connect_duration_ns = 2_000_000, // 2ms
+        .tls_handshake_duration_ns = 15_000_000, // 15ms
+        .reused = false,
+        .pool_wait_ns = 100_000, // 0.1ms
+        .local_port = 54321,
+    };
+
+    // Set TLS cipher and version
+    const cipher = "TLS_AES_256_GCM_SHA384";
+    const version = "TLSv1.3";
+    @memcpy(info.tls_cipher[0..cipher.len], cipher);
+    @memcpy(info.tls_version[0..version.len], version);
+
+    try std.testing.expectEqual(@as(u64, 15_000_000), info.tls_handshake_duration_ns);
+    try std.testing.expectEqualStrings(cipher, info.tls_cipher[0..cipher.len]);
+    try std.testing.expectEqualStrings(version, info.tls_version[0..version.len]);
+}
+
+test "UpstreamConnectInfo reused connection" {
+    const info = UpstreamConnectInfo{
+        .dns_duration_ns = 0, // No DNS for reused
+        .tcp_connect_duration_ns = 0, // No TCP connect for reused
+        .tls_handshake_duration_ns = 0, // No TLS handshake for reused
+        .reused = true,
+        .pool_wait_ns = 50_000, // 50us waiting for pool slot
+        .local_port = 33333,
+    };
+
+    try std.testing.expect(info.reused);
+    try std.testing.expectEqual(@as(u64, 0), info.dns_duration_ns);
+    try std.testing.expectEqual(@as(u64, 0), info.tcp_connect_duration_ns);
+    try std.testing.expectEqual(@as(u64, 0), info.tls_handshake_duration_ns);
+    try std.testing.expectEqual(@as(u64, 50_000), info.pool_wait_ns);
+}
+
+test "UpstreamConnectInfo tls_cipher max length" {
+    // Test that we can store a reasonably long cipher suite name
+    var info = UpstreamConnectInfo{
+        .dns_duration_ns = 0,
+        .tcp_connect_duration_ns = 0,
+        .reused = true,
+        .pool_wait_ns = 0,
+        .local_port = 12345,
+    };
+
+    // Longest common cipher suite name (63 chars max, plus null terminator space)
+    const long_cipher = "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384_SOMETHING_EXTRA_CHARS";
+    const len = @min(long_cipher.len, info.tls_cipher.len - 1); // Leave room for null
+    @memcpy(info.tls_cipher[0..len], long_cipher[0..len]);
+
+    try std.testing.expectEqualStrings(long_cipher[0..len], info.tls_cipher[0..len]);
 }

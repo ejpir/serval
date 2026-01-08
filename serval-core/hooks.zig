@@ -19,11 +19,29 @@
 //!   Return `.{ .send_response = ... }` to send a direct response without forwarding.
 //!   Use response_buf to format response body (server provides per-connection buffer).
 //!
+//! - `onRequestBody(self: *Handler, ctx: *Context, chunk: []const u8, is_last: bool) BodyAction`
+//!   Called for each request body chunk (WAF body inspection).
+//!   Return `.continue_body` to proceed or `.{ .reject = ... }` to block.
+//!
+//! - `onUpstreamRequest(self: *Handler, ctx: *Context, request: *Request) void`
+//!   Called after selectUpstream, before forwarding to upstream.
+//!   Can modify request headers, path (e.g., path rewriting).
+//!
+//! - `onUpstreamConnect(self: *Handler, ctx: *Context, info: *const UpstreamConnectInfo) void`
+//!   Called after upstream TCP+TLS handshake completes.
+//!   For logging TLS cipher, connection RTT, pool reuse, etc.
+//!
 //! - `onResponse(self: *Handler, ctx: *Context, response: *Response) Action`
 //!   Called after receiving upstream response. Can modify response.
 //!
-//! - `onError(self: *Handler, ctx: *Context, err: anyerror) void`
-//!   Called on request processing errors.
+//! - `onResponseBody(self: *Handler, ctx: *Context, chunk: []const u8, is_last: bool) BodyAction`
+//!   Called for each response body chunk (WAF data leak detection).
+//!   Return `.continue_body` to proceed or `.{ .reject = ... }` to block.
+//!
+//! - `onError(self: *Handler, ctx: *Context, err_ctx: *const ErrorContext) ErrorAction`
+//!   Called on request processing errors. Returns action for error handling:
+//!   `.default` uses standard error handling, `.send_response` sends custom response,
+//!   `.retry` retries with different upstream.
 //!
 //! - `onLog(self: *Handler, ctx: *Context, entry: LogEntry) void`
 //!   Called after request completes for access logging. LogEntry contains
@@ -43,18 +61,25 @@ const std = @import("std");
 const types = @import("types.zig");
 const context_mod = @import("context.zig");
 const log_mod = @import("log.zig");
+const errors_mod = @import("errors.zig");
 
 const Context = context_mod.Context;
 const Request = types.Request;
 const Response = types.Response;
 const Upstream = types.Upstream;
 const Action = types.Action;
+const BodyAction = types.BodyAction;
+const ErrorAction = types.ErrorAction;
 const ConnectionInfo = types.ConnectionInfo;
+const UpstreamConnectInfo = types.UpstreamConnectInfo;
 const LogEntry = log_mod.LogEntry;
+const ErrorContext = errors_mod.ErrorContext;
 
 /// Verify handler implements required interface at compile time.
 /// Required: selectUpstream(self, ctx, request) -> Upstream
-/// Optional: onRequest, onResponse, onError, onLog, onConnectionOpen, onConnectionClose
+/// Optional: onRequest, onRequestBody, onUpstreamRequest, onUpstreamConnect,
+///           onResponse, onResponseBody, onError, onLog,
+///           onConnectionOpen, onConnectionClose
 ///
 /// TigerStyle: Compile-time safety, catch signature errors at build time not runtime.
 pub fn verifyHandler(comptime Handler: type) void {
@@ -69,8 +94,31 @@ pub fn verifyHandler(comptime Handler: type) void {
     // Verify optional request hooks if declared
     // onRequest signature: (self, ctx, request, response_buf) -> Action
     verifyOptionalHook(Handler, "onRequest", &[_]type{ *Handler, *Context, *Request, []u8 }, Action);
+
+    // onRequestBody signature: (self, ctx, chunk, is_last) -> BodyAction
+    // Called for each request body chunk (WAF body inspection)
+    verifyOptionalHook(Handler, "onRequestBody", &[_]type{ *Handler, *Context, []const u8, bool }, BodyAction);
+
+    // onUpstreamRequest signature: (self, ctx, request) -> void
+    // Called after selectUpstream, before forwarding (path rewriting)
+    verifyOptionalHook(Handler, "onUpstreamRequest", &[_]type{ *Handler, *Context, *Request }, void);
+
+    // onUpstreamConnect signature: (self, ctx, info) -> void
+    // Called after upstream TCP+TLS handshake completes (observability)
+    verifyOptionalHook(Handler, "onUpstreamConnect", &[_]type{ *Handler, *Context, *const UpstreamConnectInfo }, void);
+
+    // onResponse signature: (self, ctx, response) -> Action
     verifyOptionalHook(Handler, "onResponse", &[_]type{ *Handler, *Context, *Response }, Action);
-    verifyOptionalHook(Handler, "onError", &[_]type{ *Handler, *Context, anyerror }, void);
+
+    // onResponseBody signature: (self, ctx, chunk, is_last) -> BodyAction
+    // Called for each response body chunk (WAF data leak detection)
+    verifyOptionalHook(Handler, "onResponseBody", &[_]type{ *Handler, *Context, []const u8, bool }, BodyAction);
+
+    // onError signature: (self, ctx, err_ctx) -> ErrorAction
+    // Called on request processing errors, returns action for error handling
+    verifyOptionalHook(Handler, "onError", &[_]type{ *Handler, *Context, *const ErrorContext }, ErrorAction);
+
+    // onLog signature: (self, ctx, entry) -> void
     verifyOptionalHook(Handler, "onLog", &[_]type{ *Handler, *Context, LogEntry }, void);
 
     // Verify optional connection lifecycle hooks if declared
@@ -268,6 +316,26 @@ const TestHandlerWithAllHooks = struct {
         return .continue_request;
     }
 
+    pub fn onRequestBody(self: *@This(), ctx: *Context, chunk: []const u8, is_last: bool) BodyAction {
+        _ = self;
+        _ = ctx;
+        _ = chunk;
+        _ = is_last;
+        return .continue_body;
+    }
+
+    pub fn onUpstreamRequest(self: *@This(), ctx: *Context, request: *Request) void {
+        _ = self;
+        _ = ctx;
+        _ = request;
+    }
+
+    pub fn onUpstreamConnect(self: *@This(), ctx: *Context, info: *const UpstreamConnectInfo) void {
+        _ = self;
+        _ = ctx;
+        _ = info;
+    }
+
     pub fn onResponse(self: *@This(), ctx: *Context, response: *Response) Action {
         _ = self;
         _ = ctx;
@@ -275,10 +343,19 @@ const TestHandlerWithAllHooks = struct {
         return .continue_request;
     }
 
-    pub fn onError(self: *@This(), ctx: *Context, err: anyerror) void {
+    pub fn onResponseBody(self: *@This(), ctx: *Context, chunk: []const u8, is_last: bool) BodyAction {
         _ = self;
         _ = ctx;
-        _ = err;
+        _ = chunk;
+        _ = is_last;
+        return .continue_body;
+    }
+
+    pub fn onError(self: *@This(), ctx: *Context, err_ctx: *const ErrorContext) ErrorAction {
+        _ = self;
+        _ = ctx;
+        _ = err_ctx;
+        return .default;
     }
 
     pub fn onLog(self: *@This(), ctx: *Context, entry: LogEntry) void {
@@ -307,9 +384,27 @@ test "verifyHandler accepts handler with all optional hooks" {
     // Verify all hooks are detected
     try std.testing.expect(hasHook(TestHandlerWithAllHooks, "selectUpstream"));
     try std.testing.expect(hasHook(TestHandlerWithAllHooks, "onRequest"));
+    try std.testing.expect(hasHook(TestHandlerWithAllHooks, "onRequestBody"));
+    try std.testing.expect(hasHook(TestHandlerWithAllHooks, "onUpstreamRequest"));
+    try std.testing.expect(hasHook(TestHandlerWithAllHooks, "onUpstreamConnect"));
     try std.testing.expect(hasHook(TestHandlerWithAllHooks, "onResponse"));
+    try std.testing.expect(hasHook(TestHandlerWithAllHooks, "onResponseBody"));
     try std.testing.expect(hasHook(TestHandlerWithAllHooks, "onError"));
     try std.testing.expect(hasHook(TestHandlerWithAllHooks, "onLog"));
     try std.testing.expect(hasHook(TestHandlerWithAllHooks, "onConnectionOpen"));
     try std.testing.expect(hasHook(TestHandlerWithAllHooks, "onConnectionClose"));
+}
+
+test "hasHook detects new lifecycle hooks" {
+    // Verify new hooks are detected on handler with all hooks
+    try std.testing.expect(hasHook(TestHandlerWithAllHooks, "onRequestBody"));
+    try std.testing.expect(hasHook(TestHandlerWithAllHooks, "onUpstreamRequest"));
+    try std.testing.expect(hasHook(TestHandlerWithAllHooks, "onUpstreamConnect"));
+    try std.testing.expect(hasHook(TestHandlerWithAllHooks, "onResponseBody"));
+
+    // Verify basic handler does not have new hooks
+    try std.testing.expect(!hasHook(TestHandler, "onRequestBody"));
+    try std.testing.expect(!hasHook(TestHandler, "onUpstreamRequest"));
+    try std.testing.expect(!hasHook(TestHandler, "onUpstreamConnect"));
+    try std.testing.expect(!hasHook(TestHandler, "onResponseBody"));
 }

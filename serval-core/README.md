@@ -15,9 +15,15 @@ Zero-dependency foundation module containing shared types, errors, configuration
 - `HeaderMap` - Fixed-size header storage (64 headers max) with O(1) cached lookups
 - `Method` - HTTP methods enum
 - `Version` - HTTP version enum
-- `Action` - Handler action enum (continue_request, send_response)
 - `BodyFraming` - Body framing type (content_length, chunked, none)
 - `ResponseMode` - Response encoding mode (content_length, chunked)
+
+### Hook Action Types
+- `Action` - Handler action for request/response hooks (continue_request, send_response, reject)
+- `BodyAction` - Handler action for body inspection hooks (continue_body, reject)
+- `ErrorAction` - Handler action for error hooks (default, send_response, retry)
+- `RejectResponse` - Rejection info with status code and reason
+- `DirectResponse` - Direct response data (status, body, content_type, extra_headers, response_mode)
 
 ### HeaderMap O(1) Lookups
 
@@ -94,15 +100,136 @@ Upstream connection timing for detailed logging:
 
 ```zig
 pub const UpstreamConnectInfo = struct {
-    dns_duration_ns: u64,         // DNS resolution (nanoseconds)
-    tcp_connect_duration_ns: u64, // TCP handshake (nanoseconds)
-    reused: bool,                 // Connection from pool
-    pool_wait_ns: u64,            // Pool wait time (nanoseconds)
-    local_port: u16,              // Upstream connection local port
+    dns_duration_ns: u64,             // DNS resolution (nanoseconds)
+    tcp_connect_duration_ns: u64,     // TCP handshake (nanoseconds)
+    tls_handshake_duration_ns: u64,   // TLS handshake (nanoseconds, 0 if plaintext)
+    reused: bool,                     // Connection from pool
+    pool_wait_ns: u64,                // Pool wait time (nanoseconds)
+    local_port: u16,                  // Upstream connection local port
+    tls_cipher: [64]u8,               // TLS cipher suite name (empty if plaintext)
+    tls_version: [16]u8,              // TLS protocol version (empty if plaintext)
 };
 ```
 
+**TLS fields:** When connecting to TLS upstreams, the `tls_cipher` and `tls_version` fields contain null-terminated strings identifying the negotiated cipher suite (e.g., "TLS_AES_256_GCM_SHA384") and protocol version (e.g., "TLSv1.3"). For plaintext connections, these fields are zero-initialized.
+
 **Units convention:** `_ns` suffix for nanoseconds, `_us` suffix for microseconds.
+
+## Hook Action Types
+
+The lifecycle hooks return action types that control request processing flow.
+
+### Action
+
+Returned by `onRequest` and `onResponse` hooks to control request/response processing:
+
+```zig
+pub const Action = union(enum) {
+    continue_request,              // Continue normal processing
+    send_response: DirectResponse, // Send direct response without forwarding
+    reject: RejectResponse,        // Reject with error status (400-499)
+};
+```
+
+**Example: WAF blocking in onRequest**
+```zig
+fn onRequest(ctx: *Context, request: *Request, response_buf: []u8) Action {
+    if (detectSqlInjection(request.path)) {
+        return .{ .reject = .{ .status = 403, .reason = "SQL injection detected" } };
+    }
+    return .continue_request;
+}
+```
+
+**Example: Direct response without upstream**
+```zig
+fn onRequest(ctx: *Context, request: *Request, response_buf: []u8) Action {
+    if (std.mem.eql(u8, request.path, "/health")) {
+        const body = "OK";
+        @memcpy(response_buf[0..body.len], body);
+        return .{ .send_response = .{
+            .status = 200,
+            .body = response_buf[0..body.len],
+            .content_type = "text/plain",
+        } };
+    }
+    return .continue_request;
+}
+```
+
+### BodyAction
+
+Returned by `onRequestBody` and `onResponseBody` hooks for body inspection:
+
+```zig
+pub const BodyAction = union(enum) {
+    continue_body,         // Continue processing the body chunk
+    reject: RejectResponse, // Reject (e.g., WAF detected threat in body)
+};
+```
+
+**Example: Body size validation**
+```zig
+fn onRequestBody(ctx: *Context, chunk: []const u8, is_final: bool) BodyAction {
+    ctx.body_bytes_seen += chunk.len;
+    if (ctx.body_bytes_seen > MAX_BODY_SIZE) {
+        return .{ .reject = .{ .status = 413, .reason = "Payload too large" } };
+    }
+    return .continue_body;
+}
+```
+
+### ErrorAction
+
+Returned by `onError` hook to customize error handling:
+
+```zig
+pub const ErrorAction = union(enum) {
+    default,                       // Use default 502 Bad Gateway response
+    send_response: DirectResponse, // Send custom error response
+    retry,                         // Retry with different upstream
+};
+```
+
+**Example: Custom error page**
+```zig
+fn onError(ctx: *Context, err: ErrorContext, response_buf: []u8) ErrorAction {
+    const body = "{\"error\": \"service_unavailable\"}";
+    @memcpy(response_buf[0..body.len], body);
+    return .{ .send_response = .{
+        .status = 503,
+        .body = response_buf[0..body.len],
+        .content_type = "application/json",
+    } };
+}
+```
+
+### RejectResponse
+
+Used by `Action.reject` and `BodyAction.reject` variants:
+
+```zig
+pub const RejectResponse = struct {
+    status: u16 = 403,            // HTTP status code (typically 400-499)
+    reason: []const u8 = "Forbidden", // Reason phrase for logging (not sent to client)
+};
+```
+
+### DirectResponse
+
+Used by `Action.send_response` and `ErrorAction.send_response` variants:
+
+```zig
+pub const DirectResponse = struct {
+    status: u16 = 200,
+    body: []const u8 = "",                    // Must point into response_buf
+    content_type: []const u8 = "text/plain",
+    extra_headers: []const u8 = "",           // Pre-formatted headers
+    response_mode: ResponseMode = .content_length,
+};
+```
+
+**Note:** The `body` slice must reference memory in the `response_buf` parameter provided to the hook. The server owns this buffer and will send its contents after the hook returns.
 
 ## Usage
 

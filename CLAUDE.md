@@ -225,12 +225,18 @@
   <module name="serval" path="serval/">Main HTTP/1.1 server library (imports all modules)</module>
   <module name="serval-core" path="serval-core/">Foundation: types, config, errors, context, log</module>
   <module name="serval-http" path="serval-http/">HTTP/1.1 parser</module>
+  <module name="serval-net" path="serval-net/">Socket abstraction (plain TCP + TLS unified interface)</module>
+  <module name="serval-tls" path="serval-tls/">TLS termination/origination with kTLS kernel offload</module>
   <module name="serval-pool" path="serval-pool/">Connection pooling</module>
   <module name="serval-proxy" path="serval-proxy/">Upstream forwarding (splice zero-copy)</module>
   <module name="serval-metrics" path="serval-metrics/">Metrics interfaces</module>
   <module name="serval-tracing" path="serval-tracing/">Distributed tracing interfaces</module>
+  <module name="serval-otel" path="serval-otel/">OpenTelemetry implementation (OTLP/JSON export)</module>
   <module name="serval-health" path="serval-health/">Health tracking (atomic bitmap, thresholds)</module>
+  <module name="serval-prober" path="serval-prober/">Background health probing (HTTP/HTTPS)</module>
   <module name="serval-lb" path="serval-lb/">Load balancer handler (round-robin)</module>
+  <module name="serval-server" path="serval-server/">HTTP server with connection handling and hooks</module>
+  <module name="serval-cli" path="serval-cli/">CLI argument parsing utilities</module>
 
   <design-points>
     <point>Concurrent connection handling via Io.Group.concurrent (io_uring batch submission)</point>
@@ -246,48 +252,67 @@
     <layer level="1" name="protocol">
       <module>serval-http</module>
       <module>serval-net</module>
-      <module status="future">serval-tls</module>
+      <module>serval-tls</module>
       <module status="future">serval-h2</module>
       <responsibility>Protocol parsing, socket utilities - no business logic</responsibility>
       <notes>
-        serval-http: HTTP/1.1 request/response parsing
-        serval-tls: TLS termination (client-side) and origination (upstream-side), ALPN
-        serval-h2: HTTP/2 framing, HPACK, stream multiplexing - shares types with serval-http
+        serval-http: HTTP/1.1 request/response parsing (implemented)
+        serval-net: Unified Socket abstraction for plain TCP and TLS (implemented)
+        serval-tls: TLS termination and origination with kTLS kernel offload (implemented)
+        serval-h2: HTTP/2 framing, HPACK, stream multiplexing - shares types with serval-http (future)
       </notes>
     </layer>
     <layer level="2" name="infrastructure">
       <module>serval-pool</module>
       <module>serval-metrics</module>
       <module>serval-tracing</module>
+      <module>serval-otel</module>
+      <module>serval-health</module>
+      <module>serval-prober</module>
       <module status="future">serval-cache</module>
-      <module status="future">serval-otel</module>
       <module status="future">serval-waf</module>
       <module status="future">serval-ratelimit</module>
-      <module>serval-health</module>
       <responsibility>Reusable infrastructure - generic, handler-agnostic</responsibility>
       <notes>
-        serval-tracing: Interface for distributed tracing (span creation, context propagation)
-        serval-otel: OpenTelemetry implementation of serval-tracing interface (OTLP export)
-        serval-cache: Cache storage and lookup (keys, TTL, eviction) - policy via handler hooks
-        serval-waf: Rule engine for threat detection (SQLi, XSS, etc.) - blocking via handler hooks
-        serval-ratelimit: Token bucket / sliding window rate limiting - keyed by IP, path, header
-        serval-health: Threshold-based health tracking (atomic bitmap, consecutive counters)
+        serval-pool: Fixed-size connection pooling with idle/age eviction (implemented)
+        serval-metrics: Request metrics with noop and Prometheus implementations (implemented)
+        serval-tracing: Interface for distributed tracing (implemented)
+        serval-otel: OpenTelemetry with OTLP/JSON export and batching (implemented)
+        serval-health: Threshold-based health tracking with atomic bitmap (implemented)
+        serval-prober: Background HTTP/HTTPS health probing for unhealthy backends (implemented)
+        serval-cache: Cache storage and lookup (keys, TTL, eviction) - policy via handler hooks (future)
+        serval-waf: Rule engine for threat detection (SQLi, XSS, etc.) - blocking via handler hooks (future)
+        serval-ratelimit: Token bucket / sliding window rate limiting - keyed by IP, path, header (future)
       </notes>
     </layer>
     <layer level="3" name="mechanics">
       <module>serval-proxy</module>
       <responsibility>HOW to forward - network I/O, connection mgmt, timing</responsibility>
+      <notes>
+        serval-proxy: Async upstream forwarding with splice zero-copy, TLS support (implemented)
+      </notes>
     </layer>
     <layer level="4" name="strategy">
       <module>serval-lb</module>
-      <module>serval-forward (future)</module>
-      <module>serval-router (future)</module>
+      <module status="future">serval-forward</module>
+      <module status="future">serval-router</module>
       <responsibility>WHERE/WHICH to forward - routing decisions, upstream selection</responsibility>
+      <notes>
+        serval-lb: Health-aware round-robin with background probing (implemented)
+        serval-forward: Simple forwarding handler (future)
+        serval-router: Content-based routing / API gateway (future)
+      </notes>
     </layer>
     <layer level="5" name="orchestration">
       <module>serval-server</module>
       <module>serval</module>
+      <module>serval-cli</module>
       <responsibility>Composition - wires layers together, accept loop</responsibility>
+      <notes>
+        serval-server: HTTP/1.1 server with keep-alive, handler hooks, metrics, tracing (implemented)
+        serval: Umbrella module re-exporting all modules (implemented)
+        serval-cli: CLI argument parsing utilities (implemented)
+      </notes>
     </layer>
   </layers>
 
@@ -316,20 +341,21 @@
         Cache-Control parsing → serval-http (layer 1).
         Short-circuit response → handler returns cached response before selectUpstream.
       </point>
-      <point trigger="distributed tracing / OpenTelemetry">
-        Span interface → serval-tracing (layer 2, already exists).
-        OTLP export → serval-otel (layer 2, implements serval-tracing).
+      <point trigger="distributed tracing / OpenTelemetry" status="implemented">
+        Span interface → serval-tracing (layer 2, implemented).
+        OTLP export → serval-otel (layer 2, implemented with JSON/HTTP and batching).
         Span creation → handler hooks (onRequest creates span, onResponse closes).
         Context propagation → serval-core Context struct carries trace_id, span_id.
-        W3C traceparent header → serval-http or serval-proxy injects/extracts.
+        W3C traceparent header → serval-http or serval-proxy injects/extracts (future).
       </point>
-      <point trigger="TLS / HTTPS support">
-        TLS primitives → serval-tls (layer 1): handshake, cert loading, ALPN negotiation.
-        Client termination → serval-server wraps accepted socket with TLS.
-        Upstream origination → serval-proxy wraps upstream socket with TLS.
+      <point trigger="TLS / HTTPS support" status="implemented">
+        TLS primitives → serval-tls (layer 1, implemented): handshake, cert loading, kTLS kernel offload.
+        Socket abstraction → serval-net (layer 1, implemented): unified Socket tagged union for TCP/TLS.
+        Client termination → serval-server wraps accepted socket with TLS (implemented).
+        Upstream origination → serval-proxy wraps upstream socket with TLS (implemented).
         Config → serval-core: cert_path, key_path, upstream_tls_enabled, verify_upstream.
-        Connection pooling → serval-pool: separate pools for TLS vs plain connections.
-        Stream abstraction → both serval-http and serval-tls implement same read/write interface.
+        kTLS offload → automatic detection with userspace fallback (implemented).
+        Zero-copy → splice() works with kTLS-capable sockets (implemented).
       </point>
       <point trigger="HTTP/2 support">
         Framing/HPACK → serval-h2 (layer 1): frame parsing, header compression, stream state.
@@ -366,13 +392,13 @@
         IP reputation → serval-waf or separate module: blocklists, geo-blocking.
         Body parsing → serval-waf: form data, JSON, multipart inspection (bounded, no full buffering).
       </point>
-      <point trigger="health checks">
+      <point trigger="health checks" status="implemented">
         State tracking → serval-health (layer 2, implemented): atomic bitmap + threshold counters.
         Design → Pingora-inspired: boolean health with consecutive thresholds (no circuit breaker states).
-        Passive checks → handler calls tracker.recordSuccess/recordFailure on request completion.
+        Passive checks → handler calls tracker.recordSuccess/recordFailure on request completion (implemented).
         Active probes → serval-prober (layer 2, implemented): background thread HTTP/HTTPS GET probes against unhealthy backends.
-        TLS support → serval-prober detects upstream.tls flag and performs TLS handshake with SNI before HTTP probe.
-        Integration → selectUpstream uses tracker.findNthHealthy() to skip unhealthy backends.
+        TLS support → serval-prober detects upstream.tls flag and performs TLS handshake with SNI before HTTP probe (implemented).
+        Integration → selectUpstream uses tracker.findNthHealthy() to skip unhealthy backends (implemented in serval-lb).
         Config → DEFAULT_UNHEALTHY_THRESHOLD (3), DEFAULT_HEALTHY_THRESHOLD (2), DEFAULT_PROBE_INTERVAL_MS (5000), DEFAULT_HEALTH_PATH ("/").
       </point>
       <point trigger="rate limiting">

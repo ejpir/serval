@@ -19,6 +19,7 @@ const debugLog = serval_core.debugLog;
 
 const serval_net = @import("serval-net");
 const setTcpNoDelay = serval_net.setTcpNoDelay;
+const serval_tls = @import("serval-tls");
 
 const pool_mod = @import("serval-pool").pool;
 const metrics_mod = @import("serval-metrics").metrics;
@@ -52,6 +53,15 @@ var global_connection_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 const REQUEST_BUFFER_SIZE_BYTES = config.REQUEST_BUFFER_SIZE_BYTES;
 const RESPONSE_BUFFER_SIZE_BYTES = config.RESPONSE_BUFFER_SIZE_BYTES;
 const WRITE_BUFFER_SIZE_BYTES = config.SERVER_WRITE_BUFFER_SIZE_BYTES;
+
+// Hook-related types
+const Action = types.Action;
+const BodyAction = types.BodyAction;
+const ErrorAction = types.ErrorAction;
+const DirectResponse = types.DirectResponse;
+const RejectResponse = types.RejectResponse;
+const ResponseMode = types.ResponseMode;
+const UpstreamConnectInfo = types.UpstreamConnectInfo;
 
 // =============================================================================
 // Connection Handling (RFC 9112)
@@ -120,6 +130,7 @@ pub fn Server(
             metrics: *Metrics,
             tracer: *Tracer,
             cfg: Config,
+            client_ctx: ?*serval_tls.ssl.SSL_CTX,
         ) Self {
             assert(@intFromPtr(handler) != 0);
             assert(@intFromPtr(pool) != 0);
@@ -135,7 +146,7 @@ pub fn Server(
                 .metrics = metrics,
                 .tracer = tracer,
                 .config = cfg,
-                .forwarder = forwarder_mod.Forwarder(Pool, Tracer).init(pool, tracer, verify_upstream),
+                .forwarder = forwarder_mod.Forwarder(Pool, Tracer).init(pool, tracer, verify_upstream, client_ctx),
             };
         }
 
@@ -343,19 +354,38 @@ pub fn Server(
                 ctx.span_handle = span_handle; // Store in context for handlers
 
                 // Call onRequest hook if present
+                // TigerStyle: Handle all Action variants explicitly
+                var response_buf: [RESPONSE_BUFFER_SIZE_BYTES]u8 = undefined;
                 if (comptime hooks.hasHook(Handler, "onRequest")) {
-                    if (handler.onRequest(&ctx, &parser.request) == .send_response) {
-                        tracer.endSpan(span_handle, null);
-                        // Advance buffer offset past this request for pipelining
-                        const body_length = getBodyLength(&parser.request);
-                        buffer_offset += parser.headers_end + body_length;
-                        continue;
+                    const action = handler.onRequest(&ctx, &parser.request, &response_buf);
+                    switch (action) {
+                        .continue_request => {}, // Proceed to selectUpstream
+                        .send_response => |direct_response| {
+                            // Send direct response without forwarding to upstream
+                            sendDirectResponseImpl(io, stream, direct_response);
+                            ctx.response_status = direct_response.status;
+                            const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
+                            metrics.requestEnd(direct_response.status, duration_ns);
+                            tracer.endSpan(span_handle, null);
+                            // Advance buffer offset past this request for pipelining
+                            const body_length = getBodyLength(&parser.request);
+                            buffer_offset += parser.headers_end + body_length;
+                            continue;
+                        },
+                        .reject => |reject| {
+                            // Send rejection response (e.g., WAF blocking, rate limiting)
+                            sendRejectResponseImpl(io, stream, reject);
+                            ctx.response_status = reject.status;
+                            const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
+                            metrics.requestEnd(reject.status, duration_ns);
+                            tracer.endSpan(span_handle, reject.reason);
+                            // Advance buffer offset past this request for pipelining
+                            const body_length = getBodyLength(&parser.request);
+                            buffer_offset += parser.headers_end + body_length;
+                            continue;
+                        },
                     }
                 }
-
-                // Select upstream and forward
-                var upstream = handler.selectUpstream(&ctx, &parser.request);
-                ctx.upstream = upstream;
 
                 // Extract body info for streaming using parser's body_framing.
                 // body_framing is determined by Transfer-Encoding (chunked) or Content-Length.
@@ -374,8 +404,48 @@ pub fn Server(
                     else
                         &[_]u8{},
                 };
+
+                // Call onRequestBody hook if present and request has body data
+                // TigerStyle: Handle body inspection for WAF/validation
+                // Note: For MVP, call once with initial body bytes. Full body streaming
+                // inspection would require intercepting the body forwarding in forwarder.
+                if (comptime hooks.hasHook(Handler, "onRequestBody")) {
+                    if (body_bytes_in_buffer > 0) {
+                        const body_action = handler.onRequestBody(
+                            &ctx,
+                            body_info.initial_body,
+                            body_bytes_in_buffer == body_info.framing.getContentLength().?,
+                        );
+                        switch (body_action) {
+                            .continue_body => {}, // Proceed to selectUpstream
+                            .reject => |reject| {
+                                sendRejectResponseImpl(io, stream, reject);
+                                ctx.response_status = reject.status;
+                                const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
+                                metrics.requestEnd(reject.status, duration_ns);
+                                tracer.endSpan(span_handle, reject.reason);
+                                const body_length = getBodyLength(&parser.request);
+                                buffer_offset += parser.headers_end + body_length;
+                                continue;
+                            },
+                        }
+                    }
+                }
+
+                // Select upstream and forward
+                var upstream = handler.selectUpstream(&ctx, &parser.request);
+                ctx.upstream = upstream;
+
+                // Call onUpstreamRequest hook after selectUpstream, before forwarding
+                // TigerStyle: Allows path rewriting, header injection before forward
+                if (comptime hooks.hasHook(Handler, "onUpstreamRequest")) {
+                    handler.onUpstreamRequest(&ctx, &parser.request);
+                }
+
                 // Forward using async stream I/O (creates child spans for pool/connect/send/recv)
-                const forward_result = forwarder.forward(io, stream, &parser.request, &upstream, body_info, span_handle);
+                // Note: client_tls is null for now - plaintext client connections
+                // TLS client connections would need to pass the TLSStream here
+                const forward_result = forwarder.forward(io, stream, null, &parser.request, &upstream, body_info, span_handle);
 
                 const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
                 ctx.duration_ns = duration_ns;
@@ -459,7 +529,7 @@ pub fn Server(
             return n;
         }
 
-        /// Handle successful forward: update metrics and call onLog hook.
+        /// Handle successful forward: call lifecycle hooks, update metrics, call onLog hook.
         /// TigerStyle: Standalone function with explicit dependencies.
         fn handleForwardSuccessImpl(
             handler: *Handler,
@@ -474,6 +544,44 @@ pub fn Server(
 
             ctx.response_status = result.status;
             ctx.bytes_sent = result.response_bytes;
+
+            // Call onUpstreamConnect hook if present
+            // TigerStyle: Provide connection info from ForwardResult for observability
+            if (comptime hooks.hasHook(Handler, "onUpstreamConnect")) {
+                const connect_info = UpstreamConnectInfo{
+                    .dns_duration_ns = result.dns_duration_ns,
+                    .tcp_connect_duration_ns = result.tcp_connect_duration_ns,
+                    .tls_handshake_duration_ns = 0, // TODO: Extract from TLS layer when available
+                    .reused = result.connection_reused,
+                    .pool_wait_ns = result.pool_wait_ns,
+                    .local_port = result.upstream_local_port,
+                    // TLS cipher/version would need to come from forwarder
+                };
+                handler.onUpstreamConnect(ctx, &connect_info);
+            }
+
+            // Call onResponse hook if present
+            // TigerStyle: Allow handlers to observe/modify response
+            if (comptime hooks.hasHook(Handler, "onResponse")) {
+                var response = Response{
+                    .status = result.status,
+                    // Headers and body not available - response was streamed to client
+                    // This is a limitation of the zero-copy streaming design
+                };
+                const response_action = handler.onResponse(ctx, &response);
+                switch (response_action) {
+                    .continue_request => {}, // Normal completion
+                    .send_response => {
+                        // Note: Response already sent via streaming, cannot replace
+                        // Handler should use onUpstreamRequest to short-circuit if needed
+                        debugLog("onResponse: send_response ignored, response already streamed", .{});
+                    },
+                    .reject => {
+                        // Note: Response already sent, cannot reject
+                        debugLog("onResponse: reject ignored, response already streamed", .{});
+                    },
+                }
+            }
 
             // Track per-upstream stats if metrics supports it and upstream is set
             if (comptime @hasDecl(Metrics, "requestEndWithUpstream")) {
@@ -521,7 +629,7 @@ pub fn Server(
             }
         }
 
-        /// Handle forward error: call onError hook, send 502, update metrics.
+        /// Handle forward error: call onError hook, handle ErrorAction, update metrics.
         /// TigerStyle: Standalone function with explicit dependencies.
         fn handleForwardErrorImpl(
             handler: *Handler,
@@ -539,6 +647,8 @@ pub fn Server(
 
             const error_phase = forwardErrorToPhase(err);
 
+            // Determine error response based on handler's ErrorAction
+            var response_status: u16 = 502;
             if (comptime hooks.hasHook(Handler, "onError")) {
                 const error_ctx = errors.ErrorContext{
                     .err = forwardErrorToRequestError(err),
@@ -546,17 +656,38 @@ pub fn Server(
                     .upstream = upstream,
                     .is_retry = false,
                 };
-                handler.onError(ctx, error_ctx);
+                const error_action = handler.onError(ctx, &error_ctx);
+                switch (error_action) {
+                    .default => {
+                        // Default: send 502 Bad Gateway
+                        sendErrorResponseImpl(io, stream, 502, "Bad Gateway");
+                        response_status = 502;
+                    },
+                    .send_response => |direct_response| {
+                        // Custom error response from handler
+                        sendDirectResponseImpl(io, stream, direct_response);
+                        response_status = direct_response.status;
+                    },
+                    .retry => {
+                        // Note: Retry would require re-running selectUpstream and forwarder
+                        // This is complex and would need restructuring of the main loop.
+                        // For MVP, treat retry as default behavior with a log message.
+                        debugLog("onError: retry action not yet implemented, using default", .{});
+                        sendErrorResponseImpl(io, stream, 502, "Bad Gateway");
+                        response_status = 502;
+                    },
+                }
+            } else {
+                // No onError hook, use default 502
+                sendErrorResponseImpl(io, stream, 502, "Bad Gateway");
             }
-
-            sendErrorResponseImpl(io, stream, 502, "Bad Gateway");
-            ctx.response_status = 502;
+            ctx.response_status = response_status;
 
             // Track per-upstream stats if metrics supports it
             if (comptime @hasDecl(Metrics, "requestEndWithUpstream")) {
-                metrics.requestEndWithUpstream(502, duration_ns, upstream.idx);
+                metrics.requestEndWithUpstream(response_status, duration_ns, upstream.idx);
             } else {
-                metrics.requestEnd(502, duration_ns);
+                metrics.requestEnd(response_status, duration_ns);
             }
 
             if (comptime hooks.hasHook(Handler, "onLog")) {
@@ -567,7 +698,7 @@ pub fn Server(
                     .method = request.method,
                     .path = request.path,
                     .request_bytes = ctx.bytes_received,
-                    .status = 502,
+                    .status = response_status,
                     .response_bytes = 0,
                     .upstream = ctx.upstream,
                     .upstream_duration_ns = duration_ns,
@@ -683,6 +814,81 @@ pub fn Server(
             assert(message.len > 0);
             sendResponseImpl(io, stream, 501, "text/plain", message, true);
         }
+
+        /// Send direct response from handler (onRequest hook returning .send_response).
+        /// Supports both Content-Length and chunked response modes.
+        /// TigerStyle: Explicit handling of both response modes.
+        fn sendDirectResponseImpl(io: Io, stream: Io.net.Stream, direct: DirectResponse) void {
+            assert(direct.status >= 100 and direct.status < 600);
+
+            var response_buf: [RESPONSE_BUFFER_SIZE_BYTES]u8 = std.mem.zeroes([RESPONSE_BUFFER_SIZE_BYTES]u8);
+
+            const headers = switch (direct.response_mode) {
+                .content_length => std.fmt.bufPrint(
+                    &response_buf,
+                    "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\n{s}\r\n",
+                    .{
+                        direct.status,
+                        statusText(direct.status),
+                        direct.content_type,
+                        direct.body.len,
+                        direct.extra_headers,
+                    },
+                ),
+                .chunked => std.fmt.bufPrint(
+                    &response_buf,
+                    "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nTransfer-Encoding: chunked\r\n{s}\r\n",
+                    .{
+                        direct.status,
+                        statusText(direct.status),
+                        direct.content_type,
+                        direct.extra_headers,
+                    },
+                ),
+            };
+
+            const headers_data = headers catch return;
+
+            var write_buf: [WRITE_BUFFER_SIZE_BYTES]u8 = std.mem.zeroes([WRITE_BUFFER_SIZE_BYTES]u8);
+            var writer = stream.writer(io, &write_buf);
+            writer.interface.writeAll(headers_data) catch return;
+
+            // Send body based on response mode
+            switch (direct.response_mode) {
+                .content_length => {
+                    // Simple Content-Length body
+                    writer.interface.writeAll(direct.body) catch return;
+                },
+                .chunked => {
+                    // Chunked encoding: send as single chunk + final chunk
+                    if (direct.body.len > 0) {
+                        // Chunk size in hex + CRLF
+                        var chunk_header_buf: [32]u8 = undefined;
+                        const chunk_header = std.fmt.bufPrint(
+                            &chunk_header_buf,
+                            "{x}\r\n",
+                            .{direct.body.len},
+                        ) catch return;
+                        writer.interface.writeAll(chunk_header) catch return;
+                        writer.interface.writeAll(direct.body) catch return;
+                        writer.interface.writeAll("\r\n") catch return;
+                    }
+                    // Final zero-length chunk
+                    writer.interface.writeAll("0\r\n\r\n") catch return;
+                },
+            }
+            writer.interface.flush() catch return;
+        }
+
+        /// Send rejection response from handler (onRequest/onRequestBody hook returning .reject).
+        /// Sends a minimal error response with the rejection status code.
+        /// TigerStyle: Explicit error response for WAF/rate limiting rejections.
+        fn sendRejectResponseImpl(io: Io, stream: Io.net.Stream, reject: RejectResponse) void {
+            assert(reject.status >= 400 and reject.status < 600);
+
+            // Send minimal text/plain response with status text
+            sendResponseImpl(io, stream, reject.status, "text/plain", statusText(reject.status), false);
+        }
     };
 }
 
@@ -712,8 +918,9 @@ test "Server compiles with valid handler" {
     var metrics = metrics_mod.NoopMetrics{};
     var tracer = tracing_mod.NoopTracer{};
 
+    // TigerStyle: null client_ctx for tests without TLS upstreams.
     const server = Server(TestHandler, pool_mod.SimplePool, metrics_mod.NoopMetrics, tracing_mod.NoopTracer)
-        .init(&handler, &pool, &metrics, &tracer, .{});
+        .init(&handler, &pool, &metrics, &tracer, .{}, null);
 
     try std.testing.expectEqual(@as(u16, 8080), server.config.port);
 }
