@@ -4,6 +4,13 @@ Fixed-size connection pooling with no runtime allocation.
 
 ## Purpose
 
+**Connection pooling** - reuses TCP connections to backends to avoid per-request connection overhead. This is different from "backend pools" in `serval-router`.
+
+| Term | Module | Meaning |
+|------|--------|---------|
+| Connection pool | **serval-pool** | Reuse TCP connections to backends |
+| Backend pool | serval-router | Group of backend servers for routing |
+
 Provides connection reuse between the proxy and upstream backends. Implements a compile-time interface that allows swapping pool implementations. Includes lifecycle management with idle timeout eviction and max connection age limits.
 
 ## Dependencies

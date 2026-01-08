@@ -4,7 +4,22 @@ Health-aware load balancer handler for serval HTTP server.
 
 ## Purpose
 
-Standalone load balancing module with integrated health tracking and automatic background probing. Backends marked unhealthy after consecutive failures recover automatically when background probes succeed.
+**Single-pool load balancing** with integrated health tracking and automatic background probing. Backends marked unhealthy after consecutive failures recover automatically when probes succeed.
+
+Use `serval-lb` when you have one set of backends and need to distribute traffic across them. For routing to different backend pools based on path/host, see `serval-router`.
+
+## When to Use
+
+| Need | Module |
+|------|--------|
+| Balance across ONE pool of backends | **serval-lb** |
+| Route to DIFFERENT pools based on path/host | serval-router |
+
+```
+serval-lb:     client → [LB] → backend1, backend2, backend3
+serval-router: client → [Router] → /api/* → pool1 → backend1, backend2
+                                 → /static/* → pool2 → backend3, backend4
+```
 
 ## Exports
 

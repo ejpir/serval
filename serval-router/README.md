@@ -4,7 +4,22 @@ Content-based router for serval HTTP server.
 
 ## Purpose
 
-Routes incoming requests to backend pools based on host and path matching. Each pool embeds an LbHandler for health-aware load balancing. Supports path rewriting (strip prefix) for API gateway patterns.
+**Multi-pool routing** based on host and path matching. Each pool has its own `LbHandler` for health-aware load balancing. Supports path rewriting (strip prefix) for API gateway patterns.
+
+Use `serval-router` when you need to route requests to different backend pools. For simple single-pool load balancing, see `serval-lb`.
+
+## When to Use
+
+| Need | Module |
+|------|--------|
+| Balance across ONE pool of backends | serval-lb |
+| Route to DIFFERENT pools based on path/host | **serval-router** |
+
+```
+serval-lb:     client → [LB] → backend1, backend2, backend3
+serval-router: client → [Router] → /api/* → pool1 → backend1, backend2
+                                 → /static/* → pool2 → backend3, backend4
+```
 
 ## Layer
 
