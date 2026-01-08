@@ -135,6 +135,20 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Router module - depends on core, lb, health, prober, tls (Layer 4 - Strategy)
+    // Note: Not yet added to umbrella module - will be integrated when feature is complete
+    const serval_router_module = b.addModule("serval-router", .{
+        .root_source_file = b.path("serval-router/mod.zig"),
+        .imports = &.{
+            .{ .name = "serval-core", .module = serval_core_module },
+            .{ .name = "serval-lb", .module = serval_lb_module },
+            .{ .name = "serval-health", .module = serval_health_module },
+            .{ .name = "serval-prober", .module = serval_prober_module },
+            .{ .name = "serval-tls", .module = serval_tls_module },
+        },
+    });
+    _ = serval_router_module; // Used by test-router step (referenced via path)
+
     // Main serval module - composes all (umbrella)
     const serval_module = b.addModule("serval", .{
         .root_source_file = b.path("serval/mod.zig"),
@@ -205,6 +219,30 @@ pub fn build(b: *std.Build) void {
 
     const lb_test_step = b.step("test-lb", "Run serval-lb library tests");
     lb_test_step.dependOn(&run_lb_tests.step);
+
+    // Router module tests
+    // Note: Links SSL libraries since serval-router depends on serval-lb/prober which depend on serval-tls
+    const router_tests_mod = b.createModule(.{
+        .root_source_file = b.path("serval-router/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    router_tests_mod.linkSystemLibrary("ssl", .{});
+    router_tests_mod.linkSystemLibrary("crypto", .{});
+    router_tests_mod.addImport("serval-core", serval_core_module);
+    router_tests_mod.addImport("serval-lb", serval_lb_module);
+    router_tests_mod.addImport("serval-health", serval_health_module);
+    router_tests_mod.addImport("serval-prober", serval_prober_module);
+    router_tests_mod.addImport("serval-tls", serval_tls_module);
+    const router_tests = b.addTest(.{
+        .name = "router_tests",
+        .root_module = router_tests_mod,
+    });
+    const run_router_tests = b.addRunArtifact(router_tests);
+
+    const router_test_step = b.step("test-router", "Run serval-router library tests");
+    router_test_step.dependOn(&run_router_tests.step);
 
     // Health module tests
     const health_tests_mod = b.createModule(.{
