@@ -7,7 +7,8 @@ HTTP server framework for Zig — build backends, proxies, load balancers, API g
 - **Modular architecture** — Use the full server or individual components (parser, pool, forwarder)
 - **Compile-time composition** — Generic interfaces verified at build time, zero runtime dispatch
 - **TLS support** — Client-side termination and upstream HTTPS (OpenSSL)
-- **Zero-copy forwarding** — Linux splice() for body transfer when available
+- **kTLS kernel offload** — Hardware-accelerated TLS with automatic fallback
+- **Zero-copy forwarding** — Linux splice() for body transfer (including kTLS)
 - **Connection pooling** — Reuse upstream connections across requests
 - **Pluggable components** — Custom handlers, metrics, and tracing implementations
 - **No runtime allocation** — All memory allocated at startup
@@ -74,7 +75,7 @@ exe.root_module.addImport("serval-lb", serval.module("serval-lb"));
 | `serval` | Umbrella module — re-exports everything |
 | `serval-core` | Types, config, errors, context |
 | `serval-http` | HTTP/1.1 request parser |
-| `serval-tls` | TLS termination and origination (OpenSSL) |
+| `serval-tls` | TLS termination/origination with kTLS offload |
 | `serval-pool` | Connection pooling |
 | `serval-proxy` | Upstream forwarding |
 | `serval-server` | HTTP/1.1 server |
@@ -258,6 +259,7 @@ zig build run-echo-backend -- --help
 | Active health probing (HTTP/HTTPS) | Complete |
 | TLS termination (server-side) | Complete |
 | TLS origination (upstream HTTPS) | Complete |
+| kTLS kernel offload | Complete |
 | Chunked encoding | Complete |
 | HTTP/2 | Not implemented |
 
