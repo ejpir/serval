@@ -7,7 +7,6 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
-const Io = std.Io;
 
 const config = @import("serval-core").config;
 const time = @import("serval-core").time;
@@ -17,8 +16,8 @@ const UpstreamIndex = config.UpstreamIndex;
 const serval_core = @import("serval-core");
 const debugLog = serval_core.debugLog;
 
-const serval_tls = @import("serval-tls");
-const TLSStream = serval_tls.TLSStream;
+const net = @import("serval-net");
+const Socket = net.Socket;
 
 // =============================================================================
 // Pool Interface Verification
@@ -26,13 +25,13 @@ const TLSStream = serval_tls.TLSStream;
 
 pub fn verifyPool(comptime Pool: type) void {
     if (!@hasDecl(Pool, "acquire")) {
-        @compileError("Pool must implement: pub fn acquire(self, upstream_idx: UpstreamIndex, io: Io) ?Connection");
+        @compileError("Pool must implement: pub fn acquire(self, upstream_idx: UpstreamIndex) ?Connection");
     }
     if (!@hasDecl(Pool, "release")) {
-        @compileError("Pool must implement: pub fn release(self, upstream_idx: UpstreamIndex, conn: Connection, healthy: bool, io: Io) void");
+        @compileError("Pool must implement: pub fn release(self, upstream_idx: UpstreamIndex, conn: Connection, healthy: bool) void");
     }
     if (!@hasDecl(Pool, "drain")) {
-        @compileError("Pool must implement: pub fn drain(self, io: Io) void");
+        @compileError("Pool must implement: pub fn drain(self) void");
     }
 }
 
@@ -70,7 +69,9 @@ const STALE_CONNECTION_FLAGS = std.posix.POLL.IN | std.posix.POLL.HUP |
     std.posix.POLL.ERR | std.posix.POLL.NVAL;
 
 pub const Connection = struct {
-    stream: Io.net.Stream,
+    /// Unified socket (plain TCP or TLS).
+    /// TigerStyle: Single type handles both encrypted and unencrypted connections.
+    socket: Socket,
     /// Timestamp when connection was established (monotonic nanoseconds).
     /// TigerStyle: u64 for nanoseconds, explicit unit in name.
     created_ns: u64 = 0,
@@ -80,27 +81,20 @@ pub const Connection = struct {
     /// Sentinel to detect double-release. Set to magic value when in pool.
     /// TigerStyle: Defense in depth against use-after-release bugs.
     pool_sentinel: u32 = IN_USE_SENTINEL,
-    /// Optional TLS stream for encrypted connections.
-    /// When non-null, I/O operations must use TLS read/write instead of raw socket.
-    /// TigerStyle: Explicit null means plaintext connection.
-    tls: ?TLSStream = null,
 
     const IN_POOL_SENTINEL: u32 = 0xDEAD_BEEF;
     const IN_USE_SENTINEL: u32 = 0xCAFE_BABE;
 
-    /// Close the connection stream.
-    /// TigerStyle: Explicit io parameter for async close.
-    pub fn close(self: *Connection, io: Io) void {
-        if (self.tls) |*tls_stream| {
-            tls_stream.close();
-        }
-        self.stream.close(io);
+    /// Close the connection socket.
+    /// TigerStyle: Socket.close() handles both plain and TLS cleanup.
+    pub fn close(self: *Connection) void {
+        self.socket.close();
     }
 
-    /// Get raw file descriptor for splice operations.
+    /// Get raw file descriptor for splice operations and polling.
     /// TigerStyle: Zero-copy splice needs raw fd.
     pub fn getFd(self: *const Connection) i32 {
-        return self.stream.socket.handle;
+        return self.socket.getFd();
     }
 
     /// Check if connection is unusable and should not be reused.
@@ -109,7 +103,7 @@ pub const Connection = struct {
     /// Returns true if connection should NOT be reused.
     /// TigerStyle: Positive naming - true means "bad, don't use".
     pub fn isUnusable(self: *const Connection) bool {
-        const fd = self.stream.socket.handle;
+        const fd = self.socket.getFd();
         if (fd < 0) return true;
 
         var poll_fds = [_]std.posix.pollfd{
@@ -146,17 +140,17 @@ pub const Connection = struct {
 // =============================================================================
 
 pub const NoPool = struct {
-    pub fn acquire(_: *@This(), _: UpstreamIndex, _: Io) ?Connection {
+    pub fn acquire(_: *@This(), _: UpstreamIndex) ?Connection {
         return null;
     }
 
-    pub fn release(_: *@This(), _: UpstreamIndex, conn: Connection, _: bool, io: Io) void {
+    pub fn release(_: *@This(), _: UpstreamIndex, conn: Connection, _: bool) void {
         var c = conn;
-        c.close(io);
+        c.close();
     }
 
     /// No-op for NoPool since it doesn't store connections.
-    pub fn drain(_: *@This(), _: Io) void {}
+    pub fn drain(_: *@This()) void {}
 };
 
 // =============================================================================
@@ -214,7 +208,7 @@ pub const SimplePool = struct {
     /// Returns null if no connections available.
     /// Skips and collects stale connections (idle timeout or max age exceeded).
     /// TigerStyle: Mutex held only for array access, I/O (close) outside lock.
-    pub fn acquire(self: *SimplePool, upstream_idx: UpstreamIndex, io: Io) ?Connection {
+    pub fn acquire(self: *SimplePool, upstream_idx: UpstreamIndex) ?Connection {
         assert(upstream_idx < MAX_UPSTREAMS);
 
         const now_ns = time.monotonicNanos();
@@ -276,7 +270,7 @@ pub const SimplePool = struct {
         for (stale_conns[0..stale_count]) |maybe_conn| {
             if (maybe_conn) |*conn| {
                 var c = conn.*;
-                c.close(io);
+                c.close();
                 self.emitMetric(upstream_idx, .acquire_evicted);
             }
         }
@@ -296,8 +290,8 @@ pub const SimplePool = struct {
     /// Updates last_used_ns timestamp for idle timeout tracking.
     /// TigerStyle: Single lock acquisition for atomic state update, I/O outside mutex.
     /// Defense in depth with sentinel to detect double-release.
-    /// self.pool.release(upstream.idx, mutable_conn, true, io);
-    pub fn release(self: *SimplePool, upstream_idx: UpstreamIndex, conn: Connection, healthy: bool, io: Io) void {
+    /// self.pool.release(upstream.idx, mutable_conn, true);
+    pub fn release(self: *SimplePool, upstream_idx: UpstreamIndex, conn: Connection, healthy: bool) void {
         assert(upstream_idx < MAX_UPSTREAMS);
         // TigerStyle: Verify sentinel - must not be double-released
         assert(conn.pool_sentinel == Connection.IN_USE_SENTINEL);
@@ -335,7 +329,7 @@ pub const SimplePool = struct {
 
         // I/O outside mutex - close if unhealthy or pool was full
         if (should_close) {
-            c.close(io);
+            c.close();
             self.emitMetric(upstream_idx, .release_closed);
         } else if (healthy) {
             self.emitMetric(upstream_idx, .release_stored);
@@ -345,8 +339,8 @@ pub const SimplePool = struct {
     }
 
     /// Close all pooled connections. Call during server shutdown.
-    /// TigerStyle: Explicit io parameter for async close.
-    pub fn drain(self: *SimplePool, io: Io) void {
+    /// TigerStyle: Socket.close() handles both plain and TLS cleanup.
+    pub fn drain(self: *SimplePool) void {
         // Collect connections to close under lock.
         // TigerStyle: Bounded array, no allocation.
         var to_close: [MAX_UPSTREAMS * MAX_CONNS_PER_UPSTREAM]?Connection =
@@ -373,7 +367,7 @@ pub const SimplePool = struct {
         for (to_close[0..close_count]) |maybe_conn| {
             if (maybe_conn) |*conn| {
                 var c = conn.*;
-                c.close(io);
+                c.close();
             }
         }
     }
@@ -419,14 +413,12 @@ pub const SimplePool = struct {
 
 test "NoPool always returns null" {
     var pool = NoPool{};
-    // Pass undefined io since NoPool doesn't use it
-    try std.testing.expectEqual(@as(?Connection, null), pool.acquire(0, undefined));
+    try std.testing.expectEqual(@as(?Connection, null), pool.acquire(0));
 }
 
 test "SimplePool acquire from empty returns null" {
     var pool = SimplePool.init();
-    // Pass undefined io since no connections to close
-    try std.testing.expectEqual(@as(?Connection, null), pool.acquire(0, undefined));
+    try std.testing.expectEqual(@as(?Connection, null), pool.acquire(0));
 }
 
 test "SimplePool stores and retrieves connections" {
@@ -437,11 +429,11 @@ test "SimplePool stores and retrieves connections" {
     try std.testing.expectEqual(@as(u8, 0), pool.counts[0]);
 
     // Directly store a connection (simulating release with healthy=true)
-    // We use undefined stream since we only test pool counting, not I/O
+    // We use undefined socket since we only test pool counting, not I/O
     // Set timestamps to now so connection is not considered stale
     // Set sentinel to IN_POOL_SENTINEL as if it were properly released
     const test_conn: Connection = .{
-        .stream = undefined,
+        .socket = undefined,
         .created_ns = now_ns,
         .last_used_ns = now_ns,
         .pool_sentinel = Connection.IN_POOL_SENTINEL,
@@ -450,8 +442,8 @@ test "SimplePool stores and retrieves connections" {
     pool.counts[0] = 1;
     try std.testing.expectEqual(@as(u8, 1), pool.counts[0]);
 
-    // Acquire returns it (pass undefined io since connection is valid)
-    const conn = pool.acquire(0, undefined);
+    // Acquire returns it
+    const conn = pool.acquire(0);
     try std.testing.expect(conn != null);
     try std.testing.expectEqual(@as(u8, 0), pool.counts[0]);
     // Verify sentinel changed to IN_USE after acquire
@@ -465,7 +457,7 @@ test "SimplePool respects max connections per upstream" {
     // Fill up the pool for upstream 0 with properly initialized connections
     for (0..SimplePool.MAX_CONNS_PER_UPSTREAM) |i| {
         pool.connections[0][i] = .{
-            .stream = undefined,
+            .socket = undefined,
             .created_ns = now_ns,
             .last_used_ns = now_ns,
             .pool_sentinel = Connection.IN_POOL_SENTINEL,
@@ -478,7 +470,7 @@ test "SimplePool respects max connections per upstream" {
 
 test "Connection has timestamp fields" {
     const conn: Connection = .{
-        .stream = undefined,
+        .socket = undefined,
         .created_ns = 12345,
         .last_used_ns = 67890,
     };
@@ -488,12 +480,12 @@ test "Connection has timestamp fields" {
 
 test "Connection sentinel values" {
     // Default sentinel is IN_USE
-    const conn: Connection = .{ .stream = undefined };
+    const conn: Connection = .{ .socket = undefined };
     try std.testing.expectEqual(Connection.IN_USE_SENTINEL, conn.pool_sentinel);
 
     // IN_POOL sentinel marks connection as pooled
     const pooled_conn: Connection = .{
-        .stream = undefined,
+        .socket = undefined,
         .pool_sentinel = Connection.IN_POOL_SENTINEL,
     };
     try std.testing.expectEqual(Connection.IN_POOL_SENTINEL, pooled_conn.pool_sentinel);
@@ -515,13 +507,13 @@ test "SimplePool getStats returns correct counts" {
 
     // Add some connections to the pool (simulating release)
     pool.connections[0][0] = .{
-        .stream = undefined,
+        .socket = undefined,
         .created_ns = now_ns,
         .last_used_ns = now_ns,
         .pool_sentinel = Connection.IN_POOL_SENTINEL,
     };
     pool.connections[0][1] = .{
-        .stream = undefined,
+        .socket = undefined,
         .created_ns = now_ns,
         .last_used_ns = now_ns,
         .pool_sentinel = Connection.IN_POOL_SENTINEL,
@@ -530,7 +522,7 @@ test "SimplePool getStats returns correct counts" {
 
     // Add connections for a second upstream
     pool.connections[1][0] = .{
-        .stream = undefined,
+        .socket = undefined,
         .created_ns = now_ns,
         .last_used_ns = now_ns,
         .pool_sentinel = Connection.IN_POOL_SENTINEL,
@@ -559,7 +551,7 @@ test "SimplePool checked_out_counts tracks acquire and release" {
 
     // Add a connection to the pool
     pool.connections[0][0] = .{
-        .stream = undefined,
+        .socket = undefined,
         .created_ns = now_ns,
         .last_used_ns = now_ns,
         .pool_sentinel = Connection.IN_POOL_SENTINEL,
@@ -567,7 +559,7 @@ test "SimplePool checked_out_counts tracks acquire and release" {
     pool.counts[0] = 1;
 
     // Acquire increments checked_out_counts
-    const conn = pool.acquire(0, undefined);
+    const conn = pool.acquire(0);
     try std.testing.expect(conn != null);
     try std.testing.expectEqual(@as(u8, 1), pool.checked_out_counts[0]);
     try std.testing.expectEqual(@as(u8, 0), pool.counts[0]);
@@ -587,7 +579,7 @@ test "Contract: acquired connections must have created_ns > 0" {
 
     // Store connection with created_ns = 0 (the bug case)
     pool.connections[0][0] = .{
-        .stream = undefined,
+        .socket = undefined,
         .created_ns = 0, // BUG: forwarder didn't set this
         .last_used_ns = now_ns,
         .pool_sentinel = Connection.IN_POOL_SENTINEL,
@@ -595,7 +587,7 @@ test "Contract: acquired connections must have created_ns > 0" {
     pool.counts[0] = 1;
 
     // Pool should evict it as too old (age = now_ns - 0 = massive)
-    const result = pool.acquire(0, undefined);
+    const result = pool.acquire(0);
     try std.testing.expectEqual(@as(?Connection, null), result);
     try std.testing.expectEqual(@as(u8, 0), pool.counts[0]); // Evicted
 }
@@ -606,14 +598,14 @@ test "Invariant: acquired connections have valid timestamps" {
 
     // Store a properly initialized connection
     pool.connections[0][0] = .{
-        .stream = undefined,
+        .socket = undefined,
         .created_ns = now_ns - 1000,
         .last_used_ns = now_ns,
         .pool_sentinel = Connection.IN_POOL_SENTINEL,
     };
     pool.counts[0] = 1;
 
-    const result = pool.acquire(0, undefined);
+    const result = pool.acquire(0);
     try std.testing.expect(result != null);
 
     // INVARIANT: All acquired connections MUST have valid timestamps
@@ -628,7 +620,7 @@ test "Pool evicts connections exceeding max age (5 minutes)" {
 
     const max_age_ns = 5 * 60 * std.time.ns_per_s;
     const old_conn: Connection = .{
-        .stream = undefined,
+        .socket = undefined,
         .created_ns = now_ns - (max_age_ns + (60 * std.time.ns_per_s)), // 6 min old
         .last_used_ns = now_ns - 1000, // Used recently, but too old overall
         .pool_sentinel = Connection.IN_POOL_SENTINEL,
@@ -638,7 +630,7 @@ test "Pool evicts connections exceeding max age (5 minutes)" {
     pool.counts[0] = 1;
 
     // Should evict due to max age
-    const result = pool.acquire(0, undefined);
+    const result = pool.acquire(0);
     try std.testing.expectEqual(@as(?Connection, null), result);
     try std.testing.expectEqual(@as(u8, 0), pool.counts[0]);
 }
@@ -649,7 +641,7 @@ test "Pool evicts connections exceeding idle timeout (60 seconds)" {
 
     const idle_timeout_ns = 60 * std.time.ns_per_s;
     const idle_conn: Connection = .{
-        .stream = undefined,
+        .socket = undefined,
         .created_ns = now_ns - (10 * std.time.ns_per_s), // 10s old
         .last_used_ns = now_ns - (idle_timeout_ns + std.time.ns_per_s), // 61s idle
         .pool_sentinel = Connection.IN_POOL_SENTINEL,
@@ -659,7 +651,7 @@ test "Pool evicts connections exceeding idle timeout (60 seconds)" {
     pool.counts[0] = 1;
 
     // Should evict due to idle timeout
-    const result = pool.acquire(0, undefined);
+    const result = pool.acquire(0);
     try std.testing.expectEqual(@as(?Connection, null), result);
     try std.testing.expectEqual(@as(u8, 0), pool.counts[0]);
 }
@@ -669,7 +661,7 @@ test "Pool retains fresh, recently-used connections" {
     const now_ns = time.monotonicNanos();
 
     const fresh_conn: Connection = .{
-        .stream = undefined,
+        .socket = undefined,
         .created_ns = now_ns - (30 * std.time.ns_per_s), // 30s old
         .last_used_ns = now_ns - (5 * std.time.ns_per_s), // Used 5s ago
         .pool_sentinel = Connection.IN_POOL_SENTINEL,
@@ -679,7 +671,7 @@ test "Pool retains fresh, recently-used connections" {
     pool.counts[0] = 1;
 
     // Should successfully acquire (not evicted)
-    const result = pool.acquire(0, undefined);
+    const result = pool.acquire(0);
     try std.testing.expect(result != null);
     try std.testing.expectEqual(@as(u8, 0), pool.counts[0]); // Removed from pool
     try std.testing.expectEqual(Connection.IN_USE_SENTINEL, result.?.pool_sentinel);
@@ -691,17 +683,17 @@ test "Full lifecycle: acquire → release → acquire reuses connection" {
 
     // Simulate first request: create connection and release to pool
     const new_conn: Connection = .{
-        .stream = undefined,
+        .socket = undefined,
         .created_ns = now_ns,
         .last_used_ns = now_ns,
         .pool_sentinel = Connection.IN_USE_SENTINEL,
     };
 
-    pool.release(0, new_conn, true, undefined);
+    pool.release(0, new_conn, true);
     try std.testing.expectEqual(@as(u8, 1), pool.counts[0]);
 
     // Simulate second request: acquire from pool
-    const reused_conn = pool.acquire(0, undefined);
+    const reused_conn = pool.acquire(0);
     try std.testing.expect(reused_conn != null);
     try std.testing.expectEqual(@as(u8, 0), pool.counts[0]);
 
@@ -722,20 +714,20 @@ test "CRITICAL: Release unhealthy connection does NOT pool it" {
     const now_ns = time.monotonicNanos();
 
     const unhealthy_conn: Connection = .{
-        .stream = undefined,
+        .socket = undefined,
         .created_ns = now_ns,
         .last_used_ns = now_ns,
         .pool_sentinel = Connection.IN_USE_SENTINEL,
     };
 
     // Release as unhealthy (healthy=false)
-    pool.release(0, unhealthy_conn, false, undefined);
+    pool.release(0, unhealthy_conn, false);
 
     // Should NOT be in pool
     try std.testing.expectEqual(@as(u8, 0), pool.counts[0]);
 
     // Next acquire should return null (pool is empty)
-    const result = pool.acquire(0, undefined);
+    const result = pool.acquire(0);
     try std.testing.expectEqual(@as(?Connection, null), result);
 }
 
@@ -748,12 +740,12 @@ test "CRITICAL: Pool full drops healthy connection (bounded buffer)" {
     // Fill pool to MAX_CONNS_PER_UPSTREAM
     for (0..SimplePool.MAX_CONNS_PER_UPSTREAM) |i| {
         const conn: Connection = .{
-            .stream = undefined,
+            .socket = undefined,
             .created_ns = now_ns,
             .last_used_ns = now_ns,
             .pool_sentinel = Connection.IN_USE_SENTINEL,
         };
-        pool.release(0, conn, true, undefined);
+        pool.release(0, conn, true);
         try std.testing.expectEqual(@as(u8, @intCast(i + 1)), pool.counts[0]);
     }
 
@@ -762,12 +754,12 @@ test "CRITICAL: Pool full drops healthy connection (bounded buffer)" {
 
     // Release one more healthy connection - should be dropped (closed)
     const overflow_conn: Connection = .{
-        .stream = undefined,
+        .socket = undefined,
         .created_ns = now_ns,
         .last_used_ns = now_ns,
         .pool_sentinel = Connection.IN_USE_SENTINEL,
     };
-    pool.release(0, overflow_conn, true, undefined);
+    pool.release(0, overflow_conn, true);
 
     // Pool should still be at max (overflow connection was closed)
     try std.testing.expectEqual(SimplePool.MAX_CONNS_PER_UPSTREAM, pool.counts[0]);
@@ -781,34 +773,34 @@ test "CRITICAL: Multiple upstreams are isolated" {
 
     // Release connection to upstream 0
     const conn_upstream_0: Connection = .{
-        .stream = undefined,
+        .socket = undefined,
         .created_ns = now_ns,
         .last_used_ns = now_ns,
         .pool_sentinel = Connection.IN_USE_SENTINEL,
     };
-    pool.release(0, conn_upstream_0, true, undefined);
+    pool.release(0, conn_upstream_0, true);
 
     // Release connection to upstream 1
     const conn_upstream_1: Connection = .{
-        .stream = undefined,
+        .socket = undefined,
         .created_ns = now_ns,
         .last_used_ns = now_ns,
         .pool_sentinel = Connection.IN_USE_SENTINEL,
     };
-    pool.release(1, conn_upstream_1, true, undefined);
+    pool.release(1, conn_upstream_1, true);
 
     // Verify counts
     try std.testing.expectEqual(@as(u8, 1), pool.counts[0]);
     try std.testing.expectEqual(@as(u8, 1), pool.counts[1]);
 
     // Acquire from upstream 0 - should get upstream 0's connection
-    const result_0 = pool.acquire(0, undefined);
+    const result_0 = pool.acquire(0);
     try std.testing.expect(result_0 != null);
     try std.testing.expectEqual(@as(u8, 0), pool.counts[0]); // upstream 0 now empty
     try std.testing.expectEqual(@as(u8, 1), pool.counts[1]); // upstream 1 unchanged
 
     // Acquire from upstream 1 - should get upstream 1's connection
-    const result_1 = pool.acquire(1, undefined);
+    const result_1 = pool.acquire(1);
     try std.testing.expect(result_1 != null);
     try std.testing.expectEqual(@as(u8, 0), pool.counts[0]); // upstream 0 still empty
     try std.testing.expectEqual(@as(u8, 0), pool.counts[1]); // upstream 1 now empty
@@ -822,33 +814,33 @@ test "CRITICAL: LIFO order preserves cache locality" {
 
     // Release 3 connections with different timestamps
     const old_conn: Connection = .{
-        .stream = undefined,
+        .socket = undefined,
         .created_ns = now_ns - 1000,
         .last_used_ns = now_ns - 1000,
         .pool_sentinel = Connection.IN_USE_SENTINEL,
     };
-    pool.release(0, old_conn, true, undefined);
+    pool.release(0, old_conn, true);
 
     const mid_conn: Connection = .{
-        .stream = undefined,
+        .socket = undefined,
         .created_ns = now_ns - 500,
         .last_used_ns = now_ns - 500,
         .pool_sentinel = Connection.IN_USE_SENTINEL,
     };
-    pool.release(0, mid_conn, true, undefined);
+    pool.release(0, mid_conn, true);
 
     const recent_conn: Connection = .{
-        .stream = undefined,
+        .socket = undefined,
         .created_ns = now_ns - 100,
         .last_used_ns = now_ns - 100,
         .pool_sentinel = Connection.IN_USE_SENTINEL,
     };
-    pool.release(0, recent_conn, true, undefined);
+    pool.release(0, recent_conn, true);
 
     try std.testing.expectEqual(@as(u8, 3), pool.counts[0]);
 
     // Acquire should return MOST RECENT (LIFO)
-    const result = pool.acquire(0, undefined);
+    const result = pool.acquire(0);
     try std.testing.expect(result != null);
     try std.testing.expectEqual(now_ns - 100, result.?.last_used_ns);
 }
@@ -862,12 +854,12 @@ test "CRITICAL: Drain closes all pooled connections" {
     // Add connections to multiple upstreams
     for (0..3) |upstream_idx| {
         const conn: Connection = .{
-            .stream = undefined,
+            .socket = undefined,
             .created_ns = now_ns,
             .last_used_ns = now_ns,
             .pool_sentinel = Connection.IN_USE_SENTINEL,
         };
-        pool.release(@intCast(upstream_idx), conn, true, undefined);
+        pool.release(@intCast(upstream_idx), conn, true);
     }
 
     try std.testing.expectEqual(@as(u8, 1), pool.counts[0]);
@@ -875,7 +867,7 @@ test "CRITICAL: Drain closes all pooled connections" {
     try std.testing.expectEqual(@as(u8, 1), pool.counts[2]);
 
     // Drain should empty all pools
-    pool.drain(undefined);
+    pool.drain();
 
     try std.testing.expectEqual(@as(u8, 0), pool.counts[0]);
     try std.testing.expectEqual(@as(u8, 0), pool.counts[1]);
@@ -917,34 +909,34 @@ test "CRITICAL: Metrics callback receives correct events" {
     const now_ns = time.monotonicNanos();
 
     // Acquire from empty pool - should emit acquire_miss
-    _ = pool.acquire(0, undefined);
+    _ = pool.acquire(0);
     try std.testing.expectEqual(@as(u32, 0), TestMetrics.acquire_hits);
     try std.testing.expectEqual(@as(u32, 1), TestMetrics.acquire_misses);
 
     // Release healthy connection - should emit release_stored
     const conn: Connection = .{
-        .stream = undefined,
+        .socket = undefined,
         .created_ns = now_ns,
         .last_used_ns = now_ns,
         .pool_sentinel = Connection.IN_USE_SENTINEL,
     };
-    pool.release(0, conn, true, undefined);
+    pool.release(0, conn, true);
     try std.testing.expectEqual(@as(u32, 1), TestMetrics.release_stored);
     try std.testing.expectEqual(@as(u32, 0), TestMetrics.release_closed);
 
     // Acquire from pool - should emit acquire_hit
-    _ = pool.acquire(0, undefined);
+    _ = pool.acquire(0);
     try std.testing.expectEqual(@as(u32, 1), TestMetrics.acquire_hits);
     try std.testing.expectEqual(@as(u32, 1), TestMetrics.acquire_misses); // Unchanged
 
     // Release unhealthy connection - should emit release_closed
     const unhealthy: Connection = .{
-        .stream = undefined,
+        .socket = undefined,
         .created_ns = now_ns,
         .last_used_ns = now_ns,
         .pool_sentinel = Connection.IN_USE_SENTINEL,
     };
-    pool.release(0, unhealthy, false, undefined);
+    pool.release(0, unhealthy, false);
     try std.testing.expectEqual(@as(u32, 1), TestMetrics.release_stored); // Unchanged
     try std.testing.expectEqual(@as(u32, 1), TestMetrics.release_closed);
 }
@@ -957,7 +949,7 @@ test "CRITICAL: Boundary - connection at exactly max age threshold" {
 
     // Connection at EXACTLY max age (not over)
     const boundary_conn: Connection = .{
-        .stream = undefined,
+        .socket = undefined,
         .created_ns = now_ns - max_age_ns,
         .last_used_ns = now_ns,
         .pool_sentinel = Connection.IN_POOL_SENTINEL,
@@ -967,7 +959,7 @@ test "CRITICAL: Boundary - connection at exactly max age threshold" {
     pool.counts[0] = 1;
 
     // Should be evicted (age > MAX, not >=)
-    const result = pool.acquire(0, undefined);
+    const result = pool.acquire(0);
     // TigerStyle: Document expected behavior explicitly
     // Current implementation: if (age_ns > MAX_CONNECTION_AGE_NS)
     // So exactly-at-threshold should NOT be evicted
@@ -982,7 +974,7 @@ test "CRITICAL: Boundary - connection at exactly idle timeout threshold" {
 
     // Connection at EXACTLY idle timeout (not over)
     const boundary_conn: Connection = .{
-        .stream = undefined,
+        .socket = undefined,
         .created_ns = now_ns - 1000,
         .last_used_ns = now_ns - idle_timeout_ns,
         .pool_sentinel = Connection.IN_POOL_SENTINEL,
@@ -992,7 +984,7 @@ test "CRITICAL: Boundary - connection at exactly idle timeout threshold" {
     pool.counts[0] = 1;
 
     // Should NOT be evicted (idle > TIMEOUT, not >=)
-    const result = pool.acquire(0, undefined);
+    const result = pool.acquire(0);
     try std.testing.expect(result != null);
 }
 
@@ -1003,24 +995,24 @@ test "CRITICAL: checked_out_counts prevents pool accounting bugs" {
     const now_ns = time.monotonicNanos();
 
     const conn: Connection = .{
-        .stream = undefined,
+        .socket = undefined,
         .created_ns = now_ns,
         .last_used_ns = now_ns,
         .pool_sentinel = Connection.IN_USE_SENTINEL,
     };
-    pool.release(0, conn, true, undefined);
+    pool.release(0, conn, true);
 
     try std.testing.expectEqual(@as(u8, 0), pool.checked_out_counts[0]);
     try std.testing.expectEqual(@as(u8, 1), pool.counts[0]);
 
     // Acquire increments checked_out
-    const acquired = pool.acquire(0, undefined);
+    const acquired = pool.acquire(0);
     try std.testing.expect(acquired != null);
     try std.testing.expectEqual(@as(u8, 1), pool.checked_out_counts[0]);
     try std.testing.expectEqual(@as(u8, 0), pool.counts[0]);
 
     // Release decrements checked_out
-    pool.release(0, acquired.?, true, undefined);
+    pool.release(0, acquired.?, true);
     try std.testing.expectEqual(@as(u8, 0), pool.checked_out_counts[0]);
     try std.testing.expectEqual(@as(u8, 1), pool.counts[0]);
 
@@ -1044,12 +1036,12 @@ test "CRITICAL: Concurrent acquire/release is thread-safe" {
     const NUM_INITIAL_CONNECTIONS = 8;
     for (0..NUM_INITIAL_CONNECTIONS) |_| {
         const conn: Connection = .{
-            .stream = undefined,
+            .socket = undefined,
             .created_ns = now_ns,
             .last_used_ns = now_ns,
             .pool_sentinel = Connection.IN_USE_SENTINEL,
         };
-        pool.release(0, conn, true, undefined);
+        pool.release(0, conn, true);
     }
 
     try std.testing.expectEqual(@as(u8, NUM_INITIAL_CONNECTIONS), pool.counts[0]);
@@ -1060,12 +1052,12 @@ test "CRITICAL: Concurrent acquire/release is thread-safe" {
             var i: u32 = 0;
             while (i < iterations) : (i += 1) {
                 // Try to acquire
-                if (p.acquire(0, undefined)) |conn| {
+                if (p.acquire(0)) |conn| {
                     // Simulate some work
                     std.Thread.yield() catch {};
 
                     // Release back to pool
-                    p.release(0, conn, true, undefined);
+                    p.release(0, conn, true);
                 } else {
                     // Pool was empty, yield and retry
                     std.Thread.yield() catch {};
@@ -1107,12 +1099,12 @@ test "CRITICAL: Race on pool full condition does not overflow" {
     const INITIAL = SimplePool.MAX_CONNS_PER_UPSTREAM - 1;
     for (0..INITIAL) |_| {
         const conn: Connection = .{
-            .stream = undefined,
+            .socket = undefined,
             .created_ns = now_ns,
             .last_used_ns = now_ns,
             .pool_sentinel = Connection.IN_USE_SENTINEL,
         };
-        pool.release(0, conn, true, undefined);
+        pool.release(0, conn, true);
     }
 
     // Multiple threads try to release simultaneously
@@ -1120,12 +1112,12 @@ test "CRITICAL: Race on pool full condition does not overflow" {
     const ReleaseWorker = struct {
         fn run(p: *SimplePool, timestamp: u64) void {
             const conn: Connection = .{
-                .stream = undefined,
+                .socket = undefined,
                 .created_ns = timestamp,
                 .last_used_ns = timestamp,
                 .pool_sentinel = Connection.IN_USE_SENTINEL,
             };
-            p.release(0, conn, true, undefined);
+            p.release(0, conn, true);
         }
     };
 
@@ -1155,7 +1147,7 @@ test "CRITICAL: Sentinel lifecycle prevents use-after-release" {
 
     // New connection starts with IN_USE_SENTINEL
     var conn: Connection = .{
-        .stream = undefined,
+        .socket = undefined,
         .created_ns = now_ns,
         .last_used_ns = now_ns,
         .pool_sentinel = Connection.IN_USE_SENTINEL,
@@ -1163,35 +1155,35 @@ test "CRITICAL: Sentinel lifecycle prevents use-after-release" {
     try std.testing.expectEqual(Connection.IN_USE_SENTINEL, conn.pool_sentinel);
 
     // Release to pool (changes sentinel to IN_POOL_SENTINEL internally)
-    pool.release(0, conn, true, undefined);
+    pool.release(0, conn, true);
     try std.testing.expectEqual(@as(u8, 1), pool.counts[0]);
 
     // NOTE: `conn` is now INVALID - sentinel changed, must not be used
     // Attempting to release again would assert: sentinel != IN_USE_SENTINEL
 
     // Correct usage: acquire fresh connection
-    const conn2 = pool.acquire(0, undefined);
+    const conn2 = pool.acquire(0);
     try std.testing.expect(conn2 != null);
     try std.testing.expectEqual(Connection.IN_USE_SENTINEL, conn2.?.pool_sentinel);
 
     // This NEW connection can be released
-    pool.release(0, conn2.?, true, undefined);
+    pool.release(0, conn2.?, true);
     try std.testing.expectEqual(@as(u8, 1), pool.counts[0]);
 
     // Full cycle again
-    const conn3 = pool.acquire(0, undefined);
+    const conn3 = pool.acquire(0);
     try std.testing.expect(conn3 != null);
     try std.testing.expectEqual(Connection.IN_USE_SENTINEL, conn3.?.pool_sentinel);
 
     // Release as unhealthy (still requires correct sentinel)
-    pool.release(0, conn3.?, false, undefined);
+    pool.release(0, conn3.?, false);
     try std.testing.expectEqual(@as(u8, 0), pool.counts[0]); // Not pooled (unhealthy)
 }
 
 test "Sentinel: Default connection has IN_USE_SENTINEL" {
     // Document that default initialization is IN_USE (safe for new connections)
     const conn: Connection = .{
-        .stream = undefined,
+        .socket = undefined,
     };
     try std.testing.expectEqual(Connection.IN_USE_SENTINEL, conn.pool_sentinel);
 }
@@ -1203,7 +1195,7 @@ test "Sentinel: Pool acquire changes IN_POOL → IN_USE" {
 
     // Manually insert connection with IN_POOL_SENTINEL
     pool.connections[0][0] = .{
-        .stream = undefined,
+        .socket = undefined,
         .created_ns = now_ns,
         .last_used_ns = now_ns,
         .pool_sentinel = Connection.IN_POOL_SENTINEL,
@@ -1211,7 +1203,7 @@ test "Sentinel: Pool acquire changes IN_POOL → IN_USE" {
     pool.counts[0] = 1;
 
     // Acquire should change sentinel to IN_USE
-    const conn = pool.acquire(0, undefined);
+    const conn = pool.acquire(0);
     try std.testing.expect(conn != null);
     try std.testing.expectEqual(Connection.IN_USE_SENTINEL, conn.?.pool_sentinel);
 }

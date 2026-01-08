@@ -1,15 +1,29 @@
 // lib/serval-net/mod.zig
 //! Serval Network Utilities
 //!
-//! Socket configuration and connection utilities.
+//! Socket abstraction (plain + TLS) and TCP configuration utilities.
 //! Like Pingora's connectors module.
 //! TigerStyle: Focused utilities, explicit error handling.
 
-pub const socket = @import("socket.zig");
-pub const setTcpNoDelay = socket.setTcpNoDelay;
-pub const setTcpKeepAlive = socket.setTcpKeepAlive;
-pub const setTcpQuickAck = socket.setTcpQuickAck;
-pub const setSoLinger = socket.setSoLinger;
+const socket = @import("socket.zig");
+
+/// Unified socket type for both plain TCP and TLS connections.
+/// TigerStyle: Tagged union, explicit dispatch.
+pub const Socket = socket.Socket;
+
+/// Error type for socket operations.
+/// TigerStyle: Explicit error set.
+pub const SocketError = socket.SocketError;
+
+/// TCP socket configuration utilities.
+pub const tcp = @import("tcp.zig");
+
+// Re-export common TCP utilities for convenience.
+// TigerStyle: Explicit exports, no wildcard imports.
+pub const setTcpNoDelay = tcp.setTcpNoDelay;
+pub const setTcpKeepAlive = tcp.setTcpKeepAlive;
+pub const setTcpQuickAck = tcp.setTcpQuickAck;
+pub const setSoLinger = tcp.setSoLinger;
 
 // =============================================================================
 // IPv4 Parsing
@@ -74,6 +88,8 @@ pub fn parseIPv4(host: []const u8) ?u32 {
 
 test {
     _ = @import("socket.zig");
+    _ = @import("tcp.zig");
+    _ = @import("tls_socket.zig");
 }
 
 test "parseIPv4 valid addresses" {

@@ -8,15 +8,17 @@
 //!   lb_example [OPTIONS]
 //!
 //! Options:
-//!   --port <PORT>           Listening port (default: 8080)
-//!   --backends <HOSTS>      Comma-separated backend addresses (default: 127.0.0.1:8001,127.0.0.1:8002)
-//!   --cert <PATH>           Server certificate file (PEM format, enables TLS)
-//!   --key <PATH>            Server private key file (PEM format, required with --cert)
-//!   --upstream-tls <HOSTS>  Comma-separated TLS backend addresses (enables HTTPS to those backends)
-//!   --stats                 Enable real-time terminal stats display
-//!   --debug                 Enable debug logging
-//!   --help                  Show help message
-//!   --version               Show version
+//!   --port <PORT>                Listening port (default: 8080)
+//!   --backends <HOSTS>           Comma-separated backend addresses (default: 127.0.0.1:8001,127.0.0.1:8002)
+//!   --cert <PATH>                Server certificate file (PEM format, enables TLS)
+//!   --key <PATH>                 Server private key file (PEM format, required with --cert)
+//!   --upstream-tls <HOSTS>       Comma-separated TLS backend addresses (enables HTTPS to those backends)
+//!   --insecure-skip-verify       Skip TLS certificate verification for upstream probes (insecure, for testing only)
+//!   --stats                      Enable real-time terminal stats display
+//!   --trace                      Enable OpenTelemetry tracing
+//!   --debug                      Enable debug logging
+//!   --help                       Show help message
+//!   --version                    Show version
 
 const std = @import("std");
 const serval = @import("serval");
@@ -25,10 +27,12 @@ const cli = @import("serval-cli");
 const otel = @import("serval-otel");
 const serval_metrics = @import("serval-metrics");
 const stats_display = @import("stats_display");
+const tls = @import("serval-tls");
 
 const RealTimeMetrics = serval_metrics.RealTimeMetrics;
 const StatsDisplay = stats_display.StatsDisplay;
 const LbHandler = serval_lb.LbHandler;
+const ssl = tls.ssl;
 
 /// Version of this binary.
 const VERSION = "0.1.0";
@@ -48,6 +52,8 @@ const LbExtra = struct {
     /// Comma-separated list of TLS-enabled backend addresses (host:port,host:port,...)
     /// Backends in this list will use HTTPS instead of HTTP
     @"upstream-tls": ?[]const u8 = null,
+    /// Skip TLS certificate verification for upstream HTTPS probes (insecure, for testing only)
+    @"insecure-skip-verify": bool = false,
 };
 
 /// Maximum number of upstreams supported.
@@ -139,10 +145,16 @@ pub fn main() !void {
         break :blk .{
             .cert_path = cert_path,
             .key_path = args.extra.key,
+            .verify_upstream = !args.extra.@"insecure-skip-verify",
         };
     } else if (args.extra.key) |_| {
         std.debug.print("Error: --cert is required when --key is specified\n", .{});
         return error.MissingTlsCert;
+    } else if (args.extra.@"insecure-skip-verify") blk: {
+        // If only --insecure-skip-verify is specified (no server TLS), still configure upstream verification
+        break :blk .{
+            .verify_upstream = false,
+        };
     } else null;
 
     // Initialize connection pool
@@ -151,11 +163,40 @@ pub fn main() !void {
     // Initialize metrics
     var metrics = RealTimeMetrics.init();
 
+    // Check if any upstreams need TLS for health probes
+    const has_tls_upstreams = blk: {
+        for (upstreams) |upstream| {
+            if (upstream.tls) break :blk true;
+        }
+        break :blk false;
+    };
+
+    // Create SSL context for health probes if needed
+    // TigerStyle: Caller owns SSL_CTX lifetime
+    const probe_ctx: ?*ssl.SSL_CTX = if (has_tls_upstreams) ctx_blk: {
+        ssl.init();
+        const ctx = ssl.createClientCtx() catch {
+            std.debug.print("Error: failed to create SSL context for health probes\n", .{});
+            return error.TlsInitFailed;
+        };
+
+        // Configure certificate verification
+        const verify_upstream = if (tls_config) |cfg| cfg.verify_upstream else true;
+        if (verify_upstream) {
+            ssl.SSL_CTX_set_verify(ctx, ssl.SSL_VERIFY_PEER, null);
+        } else {
+            ssl.SSL_CTX_set_verify(ctx, ssl.SSL_VERIFY_NONE, null);
+        }
+
+        break :ctx_blk ctx;
+    } else null;
+    defer if (probe_ctx) |ctx| ssl.SSL_CTX_free(ctx);
+
     // Initialize load balancer with automatic health tracking and probing
     var handler: LbHandler = undefined;
     try handler.init(upstreams, .{
         .probe_interval_ms = 5000, // Probe every 5 seconds
-    });
+    }, probe_ctx);
     defer handler.deinit();
 
     // Initialize stats display if enabled
@@ -228,10 +269,12 @@ pub fn main() !void {
             RealTimeMetrics,
             otel.OtelTracer,
         );
+        // Pass probe_ctx as client_ctx for upstream TLS connections.
+        // Same SSL context is used for probing and forwarding.
         var server = OtelServerType.init(&handler, &pool, &metrics, &tracer, .{
             .port = args.port,
             .tls = tls_config,
-        });
+        }, probe_ctx);
 
         server.run(io, &shutdown) catch |err| {
             std.debug.print("Server error: {}\n", .{err});
@@ -247,10 +290,12 @@ pub fn main() !void {
             RealTimeMetrics,
             serval.NoopTracer,
         );
+        // Pass probe_ctx as client_ctx for upstream TLS connections.
+        // Same SSL context is used for probing and forwarding.
         var server = NoopServerType.init(&handler, &pool, &metrics, &tracer, .{
             .port = args.port,
             .tls = tls_config,
-        });
+        }, probe_ctx);
 
         server.run(io, &shutdown) catch |err| {
             std.debug.print("Server error: {}\n", .{err});

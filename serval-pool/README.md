@@ -6,9 +6,14 @@ Fixed-size connection pooling with no runtime allocation.
 
 Provides connection reuse between the proxy and upstream backends. Implements a compile-time interface that allows swapping pool implementations. Includes lifecycle management with idle timeout eviction and max connection age limits.
 
+## Dependencies
+
+- `serval-core` - Foundation types, time utilities
+- `serval-net` - Socket type (unified plain/TLS abstraction)
+
 ## Exports
 
-- `Connection` - Connection handle wrapping `Io.net.Stream` for async I/O
+- `Connection` - Connection handle wrapping `Socket` for unified I/O (plain or TLS)
 - `SimplePool` - Fixed-size connection pool with lifecycle management (default)
 - `PoolStats` - Pool statistics snapshot for observability
 - `PoolEvent` - Metrics event types for pool operations
@@ -24,39 +29,38 @@ const time = @import("serval-core").time;
 
 var pool = pool_mod.SimplePool.init();
 
-// Try to reuse an existing connection (requires io for stale connection cleanup)
-if (pool.acquire(upstream_idx, io)) |conn| {
-    // Use conn.stream for async I/O
+// Try to reuse an existing connection
+if (pool.acquire(upstream_idx)) |conn| {
+    // Use conn.socket for I/O (handles both plain and TLS)
     // Use conn.getFd() for raw fd (splice operations)
 } else {
-    // Create new connection via Io.net.IpAddress.connect()
+    // Create new connection via Socket.connect()
     // Set created_ns for max age tracking:
-    var new_conn = Connection{ .stream = stream, .created_ns = time.monotonicNanos() };
+    var new_conn = Connection{ .socket = socket, .created_ns = time.monotonicNanos() };
 }
 
-// Return connection to pool (requires io for async close)
+// Return connection to pool
 // release() automatically sets last_used_ns
-pool.release(upstream_idx, conn, healthy, io);
+pool.release(upstream_idx, conn, healthy);
 
 // During server shutdown, drain all pooled connections
-pool.drain(io);
+pool.drain();
 ```
 
 ## Connection
 
-Wraps an `Io.net.Stream` for async I/O with io_uring integration:
+Wraps a `Socket` for unified I/O supporting both plain TCP and TLS connections:
 
 ```zig
 pub const Connection = struct {
-    stream: Io.net.Stream,
+    socket: Socket,           // Unified socket (plain or TLS)
     created_ns: u64 = 0,      // Monotonic timestamp when established
     last_used_ns: u64 = 0,    // Monotonic timestamp when last released
     pool_sentinel: u32,       // Defense against double-release
 
-    pub fn close(self: *Connection, io: Io) void;
+    pub fn close(self: *Connection) void;
     pub fn getFd(self: *const Connection) i32;  // For splice zero-copy
     pub fn isUnusable(self: *const Connection) bool;  // Check if connection should not be reused
-    pub fn hasStaleData(self: *const Connection) bool;  // Deprecated alias for isUnusable()
 };
 ```
 
@@ -65,9 +69,9 @@ pub const Connection = struct {
 Any pool implementation must provide:
 
 ```zig
-pub fn acquire(self, upstream_idx: u32, io: Io) ?Connection
-pub fn release(self, upstream_idx: u32, conn: Connection, healthy: bool, io: Io) void
-pub fn drain(self, io: Io) void
+pub fn acquire(self, upstream_idx: u32) ?Connection
+pub fn release(self, upstream_idx: u32, conn: Connection, healthy: bool) void
+pub fn drain(self) void
 ```
 
 ## Lifecycle Management
@@ -84,7 +88,7 @@ A magic value (`IN_USE_SENTINEL` / `IN_POOL_SENTINEL`) tracks connection state:
 - Detects use-after-release (defense in depth)
 
 ### Graceful Shutdown
-Call `drain(io)` during server shutdown to close all pooled connections cleanly.
+Call `drain()` during server shutdown to close all pooled connections cleanly.
 
 ## Implementations
 
@@ -139,7 +143,7 @@ pub const PoolStats = struct {
 ### Use Cases
 - **Leak detection**: `total_checked_out` grows unbounded if connections are never released
 - **Capacity monitoring**: Compare `checked_out` against limits to detect saturation
-- **Debugging hangs**: Identify which upstream has connections that are never returned
+- **Hangs debugging**: Identify which upstream has connections that are never returned
 
 ## Metrics Hooks
 
@@ -201,5 +205,4 @@ When no callback is set (using `SimplePool.init()`), the metrics check is a simp
 - Assertions on upstream_idx bounds
 - Explicit u8/u32/u64 types
 - Unit suffixes: `created_ns`, `last_used_ns`, `IDLE_TIMEOUT_NS`
-- I/O outside mutex (no blocking pool access)
 - Sentinel values for use-after-release detection

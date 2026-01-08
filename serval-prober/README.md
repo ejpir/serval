@@ -4,7 +4,7 @@ Background health probing for backend upstreams.
 
 ## Purpose
 
-Active health checking module that runs HTTP GET probes against unhealthy backends in a background thread. Used by load balancers and routers to detect when failed backends recover.
+Active health checking module that runs HTTP/HTTPS GET probes against unhealthy backends in a background thread. Supports both plain HTTP and TLS-encrypted HTTPS backends. Used by load balancers and routers to detect when failed backends recover.
 
 ## Exports
 
@@ -15,7 +15,15 @@ Active health checking module that runs HTTP GET probes against unhealthy backen
 
 ```zig
 const prober = @import("serval-prober");
+const ssl = @import("serval-tls").ssl;
 const std = @import("std");
+
+// Initialize OpenSSL (once, at startup)
+ssl.init();
+
+// Create SSL context for TLS probes (if any upstreams use TLS)
+const client_ctx = try ssl.createClientCtx();
+defer ssl.SSL_CTX_free(client_ctx);
 
 // Create context for prober thread
 const ctx = prober.ProberContext{
@@ -25,6 +33,7 @@ const ctx = prober.ProberContext{
     .probe_interval_ms = 5000,
     .probe_timeout_ms = 2000,
     .health_path = "/health",
+    .client_ctx = client_ctx,  // Pass null if no TLS upstreams
 };
 
 // Start prober in background thread
@@ -40,14 +49,21 @@ thread.join();
 
 ```zig
 pub const ProberContext = struct {
-    upstreams: []const Upstream,           // Backends to probe
-    health: *HealthState,                  // Health state to update
+    upstreams: []const Upstream,            // Backends to probe
+    health: *HealthState,                   // Health state to update
     probe_running: *std.atomic.Value(bool), // Shutdown signal
-    probe_interval_ms: u32,                // Interval between probe cycles
-    probe_timeout_ms: u32,                 // Per-probe TCP timeout
-    health_path: []const u8,               // HTTP path to probe
+    probe_interval_ms: u32,                 // Interval between probe cycles
+    probe_timeout_ms: u32,                  // Per-probe TCP timeout
+    health_path: []const u8,                // HTTP path to probe
+    client_ctx: ?*ssl.SSL_CTX,              // Caller-provided SSL context for TLS probes
 };
 ```
+
+**SSL Context Lifecycle:**
+- Caller creates `SSL_CTX` via `ssl.createClientCtx()` before starting prober
+- Pass `client_ctx` to `ProberContext` for TLS probes
+- Caller frees `SSL_CTX` via `ssl.SSL_CTX_free()` after stopping prober
+- Pass `null` if no upstreams use TLS
 
 ## Design
 
@@ -60,10 +76,18 @@ Active probing only targets unhealthy backends - healthy ones get passive checks
 
 ### Probe Protocol
 
+**Plain HTTP (upstream.tls = false):**
 1. TCP connect with timeout
 2. Send `GET {health_path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n`
 3. Read response, check for `2xx` status
 4. On success, call `health.recordSuccess(idx)`
+
+**HTTPS (upstream.tls = true):**
+1. TCP connect with timeout
+2. TLS handshake with SNI (Server Name Indication) set to upstream.host
+3. Send `GET {health_path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n` over TLS
+4. Read TLS-encrypted response, check for `2xx` status
+5. On success, call `health.recordSuccess(idx)`
 
 ### Blocking I/O
 
@@ -83,8 +107,11 @@ serval-prober/
 ## Dependencies
 
 - `serval-core` - Upstream type, config
-- `serval-net` - parseIPv4 for address parsing
+- `serval-net` - Socket abstraction for TCP connections
 - `serval-health` - HealthState for recording results
+- `serval-tls` - TLS client handshake for HTTPS probes
+
+**Note:** Requires linking OpenSSL/LibreSSL (`-lssl -lcrypto`).
 
 ## TigerStyle Compliance
 

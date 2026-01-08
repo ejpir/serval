@@ -4,18 +4,125 @@ Network utilities for serval. Like Pingora's `connectors` module.
 
 ## Purpose
 
-Socket configuration and connection establishment helpers.
+Unified socket abstraction (plain TCP + TLS) and TCP configuration helpers.
 
 ## Exports
 
 | Symbol | Description |
 |--------|-------------|
-| `setTcpNoDelay(fd: i32) bool` | Disable Nagle's algorithm for low-latency responses |
-| `setTcpKeepAlive(fd: i32, idle_secs: u32, interval_secs: u32, count: u32) bool` | Configure TCP keepalive probes |
-| `setTcpQuickAck(fd: i32) bool` | Disable delayed ACKs (Linux only) |
-| `setSoLinger(fd: i32, timeout_secs: u16) bool` | Configure SO_LINGER close behavior |
+| `Socket` | Tagged union for plain TCP and TLS sockets |
+| `SocketError` | Unified error type for socket operations |
+| `Socket.Plain.initClient(fd)` | Create plain client socket from fd |
+| `Socket.Plain.initServer(fd)` | Create plain server socket from fd |
+| `Socket.TLS.TLSSocket.initClient(fd, ctx, host)` | Create TLS client socket with SNI |
+| `Socket.TLS.TLSSocket.initServer(fd, ctx)` | Create TLS server socket |
+| `socket.read(buf)` | Read data into buffer |
+| `socket.write(data)` | Write data to socket |
+| `socket.close()` | Close socket and free resources |
+| `socket.getFd()` | Get raw fd for splice/poll |
+| `socket.isTLS()` | Check if TLS for splice eligibility |
+| `tcp.setTcpNoDelay(fd)` | Disable Nagle's algorithm |
+| `tcp.setTcpKeepAlive(fd, idle, interval, count)` | Configure TCP keepalive |
+| `tcp.setTcpQuickAck(fd)` | Disable delayed ACKs (Linux) |
+| `tcp.setSoLinger(fd, timeout)` | Configure SO_LINGER |
+| `parseIPv4(host)` | Parse IPv4 address to network-order u32 |
 
-## API
+## Socket API
+
+### Socket (Tagged Union)
+
+Unified socket type for both plain TCP and TLS connections. Tagged union with explicit dispatch - not generics (TigerStyle: explicit types).
+
+```zig
+pub const Socket = union(enum) {
+    plain: PlainSocket,
+    tls: TLSSocket,
+};
+```
+
+### SocketError
+
+Unified error type for all socket operations:
+
+| Error | Description |
+|-------|-------------|
+| `ConnectionReset` | RST received from peer |
+| `ConnectionClosed` | Clean close by peer |
+| `BrokenPipe` | Write to closed connection (EPIPE) |
+| `Timeout` | Operation timed out |
+| `TLSError` | TLS handshake, encryption, or certificate error |
+| `Unexpected` | Unknown error from syscall or SSL |
+
+### Socket.Plain.initClient(fd: i32) Socket
+
+Create plain client socket from file descriptor.
+
+**Parameters:**
+- `fd`: Socket file descriptor (must be >= 0)
+
+**Returns:** `Socket` with `.plain` variant
+
+### Socket.Plain.initServer(fd: i32) Socket
+
+Create plain server socket from file descriptor. Same as `initClient` for plain TCP, but documents intent for symmetric API with TLS.
+
+**Parameters:**
+- `fd`: Socket file descriptor (must be >= 0)
+
+**Returns:** `Socket` with `.plain` variant
+
+### Socket.TLS.TLSSocket.initClient(fd: i32, ctx: *SSL_CTX, host: []const u8) SocketError!Socket
+
+Create TLS client socket with Server Name Indication (SNI). Performs TLS handshake.
+
+**Parameters:**
+- `fd`: Socket file descriptor (must be >= 0)
+- `ctx`: OpenSSL SSL_CTX pointer (caller owns lifecycle)
+- `host`: Hostname for SNI (max 253 chars per RFC 6066)
+
+**Returns:** `Socket` with `.tls` variant, or `SocketError`
+
+### Socket.TLS.TLSSocket.initServer(fd: i32, ctx: *SSL_CTX) SocketError!Socket
+
+Create TLS server socket for incoming client connection. Performs TLS handshake.
+
+**Parameters:**
+- `fd`: Socket file descriptor (must be >= 0)
+- `ctx`: OpenSSL SSL_CTX pointer (caller owns lifecycle)
+
+**Returns:** `Socket` with `.tls` variant, or `SocketError`
+
+### socket.read(buf: []u8) SocketError!usize
+
+Read data into buffer. Works for both plain and TLS sockets.
+
+**Parameters:**
+- `buf`: Buffer to read into (must be non-empty)
+
+**Returns:** Bytes read, 0 on EOF/clean close
+
+### socket.write(data: []const u8) SocketError!usize
+
+Write data to socket. Works for both plain and TLS sockets.
+
+**Parameters:**
+- `data`: Data to write (must be non-empty)
+
+**Returns:** Bytes written
+
+### socket.close() void
+
+Close socket and free resources. For TLS, performs graceful shutdown before closing fd.
+
+### socket.getFd() i32
+
+Get raw file descriptor. Useful for splice (plaintext only) and poll operations.
+
+### socket.isTLS() bool
+
+Check if this is a TLS socket. Used to determine splice eligibility - zero-copy splice only works with plain sockets.
+
+## TCP Utilities API
 
 ### `setTcpNoDelay(fd: i32) bool`
 
@@ -27,11 +134,6 @@ Disable Nagle's algorithm on a TCP socket to prevent 40ms delays when sending sm
 **Returns:**
 - `true`: Success (or fd was -1 sentinel)
 - `false`: setsockopt failed (logged at debug level)
-
-**TigerStyle Notes:**
-- Returns bool instead of void to avoid swallowing errors with `catch {}`
-- Callers can explicitly discard with `_ = setTcpNoDelay(fd)` if result not needed
-- Asserts `fd >= -1` (fd < -1 indicates programming error)
 
 ### `setTcpKeepAlive(fd: i32, idle_secs: u32, interval_secs: u32, count: u32) bool`
 
@@ -79,13 +181,81 @@ Configure SO_LINGER close behavior.
 - `true`: Success
 - `false`: setsockopt failed (logged at debug level)
 
-## Future Additions
+### `parseIPv4(host: []const u8) ?u32`
 
-- `setSocketBuffer()` - SO_RCVBUF/SO_SNDBUF sizing
-- `setReuseAddr()` - SO_REUSEADDR/SO_REUSEPORT
-- Connection timeout helpers
+Parse IPv4 address string to network-order u32.
+
+**Parameters:**
+- `host`: IPv4 address string (e.g., "192.168.1.1")
+
+**Returns:**
+- `u32`: Network-order address
+- `null`: Invalid address format
 
 ## Usage
+
+### Plain TCP Socket
+
+```zig
+const net = @import("serval-net");
+
+// Create plain socket from accepted fd
+var socket = net.Socket.Plain.initServer(client_fd);
+defer socket.close();
+
+// Configure TCP options
+_ = net.tcp.setTcpNoDelay(socket.getFd());
+
+// Read/write
+var buf: [4096]u8 = undefined;
+const n = try socket.read(&buf);
+_ = try socket.write(buf[0..n]);
+
+// Check for splice eligibility
+if (!socket.isTLS()) {
+    // Can use zero-copy splice
+}
+```
+
+### TLS Socket (Client)
+
+```zig
+const net = @import("serval-net");
+const tls = @import("serval-tls");
+
+// SSL_CTX lifecycle is caller's responsibility
+const ctx = try tls.ssl.createClientContext();
+defer tls.ssl.destroyContext(ctx);
+
+// Create TLS socket with SNI
+var socket = try net.Socket.TLS.TLSSocket.initClient(upstream_fd, ctx, "api.example.com");
+defer socket.close();
+
+// Read/write (encrypted transparently)
+const n = try socket.read(&buf);
+_ = try socket.write(response);
+```
+
+### TLS Socket (Server)
+
+```zig
+const net = @import("serval-net");
+const tls = @import("serval-tls");
+
+// SSL_CTX with cert/key is caller's responsibility
+const ctx = try tls.ssl.createServerContext("cert.pem", "key.pem");
+defer tls.ssl.destroyContext(ctx);
+
+// Accept and wrap with TLS
+var socket = try net.Socket.TLS.TLSSocket.initServer(client_fd, ctx);
+defer socket.close();
+
+// Read/write (decryption transparent)
+const n = try socket.read(&buf);
+_ = try socket.write(response);
+```
+
+### TCP Configuration
 
 ```zig
 const net = @import("serval-net");
@@ -106,16 +276,49 @@ _ = net.setSoLinger(socket_fd, 0); // Immediate close with RST
 _ = net.setSoLinger(socket_fd, 5); // Wait up to 5s for data to send
 ```
 
+## Design Decisions
+
+| Decision | Rationale |
+|----------|-----------|
+| Tagged union, not generics | TigerStyle: explicit types, predictable code size |
+| Caller owns SSL_CTX | TigerStyle: explicit resource management, no hidden state |
+| Zero-copy splice only for plain | TLS requires encryption/decryption - can't splice ciphertext |
+| SNI max 253 chars | RFC 6066 limit, bounded stack buffer (no allocation) |
+| SocketError unifies errors | Single error type for both plain and TLS operations |
+
 ## Dependencies
 
-None (uses only std).
+- `serval-tls` - TLS handshake and stream operations
+- `std` - POSIX socket operations
 
 ## Implementation Status
 
 | Feature | Status |
 |---------|--------|
+| Socket tagged union | Complete |
+| Plain socket read/write/close | Complete |
+| TLS socket initClient with SNI | Complete |
+| TLS socket initServer | Complete |
+| TLS socket read/write/close | Complete |
+| getFd for splice/poll | Complete |
+| isTLS for splice eligibility | Complete |
 | TCP_NODELAY | Complete |
 | TCP_KEEPALIVE | Complete |
 | TCP_QUICKACK | Complete (Linux) |
 | SO_LINGER | Complete |
-| Socket buffers | Not implemented |
+| parseIPv4 | Complete |
+| Socket buffers (SO_RCVBUF/SO_SNDBUF) | Not implemented |
+
+## TigerStyle Compliance
+
+| Rule | Status | Notes |
+|------|--------|-------|
+| S1: Assertions | Pass | Preconditions on all functions (fd >= 0, buf.len > 0, etc.) |
+| S2: No recursion | Pass | No recursive calls |
+| S3: Bounded loops | Pass | parseIPv4 uses max_iterations bound |
+| S4: No catch {} | Pass | All errors mapped explicitly to SocketError |
+| S5: No allocation after init | Pass | SNI uses stack buffer, zeroed |
+| S6: Explicit error handling | Pass | mapPosixError, mapTlsError handle all cases |
+| P1: Network >> CPU | Pass | Tagged union dispatch is negligible vs I/O |
+| C1: Units in names | Pass | timeout_secs, interval_secs |
+| Y1: snake_case | Pass | All identifiers follow convention |

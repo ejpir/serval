@@ -96,6 +96,10 @@ pub fn Server(
         tracer: *Tracer,
         config: Config,
         forwarder: forwarder_mod.Forwarder(Pool, Tracer),
+        /// Client SSL context for upstream TLS connections.
+        /// Created once at init, shared across all connections.
+        /// TigerStyle: Caller owns lifecycle via deinit.
+        client_ctx: ?*ssl.SSL_CTX,
 
         pub fn init(
             handler: *Handler,
@@ -103,6 +107,7 @@ pub fn Server(
             metrics: *Metrics,
             tracer: *Tracer,
             cfg: Config,
+            client_ctx: ?*ssl.SSL_CTX,
         ) Self {
             assert(@intFromPtr(handler) != 0);
             assert(@intFromPtr(pool) != 0);
@@ -118,8 +123,16 @@ pub fn Server(
                 .metrics = metrics,
                 .tracer = tracer,
                 .config = cfg,
-                .forwarder = forwarder_mod.Forwarder(Pool, Tracer).init(pool, tracer, verify_upstream),
+                .forwarder = forwarder_mod.Forwarder(Pool, Tracer).init(pool, tracer, verify_upstream, client_ctx),
+                .client_ctx = client_ctx,
             };
+        }
+
+        /// Clean up server resources.
+        /// TigerStyle: Explicit deinit, pairs with init.
+        pub fn deinit(self: *Self) void {
+            // TigerStyle: Client context is owned by caller, not freed here
+            _ = self;
         }
 
         /// Run the server with concurrent connection handling.
@@ -871,7 +884,8 @@ test "MinimalServer compiles" {
     var metrics = metrics_mod.NoopMetrics{};
     var tracer = tracing_mod.NoopTracer{};
 
-    _ = MinimalServer(TestHandler).init(&handler, &pool, &metrics, &tracer, .{});
+    // TigerStyle: null client_ctx for tests without TLS upstreams.
+    _ = MinimalServer(TestHandler).init(&handler, &pool, &metrics, &tracer, .{}, null);
 }
 
 test "parseContentLengthValue valid" {

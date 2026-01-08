@@ -251,10 +251,11 @@ pub fn main() !void {
         serval.NoopMetrics,
         serval.NoopTracer,
     );
+    // Echo backend doesn't forward to upstreams, so no client_ctx needed.
     var server = ServerType.init(&handler, &pool, &metrics, &tracer, .{
         .port = args.port,
         .tls = tls_config,
-    });
+    }, null);
 
     server.run(io, &shutdown) catch |err| {
         std.debug.print("Server error: {}\n", .{err});

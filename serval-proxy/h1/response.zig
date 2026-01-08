@@ -33,6 +33,9 @@ const forwardChunkedBody = chunked_transfer.forwardChunkedBody;
 const pool_mod = @import("serval-pool").pool;
 const Connection = pool_mod.Connection;
 
+const net = @import("serval-net");
+const Socket = net.Socket;
+
 const serval_tls = @import("serval-tls");
 const TLSStream = serval_tls.TLSStream;
 
@@ -143,18 +146,21 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
 }
 
 /// Forward upstream response to client.
-/// TigerStyle: Uses stream for headers, raw fds for splice body forwarding.
-/// client_tls is the TLS stream for client connection (for encrypted responses).
+/// TigerStyle: Uses Socket abstraction for unified TLS/plaintext handling.
+/// upstream_socket and client_socket handle body forwarding.
 pub fn forwardResponse(
     io: Io,
     upstream_conn: *Connection,
     client_stream: Io.net.Stream,
-    client_tls: ?*TLSStream,
+    upstream_socket: *Socket,
+    client_socket: *Socket,
     is_pooled: bool,
 ) ForwardError!ForwardResult {
-    // Precondition: file descriptors must be valid (non-negative).
-    assert(upstream_conn.stream.socket.handle >= 0);
-    assert(client_stream.socket.handle >= 0);
+    _ = client_stream; // Unused - client_socket provides the Socket
+    // Precondition: socket file descriptors must be valid (non-negative).
+    assert(upstream_conn.getFd() >= 0);
+    assert(upstream_socket.getFd() >= 0);
+    assert(client_socket.getFd() >= 0);
 
     // Time the entire recv phase (headers + body from upstream)
     const recv_start_ns = time.monotonicNanos();
@@ -169,11 +175,11 @@ pub fn forwardResponse(
     // Detect body transfer mode: chunked or content-length based.
     const is_chunked = isChunkedResponse(header_buffer[0..headers.header_len]);
 
-    debugLog("recv: headers received fd={d} status={d} content_length={?d} chunked={}", .{ upstream_conn.stream.socket.handle, status, content_length, is_chunked });
+    debugLog("recv: headers received fd={d} status={d} content_length={?d} chunked={}", .{ upstream_conn.getFd(), status, content_length, is_chunked });
 
-    // Forward headers and any pre-fetched body to client via async stream.
-    // TigerStyle: Use TLS for client if available, otherwise plaintext.
-    var client_conn = Connection{ .stream = client_stream, .tls = if (client_tls) |tls| tls.* else null };
+    // Forward headers to client using client Socket.
+    // TigerStyle: Use Connection wrapper for sendBuffer compatibility.
+    var client_conn = Connection{ .socket = client_socket.* };
     try sendBuffer(&client_conn, io, header_buffer[0..headers.header_len]);
 
     // Forward remaining body.
@@ -181,23 +187,18 @@ pub fn forwardResponse(
     const body_already_read: u64 = headers.header_len - headers.header_end;
     var total_body_bytes: u64 = body_already_read;
 
-    // Extract raw fds and optional TLS streams for body forwarding.
-    const upstream_fd = upstream_conn.stream.socket.handle;
-    const client_fd = client_stream.socket.handle;
-    const maybe_upstream_tls = if (upstream_conn.tls) |*tls| tls else null;
-
     if (is_chunked) {
         // Chunked transfer encoding: forward chunks until final chunk.
-        // TigerStyle: Pass client_tls for encrypted client responses.
+        // TigerStyle: Use Socket abstraction for unified TLS/plaintext handling.
         debugLog("recv: forwarding chunked body", .{});
-        total_body_bytes += try forwardChunkedBody(maybe_upstream_tls, client_tls, upstream_fd, client_fd);
+        total_body_bytes += try forwardChunkedBody(upstream_socket, client_socket);
     } else if (content_length) |length| {
         // Content-Length based: forward exact number of bytes.
         if (length > body_already_read) {
             const remaining = length - body_already_read;
             debugLog("recv: forwarding body remaining={d}", .{remaining});
-            // TigerStyle: Pass client_tls for encrypted client responses.
-            total_body_bytes += try forwardBody(maybe_upstream_tls, client_tls, upstream_fd, client_fd, remaining);
+            // TigerStyle: Use Socket abstraction for unified TLS/plaintext handling.
+            total_body_bytes += try forwardBody(upstream_socket, client_socket, remaining);
         }
     }
     // else: No body (e.g., 204, 304) or connection-close semantics.
@@ -217,7 +218,7 @@ pub fn forwardResponse(
     };
 }
 
-/// Receive HTTP response headers from upstream using async stream reader.
+/// Receive HTTP response headers from upstream using Socket abstraction.
 /// TigerStyle: Explicit io parameter, stale detection for pooled connections.
 pub fn receiveHeaders(
     conn: *Connection,
@@ -225,8 +226,9 @@ pub fn receiveHeaders(
     buffer: *[config.MAX_HEADER_SIZE_BYTES]u8,
     is_pooled: bool,
 ) ForwardError!HeadersResult {
-    // Precondition: stream fd must be valid.
-    assert(conn.stream.socket.handle >= 0);
+    _ = io; // Unused - Socket handles I/O internally
+    // Precondition: socket fd must be valid.
+    assert(conn.getFd() >= 0);
     // Precondition: buffer is provided (not null via pointer).
     assert(buffer.len == config.MAX_HEADER_SIZE_BYTES);
 
@@ -234,56 +236,26 @@ pub fn receiveHeaders(
     const max_iterations: usize = config.MAX_HEADER_SIZE_BYTES;
     var iterations: usize = 0;
 
-    // Different read path for TLS vs plaintext
-    if (conn.tls) |*tls_stream| {
-        // TLS path: use TLS read
-        // SslRead error includes normal connection close, no debug log needed.
-        while (header_len < buffer.len and iterations < max_iterations) : (iterations += 1) {
-            const remaining = buffer[header_len..];
-            const n = tls_stream.read(remaining) catch {
-                if (is_pooled and header_len == 0) return ForwardError.StaleConnection;
-                return ForwardError.RecvFailed;
-            };
+    // Use Socket abstraction for unified TLS/plaintext header reading.
+    while (header_len < buffer.len and iterations < max_iterations) : (iterations += 1) {
+        const remaining = buffer[header_len..];
+        const n = conn.socket.read(remaining) catch {
+            if (is_pooled and header_len == 0) return ForwardError.StaleConnection;
+            return ForwardError.RecvFailed;
+        };
 
-            if (n == 0) {
-                if (is_pooled and header_len == 0) return ForwardError.StaleConnection;
-                return ForwardError.RecvFailed;
-            }
-
-            header_len += n;
-
-            // Check for end of headers
-            if (std.mem.indexOf(u8, buffer[0..header_len], "\r\n\r\n")) |end_pos| {
-                const header_end = end_pos + 4;
-                assert(header_end <= header_len);
-                return .{ .header_len = header_len, .header_end = header_end };
-            }
+        if (n == 0) {
+            if (is_pooled and header_len == 0) return ForwardError.StaleConnection;
+            return ForwardError.RecvFailed;
         }
-    } else {
-        // Plaintext path: use stream reader
-        var read_buf: [config.STREAM_READ_BUFFER_SIZE_BYTES]u8 = std.mem.zeroes([config.STREAM_READ_BUFFER_SIZE_BYTES]u8);
-        var reader = conn.stream.reader(io, &read_buf);
 
-        while (header_len < buffer.len and iterations < max_iterations) : (iterations += 1) {
-            var bufs: [1][]u8 = .{buffer[header_len..]};
-            const n = reader.interface.readVec(&bufs) catch {
-                if (is_pooled and header_len == 0) return ForwardError.StaleConnection;
-                return ForwardError.RecvFailed;
-            };
+        header_len += n;
 
-            if (n == 0) {
-                if (is_pooled and header_len == 0) return ForwardError.StaleConnection;
-                return ForwardError.RecvFailed;
-            }
-
-            header_len += n;
-
-            // Check for end of headers
-            if (std.mem.indexOf(u8, buffer[0..header_len], "\r\n\r\n")) |end_pos| {
-                const header_end = end_pos + 4;
-                assert(header_end <= header_len);
-                return .{ .header_len = header_len, .header_end = header_end };
-            }
+        // Check for end of headers
+        if (std.mem.indexOf(u8, buffer[0..header_len], "\r\n\r\n")) |end_pos| {
+            const header_end = end_pos + 4;
+            assert(header_end <= header_len);
+            return .{ .header_len = header_len, .header_end = header_end };
         }
     }
 

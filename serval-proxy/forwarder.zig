@@ -28,8 +28,10 @@ const Protocol = proxy_types.Protocol;
 
 const connect = @import("connect.zig");
 const ConnectResult = connect.ConnectResult;
+const ConnectConfig = connect.ConnectConfig;
 const connectUpstream = connect.connectUpstream;
 const getLocalPortFromStream = connect.getLocalPortFromStream;
+const getLocalPortFromSocket = connect.getLocalPortFromSocket;
 
 const h1 = @import("h1/mod.zig");
 const sendRequest = h1.sendRequest;
@@ -43,6 +45,10 @@ const forwardResponse = h1.forwardResponse;
 const serval_tls = @import("serval-tls");
 const TLSStream = serval_tls.TLSStream;
 const HandshakeInfo = serval_tls.HandshakeInfo;
+const ssl = serval_tls.ssl;
+
+const net = @import("serval-net");
+const Socket = net.Socket;
 
 const Request = types.Request;
 const Upstream = types.Upstream;
@@ -63,12 +69,17 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
         pool: *Pool,
         tracer: *Tracer,
         verify_upstream_tls: bool,
+        /// Optional SSL context for upstream TLS connections.
+        /// Caller provides and owns lifecycle; null means no TLS to upstreams.
+        /// TigerStyle: Explicit ownership, caller manages context.
+        client_ctx: ?*ssl.SSL_CTX,
 
-        pub fn init(p: *Pool, t: *Tracer, verify_upstream_tls: bool) Self {
+        pub fn init(p: *Pool, t: *Tracer, verify_upstream_tls: bool, client_ctx: ?*ssl.SSL_CTX) Self {
             return .{
                 .pool = p,
                 .tracer = t,
                 .verify_upstream_tls = verify_upstream_tls,
+                .client_ctx = client_ctx,
             };
         }
 
@@ -115,7 +126,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
 
             // Try pooled connections with bounded retry on stale
             while (stale_retries < MAX_STALE_RETRIES) : (stale_retries += 1) {
-                if (self.pool.acquire(upstream.idx, io)) |pooled_conn| {
+                if (self.pool.acquire(upstream.idx)) |pooled_conn| {
                     const pool_end_ns = time.monotonicNanos();
                     const pool_wait_ns = time.elapsedNanos(pool_start_ns, pool_end_ns);
 
@@ -124,15 +135,15 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
                     if (pooled_conn.isUnusable()) {
                         debugLog("forward: pool hit but STALE (retry {d}/{d}), closing", .{ stale_retries + 1, MAX_STALE_RETRIES });
                         var stale_conn = pooled_conn;
-                        stale_conn.close(io);
+                        stale_conn.close();
                         continue; // Try next pooled connection
                     }
 
                     // DON'T end span here - wait until we know connection works
-                    debugLog("forward: pool HIT, reusing connection fd={d}", .{pooled_conn.stream.socket.handle});
+                    debugLog("forward: pool HIT, reusing connection fd={d}", .{pooled_conn.socket.getFd()});
 
                     // Get local port from pooled connection
-                    const local_port = getLocalPortFromStream(pooled_conn.stream);
+                    const local_port = getLocalPortFromSocket(pooled_conn.socket);
 
                     const result = self.forwardWithConnection(
                         io,
@@ -203,7 +214,12 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
 
             // TCP connect phase with span
             const connect_span = self.tracer.startSpan("tcp_connect", forward_span);
-            const connect_result = connectUpstream(upstream, io, self.verify_upstream_tls) catch |err| {
+            const connect_config = ConnectConfig{
+                .timeout_ns = config.CONNECT_TIMEOUT_NS,
+                .verify_upstream_tls = self.verify_upstream_tls,
+                .client_ctx = self.client_ctx,
+            };
+            const connect_result = connectUpstream(upstream, io, connect_config) catch |err| {
                 self.tracer.endSpan(connect_span, @errorName(err));
                 return err;
             };
@@ -212,9 +228,11 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             self.tracer.endSpan(connect_span, null);
 
             // TLS handshake span (if TLS was used)
-            if (connect_result.conn.tls) |tls_stream| {
+            // Access TLS stream info from Socket union if TLS variant.
+            if (connect_result.socket.isTLS()) {
+                const tls_socket = connect_result.socket.tls;
                 const tls_span = self.tracer.startSpan("tls.handshake.client", forward_span);
-                const info = &tls_stream.info;
+                const info = &tls_socket.stream.info;
                 self.tracer.setStringAttribute(tls_span, "tls.version", info.version());
                 self.tracer.setStringAttribute(tls_span, "tls.cipher", info.cipher());
                 self.tracer.setIntAttribute(tls_span, "tls.handshake_duration_ns", @intCast(info.handshake_duration_ns));
@@ -233,13 +251,20 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
                 self.tracer.endSpan(tls_span, null);
             }
 
+            // Create Connection struct for pool compatibility
+            // TigerStyle: Connection now uses Socket directly.
+            const conn = Connection{
+                .socket = connect_result.socket,
+                .created_ns = connect_result.created_ns,
+            };
+
             return self.forwardWithConnection(
                 io,
                 client_stream,
                 client_tls,
                 request,
                 upstream,
-                connect_result.conn,
+                conn,
                 false,
                 body_info,
                 connect_result.tcp_connect_duration_ns,
@@ -273,10 +298,10 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
                 // Otherwise stats show phantom "checked out" connections forever
                 if (is_pooled) {
                     // Release with healthy=false (don't return to pool, but update counts)
-                    self.pool.release(upstream.idx, mutable_conn, false, io);
+                    self.pool.release(upstream.idx, mutable_conn, false);
                 } else {
                     // Fresh connection never entered pool, just close it
-                    mutable_conn.close(io);
+                    mutable_conn.close();
                 }
             }
 
@@ -295,6 +320,14 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
                 return err;
             };
 
+            // Create Socket wrappers for body forwarding.
+            // TigerStyle: Connection.socket is already a Socket, use it directly for upstream.
+            // For client, create Socket from client_tls or plaintext fd.
+            var client_socket = if (client_tls) |tls|
+                Socket{ .tls = .{ .fd = client_stream.socket.handle, .stream = tls.* } }
+            else
+                Socket.Plain.initClient(client_stream.socket.handle);
+
             // Stream request body if present
             if (body_info.getContentLength()) |content_length| {
                 if (content_length > config.MAX_BODY_SIZE_BYTES) {
@@ -302,9 +335,9 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
                     return ForwardError.RequestBodyTooLarge;
                 }
                 debugLog("send: streaming body content_length={d}", .{content_length});
-                // Extract raw fd for splice (plaintext) or userspace copy (TLS)
-                const client_fd = client_stream.socket.handle;
-                _ = streamRequestBody(client_fd, &mutable_conn, io, body_info) catch |err| {
+                // Use Socket abstraction for unified TLS/plaintext handling.
+                // Connection.socket is already a Socket.
+                _ = streamRequestBody(&client_socket, &mutable_conn.socket, &mutable_conn, io, body_info) catch |err| {
                     self.tracer.endSpan(send_span, @errorName(err));
                     return err;
                 };
@@ -319,7 +352,9 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             // Recv phase span (response headers + body)
             const recv_span = self.tracer.startSpan("recv_response", forward_span);
             debugLog("recv: awaiting response headers", .{});
-            var result = forwardResponse(io, &mutable_conn, client_stream, client_tls, is_pooled) catch |err| {
+            // Use Socket abstraction for unified TLS/plaintext body forwarding.
+            // Connection.socket is already a Socket.
+            var result = forwardResponse(io, &mutable_conn, client_stream, &mutable_conn.socket, &client_socket, is_pooled) catch |err| {
                 self.tracer.endSpan(recv_span, @errorName(err));
                 return err;
             };
@@ -339,7 +374,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             // pooling if present. Current implementation relies on StaleConnection retry
             // (Pingora-style). Consider adding explicit header check if retry overhead
             // becomes measurable.
-            self.pool.release(upstream.idx, mutable_conn, true, io);
+            self.pool.release(upstream.idx, mutable_conn, true);
 
             debugLog("forward: complete status={d} pooled={}", .{ result.status, is_pooled });
             return result;
@@ -354,14 +389,16 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
 test "Forwarder init with NoPool" {
     var no_pool = pool_mod.NoPool{};
     var tracer = serval_tracing.NoopTracer{};
-    const forwarder = Forwarder(pool_mod.NoPool, serval_tracing.NoopTracer).init(&no_pool, &tracer, true);
+    // TigerStyle: null client_ctx for tests without TLS upstreams.
+    const forwarder = Forwarder(pool_mod.NoPool, serval_tracing.NoopTracer).init(&no_pool, &tracer, true, null);
     _ = forwarder;
 }
 
 test "Forwarder init with SimplePool" {
     var simple_pool = pool_mod.SimplePool.init();
     var tracer = serval_tracing.NoopTracer{};
-    const forwarder = Forwarder(pool_mod.SimplePool, serval_tracing.NoopTracer).init(&simple_pool, &tracer, true);
+    // TigerStyle: null client_ctx for tests without TLS upstreams.
+    const forwarder = Forwarder(pool_mod.SimplePool, serval_tracing.NoopTracer).init(&simple_pool, &tracer, true, null);
     _ = forwarder;
 }
 

@@ -21,6 +21,9 @@ const Method = types.Method;
 const pool_mod = @import("serval-pool").pool;
 const Connection = pool_mod.Connection;
 
+const net = @import("serval-net");
+const Socket = net.Socket;
+
 // =============================================================================
 // RFC 7230 Hop-by-Hop Header Filtering
 // =============================================================================
@@ -148,35 +151,28 @@ pub fn buildRequestBuffer(buffer: []u8, request: *const Request) ?usize {
 // Request Sending
 // =============================================================================
 
-/// Send buffer to connection (TLS or plaintext).
+/// Send buffer to connection using Socket abstraction.
+/// Handles both TLS and plaintext transparently.
 /// TigerStyle: Explicit io parameter for async I/O.
 pub fn sendBuffer(conn: *Connection, io: Io, data: []const u8) ForwardError!void {
+    _ = io; // Unused - Socket handles I/O internally
     assert(data.len > 0);
 
-    // Use TLS write if connection is encrypted
-    if (conn.tls) |*tls_stream| {
-        // TLS write - blocking operation (socket is async via std.Io)
-        var remaining = data;
-        var iteration: u32 = 0;
-        const max_iterations: u32 = 10000; // S4: explicit bound
+    var remaining = data;
+    var iteration: u32 = 0;
+    const max_iterations: u32 = 10000; // S4: explicit bound
 
-        while (remaining.len > 0 and iteration < max_iterations) {
-            iteration += 1;
-            const written = tls_stream.write(remaining) catch return ForwardError.SendFailed;
-            assert(written > 0);
-            assert(written <= remaining.len);
-            remaining = remaining[written..];
-        }
+    // Use Socket abstraction for unified TLS/plaintext handling.
+    while (remaining.len > 0 and iteration < max_iterations) {
+        iteration += 1;
+        const written = conn.socket.write(remaining) catch return ForwardError.SendFailed;
+        if (written == 0) return ForwardError.SendFailed;
+        assert(written <= remaining.len);
+        remaining = remaining[written..];
+    }
 
-        if (iteration >= max_iterations) {
-            return ForwardError.SendFailed; // TLS write exceeded max iterations
-        }
-    } else {
-        // Plain TCP write
-        var write_buf: [config.STREAM_WRITE_BUFFER_SIZE_BYTES]u8 = std.mem.zeroes([config.STREAM_WRITE_BUFFER_SIZE_BYTES]u8);
-        var writer = conn.stream.writer(io, &write_buf);
-        writer.interface.writeAll(data) catch return ForwardError.SendFailed;
-        writer.interface.flush() catch return ForwardError.SendFailed;
+    if (iteration >= max_iterations) {
+        return ForwardError.SendFailed; // Write exceeded max iterations
     }
 }
 

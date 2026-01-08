@@ -370,9 +370,10 @@
         State tracking → serval-health (layer 2, implemented): atomic bitmap + threshold counters.
         Design → Pingora-inspired: boolean health with consecutive thresholds (no circuit breaker states).
         Passive checks → handler calls tracker.recordSuccess/recordFailure on request completion.
-        Active probes → handler layer responsibility (not in serval-health, uses config.DEFAULT_HEALTH_PATH).
+        Active probes → serval-prober (layer 2, implemented): background thread HTTP/HTTPS GET probes against unhealthy backends.
+        TLS support → serval-prober detects upstream.tls flag and performs TLS handshake with SNI before HTTP probe.
         Integration → selectUpstream uses tracker.findNthHealthy() to skip unhealthy backends.
-        Config → DEFAULT_UNHEALTHY_THRESHOLD (3), DEFAULT_HEALTHY_THRESHOLD (2).
+        Config → DEFAULT_UNHEALTHY_THRESHOLD (3), DEFAULT_HEALTHY_THRESHOLD (2), DEFAULT_PROBE_INTERVAL_MS (5000), DEFAULT_HEALTH_PATH ("/").
       </point>
       <point trigger="rate limiting">
         Algorithm → serval-ratelimit (layer 2): token bucket, sliding window, or fixed window.

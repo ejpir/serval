@@ -115,6 +115,11 @@ comptime {
 /// TigerStyle: Bounded retry prevents pool exhaustion spiral.
 pub const MAX_STALE_RETRIES: u8 = 2;
 
+/// Default upstream connection timeout in nanoseconds.
+/// Used when creating TCP connections to backend servers.
+/// TigerStyle: u64 nanoseconds, 30 seconds default (typical for load balancers).
+pub const CONNECT_TIMEOUT_NS: u64 = 30 * 1000 * 1000 * 1000;
+
 // =============================================================================
 // Health Check Limits
 // =============================================================================

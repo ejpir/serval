@@ -13,16 +13,6 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("serval-core/mod.zig"),
     });
 
-    // Network utilities - no dependencies
-    const serval_net_module = b.addModule("serval-net", .{
-        .root_source_file = b.path("serval-net/mod.zig"),
-    });
-
-    // CLI module - no dependencies
-    const serval_cli_module = b.addModule("serval-cli", .{
-        .root_source_file = b.path("serval-cli/mod.zig"),
-    });
-
     // TLS module - no dependencies (Layer 1 - Protocol)
     // Note: Linking happens per compilation unit (tests, executables)
     // Modules cannot link libraries directly in Zig build system
@@ -31,12 +21,25 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
-    // Pool module - depends on core and tls
+    // Network utilities - depends on tls for TLSSocket
+    const serval_net_module = b.addModule("serval-net", .{
+        .root_source_file = b.path("serval-net/mod.zig"),
+        .imports = &.{
+            .{ .name = "serval-tls", .module = serval_tls_module },
+        },
+    });
+
+    // CLI module - no dependencies
+    const serval_cli_module = b.addModule("serval-cli", .{
+        .root_source_file = b.path("serval-cli/mod.zig"),
+    });
+
+    // Pool module - depends on core and net
     const serval_pool_module = b.addModule("serval-pool", .{
         .root_source_file = b.path("serval-pool/mod.zig"),
         .imports = &.{
             .{ .name = "serval-core", .module = serval_core_module },
-            .{ .name = "serval-tls", .module = serval_tls_module },
+            .{ .name = "serval-net", .module = serval_net_module },
         },
     });
 
@@ -109,23 +112,25 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // Prober module - depends on core, net, health
+    // Prober module - depends on core, net, health, tls
     const serval_prober_module = b.addModule("serval-prober", .{
         .root_source_file = b.path("serval-prober/mod.zig"),
         .imports = &.{
             .{ .name = "serval-core", .module = serval_core_module },
             .{ .name = "serval-net", .module = serval_net_module },
             .{ .name = "serval-health", .module = serval_health_module },
+            .{ .name = "serval-tls", .module = serval_tls_module },
         },
     });
 
-    // Load balancer handler module - depends on core, health, prober
+    // Load balancer handler module - depends on core, health, prober, tls
     const serval_lb_module = b.addModule("serval-lb", .{
         .root_source_file = b.path("serval-lb/mod.zig"),
         .imports = &.{
             .{ .name = "serval-core", .module = serval_core_module },
             .{ .name = "serval-health", .module = serval_health_module },
             .{ .name = "serval-prober", .module = serval_prober_module },
+            .{ .name = "serval-tls", .module = serval_tls_module },
         },
     });
 
@@ -178,14 +183,19 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_serval_tests.step);
 
     // Load balancer handler tests
+    // Note: Links SSL libraries since serval-prober and serval-lb now depend on serval-tls
     const lb_tests_mod = b.createModule(.{
         .root_source_file = b.path("serval-lb/mod.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
+    lb_tests_mod.linkSystemLibrary("ssl", .{});
+    lb_tests_mod.linkSystemLibrary("crypto", .{});
     lb_tests_mod.addImport("serval-core", serval_core_module);
     lb_tests_mod.addImport("serval-health", serval_health_module);
     lb_tests_mod.addImport("serval-prober", serval_prober_module);
+    lb_tests_mod.addImport("serval-tls", serval_tls_module);
     const lb_tests = b.addTest(.{
         .name = "lb_tests",
         .root_module = lb_tests_mod,
@@ -229,6 +239,26 @@ pub fn build(b: *std.Build) void {
 
     const tls_test_step = b.step("test-tls", "Run serval-tls library tests");
     tls_test_step.dependOn(&run_tls_tests.step);
+
+    // Network module tests
+    // Note: Links SSL libraries since serval-net now depends on serval-tls
+    const net_tests_mod = b.createModule(.{
+        .root_source_file = b.path("serval-net/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    net_tests_mod.linkSystemLibrary("ssl", .{});
+    net_tests_mod.linkSystemLibrary("crypto", .{});
+    net_tests_mod.addImport("serval-tls", serval_tls_module);
+    const net_tests = b.addTest(.{
+        .name = "net_tests",
+        .root_module = net_tests_mod,
+    });
+    const run_net_tests = b.addRunArtifact(net_tests);
+
+    const net_test_step = b.step("test-net", "Run serval-net library tests");
+    net_test_step.dependOn(&run_net_tests.step);
 
     // OpenTelemetry module tests
     const otel_tests_mod = b.createModule(.{
@@ -279,6 +309,7 @@ pub fn build(b: *std.Build) void {
     lb_example_mod.addImport("serval-otel", serval_otel_module);
     lb_example_mod.addImport("serval-metrics", serval_metrics_module);
     lb_example_mod.addImport("serval-health", serval_health_module);
+    lb_example_mod.addImport("serval-tls", serval_tls_module);
     lb_example_mod.addImport("stats_display", stats_display_module);
     const lb_example = b.addExecutable(.{
         .name = "lb_example",

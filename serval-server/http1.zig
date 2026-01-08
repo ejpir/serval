@@ -126,13 +126,16 @@ pub fn Server(
             assert(@intFromPtr(metrics) != 0);
             assert(@intFromPtr(tracer) != 0);
 
+            // Get verify_upstream setting from TlsConfig (default: true)
+            const verify_upstream = if (cfg.tls) |tls_cfg| tls_cfg.verify_upstream else true;
+
             return .{
                 .handler = handler,
                 .pool = pool,
                 .metrics = metrics,
                 .tracer = tracer,
                 .config = cfg,
-                .forwarder = forwarder_mod.Forwarder(Pool, Tracer).init(pool, tracer),
+                .forwarder = forwarder_mod.Forwarder(Pool, Tracer).init(pool, tracer, verify_upstream),
             };
         }
 
@@ -721,7 +724,8 @@ test "MinimalServer compiles" {
     var metrics = metrics_mod.NoopMetrics{};
     var tracer = tracing_mod.NoopTracer{};
 
-    _ = MinimalServer(TestHandler).init(&handler, &pool, &metrics, &tracer, .{});
+    // TigerStyle: null client_ctx for tests without TLS upstreams.
+    _ = MinimalServer(TestHandler).init(&handler, &pool, &metrics, &tracer, .{}, null);
 }
 
 test "parseContentLengthValue valid" {

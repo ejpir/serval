@@ -118,11 +118,11 @@ Standalone:
 | Module | Purpose | Key Exports |
 |--------|---------|-------------|
 | serval-core | Shared types, config, errors, hook verification | `Request`, `Config`, `Context`, `verifyHandler`, `hasHook` |
-| serval-net | Socket configuration utilities | `setTcpNoDelay` |
+| serval-net | Socket configuration utilities | `Socket`, `SocketError`, `setTcpNoDelay` |
 | serval-http | HTTP/1.1 parsing | `Parser` |
-| serval-pool | Connection reuse | `SimplePool`, `NoPool`, `Connection` |
+| serval-pool | Connection reuse (wraps Socket) | `SimplePool`, `NoPool`, `Connection` |
 | serval-health | Backend health tracking | `HealthState`, `UpstreamIndex`, `MAX_UPSTREAMS` |
-| serval-prober | Background health probing (HTTP/HTTPS) | `ProberContext`, `probeLoop`, `freeClientCtx` |
+| serval-prober | Background health probing (HTTP/HTTPS) | `ProberContext`, `probeLoop` |
 | serval-proxy | Request forwarding | `Forwarder`, `ForwardResult`, `BodyInfo`, `Protocol` |
 | serval-metrics | Observability | `NoopMetrics`, `PrometheusMetrics`, `RealTimeMetrics` |
 | serval-tracing | Distributed tracing interface | `NoopTracer`, `SpanHandle` |
@@ -223,10 +223,10 @@ pub fn onLog(self: *@This(), ctx: *Context, entry: LogEntry) void
 
 ```zig
 pub fn acquire(self: *@This(), upstream_idx: u32) ?Connection
-pub fn release(self: *@This(), upstream_idx: u32, conn: Connection, healthy: bool, io: Io) void
+pub fn release(self: *@This(), upstream_idx: u32, conn: Connection, healthy: bool) void
 ```
 
-`Connection` wraps `Io.net.Stream` for async I/O. Use `conn.getFd()` for splice operations.
+`Connection` wraps `Socket` for unified plain/TLS I/O. Use `conn.getFd()` for splice operations.
 
 Implementations: `SimplePool` (basic reuse), `NoPool` (always fresh)
 
@@ -328,13 +328,13 @@ try parser.parseHeaders(data);
 // Just the pool (with async stream connections)
 const pool_mod = @import("serval-pool");
 var pool = pool_mod.SimplePool.init();
-if (pool.acquire(upstream.idx, io)) |conn| {
-    // Use conn.stream for async I/O
+if (pool.acquire(upstream.idx)) |conn| {
+    // Use conn.socket for I/O
     // Use conn.getFd() for splice zero-copy
-    defer pool.release(upstream.idx, conn, true, io);
+    defer pool.release(upstream.idx, conn, true);
 }
 // Graceful shutdown
-pool.drain(io);
+pool.drain();
 ```
 
 ---
@@ -420,7 +420,7 @@ const MyHandler = struct {
 | Add new error types | `lib/serval-core/errors.zig` |
 | Add logging utilities | `lib/serval-core/log.zig` |
 | Modify handler hook verification | `lib/serval-core/hooks.zig` |
-| Add socket utilities | `lib/serval-net/socket.zig` |
+| Add socket utilities or Socket abstraction | `lib/serval-net/socket.zig` |
 | Modify HTTP parsing | `lib/serval-http/parser.zig` |
 | Change connection pooling strategy | `lib/serval-pool/pool.zig` |
 | Modify forwarding behavior | `lib/serval-proxy/forwarder.zig` |

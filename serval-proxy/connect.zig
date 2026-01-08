@@ -14,11 +14,10 @@ const debugLog = serval_core.debugLog;
 const time = serval_core.time;
 
 const serval_net = @import("serval-net");
+const Socket = serval_net.Socket;
+const SocketError = serval_net.SocketError;
 const setTcpNoDelay = serval_net.setTcpNoDelay;
 const setTcpKeepAlive = serval_net.setTcpKeepAlive;
-
-const pool_mod = @import("serval-pool").pool;
-const Connection = pool_mod.Connection;
 
 const types = @import("types.zig");
 const ForwardError = types.ForwardError;
@@ -28,7 +27,25 @@ const Upstream = serval_core.types.Upstream;
 
 const serval_tls = @import("serval-tls");
 const ssl = serval_tls.ssl;
-const TLSStream = serval_tls.TLSStream;
+
+// =============================================================================
+// Configuration
+// =============================================================================
+
+/// Configuration for upstream connection.
+/// TigerStyle: Explicit config struct, no hidden defaults.
+pub const ConnectConfig = struct {
+    /// Connection timeout in nanoseconds.
+    /// TigerStyle: u64 for nanoseconds, explicit unit in name.
+    timeout_ns: u64,
+    /// Whether to verify upstream TLS certificates.
+    /// TigerStyle: Explicit, not inferred from environment.
+    verify_upstream_tls: bool,
+    /// Optional SSL context for TLS connections.
+    /// Caller provides this for TLS; null means no TLS capability.
+    /// TigerStyle: Caller owns context lifecycle.
+    client_ctx: ?*ssl.SSL_CTX = null,
+};
 
 // =============================================================================
 // Connection Result
@@ -36,7 +53,15 @@ const TLSStream = serval_tls.TLSStream;
 
 /// Result of connecting to upstream, includes timing and socket info.
 pub const ConnectResult = struct {
-    conn: Connection,
+    /// Unified socket abstraction (plain or TLS).
+    /// TigerStyle: Single type for both, caller uses read/write interface.
+    socket: Socket,
+    /// Raw Io stream handle (for legacy close, pool integration).
+    /// TigerStyle: Transitional field for pool compatibility.
+    stream: Io.net.Stream,
+    /// Timestamp when connection was established (monotonic nanoseconds).
+    /// TigerStyle: u64 for nanoseconds, explicit unit in name.
+    created_ns: u64,
     /// Protocol negotiated at connection time. Immutable for connection lifetime.
     /// TigerStyle: Single source of truth, no mid-connection renegotiation.
     /// Future: TLS negotiation via ALPN, h2c detection via preface.
@@ -45,49 +70,6 @@ pub const ConnectResult = struct {
     local_port: u16,
 };
 
-// =============================================================================
-// Client SSL_CTX (Global, Cached)
-// =============================================================================
-
-/// Global client SSL_CTX for upstream TLS connections.
-/// TigerStyle S5: Created once at init time, not per-connection.
-/// Null until first TLS upstream connection is needed.
-var global_client_ctx: ?*ssl.SSL_CTX = null;
-
-/// Get or create the global client SSL_CTX.
-/// TigerStyle: Lazy initialization on first use, cached thereafter.
-/// Thread-safe via atomic check (single-threaded use assumed in current design).
-///
-/// NOTE: global_client_ctx is intentionally never freed during normal operation.
-/// TigerStyle C5: Process-lifetime resources are acceptable. The SSL_CTX lives
-/// for the entire program execution and is reclaimed by the OS on process exit.
-/// freeClientCtx() is provided for explicit shutdown sequences but not required.
-fn getClientCtx() !*ssl.SSL_CTX {
-    if (global_client_ctx) |ctx| {
-        return ctx;
-    }
-
-    // Initialize BoringSSL library
-    ssl.init();
-
-    // Create client context
-    const ctx = try ssl.createClientCtx();
-    global_client_ctx = ctx;
-
-    debugLog("TLS: created global client SSL_CTX", .{});
-    return ctx;
-}
-
-/// Free the global client SSL_CTX.
-/// Should be called on shutdown. Currently not wired to any shutdown hook.
-/// TigerStyle C5: Resource cleanup paired with creation.
-pub fn freeClientCtx() void {
-    if (global_client_ctx) |ctx| {
-        ssl.SSL_CTX_free(ctx);
-        global_client_ctx = null;
-        debugLog("TLS: freed global client SSL_CTX", .{});
-    }
-}
 
 // =============================================================================
 // Port Extraction
@@ -113,59 +95,28 @@ pub fn getLocalPortFromStream(stream: Io.net.Stream) u16 {
     return getLocalPort(stream.socket.handle);
 }
 
+/// Get local port from Socket abstraction.
+/// TigerStyle: Works with both plain and TLS sockets.
+pub fn getLocalPortFromSocket(socket: Socket) u16 {
+    return getLocalPort(socket.getFd());
+}
+
 // =============================================================================
 // TCP Connect
 // =============================================================================
 
-/// Perform TLS handshake on an established TCP connection.
-/// TigerStyle: Extract TLS logic to keep connectUpstream under 70 lines (Y1).
-fn performTlsHandshake(
+/// Connect to upstream and return a unified Socket.
+/// TigerStyle: Explicit config parameter, timing collected at phase boundaries.
+/// Wraps connection with TLS if upstream.tls is true and client_ctx is provided.
+pub fn connectUpstream(
     upstream: *const Upstream,
-    stream: Io.net.Stream,
     io: Io,
-) ForwardError!TLSStream {
-    assert(upstream.host.len > 0);
-
-    const ctx = getClientCtx() catch |err| {
-        debugLog("connect: FAILED to get client SSL_CTX err={s}", .{@errorName(err)});
-        var mut_stream = stream;
-        mut_stream.close(io);
-        return ForwardError.ConnectFailed;
-    };
-
-    // SNI requires null-terminated hostname
-    // TigerStyle S5: Stack allocation for small strings, bounded by MAX_URI_LENGTH
-    const max_sni_len = 256; // Reasonable limit for hostname
-    if (upstream.host.len >= max_sni_len) {
-        debugLog("connect: FAILED hostname too long for SNI", .{});
-        var mut_stream = stream;
-        mut_stream.close(io);
-        return ForwardError.InvalidAddress;
-    }
-
-    var sni_buf: [max_sni_len:0]u8 = std.mem.zeroes([max_sni_len:0]u8); // S5: zeroed to prevent leaks
-    @memcpy(sni_buf[0..upstream.host.len], upstream.host);
-    sni_buf[upstream.host.len] = 0;
-    const sni_z: [*:0]const u8 = @ptrCast(&sni_buf);
-
-    const fd: c_int = @intCast(stream.socket.handle);
-    const tls_stream = TLSStream.initClient(ctx, fd, sni_z, std.heap.page_allocator) catch |err| {
-        debugLog("connect: FAILED TLS handshake err={s}", .{@errorName(err)});
-        var mut_stream = stream;
-        mut_stream.close(io);
-        return ForwardError.ConnectFailed;
-    };
-
-    debugLog("connect: TLS handshake complete", .{});
-    return tls_stream;
-}
-
-/// Connect to upstream using async Io.net.
-/// TigerStyle: Explicit io parameter, timing collected at phase boundaries.
-/// Wraps connection with TLS if upstream.tls is true.
-pub fn connectUpstream(upstream: *const Upstream, io: Io) ForwardError!ConnectResult {
+    config: ConnectConfig,
+) ForwardError!ConnectResult {
+    // S1: preconditions
     assert(upstream.port > 0);
     assert(upstream.host.len > 0);
+    assert(config.timeout_ns > 0);
 
     debugLog("connect: start {s}:{d} tls={}", .{ upstream.host, upstream.port, upstream.tls });
 
@@ -182,30 +133,49 @@ pub fn connectUpstream(upstream: *const Upstream, io: Io) ForwardError!ConnectRe
         return ForwardError.ConnectFailed;
     };
     const connect_end_ns = time.monotonicNanos();
-    debugLog("connect: complete fd={d} duration_us={d}", .{ stream.socket.handle, time.elapsedNanos(connect_start_ns, connect_end_ns) / 1000 });
+
+    const fd: i32 = stream.socket.handle;
+    debugLog("connect: complete fd={d} duration_us={d}", .{ fd, time.elapsedNanos(connect_start_ns, connect_end_ns) / 1000 });
 
     // Disable Nagle's algorithm for low-latency request forwarding
     // TigerStyle: Explicit discard - TCP_NODELAY is optimization, not required
-    _ = setTcpNoDelay(stream.socket.handle);
+    _ = setTcpNoDelay(fd);
 
     // Enable TCP keepalive for detecting dead connections in pool
     // TigerStyle: Explicit parameters - 60s idle, 10s interval, 3 probes
-    _ = setTcpKeepAlive(stream.socket.handle, 60, 10, 3);
+    _ = setTcpKeepAlive(fd, 60, 10, 3);
 
-    const local_port = getLocalPortFromStream(stream);
+    const local_port = getLocalPort(fd);
 
-    // Wrap with TLS if upstream requires it
-    const maybe_tls: ?TLSStream = if (upstream.tls)
-        try performTlsHandshake(upstream, stream, io)
-    else
-        null;
+    // Create Socket based on TLS requirement
+    const socket: Socket = if (upstream.tls) blk: {
+        // TLS required - check if caller provided context
+        const ctx = config.client_ctx orelse {
+            debugLog("connect: FAILED TLS required but no client_ctx provided", .{});
+            var mut_stream = stream;
+            mut_stream.close(io);
+            return ForwardError.ConnectFailed;
+        };
+
+        // Perform TLS handshake using TLSSocket.initClient
+        // TigerStyle: Socket.TLS is the tls_socket module, TLSSocket.initClient returns Socket.
+        break :blk Socket.TLS.TLSSocket.initClient(fd, ctx, upstream.host) catch |err| {
+            debugLog("connect: FAILED TLS handshake err={s}", .{@errorName(err)});
+            var mut_stream = stream;
+            mut_stream.close(io);
+            return ForwardError.ConnectFailed;
+        };
+    } else Socket.Plain.initClient(fd);
+
+    // S1: postcondition - socket fd matches original fd
+    assert(socket.getFd() == fd);
+
+    debugLog("connect: socket ready tls={}", .{socket.isTLS()});
 
     return .{
-        .conn = .{
-            .stream = stream,
-            .created_ns = connect_end_ns,
-            .tls = maybe_tls,
-        },
+        .socket = socket,
+        .stream = stream,
+        .created_ns = connect_end_ns,
         .protocol = .h1, // Future: negotiate via ALPN or detect h2c preface
         .tcp_connect_duration_ns = time.elapsedNanos(connect_start_ns, connect_end_ns),
         .local_port = local_port,
@@ -260,36 +230,75 @@ test "getLocalPort: returns valid port for bound socket" {
 }
 
 // =============================================================================
+// ConnectConfig Type Tests
+// =============================================================================
+
+test "ConnectConfig: struct fields have correct defaults" {
+    // TigerStyle: Verify config defaults and required fields
+    const config = ConnectConfig{
+        .timeout_ns = 5_000_000_000, // 5 seconds
+        .verify_upstream_tls = true,
+        // client_ctx defaults to null
+    };
+
+    try testing.expectEqual(@as(u64, 5_000_000_000), config.timeout_ns);
+    try testing.expect(config.verify_upstream_tls);
+    try testing.expectEqual(@as(?*ssl.SSL_CTX, null), config.client_ctx);
+}
+
+test "ConnectConfig: timeout_ns uses nanoseconds" {
+    // TigerStyle: Verify unit consistency
+    // 30 second timeout
+    const config = ConnectConfig{
+        .timeout_ns = 30_000_000_000,
+        .verify_upstream_tls = false,
+    };
+
+    try testing.expectEqual(@as(u64, 30_000_000_000), config.timeout_ns);
+}
+
+// =============================================================================
 // ConnectResult Type Tests
 // =============================================================================
 
 test "ConnectResult: struct fields are correctly typed" {
     // TigerStyle: Verify contract - all fields have expected types and sizes
+    // Create a real socket to get a valid fd
+    const sock = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch {
+        return; // Skip if socket creation fails
+    };
+    defer posix.close(sock);
+
     const result = ConnectResult{
-        .conn = .{
-            .stream = undefined,
-            .created_ns = 12345678,
-        },
+        .socket = Socket.Plain.initClient(sock),
+        .stream = undefined,
+        .created_ns = 12345678,
         .protocol = .h1,
         .tcp_connect_duration_ns = 1000000,
         .local_port = 8080,
     };
 
-    try testing.expectEqual(@as(u64, 12345678), result.conn.created_ns);
+    try testing.expectEqual(@as(u64, 12345678), result.created_ns);
     try testing.expectEqual(Protocol.h1, result.protocol);
     try testing.expectEqual(@as(u64, 1000000), result.tcp_connect_duration_ns);
     try testing.expectEqual(@as(u16, 8080), result.local_port);
+    try testing.expect(!result.socket.isTLS());
+    try testing.expectEqual(sock, result.socket.getFd());
 }
 
 test "ConnectResult: tcp_connect_duration_ns uses u64 for nanoseconds" {
     // TigerStyle: Timing in nanoseconds, u64 to avoid overflow
     // Max u64 = ~584 years in nanoseconds - sufficient for any connect timeout
+    const sock = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch {
+        return;
+    };
+    defer posix.close(sock);
+
     const max_duration: u64 = std.math.maxInt(u64);
     const result = ConnectResult{
-        .conn = .{
-            .stream = undefined,
-            .created_ns = 0,
-        },
+        .socket = Socket.Plain.initClient(sock),
+        .stream = undefined,
+        .created_ns = 0,
         .protocol = .h1,
         .tcp_connect_duration_ns = max_duration,
         .local_port = 0,
@@ -373,23 +382,29 @@ test "TCP options: NoDelay and KeepAlive functions are called" {
 }
 
 // =============================================================================
-// Connection struct integration
+// ConnectResult created_ns integration
 // =============================================================================
 
-test "Connection from connectUpstream has created_ns set" {
+test "ConnectResult: created_ns is properly set" {
     // TigerStyle: Document the contract that created_ns is set to connect_end_ns
     // This is critical for pool eviction - unset created_ns (0) causes immediate eviction
 
-    // We can't actually call connectUpstream without io_uring,
-    // but we verify the Connection type has the expected fields
-    const conn = pool_mod.Connection{
+    const sock = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch {
+        return;
+    };
+    defer posix.close(sock);
+
+    const result = ConnectResult{
+        .socket = Socket.Plain.initClient(sock),
         .stream = undefined,
         .created_ns = time.monotonicNanos(),
-        .last_used_ns = 0,
+        .protocol = .h1,
+        .tcp_connect_duration_ns = 0,
+        .local_port = 0,
     };
 
     // TigerStyle: Postcondition - created_ns must be > 0 for pool to work correctly
-    try testing.expect(conn.created_ns > 0);
+    try testing.expect(result.created_ns > 0);
 }
 
 // =============================================================================
@@ -447,16 +462,18 @@ test "IPv4 invalid addresses fail to parse via std.Io" {
 
 test "CRITICAL: connectUpstream result has valid timestamps for pool" {
     // This contract is critical for connection pooling:
-    // - ConnectResult.conn.created_ns must be set to connect_end_ns
+    // - ConnectResult.created_ns must be set to connect_end_ns
     // - created_ns = 0 causes immediate eviction (age = now - 0 = huge)
     //
     // Code inspection shows:
     //   const connect_end_ns = time.monotonicNanos();
     //   ...
-    //   .conn = .{
+    //   return .{
+    //       .socket = socket,
     //       .stream = stream,
     //       .created_ns = connect_end_ns,  // <-- correctly set
-    //   },
+    //       ...
+    //   };
     //
     // This test documents the contract. Actual runtime verification
     // would require integration tests with a listening server.

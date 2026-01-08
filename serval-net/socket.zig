@@ -1,169 +1,277 @@
-// lib/serval-net/socket.zig
-//! Socket Utilities
+// serval-net/socket.zig
+//! Unified Socket Abstraction
 //!
-//! Common socket configuration helpers.
-//! TigerStyle: Small focused functions, explicit error handling.
+//! Tagged union providing a consistent interface for both plain TCP and TLS sockets.
+//! TigerStyle: Explicit types, no generics, runtime dispatch is acceptable (P1: network >> CPU).
 
 const std = @import("std");
 const assert = std.debug.assert;
 const posix = std.posix;
 
-// Verify TCP protocol number at comptime (defense in depth)
-comptime {
-    assert(posix.IPPROTO.TCP == 6);
-}
+pub const tls_socket = @import("tls_socket.zig");
 
-/// Disable Nagle's algorithm on a TCP socket.
-/// Prevents 40ms delay when sending small packets (Nagle + delayed ACKs).
-/// Returns true if successful, false if setsockopt failed.
-/// TigerStyle: Explicit return value instead of swallowing errors.
-pub fn setTcpNoDelay(fd: i32) bool {
-    // Precondition: fd must be >= -1 (-1 is valid "skip" sentinel, < -1 is programming error)
-    assert(fd >= -1);
+// =============================================================================
+// Error Types
+// =============================================================================
 
-    // No-op for invalid fd sentinel, not an error
-    if (fd < 0) return true;
+/// Unified error type for socket operations.
+/// TigerStyle: Explicit error set, no catch {}.
+pub const SocketError = error{
+    /// Connection was reset by peer (RST received).
+    ConnectionReset,
+    /// Connection was closed cleanly by peer.
+    ConnectionClosed,
+    /// Write to closed connection (SIGPIPE/EPIPE).
+    BrokenPipe,
+    /// Operation timed out.
+    Timeout,
+    /// TLS-specific error (handshake, encryption, certificate).
+    TLSError,
+    /// Unexpected error from underlying syscall or SSL.
+    Unexpected,
+};
 
-    // Use native endianness - setsockopt expects host byte order for integer options
-    const enabled: u32 = 1;
-    const value_bytes = std.mem.asBytes(&enabled);
+// =============================================================================
+// Plain Socket
+// =============================================================================
 
-    posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, value_bytes) catch |err| {
-        // Log at debug level - this is an optimization, not critical
-        // TigerStyle: Explicit error handling instead of catch {}
-        std.log.debug("setTcpNoDelay failed on fd {d}: {s}", .{ fd, @errorName(err) });
-        return false;
-    };
-
-    return true;
-}
-
-/// Configure TCP keepalive on a socket.
-/// Sends probes after idle_secs of inactivity, then every interval_secs,
-/// closing after count failed probes.
-/// Returns true if all options set successfully.
-/// TigerStyle: Explicit parameters, no magic defaults.
-pub fn setTcpKeepAlive(
+/// Plain TCP socket (no encryption).
+/// TigerStyle: Thin wrapper over fd with explicit lifecycle.
+pub const PlainSocket = struct {
     fd: i32,
-    idle_secs: u32,
-    interval_secs: u32,
-    count: u32,
-) bool {
-    // Preconditions: valid fd and positive timing values
-    assert(fd >= 0);
-    assert(idle_secs > 0);
-    assert(interval_secs > 0);
-    assert(count > 0);
 
-    // Enable keepalive
-    const enabled: u32 = 1;
-    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.KEEPALIVE, std.mem.asBytes(&enabled)) catch |err| {
-        std.log.debug("setTcpKeepAlive SO_KEEPALIVE failed on fd {d}: {s}", .{ fd, @errorName(err) });
-        return false;
+    /// Read data into buffer.
+    /// Returns bytes read, 0 on EOF/clean close.
+    /// TigerStyle S1: Assertions for preconditions.
+    pub fn read(self: *PlainSocket, buf: []u8) SocketError!usize {
+        assert(self.fd >= 0); // S1: precondition
+        assert(buf.len > 0); // S1: precondition
+
+        const n = posix.read(self.fd, buf) catch |err| {
+            return mapPosixError(err);
+        };
+
+        return n;
+    }
+
+    /// Write data to socket.
+    /// Returns bytes written.
+    /// TigerStyle S1: Assertions for preconditions.
+    pub fn write(self: *PlainSocket, data: []const u8) SocketError!usize {
+        assert(self.fd >= 0); // S1: precondition
+        assert(data.len > 0); // S1: precondition
+
+        const n = posix.write(self.fd, data) catch |err| {
+            return mapPosixError(err);
+        };
+
+        return n;
+    }
+
+    /// Close the socket.
+    /// TigerStyle: Explicit close, caller owns fd.
+    pub fn close(self: *PlainSocket) void {
+        assert(self.fd >= 0); // S1: precondition
+        posix.close(self.fd);
+        self.fd = -1; // Mark as closed
+    }
+};
+
+// =============================================================================
+// Socket Union
+// =============================================================================
+
+/// Unified socket type for both plain and TLS connections.
+/// TigerStyle: Tagged union, explicit dispatch, no generics.
+pub const Socket = union(enum) {
+    plain: PlainSocket,
+    tls: tls_socket.TLSSocket,
+
+    /// Plain socket creation namespace.
+    pub const Plain = struct {
+        /// Create plain client socket from fd.
+        /// TigerStyle: Consistent API with TLS.initClient.
+        pub fn initClient(fd: i32) Socket {
+            assert(fd >= 0); // S1: precondition
+            return .{ .plain = .{ .fd = fd } };
+        }
+
+        /// Create plain server socket from fd.
+        /// Same as initClient for plain TCP, but documents intent.
+        /// TigerStyle: Symmetric API with TLS.initServer.
+        pub fn initServer(fd: i32) Socket {
+            assert(fd >= 0); // S1: precondition
+            return .{ .plain = .{ .fd = fd } };
+        }
     };
 
-    // Set timing parameters (Linux only - other platforms use system defaults)
-    if (@import("builtin").os.tag == .linux) {
-        // TCP_KEEPIDLE: idle time before first probe
-        posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.KEEPIDLE, std.mem.asBytes(&idle_secs)) catch |err| {
-            std.log.debug("setTcpKeepAlive KEEPIDLE failed on fd {d}: {s}", .{ fd, @errorName(err) });
-            return false;
-        };
+    /// TLS socket creation namespace.
+    /// Delegates to tls_socket module.
+    pub const TLS = tls_socket;
 
-        // TCP_KEEPINTVL: interval between probes
-        posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.KEEPINTVL, std.mem.asBytes(&interval_secs)) catch |err| {
-            std.log.debug("setTcpKeepAlive KEEPINTVL failed on fd {d}: {s}", .{ fd, @errorName(err) });
-            return false;
-        };
+    /// Read data into buffer.
+    /// Returns bytes read, 0 on EOF/clean close.
+    /// TigerStyle: Dispatch to underlying implementation.
+    pub fn read(self: *Socket, buf: []u8) SocketError!usize {
+        assert(buf.len > 0); // S1: precondition
 
-        // TCP_KEEPCNT: probe count before declaring dead
-        posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.KEEPCNT, std.mem.asBytes(&count)) catch |err| {
-            std.log.debug("setTcpKeepAlive KEEPCNT failed on fd {d}: {s}", .{ fd, @errorName(err) });
-            return false;
+        return switch (self.*) {
+            .plain => |*s| s.read(buf),
+            .tls => |*s| s.read(buf),
         };
     }
-    // On non-Linux, only SO_KEEPALIVE is set (uses system defaults for timing)
 
-    return true;
-}
+    /// Write data to socket.
+    /// Returns bytes written.
+    /// TigerStyle: Dispatch to underlying implementation.
+    pub fn write(self: *Socket, data: []const u8) SocketError!usize {
+        assert(data.len > 0); // S1: precondition
 
-/// Disable delayed ACKs on a TCP socket (Linux only).
-/// Reduces latency at cost of more ACK packets.
-/// Returns true if successful (or not Linux).
-/// TigerStyle: Explicit opt-in for latency optimization.
-pub fn setTcpQuickAck(fd: i32) bool {
-    // Precondition: valid fd
-    assert(fd >= 0);
+        return switch (self.*) {
+            .plain => |*s| s.write(data),
+            .tls => |*s| s.write(data),
+        };
+    }
 
-    if (@import("builtin").os.tag != .linux) return true;
+    /// Close the socket and free resources.
+    /// TigerStyle: Single close path for both types.
+    pub fn close(self: *Socket) void {
+        switch (self.*) {
+            .plain => |*s| s.close(),
+            .tls => |*s| s.close(),
+        }
+    }
 
-    const enabled: u32 = 1;
-    posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.QUICKACK, std.mem.asBytes(&enabled)) catch |err| {
-        std.log.debug("setTcpQuickAck failed on fd {d}: {s}", .{ fd, @errorName(err) });
-        return false;
+    /// Get raw file descriptor.
+    /// Useful for splice (plaintext only) and poll operations.
+    /// TigerStyle: Zero-copy splice needs raw fd.
+    pub fn getFd(self: Socket) i32 {
+        return switch (self) {
+            .plain => |s| s.fd,
+            .tls => |s| s.fd,
+        };
+    }
+
+    /// Check if this is a TLS socket.
+    /// Useful for determining splice eligibility.
+    /// TigerStyle: Explicit type check, no instanceof pattern.
+    pub fn isTLS(self: Socket) bool {
+        return switch (self) {
+            .plain => false,
+            .tls => true,
+        };
+    }
+};
+
+// =============================================================================
+// Error Mapping
+// =============================================================================
+
+/// Map posix errors to SocketError.
+/// TigerStyle S6: Explicit error handling, no catch {}.
+fn mapPosixError(err: anyerror) SocketError {
+    return switch (err) {
+        error.ConnectionResetByPeer => SocketError.ConnectionReset,
+        error.BrokenPipe => SocketError.BrokenPipe,
+        error.ConnectionTimedOut => SocketError.Timeout,
+        error.WouldBlock => SocketError.Timeout,
+        else => SocketError.Unexpected,
     };
-    return true;
 }
 
-/// Configure SO_LINGER on a socket.
-/// If timeout_secs > 0, close() blocks up to timeout_secs waiting for data to send.
-/// If timeout_secs = 0, close() returns immediately with RST, unsent data lost.
-/// Returns true if successful.
-/// TigerStyle: Explicit close behavior, no implicit blocking.
-pub fn setSoLinger(fd: i32, timeout_secs: u16) bool {
-    // Precondition: valid fd
-    assert(fd >= 0);
+// =============================================================================
+// Tests
+// =============================================================================
 
-    const linger_val = posix.linger{
-        .onoff = if (timeout_secs > 0) 1 else 0,
-        .linger = @intCast(timeout_secs),
+test "Socket.Plain.initClient creates plain socket" {
+    // Use a real socket for testing
+    const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch {
+        return; // Skip if socket creation fails
     };
-    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.LINGER, std.mem.asBytes(&linger_val)) catch |err| {
-        std.log.debug("setSoLinger failed on fd {d}: {s}", .{ fd, @errorName(err) });
-        return false;
-    };
-    return true;
+    defer posix.close(fd);
+
+    var sock = Socket.Plain.initClient(fd);
+    try std.testing.expect(!sock.isTLS());
+    try std.testing.expectEqual(fd, sock.getFd());
 }
 
-test "setTcpNoDelay does not crash on invalid fd" {
-    // -1 sentinel should return true (no-op success)
-    try std.testing.expect(setTcpNoDelay(-1) == true);
-    // fd 0 is typically stdin, setsockopt will fail but should return false (not crash)
-    _ = setTcpNoDelay(0);
-}
-
-test "setTcpKeepAlive on valid socket" {
-    const sock = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch {
-        // Socket creation failed (no network?), skip test
+test "Socket.Plain.initServer creates plain socket" {
+    const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch {
         return;
     };
-    defer posix.close(sock);
+    defer posix.close(fd);
 
-    // Valid call should succeed
-    const result = setTcpKeepAlive(sock, 60, 10, 3);
-    try std.testing.expect(result);
+    var sock = Socket.Plain.initServer(fd);
+    try std.testing.expect(!sock.isTLS());
+    try std.testing.expectEqual(fd, sock.getFd());
 }
 
-test "setTcpQuickAck on valid socket" {
-    const sock = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch {
+test "Socket.isTLS returns correct value" {
+    const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch {
         return;
     };
-    defer posix.close(sock);
+    defer posix.close(fd);
 
-    const result = setTcpQuickAck(sock);
-    // On Linux should succeed, on other platforms returns true (no-op)
-    try std.testing.expect(result);
+    const plain_sock = Socket.Plain.initClient(fd);
+    try std.testing.expect(!plain_sock.isTLS());
 }
 
-test "setSoLinger sets linger options" {
-    const sock = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch {
+test "Socket.getFd returns underlying fd" {
+    const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch {
         return;
     };
-    defer posix.close(sock);
+    defer posix.close(fd);
 
-    // Test immediate close (RST)
-    try std.testing.expect(setSoLinger(sock, 0));
+    const sock = Socket.Plain.initClient(fd);
+    try std.testing.expectEqual(fd, sock.getFd());
+}
 
-    // Test linger with timeout
-    try std.testing.expect(setSoLinger(sock, 5));
+test "mapPosixError maps common errors" {
+    try std.testing.expectEqual(SocketError.ConnectionReset, mapPosixError(error.ConnectionResetByPeer));
+    try std.testing.expectEqual(SocketError.BrokenPipe, mapPosixError(error.BrokenPipe));
+    try std.testing.expectEqual(SocketError.Timeout, mapPosixError(error.ConnectionTimedOut));
+    try std.testing.expectEqual(SocketError.Timeout, mapPosixError(error.WouldBlock));
+    try std.testing.expectEqual(SocketError.Unexpected, mapPosixError(error.OutOfMemory));
+}
+
+test "PlainSocket read/write require valid fd" {
+    // Create socket pair for testing read/write
+    const fds = posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch {
+        return; // Skip if socketpair not available
+    };
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    var sock = Socket.Plain.initClient(fds[0]);
+
+    // Write to one end
+    const msg = "hello";
+    _ = posix.write(fds[1], msg) catch return;
+
+    // Read from socket
+    var buf: [16]u8 = undefined;
+    const n = try sock.read(&buf);
+    try std.testing.expectEqual(@as(usize, 5), n);
+    try std.testing.expectEqualStrings("hello", buf[0..n]);
+}
+
+test "PlainSocket write sends data" {
+    const fds = posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch {
+        return;
+    };
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    var sock = Socket.Plain.initClient(fds[0]);
+
+    // Write through socket
+    const msg = "world";
+    const written = try sock.write(msg);
+    try std.testing.expectEqual(@as(usize, 5), written);
+
+    // Read from other end
+    var buf: [16]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch return;
+    try std.testing.expectEqual(@as(usize, 5), n);
+    try std.testing.expectEqualStrings("world", buf[0..n]);
 }
