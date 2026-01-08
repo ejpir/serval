@@ -81,6 +81,7 @@ exe.root_module.addImport("serval-lb", serval.module("serval-lb"));
 | `serval-proxy` | Upstream forwarding |
 | `serval-server` | HTTP/1.1 server |
 | `serval-lb` | Load balancer handler (round-robin) |
+| `serval-router` | Content-based routing (host/path matching, path rewriting) |
 | `serval-health` | Backend health tracking (atomic bitmap) |
 | `serval-metrics` | Metrics interfaces |
 | `serval-tracing` | Distributed tracing interfaces |
@@ -188,6 +189,32 @@ zig build run-lb-example -- --port 8080 \
 
 Only use this flag for testing with self-signed certificates. In production, use properly signed certificates and omit this flag.
 
+### Content-Based Router
+
+Route requests to different backend pools based on path:
+
+```bash
+# Terminal 1: Start API backend
+zig build run-echo-backend -- --port 8001 --id api-backend
+
+# Terminal 2: Start static backend
+zig build run-echo-backend -- --port 8002 --id static-backend
+
+# Terminal 3: Start router
+zig build run-router-example -- --port 8080 \
+  --api-backends 127.0.0.1:8001 \
+  --static-backends 127.0.0.1:8002
+
+# Terminal 4: Test routing
+curl http://localhost:8080/api/users    # -> api-backend, path rewritten to /users
+curl http://localhost:8080/static/img   # -> static-backend, path rewritten to /img
+curl http://localhost:8080/other        # -> api-backend (default), path unchanged
+```
+
+The router strips path prefixes before forwarding:
+- `/api/users` → api-pool receives `/users`
+- `/static/image.png` → static-pool receives `/image.png`
+
 ### Direct Response Handler
 
 Handlers can respond directly without forwarding using `DirectResponse`:
@@ -262,6 +289,8 @@ zig build run-echo-backend -- --help
 | TLS origination (upstream HTTPS) | Complete |
 | kTLS kernel offload | Complete |
 | Chunked encoding | Complete |
+| Content-based routing | Complete |
+| Path rewriting | Complete |
 | HTTP/2 | Not implemented |
 
 ## License
