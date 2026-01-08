@@ -201,9 +201,40 @@ Full router with multiple pools, verify routing and health tracking.
 
 All tests use `enable_probing = false`.
 
+## Kubernetes Gateway API Alignment
+
+This design provides the foundation for Gateway API HTTPRoute support. Mapping:
+
+| Gateway API | serval-router | Status |
+|-------------|---------------|--------|
+| `PathPrefix` | `PathMatch.prefix` | Implemented |
+| `Exact` | `PathMatch.exact` | Implemented |
+| `hostnames[]` | `RouteMatcher.host` | Implemented |
+| `ReplacePrefixMatch` | `strip_prefix` | Partial (strip only, no replace) |
+| `backendRef.weight` | - | Future (via LbHandler weighted selection) |
+| `headers[]` | - | Future |
+| `queryParams[]` | - | Future |
+| `method` | - | Future |
+| `RegularExpression` | - | Future |
+| `ReplaceFullPath` | - | Future |
+
+**Match semantics alignment:**
+- Gateway API: Multiple `matches[]` per rule use OR logic (any match succeeds)
+- Gateway API: Within a match, conditions are ANDed (all must succeed)
+- serval-router: First matching route wins (user controls order)
+- serval-router: Currently only path + host AND logic
+
+**Weighted backends:**
+Gateway API uses proportional weights (sum = denominator, default = 1). Future serval-router can support this by extending LbHandler with weighted selection, keeping weights on Upstream structs within each pool.
+
+**Runtime configuration:**
+Gateway API expects dynamic route updates from control plane. Phase 2 will add runtime mutable routes with bounded route table and atomic swap.
+
 ## Future Work
 
 1. **Runtime mutable routes** - For Kubernetes Gateway API control plane updates
-2. **Additional matchers** - Headers, query params, method matching
-3. **Path replacement** - Strip prefix + add different prefix
-4. **Regex path matching** - For complex routing rules
+2. **Additional matchers** - Headers, query params, method matching (AND logic)
+3. **Match OR logic** - Multiple matches per route, any can succeed
+4. **Path replacement** - `ReplacePrefixMatch` with custom replacement prefix
+5. **Regex path matching** - `RegularExpression` path match type
+6. **Weighted backends** - Proportional traffic splitting within pools
