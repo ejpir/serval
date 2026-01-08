@@ -1,6 +1,6 @@
 # serval-tls
 
-TLS termination (client-side) and origination (upstream-side) using BoringSSL.
+TLS termination (client-side) and origination (upstream-side) using OpenSSL/BoringSSL.
 
 ## Purpose
 
@@ -14,32 +14,34 @@ No business logic, only protocol implementation. Sits alongside serval-http and 
 
 ## Status
 
-**Phase 1 - In Progress**
+**Phase 1 - Complete**
 
 - Userspace-only TLS (no kTLS yet)
 - Socket BIO approach (not Memory BIO)
 - Non-blocking handshakes via io_uring poll
-- Manual BoringSSL bindings (avoids @cImport macro issues)
+- Manual SSL bindings (avoids @cImport macro issues)
 
 ## Exports
 
-- `ssl` - BoringSSL bindings module
+- `ssl` - OpenSSL/BoringSSL bindings module
   - `SSL_CTX`, `SSL` opaque types
   - `init()`, `createClientCtx()`, `createServerCtx()`
-  - Low-level BoringSSL function bindings
+  - Low-level SSL function bindings
   - Error handling utilities
 
-- `TlsStream` - Unified TLS stream interface (Task 3)
-  - `initServer()` - Server-side TLS termination
-  - `initClient()` - Client-side TLS origination
-  - `read()` - Non-blocking TLS read
-  - `write()` - Non-blocking TLS write
-  - `close()` - Graceful TLS shutdown
+- `TLSStream` - Unified TLS stream interface
+  - `initServer()` - Server-side TLS termination (accepts client connections)
+  - `initClient()` - Client-side TLS origination (connects to HTTPS backends)
+  - `read()` - TLS read (decrypts incoming data)
+  - `write()` - TLS write (encrypts outgoing data)
+  - `close()` - Graceful TLS shutdown (sends close_notify)
 
 ## Dependencies
 
 **External:**
-- BoringSSL (system-installed libssl + libcrypto)
+- OpenSSL 3.x or BoringSSL (system-installed libssl + libcrypto)
+  - Provides TLS protocol implementation (handshakes, encryption, certificates)
+  - serval-tls wraps these libraries with Zig-friendly bindings
 - Requires `link_libc = true` in build.zig
 
 **Internal:**
@@ -47,14 +49,14 @@ No business logic, only protocol implementation. Sits alongside serval-http and 
 
 ## Features
 
-### Phase 1 (Current)
-- [x] Manual BoringSSL bindings (ssl.zig)
-- [ ] TLS handshake (async via io_uring poll)
-- [ ] Server certificate loading
-- [ ] Client SNI support
-- [ ] Upstream certificate verification
-- [ ] Non-blocking read/write
-- [ ] Graceful shutdown (close_notify)
+### Phase 1 (Complete)
+- [x] Manual SSL bindings (ssl.zig)
+- [x] TLS handshake (async via io_uring poll)
+- [x] Server certificate loading
+- [x] Client SNI support
+- [x] Upstream certificate verification (optional via `verify_upstream`)
+- [x] Non-blocking read/write
+- [x] Graceful shutdown (close_notify)
 
 ### Phase 2 (Future)
 - [ ] kTLS kernel offload
@@ -182,14 +184,18 @@ zig build test-tls-integ    # Requires test certs in /tmp/test-certs/
 
 ## Implementation Status
 
-| Component | Status | File | Task |
-|-----------|--------|------|------|
-| BoringSSL bindings | Complete | ssl.zig | Task 1 |
-| TlsStream struct | Placeholder | stream.zig | Task 3 |
-| Async handshake | Not started | stream.zig | Task 3 |
-| Non-blocking I/O | Not started | stream.zig | Task 3 |
-| Certificate loading | Not started | stream.zig | Task 3 |
-| Config types | Not started | serval-core | Task 4 |
+| Component | Status | File |
+|-----------|--------|------|
+| SSL bindings | Complete | ssl.zig |
+| TLSStream struct | Complete | stream.zig |
+| Server TLS (termination) | Complete | stream.zig |
+| Client TLS (origination) | Complete | stream.zig |
+| Async handshake | Complete | stream.zig |
+| Non-blocking I/O | Complete | stream.zig |
+| Certificate loading | Complete | stream.zig |
+| Certificate verification | Complete | ssl.zig |
+| SNI support | Complete | stream.zig |
+| Config types | Complete | serval-core |
 
 ## Build Integration
 
@@ -207,8 +213,8 @@ tls_mode: enum { none, userspace, ktls }
 
 ## Prerequisites
 
-- System-installed BoringSSL or OpenSSL 3.x
-- Development headers (libssl-dev on Debian/Ubuntu)
+- OpenSSL 3.x or BoringSSL (system-installed)
+- Development headers (`libssl-dev` on Debian/Ubuntu, `openssl-devel` on RHEL)
 - For Phase 2 kTLS: Linux kernel with `tls` module (`modprobe tls`)
 
 ## Design References
