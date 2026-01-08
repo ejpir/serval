@@ -483,19 +483,20 @@ pub fn Server(
 
             // TLS: Perform handshake if TLS is configured
             // TigerStyle: Blocking handshake - std.Io handles socket-level async
+            // TLS span stays open for connection lifetime - request spans are children
+            var tls_span: SpanHandle = .{};
             var maybe_tls_stream: ?TLSStream = if (tls_ctx) |ctx| blk: {
                 // S1: precondition - ctx is non-null (enforced by if guard above)
                 const allocator = std.heap.c_allocator;
 
-                // Start TLS handshake span for tracing
-                const tls_span = tracer.startSpan("tls.handshake.server", null);
+                // Start TLS handshake span (root for this connection's trace)
+                tls_span = tracer.startSpan("tls.handshake.server", null);
 
                 const tls_stream = TLSStream.initServer(
                     ctx,
                     @intCast(stream.socket.handle),
                     allocator,
                 ) catch |err| {
-                    // End span with error
                     tracer.endSpan(tls_span, @errorName(err));
                     std.log.err("TLS handshake failed: {s}", .{@errorName(err)});
                     return;
@@ -517,11 +518,13 @@ pub fn Server(
                 if (info.certIssuer()) |issuer| {
                     tracer.setStringAttribute(tls_span, "tls.peer_cert.issuer", issuer);
                 }
-                tracer.endSpan(tls_span, null);
+                // Don't end span here - stays open for connection lifetime
 
                 break :blk tls_stream;
             } else null;
             defer if (maybe_tls_stream) |*tls_stream| tls_stream.close();
+            // End TLS span when connection closes
+            defer if (tls_span.isValid()) tracer.endSpan(tls_span, null);
 
             // Initialize context with connection-scoped fields
             var ctx = Context.init();
@@ -612,10 +615,11 @@ pub fn Server(
                     }
                 }
 
-                // Start a tracing span for this request
+                // Start a tracing span for this request (child of TLS span if present)
                 var span_name_buf: [config.OTEL_MAX_NAME_LEN]u8 = std.mem.zeroes([config.OTEL_MAX_NAME_LEN]u8);
                 const span_name = buildSpanName(parser.request.method, parser.request.path, &span_name_buf);
-                const span_handle = tracer.startSpan(span_name, null);
+                const parent_span: ?SpanHandle = if (tls_span.isValid()) tls_span else null;
+                const span_handle = tracer.startSpan(span_name, parent_span);
                 ctx.span_handle = span_handle;
 
                 // Call onRequest hook if present
