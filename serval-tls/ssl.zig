@@ -12,6 +12,7 @@ pub const SSL_CTX = opaque {};
 pub const SSL = opaque {};
 pub const SSL_METHOD = opaque {};
 pub const SSL_CIPHER = opaque {};
+pub const SSL_SESSION = opaque {};
 pub const BIO = opaque {};
 pub const X509 = opaque {};
 pub const EVP_PKEY = opaque {};
@@ -42,6 +43,11 @@ pub const SSL_FILETYPE_ASN1 = 2;
 pub const SSL_VERIFY_NONE = 0x00;
 pub const SSL_VERIFY_PEER = 0x01;
 pub const SSL_VERIFY_FAIL_IF_NO_PEER_CERT = 0x02;
+
+// SSL options (for SSL_set_options/SSL_get_options)
+// Note: These are OpenSSL 3.x values. BoringSSL may differ.
+pub const SSL_OP_ENABLE_KTLS: u64 = 1 << 3; // Enable kernel TLS (OpenSSL 3.0+)
+pub const SSL_OP_ENABLE_KTLS_TX_ZEROCOPY_SENDFILE: u64 = 1 << 34; // Zero-copy sendfile with kTLS
 
 // Library initialization
 pub extern fn OPENSSL_init_ssl(opts: u64, settings: ?*anyopaque) c_int;
@@ -76,6 +82,30 @@ pub extern fn SSL_get_error(ssl: *const SSL, ret: c_int) c_int;
 pub extern fn SSL_get_version(ssl: *const SSL) ?[*:0]const u8;
 pub extern fn SSL_get_current_cipher(ssl: *const SSL) ?*const SSL_CIPHER;
 
+// SSL options - enable/disable features like kTLS
+pub extern fn SSL_set_options(ssl: *SSL, options: u64) u64;
+pub extern fn SSL_get_options(ssl: *const SSL) u64;
+pub extern fn SSL_clear_options(ssl: *SSL, options: u64) u64;
+
+// BIO functions - needed for kTLS status checks
+pub extern fn SSL_get_rbio(ssl: *const SSL) ?*BIO;
+pub extern fn SSL_get_wbio(ssl: *const SSL) ?*BIO;
+pub extern fn BIO_ctrl(bio: *BIO, cmd: c_int, larg: c_long, parg: ?*anyopaque) c_long;
+
+// BIO control commands for kTLS status (OpenSSL 3.0+)
+pub const BIO_CTRL_GET_KTLS_SEND: c_int = 73;
+pub const BIO_CTRL_GET_KTLS_RECV: c_int = 76;
+
+/// Check if kTLS is enabled for sending (TX direction)
+pub fn BIO_get_ktls_send(bio: *BIO) bool {
+    return BIO_ctrl(bio, BIO_CTRL_GET_KTLS_SEND, 0, null) != 0;
+}
+
+/// Check if kTLS is enabled for receiving (RX direction)
+pub fn BIO_get_ktls_recv(bio: *BIO) bool {
+    return BIO_ctrl(bio, BIO_CTRL_GET_KTLS_RECV, 0, null) != 0;
+}
+
 // SNI - SSL_set_tlsext_host_name is a macro, use SSL_ctrl directly
 pub extern fn SSL_ctrl(ssl: *SSL, cmd: c_int, larg: c_long, parg: ?*anyopaque) c_long;
 
@@ -91,6 +121,57 @@ pub fn SSL_set_tlsext_host_name(ssl: *SSL, name: [*:0]const u8) c_int {
 
 // Cipher functions
 pub extern fn SSL_CIPHER_get_name(cipher: *const SSL_CIPHER) ?[*:0]const u8;
+pub extern fn SSL_CIPHER_get_id(cipher: *const SSL_CIPHER) u32;
+/// Returns the cipher's two-byte protocol ID (IANA cipher suite value).
+/// For TLS 1.3: 0x1301 (AES-128-GCM), 0x1302 (AES-256-GCM), 0x1303 (ChaCha20)
+/// For TLS 1.2: 0xc02b (ECDHE-ECDSA-AES-128-GCM), 0xc02f (ECDHE-RSA-AES-128-GCM), etc.
+pub extern fn SSL_CIPHER_get_protocol_id(cipher: *const SSL_CIPHER) u16;
+
+// TLS version query
+// Returns TLS version as integer (e.g., TLS1_2_VERSION, TLS1_3_VERSION)
+pub extern fn SSL_version(ssl: *const SSL) c_int;
+
+// ============================================================================
+// kTLS Key Extraction Functions
+// ============================================================================
+// These functions provide access to TLS session keys and random data needed
+// for kernel TLS (kTLS) offload. kTLS allows the kernel to encrypt/decrypt
+// TLS records directly, bypassing userspace for improved performance.
+//
+// Key extraction workflow:
+// 1. Complete TLS handshake
+// 2. Get session via SSL_get_session
+// 3. Extract master key, client/server random
+// 4. Use SSL_export_keying_material for TLS 1.3+ key derivation
+// 5. Pass keys to kernel via setsockopt(SOL_TLS, TLS_TX/TLS_RX)
+// ============================================================================
+
+// Session access - required to get master key for kTLS
+pub extern fn SSL_get_session(ssl: *const SSL) ?*SSL_SESSION;
+
+// Master key extraction - returns key length written to out buffer
+// For TLS 1.2: master secret is 48 bytes
+// For TLS 1.3: use SSL_export_keying_material instead
+pub extern fn SSL_SESSION_get_master_key(session: *const SSL_SESSION, out: ?[*]u8, max_out: usize) usize;
+
+// Client/server random extraction - needed for TLS 1.2 key derivation
+// Both return 32 bytes of random data when complete
+pub extern fn SSL_get_client_random(ssl: *const SSL, out: ?[*]u8, max_out: usize) usize;
+pub extern fn SSL_get_server_random(ssl: *const SSL, out: ?[*]u8, max_out: usize) usize;
+
+// RFC 5705 key material export - primary method for TLS 1.3 kTLS keys
+// Returns 1 on success, 0 on failure
+// For kTLS TLS 1.3, use label "EXPORTER-traffic-secret" with appropriate context
+pub extern fn SSL_export_keying_material(
+    ssl: *SSL,
+    out: [*]u8,
+    out_len: usize,
+    label: [*:0]const u8,
+    label_len: usize,
+    context: ?[*]const u8,
+    context_len: usize,
+    use_context: c_int,
+) c_int;
 
 // Session resumption
 pub extern fn SSL_session_reused(ssl: *const SSL) c_int;

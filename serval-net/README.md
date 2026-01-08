@@ -20,7 +20,9 @@ Unified socket abstraction (plain TCP + TLS) and TCP configuration helpers.
 | `socket.write(data)` | Write data to socket |
 | `socket.close()` | Close socket and free resources |
 | `socket.getFd()` | Get raw fd for splice/poll |
-| `socket.isTLS()` | Check if TLS for splice eligibility |
+| `socket.isTLS()` | Check if TLS socket |
+| `socket.isKtls()` | Check if kTLS kernel offload active |
+| `socket.canSplice()` | Check splice eligibility (plain or kTLS) |
 | `tcp.setTcpNoDelay(fd)` | Disable Nagle's algorithm |
 | `tcp.setTcpKeepAlive(fd, idle, interval, count)` | Configure TCP keepalive |
 | `tcp.setTcpQuickAck(fd)` | Disable delayed ACKs (Linux) |
@@ -120,7 +122,19 @@ Get raw file descriptor. Useful for splice (plaintext only) and poll operations.
 
 ### socket.isTLS() bool
 
-Check if this is a TLS socket. Used to determine splice eligibility - zero-copy splice only works with plain sockets.
+Check if this is a TLS socket.
+
+### socket.isKtls() bool
+
+Check if this socket is using kTLS kernel offload. Returns true for TLS sockets where the kernel handles encryption/decryption, false for plain sockets or userspace TLS.
+
+### socket.canSplice() bool
+
+Check if this socket supports zero-copy splice operations. Returns true for:
+- Plain TCP sockets (always splice-capable)
+- TLS sockets with kTLS enabled (kernel handles encryption transparently)
+
+Returns false for TLS sockets using userspace crypto, where data must pass through OpenSSL.
 
 ## TCP Utilities API
 
@@ -301,7 +315,9 @@ _ = net.setSoLinger(socket_fd, 5); // Wait up to 5s for data to send
 | TLS socket initServer | Complete |
 | TLS socket read/write/close | Complete |
 | getFd for splice/poll | Complete |
-| isTLS for splice eligibility | Complete |
+| isTLS check | Complete |
+| isKtls check | Complete |
+| canSplice eligibility | Complete |
 | TCP_NODELAY | Complete |
 | TCP_KEEPALIVE | Complete |
 | TCP_QUICKACK | Complete (Linux) |

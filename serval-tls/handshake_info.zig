@@ -41,6 +41,9 @@ pub const HandshakeInfo = struct {
     // Connection context
     client_mode: bool = false,
 
+    // kTLS status (kernel TLS offload)
+    ktls_enabled: bool = false,
+
     /// Returns the negotiated TLS version string (e.g., "TLSv1.3").
     pub fn version(self: *const Self) []const u8 {
         std.debug.assert(self.version_len <= VERSION_BUF_SIZE); // S1: postcondition

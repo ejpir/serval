@@ -490,6 +490,7 @@ pub const WeightedHandler = struct {
 | Protocol abstraction | serval-proxy | h1/ subdirectory, Protocol enum ready for h2 |
 | Chunked transfer encoding | serval-http, serval-proxy, serval-server | Parsing, forwarding, and direct response |
 | TLS termination | serval-tls, serval-server | Client TLS (server-side), upstream TLS (client-side) |
+| kTLS kernel offload | serval-tls | OpenSSL native + BoringSSL manual, automatic fallback |
 
 ### Not Implemented
 

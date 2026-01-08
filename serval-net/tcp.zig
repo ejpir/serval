@@ -5,6 +5,7 @@
 //! TigerStyle: Small focused functions, explicit error handling.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const posix = std.posix;
 
@@ -12,6 +13,12 @@ const posix = std.posix;
 comptime {
     assert(posix.IPPROTO.TCP == 6);
 }
+
+// kTLS constants (Linux kernel TLS offload)
+// See: https://www.kernel.org/doc/html/latest/networking/tls-offload.html
+const SOL_TLS: i32 = 282;
+const TLS_TX: u32 = 1;
+const TLS_RX: u32 = 2;
 
 /// Disable Nagle's algorithm on a TCP socket.
 /// Prevents 40ms delay when sending small packets (Nagle + delayed ACKs).
@@ -125,6 +132,125 @@ pub fn setSoLinger(fd: i32, timeout_secs: u16) bool {
     return true;
 }
 
+/// Attach TLS Upper Layer Protocol to a TCP socket (Linux only).
+/// This is the first step to enable kernel TLS offload.
+/// After attachment, use setKtlsTx/setKtlsRx to configure crypto params.
+/// Returns true if successful, false if failed or not Linux.
+/// TigerStyle: Linux-only feature with explicit platform check.
+pub fn attachTlsULP(fd: i32) bool {
+    // Precondition: valid fd
+    assert(fd >= 0);
+
+    // kTLS is Linux-only
+    if (builtin.os.tag != .linux) {
+        std.log.debug("attachTlsULP: kTLS not available (non-Linux platform)", .{});
+        return false;
+    }
+
+    // TCP_ULP expects a null-terminated string "tls"
+    const ulp_name: *const [4]u8 = "tls\x00";
+
+    // Use raw Linux syscall to handle all possible errors gracefully
+    // (posix.setsockopt panics on some unexpected errno values)
+    const rc = std.os.linux.setsockopt(
+        fd,
+        posix.IPPROTO.TCP,
+        posix.TCP.ULP,
+        ulp_name,
+        4,
+    );
+
+    const err = posix.errno(rc);
+    if (err != .SUCCESS) {
+        if (err == .NOPROTOOPT or err == .NOENT) {
+            // kTLS module not loaded or TLS ULP not available
+            std.log.debug("attachTlsULP: kTLS not available ({s})", .{@tagName(err)});
+        } else {
+            std.log.debug("attachTlsULP failed on fd {d}: {s}", .{ fd, @tagName(err) });
+        }
+        return false;
+    }
+
+    return true;
+}
+
+/// Configure kTLS TX (encrypt) offload on a socket (Linux only).
+/// Must call attachTlsULP first. crypto_info contains cipher-specific params
+/// (e.g., tls12_crypto_info_aes_gcm_128 struct from linux/tls.h).
+/// Returns true if successful.
+/// TigerStyle: Explicit crypto_info parameter, caller provides cipher config.
+pub fn setKtlsTx(fd: i32, crypto_info: []const u8) bool {
+    // Preconditions: valid fd and non-empty crypto info
+    assert(fd >= 0);
+    assert(crypto_info.len > 0);
+
+    // kTLS is Linux-only
+    if (builtin.os.tag != .linux) {
+        std.log.debug("setKtlsTx: kTLS not available (non-Linux platform)", .{});
+        return false;
+    }
+
+    // Use raw Linux syscall since SOL_TLS is not in std.posix
+    const rc = std.os.linux.setsockopt(
+        fd,
+        SOL_TLS,
+        TLS_TX,
+        crypto_info.ptr,
+        @intCast(crypto_info.len),
+    );
+
+    const err = posix.errno(rc);
+    if (err != .SUCCESS) {
+        if (err == .NOPROTOOPT) {
+            // kTLS module not loaded or not supported by kernel
+            std.log.debug("setKtlsTx: kTLS not available (ENOPROTOOPT)", .{});
+        } else {
+            std.log.debug("setKtlsTx failed on fd {d}: {s}", .{ fd, @tagName(err) });
+        }
+        return false;
+    }
+
+    return true;
+}
+
+/// Configure kTLS RX (decrypt) offload on a socket (Linux only).
+/// Must call attachTlsULP first. crypto_info contains cipher-specific params.
+/// Returns true if successful.
+/// TigerStyle: Same pattern as setKtlsTx for consistency.
+pub fn setKtlsRx(fd: i32, crypto_info: []const u8) bool {
+    // Preconditions: valid fd and non-empty crypto info
+    assert(fd >= 0);
+    assert(crypto_info.len > 0);
+
+    // kTLS is Linux-only
+    if (builtin.os.tag != .linux) {
+        std.log.debug("setKtlsRx: kTLS not available (non-Linux platform)", .{});
+        return false;
+    }
+
+    // Use raw Linux syscall since SOL_TLS is not in std.posix
+    const rc = std.os.linux.setsockopt(
+        fd,
+        SOL_TLS,
+        TLS_RX,
+        crypto_info.ptr,
+        @intCast(crypto_info.len),
+    );
+
+    const err = posix.errno(rc);
+    if (err != .SUCCESS) {
+        if (err == .NOPROTOOPT) {
+            // kTLS module not loaded or not supported by kernel
+            std.log.debug("setKtlsRx: kTLS not available (ENOPROTOOPT)", .{});
+        } else {
+            std.log.debug("setKtlsRx failed on fd {d}: {s}", .{ fd, @tagName(err) });
+        }
+        return false;
+    }
+
+    return true;
+}
+
 test "setTcpNoDelay does not crash on invalid fd" {
     // -1 sentinel should return true (no-op success)
     try std.testing.expect(setTcpNoDelay(-1) == true);
@@ -166,4 +292,50 @@ test "setSoLinger sets linger options" {
 
     // Test linger with timeout
     try std.testing.expect(setSoLinger(sock, 5));
+}
+
+test "attachTlsULP on unconnected socket" {
+    // kTLS requires a connected socket to actually succeed
+    // but we can test that the function doesn't crash on a valid fd
+    if (builtin.os.tag != .linux) {
+        // Non-Linux: should return false gracefully
+        const sock = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch return;
+        defer posix.close(sock);
+        try std.testing.expect(attachTlsULP(sock) == false);
+        return;
+    }
+
+    const sock = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch return;
+    defer posix.close(sock);
+
+    // Will likely fail (ENOTCONN or ENOPROTOOPT) but should not crash
+    _ = attachTlsULP(sock);
+}
+
+test "setKtlsTx returns false without TLS ULP attached" {
+    if (builtin.os.tag != .linux) return;
+
+    const sock = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch return;
+    defer posix.close(sock);
+
+    // Dummy crypto_info - actual kTLS requires proper tls12_crypto_info struct
+    const dummy_crypto: [40]u8 = .{0} ** 40;
+
+    // Should fail since TLS ULP not attached
+    const result = setKtlsTx(sock, &dummy_crypto);
+    try std.testing.expect(result == false);
+}
+
+test "setKtlsRx returns false without TLS ULP attached" {
+    if (builtin.os.tag != .linux) return;
+
+    const sock = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch return;
+    defer posix.close(sock);
+
+    // Dummy crypto_info
+    const dummy_crypto: [40]u8 = .{0} ** 40;
+
+    // Should fail since TLS ULP not attached
+    const result = setKtlsRx(sock, &dummy_crypto);
+    try std.testing.expect(result == false);
 }

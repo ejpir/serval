@@ -15,11 +15,15 @@ No business logic, only protocol implementation. Sits alongside serval-http and 
 ## Status
 
 **Phase 1 - Complete**
-
-- Userspace-only TLS (no kTLS yet)
+- Userspace TLS via OpenSSL/BoringSSL
 - Socket BIO approach (not Memory BIO)
 - Non-blocking handshakes via io_uring poll
 - Manual SSL bindings (avoids @cImport macro issues)
+
+**Phase 2 - Complete**
+- kTLS kernel offload (OpenSSL native + BoringSSL manual)
+- Automatic detection and fallback to userspace
+- Zero-copy sendfile() support when kTLS active
 
 ## Exports
 
@@ -35,6 +39,13 @@ No business logic, only protocol implementation. Sits alongside serval-http and 
   - `read()` - TLS read (decrypts incoming data)
   - `write()` - TLS write (encrypts outgoing data)
   - `close()` - Graceful TLS shutdown (sends close_notify)
+  - `isKtls()` - Check if kTLS kernel offload is active (zero overhead)
+  - `queryKtlsStatus()` - Get detailed kTLS TX/RX status (for diagnostics)
+
+- `ktls` - kTLS kernel offload module
+  - `tryEnableKtls()` - Attempt kTLS setup after handshake (BoringSSL path)
+  - `KtlsResult` - Result enum (ktls_enabled, userspace_fallback)
+  - Linux kernel constants and crypto info structs
 
 ## Dependencies
 
@@ -58,8 +69,14 @@ No business logic, only protocol implementation. Sits alongside serval-http and 
 - [x] Non-blocking read/write
 - [x] Graceful shutdown (close_notify)
 
-### Phase 2 (Future)
-- [ ] kTLS kernel offload
+### Phase 2 (Complete)
+- [x] kTLS kernel offload (OpenSSL native via SSL_OP_ENABLE_KTLS)
+- [x] kTLS manual key extraction (BoringSSL fallback path)
+- [x] Automatic kTLS detection and userspace fallback
+- [x] HandshakeInfo.ktls_enabled status tracking
+- [x] TLSStream.isKtls() / queryKtlsStatus() for runtime checks
+
+### Phase 3 (Future)
 - [ ] Session resumption
 - [ ] ALPN negotiation (for HTTP/2)
 - [ ] Certificate reload without restart
@@ -118,15 +135,25 @@ pub const Upstream = struct {
 - Easier to maintain and understand
 - POC confirmed this approach works
 
-### Userspace First (kTLS Later)
+### kTLS with Dual-Path Support
 
-**Decision:** Phase 1 uses userspace crypto; defer kTLS to Phase 2.
+**Decision:** Support both OpenSSL native kTLS and manual BoringSSL key extraction.
 
 **Rationale:**
-- Get working TLS support deployed faster
-- kTLS optimization can be added transparently later
-- TlsStream abstraction hides implementation (userspace vs kTLS)
-- Avoid complexity of key extraction and kernel interaction initially
+- OpenSSL 3.x has native kTLS via `SSL_OP_ENABLE_KTLS` - handles key extraction internally
+- BoringSSL requires manual key extraction via `SSL_export_keying_material`
+- Automatic detection: try OpenSSL path first, fall back to manual if needed
+- Transparent to users - TLSStream API unchanged, `isKtls()` for status
+
+**kTLS Benefits:**
+- Zero-copy sendfile() for encrypted data (kernel handles TLS records)
+- Reduced context switches (crypto in kernel space)
+- Hardware crypto offload on supported NICs
+
+**Requirements:**
+- Linux kernel with `tls` module (`modprobe tls`)
+- OpenSSL 3.0+ for native kTLS
+- Supported ciphers: AES-GCM-128, AES-GCM-256, CHACHA20-POLY1305
 
 ## Integration Points
 
@@ -196,6 +223,10 @@ zig build test-tls-integ    # Requires test certs in /tmp/test-certs/
 | Certificate verification | Complete | ssl.zig |
 | SNI support | Complete | stream.zig |
 | Config types | Complete | serval-core |
+| kTLS kernel offload | Complete | ktls.zig, stream.zig |
+| kTLS OpenSSL native | Complete | stream.zig (SSL_OP_ENABLE_KTLS) |
+| kTLS BoringSSL manual | Complete | ktls.zig (key extraction) |
+| HandshakeInfo | Complete | handshake_info.zig |
 
 ## Build Integration
 

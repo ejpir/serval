@@ -161,6 +161,35 @@ pub const Socket = union(enum) {
             .tls => true,
         };
     }
+
+    /// Returns true if this socket can use splice() for zero-copy I/O.
+    /// Plain sockets always support splice. TLS sockets only support splice
+    /// when kTLS kernel offload is enabled (kernel handles encryption).
+    ///
+    /// Why this matters: splice() moves data between file descriptors without
+    /// copying through userspace. With plain TCP, the kernel handles all I/O.
+    /// With userspace TLS, data must pass through OpenSSL for encryption,
+    /// making splice() impossible. kTLS moves TLS encryption into the kernel,
+    /// re-enabling splice() for encrypted connections.
+    ///
+    /// TigerStyle: Explicit switch on socket type (no default case).
+    pub fn canSplice(self: *const Socket) bool {
+        return switch (self.*) {
+            .plain => true, // Plain TCP: kernel handles I/O, splice always works
+            .tls => |*s| s.stream.isKtls(), // TLS: only splice if kTLS enabled
+        };
+    }
+
+    /// Check if this socket is using kTLS kernel offload.
+    /// Always returns false for plain sockets.
+    /// For TLS sockets, returns true if kTLS is enabled.
+    /// TigerStyle: Explicit switch on socket type (no default case).
+    pub fn isKtls(self: *const Socket) bool {
+        return switch (self.*) {
+            .plain => false, // Plain TCP: not TLS, so not kTLS
+            .tls => |*s| s.stream.isKtls(), // TLS: check if kTLS mode
+        };
+    }
 };
 
 // =============================================================================
@@ -274,4 +303,26 @@ test "PlainSocket write sends data" {
     const n = posix.read(fds[1], &buf) catch return;
     try std.testing.expectEqual(@as(usize, 5), n);
     try std.testing.expectEqualStrings("world", buf[0..n]);
+}
+
+test "Socket.canSplice returns true for plain sockets" {
+    const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch {
+        return;
+    };
+    defer posix.close(fd);
+
+    const sock = Socket.Plain.initClient(fd);
+    // Plain sockets always support splice (kernel handles I/O)
+    try std.testing.expect(sock.canSplice());
+}
+
+test "Socket.isKtls returns false for plain sockets" {
+    const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch {
+        return;
+    };
+    defer posix.close(fd);
+
+    const sock = Socket.Plain.initClient(fd);
+    // Plain sockets are not TLS, so cannot be kTLS
+    try std.testing.expect(!sock.isKtls());
 }
