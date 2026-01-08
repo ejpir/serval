@@ -147,7 +147,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "serval-tls", .module = serval_tls_module },
         },
     });
-    _ = serval_router_module; // Used by test-router step (referenced via path)
 
     // Main serval module - composes all (umbrella)
     const serval_module = b.addModule("serval", .{
@@ -365,6 +364,35 @@ pub fn build(b: *std.Build) void {
 
     const run_lb_example_step = b.step("run-lb-example", "Run load balancer example");
     run_lb_example_step.dependOn(&run_lb_example.step);
+
+    // Router example
+    // Note: Links SSL libraries since serval depends on serval-server which depends on serval-tls
+    const router_example_mod = b.createModule(.{
+        .root_source_file = b.path("examples/router_example.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    router_example_mod.linkSystemLibrary("ssl", .{});
+    router_example_mod.linkSystemLibrary("crypto", .{});
+    router_example_mod.addImport("serval", serval_module);
+    router_example_mod.addImport("serval-router", serval_router_module);
+    router_example_mod.addImport("serval-net", serval_net_module);
+    router_example_mod.addImport("serval-cli", serval_cli_module);
+    const router_example = b.addExecutable(.{
+        .name = "router_example",
+        .root_module = router_example_mod,
+    });
+    const build_router_example = b.addInstallArtifact(router_example, .{});
+    _ = build_router_example;
+    const run_router_example = b.addRunArtifact(router_example);
+
+    if (b.args) |args| {
+        run_router_example.addArgs(args);
+    }
+
+    const run_router_example_step = b.step("run-router-example", "Run router example");
+    run_router_example_step.dependOn(&run_router_example.step);
 
     // Echo backend example (for testing load balancer)
     // Note: Links SSL libraries since serval depends on serval-server which depends on serval-tls
