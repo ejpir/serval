@@ -20,10 +20,12 @@ Handles request forwarding to backend servers using async `Io.net.Stream` I/O in
 const proxy = @import("serval-proxy");
 const pool_mod = @import("serval-pool");
 const tracing = @import("serval-tracing");
+const net = @import("serval-net");
 
 var pool = pool_mod.SimplePool.init();
 var tracer = tracing.NoopTracer{};
-var forwarder = proxy.Forwarder(pool_mod.SimplePool, tracing.NoopTracer).init(&pool, &tracer, true);
+// DnsConfig{} uses default TTL (60s) and timeout (5s) values
+var forwarder = proxy.Forwarder(pool_mod.SimplePool, tracing.NoopTracer).init(&pool, &tracer, true, null, net.DnsConfig{});
 
 // Forward using async stream I/O
 // client_tls: pass TLS stream for encrypted client connections, null for plaintext

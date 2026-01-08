@@ -28,6 +28,8 @@ pub const ForwardError = error{
     SpliceFailed,
     /// Invalid upstream host address
     InvalidAddress,
+    /// Hostname DNS resolution failed
+    DnsResolutionFailed,
     /// Request body exceeds maximum allowed size
     RequestBodyTooLarge,
 };
@@ -124,6 +126,7 @@ test "CRITICAL: ForwardError covers all failure modes" {
         ForwardError.InvalidResponse,
         ForwardError.SpliceFailed,
         ForwardError.InvalidAddress,
+        ForwardError.DnsResolutionFailed,
         ForwardError.RequestBodyTooLarge,
     };
 

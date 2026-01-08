@@ -18,6 +18,7 @@ HTTP server framework for Zig — build backends, proxies, load balancers, API g
 ```zig
 const serval = @import("serval");
 const serval_lb = @import("serval-lb");
+const serval_net = @import("serval-net");
 
 const upstreams = [_]serval.Upstream{
     .{ .host = "127.0.0.1", .port = 8001, .idx = 0 },
@@ -38,7 +39,7 @@ var server = serval.Server(
     .port = 8080,
     // Optional: TLS termination for client connections
     // .tls = .{ .cert_path = "cert.pem", .key_path = "key.pem" },
-});
+}, null, serval_net.DnsConfig{});  // DNS config with default TTL
 
 var shutdown = std.atomic.Value(bool).init(false);
 try server.run(io, &shutdown);

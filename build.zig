@@ -21,10 +21,11 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
-    // Network utilities - depends on tls for TLSSocket
+    // Network utilities - depends on core (for config, time) and tls for TLSSocket
     const serval_net_module = b.addModule("serval-net", .{
         .root_source_file = b.path("serval-net/mod.zig"),
         .imports = &.{
+            .{ .name = "serval-core", .module = serval_core_module },
             .{ .name = "serval-tls", .module = serval_tls_module },
         },
     });
@@ -250,6 +251,7 @@ pub fn build(b: *std.Build) void {
     });
     net_tests_mod.linkSystemLibrary("ssl", .{});
     net_tests_mod.linkSystemLibrary("crypto", .{});
+    net_tests_mod.addImport("serval-core", serval_core_module);
     net_tests_mod.addImport("serval-tls", serval_tls_module);
     const net_tests = b.addTest(.{
         .name = "net_tests",
@@ -305,6 +307,7 @@ pub fn build(b: *std.Build) void {
     lb_example_mod.linkSystemLibrary("crypto", .{});
     lb_example_mod.addImport("serval", serval_module);
     lb_example_mod.addImport("serval-lb", serval_lb_module);
+    lb_example_mod.addImport("serval-net", serval_net_module);
     lb_example_mod.addImport("serval-cli", serval_cli_module);
     lb_example_mod.addImport("serval-otel", serval_otel_module);
     lb_example_mod.addImport("serval-metrics", serval_metrics_module);
@@ -336,6 +339,7 @@ pub fn build(b: *std.Build) void {
     echo_backend_mod.linkSystemLibrary("ssl", .{});
     echo_backend_mod.linkSystemLibrary("crypto", .{});
     echo_backend_mod.addImport("serval", serval_module);
+    echo_backend_mod.addImport("serval-net", serval_net_module);
     echo_backend_mod.addImport("serval-cli", serval_cli_module);
     const echo_backend = b.addExecutable(.{
         .name = "echo_backend",

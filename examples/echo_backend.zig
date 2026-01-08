@@ -21,7 +21,9 @@
 
 const std = @import("std");
 const serval = @import("serval");
+const serval_net = @import("serval-net");
 const cli = @import("serval-cli");
+const DnsConfig = serval_net.DnsConfig;
 
 /// Version of this binary.
 const VERSION = "0.1.0";
@@ -252,10 +254,11 @@ pub fn main() !void {
         serval.NoopTracer,
     );
     // Echo backend doesn't forward to upstreams, so no client_ctx needed.
+    // DnsConfig{} uses default TTL (60s) and timeout (5s) values
     var server = ServerType.init(&handler, &pool, &metrics, &tracer, .{
         .port = args.port,
         .tls = tls_config,
-    }, null);
+    }, null, DnsConfig{});
 
     server.run(io, &shutdown) catch |err| {
         std.debug.print("Server error: {}\n", .{err});

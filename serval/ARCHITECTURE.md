@@ -303,6 +303,7 @@ Implementations: `NoopTracer` (compiles away)
 ```zig
 const serval = @import("serval");
 const serval_lb = @import("serval-lb");
+const serval_net = @import("serval-net");
 
 const upstreams = [_]serval.Upstream{
     .{ .host = "127.0.0.1", .port = 8001, .idx = 0 },
@@ -319,7 +320,7 @@ var server = serval.Server(
     serval.SimplePool,
     serval.NoopMetrics,
     serval.NoopTracer,
-).init(&handler, &pool, &metrics, &tracer, .{ .port = 8080 });
+).init(&handler, &pool, &metrics, &tracer, .{ .port = 8080 }, null, serval_net.DnsConfig{});
 
 var shutdown = std.atomic.Value(bool).init(false);
 try server.run(io, &shutdown);

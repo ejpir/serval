@@ -23,11 +23,13 @@
 const std = @import("std");
 const serval = @import("serval");
 const serval_lb = @import("serval-lb");
+const serval_net = @import("serval-net");
 const cli = @import("serval-cli");
 const otel = @import("serval-otel");
 const serval_metrics = @import("serval-metrics");
 const stats_display = @import("stats_display");
 const tls = @import("serval-tls");
+const DnsConfig = serval_net.DnsConfig;
 
 const RealTimeMetrics = serval_metrics.RealTimeMetrics;
 const StatsDisplay = stats_display.StatsDisplay;
@@ -271,10 +273,11 @@ pub fn main() !void {
         );
         // Pass probe_ctx as client_ctx for upstream TLS connections.
         // Same SSL context is used for probing and forwarding.
+        // DnsConfig{} uses default TTL (60s) and timeout (5s) values
         var server = OtelServerType.init(&handler, &pool, &metrics, &tracer, .{
             .port = args.port,
             .tls = tls_config,
-        }, probe_ctx);
+        }, probe_ctx, DnsConfig{});
 
         server.run(io, &shutdown) catch |err| {
             std.debug.print("Server error: {}\n", .{err});
@@ -292,10 +295,11 @@ pub fn main() !void {
         );
         // Pass probe_ctx as client_ctx for upstream TLS connections.
         // Same SSL context is used for probing and forwarding.
+        // DnsConfig{} uses default TTL (60s) and timeout (5s) values
         var server = NoopServerType.init(&handler, &pool, &metrics, &tracer, .{
             .port = args.port,
             .tls = tls_config,
-        }, probe_ctx);
+        }, probe_ctx, DnsConfig{});
 
         server.run(io, &shutdown) catch |err| {
             std.debug.print("Server error: {}\n", .{err});

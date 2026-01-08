@@ -198,6 +198,22 @@ pub const OTEL_HTTP_TIMEOUT_MS: u32 = 30000;
 pub const OTEL_DEFAULT_ENDPOINT: []const u8 = "http://localhost:4318/v1/traces";
 
 // =============================================================================
+// DNS Resolution
+// =============================================================================
+
+/// Maximum DNS cache entries (matches MAX_UPSTREAMS for 1:1 mapping).
+pub const DNS_MAX_CACHE_ENTRIES: u32 = 64;
+
+/// Maximum hostname length per DNS spec (RFC 1035).
+pub const DNS_MAX_HOSTNAME_LEN: u32 = 253;
+
+/// Default DNS cache TTL in nanoseconds (60 seconds).
+pub const DNS_DEFAULT_TTL_NS: u64 = 60 * std.time.ns_per_s;
+
+/// DNS resolution timeout in nanoseconds (5 seconds).
+pub const DNS_TIMEOUT_NS: u64 = 5 * std.time.ns_per_s;
+
+// =============================================================================
 // Runtime Configuration
 // =============================================================================
 

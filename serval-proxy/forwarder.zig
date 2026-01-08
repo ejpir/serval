@@ -47,8 +47,10 @@ const TLSStream = serval_tls.TLSStream;
 const HandshakeInfo = serval_tls.HandshakeInfo;
 const ssl = serval_tls.ssl;
 
-const net = @import("serval-net");
-const Socket = net.Socket;
+const serval_net = @import("serval-net");
+const Socket = serval_net.Socket;
+const DnsResolver = serval_net.DnsResolver;
+const DnsConfig = serval_net.DnsConfig;
 
 const Request = types.Request;
 const Upstream = types.Upstream;
@@ -73,13 +75,27 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
         /// Caller provides and owns lifecycle; null means no TLS to upstreams.
         /// TigerStyle: Explicit ownership, caller manages context.
         client_ctx: ?*ssl.SSL_CTX,
+        /// DNS resolver with TTL caching for hostname resolution.
+        /// TigerStyle: Fixed-size cache, thread-safe, no runtime allocation.
+        dns_resolver: DnsResolver,
 
-        pub fn init(p: *Pool, t: *Tracer, verify_upstream_tls: bool, client_ctx: ?*ssl.SSL_CTX) Self {
+        pub fn init(
+            p: *Pool,
+            t: *Tracer,
+            verify_upstream_tls: bool,
+            client_ctx: ?*ssl.SSL_CTX,
+            dns_config: DnsConfig,
+        ) Self {
+            // S1: preconditions - pointers must be valid
+            assert(@intFromPtr(p) != 0);
+            assert(@intFromPtr(t) != 0);
+
             return .{
                 .pool = p,
                 .tracer = t,
                 .verify_upstream_tls = verify_upstream_tls,
                 .client_ctx = client_ctx,
+                .dns_resolver = DnsResolver.init(dns_config),
             };
         }
 
@@ -154,6 +170,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
                         pooled_conn,
                         true,
                         body_info,
+                        0, // dns_duration_ns: 0 for pooled connection
                         0, // tcp_connect_duration_ns: 0 for pooled connection
                         local_port,
                         pool_wait_ns,
@@ -219,7 +236,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
                 .verify_upstream_tls = self.verify_upstream_tls,
                 .client_ctx = self.client_ctx,
             };
-            const connect_result = connectUpstream(upstream, io, connect_config) catch |err| {
+            const connect_result = connectUpstream(upstream, io, connect_config, &self.dns_resolver) catch |err| {
                 self.tracer.endSpan(connect_span, @errorName(err));
                 return err;
             };
@@ -267,6 +284,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
                 conn,
                 false,
                 body_info,
+                connect_result.dns_duration_ns,
                 connect_result.tcp_connect_duration_ns,
                 connect_result.local_port,
                 pool_wait_ns,
@@ -286,6 +304,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             conn: Connection,
             is_pooled: bool,
             body_info: BodyInfo,
+            dns_duration_ns: u64,
             tcp_connect_duration_ns: u64,
             local_port: u16,
             pool_wait_ns: u64,
@@ -364,11 +383,11 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             self.tracer.endSpan(recv_span, null);
 
             result.connection_reused = is_pooled;
+            result.dns_duration_ns = dns_duration_ns;
             result.tcp_connect_duration_ns = tcp_connect_duration_ns;
             result.send_duration_ns = send_duration_ns;
             result.pool_wait_ns = pool_wait_ns;
             result.upstream_local_port = local_port;
-            // dns_duration_ns stays at 0 (DNS not yet implemented)
 
             // RFC 9112 recommends checking upstream's Connection: close header and not
             // pooling if present. Current implementation relies on StaleConnection retry
@@ -390,16 +409,20 @@ test "Forwarder init with NoPool" {
     var no_pool = pool_mod.NoPool{};
     var tracer = serval_tracing.NoopTracer{};
     // TigerStyle: null client_ctx for tests without TLS upstreams.
-    const forwarder = Forwarder(pool_mod.NoPool, serval_tracing.NoopTracer).init(&no_pool, &tracer, true, null);
-    _ = forwarder;
+    // DnsConfig{} uses default TTL and timeout values.
+    const forwarder = Forwarder(pool_mod.NoPool, serval_tracing.NoopTracer).init(&no_pool, &tracer, true, null, DnsConfig{});
+    // S1: postcondition - dns_resolver is initialized with default config
+    try std.testing.expectEqual(serval_core.config.DNS_DEFAULT_TTL_NS, forwarder.dns_resolver.cfg.ttl_ns);
 }
 
 test "Forwarder init with SimplePool" {
     var simple_pool = pool_mod.SimplePool.init();
     var tracer = serval_tracing.NoopTracer{};
     // TigerStyle: null client_ctx for tests without TLS upstreams.
-    const forwarder = Forwarder(pool_mod.SimplePool, serval_tracing.NoopTracer).init(&simple_pool, &tracer, true, null);
-    _ = forwarder;
+    // DnsConfig{} uses default TTL and timeout values.
+    const forwarder = Forwarder(pool_mod.SimplePool, serval_tracing.NoopTracer).init(&simple_pool, &tracer, true, null, DnsConfig{});
+    // S1: postcondition - dns_resolver is initialized with default config
+    try std.testing.expectEqual(serval_core.config.DNS_DEFAULT_TTL_NS, forwarder.dns_resolver.cfg.ttl_ns);
 }
 
 // =============================================================================

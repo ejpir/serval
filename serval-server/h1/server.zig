@@ -19,6 +19,7 @@ const debugLog = serval_core.debugLog;
 
 const serval_net = @import("serval-net");
 const setTcpNoDelay = serval_net.setTcpNoDelay;
+const DnsConfig = serval_net.DnsConfig;
 
 const pool_mod = @import("serval-pool").pool;
 const metrics_mod = @import("serval-metrics").metrics;
@@ -108,6 +109,7 @@ pub fn Server(
             tracer: *Tracer,
             cfg: Config,
             client_ctx: ?*ssl.SSL_CTX,
+            dns_config: DnsConfig,
         ) Self {
             assert(@intFromPtr(handler) != 0);
             assert(@intFromPtr(pool) != 0);
@@ -123,7 +125,7 @@ pub fn Server(
                 .metrics = metrics,
                 .tracer = tracer,
                 .config = cfg,
-                .forwarder = forwarder_mod.Forwarder(Pool, Tracer).init(pool, tracer, verify_upstream, client_ctx),
+                .forwarder = forwarder_mod.Forwarder(Pool, Tracer).init(pool, tracer, verify_upstream, client_ctx, dns_config),
                 .client_ctx = client_ctx,
             };
         }
@@ -816,6 +818,7 @@ pub fn Server(
             return switch (err) {
                 forwarder_mod.ForwardError.ConnectFailed,
                 forwarder_mod.ForwardError.InvalidAddress,
+                forwarder_mod.ForwardError.DnsResolutionFailed,
                 => .connect,
                 forwarder_mod.ForwardError.SendFailed,
                 forwarder_mod.ForwardError.StaleConnection,
@@ -834,6 +837,7 @@ pub fn Server(
             return switch (err) {
                 forwarder_mod.ForwardError.ConnectFailed => error.ConnectFailed,
                 forwarder_mod.ForwardError.InvalidAddress => error.ConnectFailed,
+                forwarder_mod.ForwardError.DnsResolutionFailed => error.ConnectFailed,
                 forwarder_mod.ForwardError.SendFailed => error.SendFailed,
                 forwarder_mod.ForwardError.StaleConnection => error.StaleConnection,
                 forwarder_mod.ForwardError.RequestBodyTooLarge => error.BodyTooLarge,
@@ -872,8 +876,10 @@ test "Server compiles with valid handler" {
     var metrics = metrics_mod.NoopMetrics{};
     var tracer = tracing_mod.NoopTracer{};
 
+    // TigerStyle: null client_ctx for tests without TLS upstreams.
+    // DnsConfig{} uses default TTL and timeout values.
     const server = Server(TestHandler, pool_mod.SimplePool, metrics_mod.NoopMetrics, tracing_mod.NoopTracer)
-        .init(&handler, &pool, &metrics, &tracer, .{});
+        .init(&handler, &pool, &metrics, &tracer, .{}, null, DnsConfig{});
 
     try std.testing.expectEqual(@as(u16, 8080), server.config.port);
 }
@@ -885,7 +891,8 @@ test "MinimalServer compiles" {
     var tracer = tracing_mod.NoopTracer{};
 
     // TigerStyle: null client_ctx for tests without TLS upstreams.
-    _ = MinimalServer(TestHandler).init(&handler, &pool, &metrics, &tracer, .{}, null);
+    // DnsConfig{} uses default TTL and timeout values.
+    _ = MinimalServer(TestHandler).init(&handler, &pool, &metrics, &tracer, .{}, null, DnsConfig{});
 }
 
 test "parseContentLengthValue valid" {

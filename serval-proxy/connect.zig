@@ -18,6 +18,8 @@ const Socket = serval_net.Socket;
 const SocketError = serval_net.SocketError;
 const setTcpNoDelay = serval_net.setTcpNoDelay;
 const setTcpKeepAlive = serval_net.setTcpKeepAlive;
+const DnsResolver = serval_net.DnsResolver;
+const DnsError = serval_net.DnsError;
 
 const types = @import("types.zig");
 const ForwardError = types.ForwardError;
@@ -66,6 +68,9 @@ pub const ConnectResult = struct {
     /// TigerStyle: Single source of truth, no mid-connection renegotiation.
     /// Future: TLS negotiation via ALPN, h2c detection via preface.
     protocol: Protocol,
+    /// Duration of DNS resolution in nanoseconds (0 if IP address was used).
+    /// TigerStyle: u64 for nanoseconds, explicit unit in name.
+    dns_duration_ns: u64,
     tcp_connect_duration_ns: u64,
     local_port: u16,
 };
@@ -108,23 +113,31 @@ pub fn getLocalPortFromSocket(socket: Socket) u16 {
 /// Connect to upstream and return a unified Socket.
 /// TigerStyle: Explicit config parameter, timing collected at phase boundaries.
 /// Wraps connection with TLS if upstream.tls is true and client_ctx is provided.
+/// Uses DnsResolver for hostname resolution with TTL caching.
 pub fn connectUpstream(
     upstream: *const Upstream,
     io: Io,
-    config: ConnectConfig,
+    cfg: ConnectConfig,
+    dns_resolver: *DnsResolver,
 ) ForwardError!ConnectResult {
     // S1: preconditions
     assert(upstream.port > 0);
     assert(upstream.host.len > 0);
-    assert(config.timeout_ns > 0);
+    assert(cfg.timeout_ns > 0);
+    assert(@intFromPtr(dns_resolver) != 0);
 
     debugLog("connect: start {s}:{d} tls={}", .{ upstream.host, upstream.port, upstream.tls });
 
-    // Parse IP address (DNS resolution not yet supported)
-    const addr = Io.net.IpAddress.parse(upstream.host, upstream.port) catch {
-        debugLog("connect: FAILED invalid address", .{});
-        return ForwardError.InvalidAddress;
+    // Resolve hostname to IP address via DnsResolver (handles both IP and DNS)
+    const resolve_result = dns_resolver.resolve(upstream.host, upstream.port, io) catch |err| {
+        debugLog("connect: FAILED DNS resolution err={s}", .{@errorName(err)});
+        return switch (err) {
+            DnsError.InvalidHostname => ForwardError.InvalidAddress,
+            DnsError.DnsResolutionFailed, DnsError.DnsTimeout, DnsError.CacheFull => ForwardError.DnsResolutionFailed,
+        };
     };
+    const addr = resolve_result.address;
+    const dns_duration_ns = resolve_result.resolution_ns;
 
     // Time the async TCP connect
     const connect_start_ns = time.monotonicNanos();
@@ -150,7 +163,7 @@ pub fn connectUpstream(
     // Create Socket based on TLS requirement
     const socket: Socket = if (upstream.tls) blk: {
         // TLS required - check if caller provided context
-        const ctx = config.client_ctx orelse {
+        const ctx = cfg.client_ctx orelse {
             debugLog("connect: FAILED TLS required but no client_ctx provided", .{});
             var mut_stream = stream;
             mut_stream.close(io);
@@ -177,6 +190,7 @@ pub fn connectUpstream(
         .stream = stream,
         .created_ns = connect_end_ns,
         .protocol = .h1, // Future: negotiate via ALPN or detect h2c preface
+        .dns_duration_ns = dns_duration_ns,
         .tcp_connect_duration_ns = time.elapsedNanos(connect_start_ns, connect_end_ns),
         .local_port = local_port,
     };
@@ -274,12 +288,14 @@ test "ConnectResult: struct fields are correctly typed" {
         .stream = undefined,
         .created_ns = 12345678,
         .protocol = .h1,
+        .dns_duration_ns = 500000,
         .tcp_connect_duration_ns = 1000000,
         .local_port = 8080,
     };
 
     try testing.expectEqual(@as(u64, 12345678), result.created_ns);
     try testing.expectEqual(Protocol.h1, result.protocol);
+    try testing.expectEqual(@as(u64, 500000), result.dns_duration_ns);
     try testing.expectEqual(@as(u64, 1000000), result.tcp_connect_duration_ns);
     try testing.expectEqual(@as(u16, 8080), result.local_port);
     try testing.expect(!result.socket.isTLS());
@@ -300,6 +316,7 @@ test "ConnectResult: tcp_connect_duration_ns uses u64 for nanoseconds" {
         .stream = undefined,
         .created_ns = 0,
         .protocol = .h1,
+        .dns_duration_ns = 0,
         .tcp_connect_duration_ns = max_duration,
         .local_port = 0,
     };
@@ -399,6 +416,7 @@ test "ConnectResult: created_ns is properly set" {
         .stream = undefined,
         .created_ns = time.monotonicNanos(),
         .protocol = .h1,
+        .dns_duration_ns = 0,
         .tcp_connect_duration_ns = 0,
         .local_port = 0,
     };

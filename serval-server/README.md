@@ -114,6 +114,7 @@ The h1/ subdirectory structure follows TigerStyle modular design principles:
 ```zig
 const serval_server = @import("serval-server");
 const serval_lb = @import("serval-lb");
+const serval_net = @import("serval-net");
 
 var handler = serval_lb.LbHandler.init(&upstreams);
 var pool = serval.SimplePool.init();
@@ -125,7 +126,7 @@ var server = serval_server.Server(
     serval.SimplePool,
     serval.NoopMetrics,
     serval.NoopTracer,
-).init(&handler, &pool, &metrics, &tracer, .{ .port = 8080 });
+).init(&handler, &pool, &metrics, &tracer, .{ .port = 8080 }, null, serval_net.DnsConfig{});
 
 var shutdown = std.atomic.Value(bool).init(false);
 try server.run(io, &shutdown);

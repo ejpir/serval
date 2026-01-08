@@ -18,6 +18,16 @@ pub const SocketError = socket.SocketError;
 /// TCP socket configuration utilities.
 pub const tcp = @import("tcp.zig");
 
+/// DNS resolution with TTL caching.
+/// TigerStyle: Fixed-size cache, thread-safe, no runtime allocation.
+pub const dns = @import("dns.zig");
+
+// Re-export DNS types for convenience.
+pub const DnsResolver = dns.DnsResolver;
+pub const DnsConfig = dns.DnsConfig;
+pub const DnsError = dns.DnsError;
+pub const ResolveResult = dns.ResolveResult;
+
 // Re-export common TCP utilities for convenience.
 // TigerStyle: Explicit exports, no wildcard imports.
 pub const setTcpNoDelay = tcp.setTcpNoDelay;
@@ -90,6 +100,7 @@ test {
     _ = @import("socket.zig");
     _ = @import("tcp.zig");
     _ = @import("tls_socket.zig");
+    _ = @import("dns.zig");
 }
 
 test "parseIPv4 valid addresses" {
