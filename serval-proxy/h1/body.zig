@@ -175,16 +175,9 @@ fn forwardBodyCopy(upstream: *Socket, client: *Socket, length_bytes: u64) Forwar
         if (n == 0) break; // Clean shutdown or EOF.
 
         // Write all read bytes to client via Socket abstraction.
-        var sent: usize = 0;
-        var send_iterations: u32 = 0;
-        const max_send_iterations: u32 = 1024;
-        while (sent < n and send_iterations < max_send_iterations) : (send_iterations += 1) {
-            const s = client.write(buffer[sent..n]) catch {
-                return ForwardError.SendFailed;
-            };
-            if (s == 0) return ForwardError.SendFailed;
-            sent += s;
-        }
+        client.writeAll(buffer[0..n]) catch {
+            return ForwardError.SendFailed;
+        };
 
         forwarded += n;
     }

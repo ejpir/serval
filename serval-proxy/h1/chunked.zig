@@ -70,7 +70,9 @@ pub fn forwardChunkedBody(
         const header_consumed: u32 = @intCast(parse_result.consumed);
 
         // Forward chunk header (size + extensions + CRLF) to destination.
-        try sendAll(dest, buffer[0..header_consumed]);
+        dest.writeAll(buffer[0..header_consumed]) catch {
+            return ForwardError.SendFailed;
+        };
         total_forwarded += header_consumed;
 
         // Consume header from buffer.
@@ -146,7 +148,9 @@ fn forwardChunkData(
     // Forward any buffered data first.
     if (buffer_len.* > 0) {
         const to_send: u32 = @intCast(@min(buffer_len.*, bytes_remaining));
-        try sendAll(dest, buffer[0..to_send]);
+        dest.writeAll(buffer[0..to_send]) catch {
+            return ForwardError.SendFailed;
+        };
         forwarded += to_send;
         bytes_remaining -= to_send;
         shiftBuffer(buffer, buffer_len, to_send);
@@ -190,7 +194,9 @@ fn forwardBytes(
         if (n == 0) return ForwardError.RecvFailed; // Unexpected EOF.
 
         // Write to destination socket.
-        try sendAll(dest, buffer[0..n]);
+        dest.writeAll(buffer[0..n]) catch {
+            return ForwardError.SendFailed;
+        };
         forwarded += n;
         remaining -= n;
     }
@@ -226,7 +232,9 @@ fn forwardCRLF(
         return ForwardError.InvalidResponse;
     }
 
-    try sendAll(dest, buffer[0..2]);
+    dest.writeAll(buffer[0..2]) catch {
+        return ForwardError.SendFailed;
+    };
     shiftBuffer(buffer, buffer_len, 2);
 
     // Postcondition: CRLF is exactly 2 bytes.
@@ -264,7 +272,9 @@ fn forwardTrailerSection(
         // Check for empty line (end of trailers).
         if (buffer_len.* >= 2 and buffer[0] == '\r' and buffer[1] == '\n') {
             // Forward final CRLF and done.
-            try sendAll(dest, buffer[0..2]);
+            dest.writeAll(buffer[0..2]) catch {
+                return ForwardError.SendFailed;
+            };
             shiftBuffer(buffer, buffer_len, 2);
             forwarded += 2;
             break;
@@ -309,30 +319,6 @@ fn recvToBuffer(
     // Postcondition: read within buffer bounds.
     assert(n <= space_remaining);
     return @intCast(n);
-}
-
-/// Send all bytes to destination socket (handles partial sends).
-fn sendAll(dest: *Socket, data: []const u8) ForwardError!void {
-    assert(dest.getFd() >= 0);
-
-    var sent: usize = 0;
-    var iterations: u32 = 0;
-    const max_iterations: u32 = 1024;
-
-    while (sent < data.len and iterations < max_iterations) : (iterations += 1) {
-        // Write to socket via Socket abstraction.
-        const n = dest.write(data[sent..]) catch {
-            return ForwardError.SendFailed;
-        };
-
-        if (n == 0) return ForwardError.SendFailed;
-        sent += n;
-    }
-
-    if (sent < data.len) return ForwardError.SendFailed;
-
-    // Postcondition: all bytes sent.
-    assert(sent == data.len);
 }
 
 /// Shift buffer contents left by `count` bytes.

@@ -190,6 +190,78 @@ pub const Socket = union(enum) {
             .tls => |*s| s.stream.isKtls(), // TLS: check if kTLS mode
         };
     }
+
+    // =========================================================================
+    // Bulk Transfer Operations
+    // =========================================================================
+
+    /// Maximum iterations for writeAll to prevent infinite loops.
+    /// 1024 partial writes is far beyond any legitimate scenario.
+    /// TigerStyle S3: Bounded loops with explicit max iterations.
+    pub const MAX_WRITE_ITERATIONS: u32 = 1024;
+
+    /// Maximum iterations for readAtLeast to prevent infinite loops.
+    /// TigerStyle S3: Bounded loops with explicit max iterations.
+    pub const MAX_READ_ITERATIONS: u32 = 1024;
+
+    /// Write all bytes to socket, handling partial writes.
+    /// Returns error if unable to write all bytes within bounded iterations.
+    /// TigerStyle: Bounded retry loop, explicit assertions.
+    pub fn writeAll(self: *Socket, data: []const u8) SocketError!void {
+        // S1: Preconditions
+        assert(data.len > 0); // Empty writes are programmer error
+
+        var sent: usize = 0;
+        var iterations: u32 = 0;
+
+        // S3: Bounded loop with explicit maximum
+        while (sent < data.len and iterations < MAX_WRITE_ITERATIONS) : (iterations += 1) {
+            const n = try self.write(data[sent..]);
+
+            // Zero write means peer closed or unrecoverable error
+            if (n == 0) return SocketError.ConnectionClosed;
+
+            sent += n;
+        }
+
+        // Check if loop exited due to iteration limit
+        if (sent < data.len) return SocketError.Unexpected;
+
+        // S2: Postcondition - all bytes written
+        assert(sent == data.len);
+    }
+
+    /// Read at least min_bytes into buffer.
+    /// Returns total bytes read (may be more than min_bytes, up to buffer.len).
+    /// Returns error if unable to read minimum bytes within bounded iterations.
+    /// TigerStyle: Bounded retry loop, explicit assertions.
+    pub fn readAtLeast(self: *Socket, buffer: []u8, min_bytes: usize) SocketError!usize {
+        // S1: Preconditions
+        assert(buffer.len > 0); // Empty buffer is programmer error
+        assert(min_bytes > 0); // Zero min_bytes is programmer error
+        assert(min_bytes <= buffer.len); // min_bytes cannot exceed buffer capacity
+
+        var total: usize = 0;
+        var iterations: u32 = 0;
+
+        // S3: Bounded loop with explicit maximum
+        while (total < min_bytes and iterations < MAX_READ_ITERATIONS) : (iterations += 1) {
+            const n = try self.read(buffer[total..]);
+
+            // Zero read means EOF before min_bytes reached
+            if (n == 0) return SocketError.ConnectionClosed;
+
+            total += n;
+        }
+
+        // Check if loop exited due to iteration limit
+        if (total < min_bytes) return SocketError.Unexpected;
+
+        // S2: Postcondition - read at least min_bytes
+        assert(total >= min_bytes);
+        assert(total <= buffer.len);
+        return total;
+    }
 };
 
 // =============================================================================
@@ -325,4 +397,101 @@ test "Socket.isKtls returns false for plain sockets" {
     const sock = Socket.Plain.initClient(fd);
     // Plain sockets are not TLS, so cannot be kTLS
     try std.testing.expect(!sock.isKtls());
+}
+
+// =============================================================================
+// Bulk Transfer Operation Tests
+// =============================================================================
+
+test "Socket.writeAll sends all bytes" {
+    const fds = posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch {
+        return; // Skip if socketpair not available
+    };
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    var sock = Socket.Plain.initClient(fds[0]);
+
+    // Write all bytes via writeAll
+    const msg = "hello world test message";
+    try sock.writeAll(msg);
+
+    // Read from other end and verify all bytes received
+    var buf: [64]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch return;
+    try std.testing.expectEqual(msg.len, n);
+    try std.testing.expectEqualStrings(msg, buf[0..n]);
+}
+
+test "Socket.writeAll error on closed connection" {
+    const fds = posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch {
+        return;
+    };
+    defer posix.close(fds[0]);
+
+    var sock = Socket.Plain.initClient(fds[0]);
+
+    // Close the read end to trigger broken pipe on write
+    posix.close(fds[1]);
+
+    // writeAll should fail when peer is closed
+    const result = sock.writeAll("test data");
+    try std.testing.expectError(SocketError.BrokenPipe, result);
+}
+
+test "Socket.readAtLeast reads minimum bytes" {
+    const fds = posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch {
+        return;
+    };
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    var sock = Socket.Plain.initClient(fds[0]);
+
+    // Write data to be read
+    const msg = "hello world";
+    _ = posix.write(fds[1], msg) catch return;
+
+    // Read at least 5 bytes (may get more)
+    var buf: [32]u8 = undefined;
+    const n = try sock.readAtLeast(&buf, 5);
+    try std.testing.expect(n >= 5);
+    try std.testing.expect(n <= msg.len);
+}
+
+test "Socket.readAtLeast error on EOF before min_bytes" {
+    const fds = posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch {
+        return;
+    };
+    defer posix.close(fds[0]);
+
+    var sock = Socket.Plain.initClient(fds[0]);
+
+    // Write only 3 bytes then close
+    _ = posix.write(fds[1], "abc") catch return;
+    posix.close(fds[1]);
+
+    // Try to read at least 10 bytes - should fail due to EOF
+    var buf: [32]u8 = undefined;
+    const result = sock.readAtLeast(&buf, 10);
+    try std.testing.expectError(SocketError.ConnectionClosed, result);
+}
+
+test "Socket.readAtLeast reads exact minimum when available" {
+    const fds = posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch {
+        return;
+    };
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    var sock = Socket.Plain.initClient(fds[0]);
+
+    // Write exactly 5 bytes
+    _ = posix.write(fds[1], "12345") catch return;
+
+    // Read at least 5 bytes
+    var buf: [32]u8 = undefined;
+    const n = try sock.readAtLeast(&buf, 5);
+    try std.testing.expectEqual(@as(usize, 5), n);
+    try std.testing.expectEqualStrings("12345", buf[0..n]);
 }
