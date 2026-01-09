@@ -120,20 +120,188 @@ Handles actual HTTP traffic routing:
 
 ## Using as AWS ALB Controller Replacement
 
-Deploy serval-gateway + router_example behind an AWS NLB for full ALB replacement:
+Deploy serval-gateway + router_example behind an AWS NLB for full ALB replacement.
+
+### How It Gets Triggered
+
+There's no explicit "trigger" — it's **event-driven via K8s watch API**:
 
 ```
-Internet ──▶ NLB (TCP/TLS passthrough) ──▶ serval fleet ──▶ Backend Services
-                                               ▲
-                                        Control Plane
-                                     (watches K8s, pushes config)
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              Kubernetes Cluster                              │
+│                                                                              │
+│  1. User applies HTTPRoute           2. K8s API notifies watcher            │
+│     ┌──────────────┐                    ┌─────────────────────┐             │
+│     │ kubectl apply│───────────────────▶│   K8s API Server    │             │
+│     │ httproute.yaml                    │                     │             │
+│     └──────────────┘                    └──────────┬──────────┘             │
+│                                                    │ watch stream           │
+│                                                    ▼                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                     serval-gateway (Control Plane)                   │   │
+│  │                                                                      │   │
+│  │  3. Watcher receives     4. reconcile()        5. Push config       │   │
+│  │     ADDED event             parses JSON           to data plane     │   │
+│  │     ┌──────────┐         ┌──────────┐         ┌──────────────┐     │   │
+│  │     │ Watcher  │────────▶│reconcile │────────▶│pushConfigTo- │     │   │
+│  │     │          │         │          │         │DataPlane()   │     │   │
+│  │     └──────────┘         └──────────┘         └──────┬───────┘     │   │
+│  └──────────────────────────────────────────────────────┼──────────────┘   │
+│                                                         │                   │
+│                                            POST /routes/update              │
+│                                                         │                   │
+│  ┌──────────────────────────────────────────────────────▼──────────────┐   │
+│  │                     router_example (Data Plane)                      │   │
+│  │                                                                      │   │
+│  │  6. Receive config    7. Atomic swap         8. Route traffic       │   │
+│  │     ┌──────────┐      ┌──────────┐          ┌──────────────┐       │   │
+│  │     │Admin API │─────▶│ConfigSwap│─────────▶│   Router     │       │   │
+│  │     │  :9901   │      │          │          │              │       │   │
+│  │     └──────────┘      └──────────┘          └──────┬───────┘       │   │
+│  └──────────────────────────────────────────────────────┼──────────────┘   │
+│                                                         │                   │
+└─────────────────────────────────────────────────────────┼───────────────────┘
+                                                          │
+                     Internet ◀───── NLB ◀────────────────┘
+                         │
+                         ▼
+                    Your Users
 ```
 
-**Advantages over AWS ALB Controller:**
-- No AWS API calls for route changes (faster updates)
-- Full control over routing logic
-- Works in any environment (not just AWS)
-- TigerStyle: zero allocation after init, bounded buffers
+**Event Flow:**
+
+1. **User creates HTTPRoute** via `kubectl apply -f httproute.yaml`
+2. **K8s API Server** stores the resource and notifies all watchers
+3. **Watcher** has an open HTTP connection: `GET /apis/gateway.networking.k8s.io/v1/httproutes?watch=true`
+4. K8s sends newline-delimited JSON: `{"type":"ADDED","object":{...}}`
+5. **`reconcile()`** parses JSON into typed config structs
+6. **`pushConfigToDataPlane()`** POSTs to router_example admin API
+7. **Router atomically swaps** config → new routes active immediately
+
+### Kubernetes Deployment
+
+```yaml
+# Control Plane (watches K8s, pushes config)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: serval-gateway
+spec:
+  replicas: 2  # HA - both watch, only leader pushes
+  template:
+    spec:
+      serviceAccountName: serval-gateway
+      containers:
+      - name: gateway
+        image: serval-gateway:latest
+        env:
+        - name: DATA_PLANE_URL
+          value: "http://serval-router:9901"
+---
+# Data Plane (handles actual traffic)
+apiVersion: apps/v1
+kind: DaemonSet  # Run on every node for low latency
+metadata:
+  name: serval-router
+spec:
+  template:
+    spec:
+      containers:
+      - name: router
+        image: serval-router:latest
+        ports:
+        - containerPort: 8080  # traffic
+        - containerPort: 9901  # admin API
+---
+# Expose data plane via NLB (TCP passthrough)
+apiVersion: v1
+kind: Service
+metadata:
+  name: serval-router
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 80
+    targetPort: 8080
+  selector:
+    app: serval-router
+```
+
+### Testing Without Kubernetes
+
+You can test the data plane directly by simulating what the control plane does:
+
+```bash
+# Terminal 1: Start data plane
+zig build run-router-example
+
+# Terminal 2: Push config (simulates control plane)
+curl -X PUT http://localhost:9901/config \
+  -H "Content-Type: application/json" \
+  -d '{
+    "routes": [
+      {"name": "api", "match": {"path_prefix": "/api"}, "pool": "api-pool"}
+    ],
+    "pools": [
+      {"name": "api-pool", "upstreams": [{"host": "httpbin.org", "port": 80}]}
+    ],
+    "default_pool": "api-pool"
+  }'
+
+# Terminal 2: Verify config was applied
+curl http://localhost:9901/routes
+
+# Terminal 2: Test routing (proxies to httpbin.org)
+curl http://localhost:8080/api/get
+```
+
+### Testing in Kubernetes (k3s)
+
+```bash
+# Start k3s
+k3s server &
+
+# Deploy serval
+kubectl apply -f deploy/serval-gateway.yaml
+
+# Create an HTTPRoute
+kubectl apply -f - <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: test-route
+spec:
+  hostnames: ["test.example.com"]
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /api
+    backendRefs:
+    - name: echo-server
+      port: 8080
+EOF
+
+# Check if config was pushed to data plane
+kubectl exec -it deploy/serval-router -- curl localhost:9901/routes
+
+# Test traffic (via NodePort or port-forward)
+kubectl port-forward svc/serval-router 8080:80 &
+curl -H "Host: test.example.com" http://localhost:8080/api/test
+```
+
+### Advantages over AWS ALB Controller
+
+| Feature | AWS ALB Controller | serval-gateway |
+|---------|-------------------|----------------|
+| Config update speed | ~30s (AWS API) | <100ms (direct push) |
+| AWS dependency | Yes | No |
+| Works outside AWS | No | Yes |
+| Memory allocations | Runtime | Zero after init |
+| Observability | CloudWatch | Built-in metrics |
 
 ## Features
 
