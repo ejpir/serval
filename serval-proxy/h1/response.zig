@@ -54,9 +54,10 @@ const parseContentLengthValue = serval_http.parseContentLengthValue;
 // =============================================================================
 
 /// Result of receiving headers from upstream.
+/// TigerStyle S2: Use u32 for bounded values (max is MAX_HEADER_SIZE_BYTES = 8192).
 pub const HeadersResult = struct {
-    header_len: usize,
-    header_end: usize,
+    header_len: u32,
+    header_end: u32,
 };
 
 /// Check if response has chunked Transfer-Encoding.
@@ -148,8 +149,8 @@ pub fn forwardResponse(
 
     // Forward remaining body.
     // TigerStyle: Use u64 for body sizes (Content-Length can exceed 4GB).
-    const body_already_read: u64 = headers.header_len - headers.header_end;
-    var total_body_bytes: u64 = body_already_read;
+    const body_already_read_bytes: u64 = headers.header_len - headers.header_end;
+    var total_body_bytes: u64 = body_already_read_bytes;
 
     if (is_chunked) {
         // Chunked transfer encoding: forward chunks until final chunk.
@@ -158,8 +159,8 @@ pub fn forwardResponse(
         total_body_bytes += try forwardChunkedBody(upstream_socket, client_socket);
     } else if (content_length) |length| {
         // Content-Length based: forward exact number of bytes.
-        if (length > body_already_read) {
-            const remaining = length - body_already_read;
+        if (length > body_already_read_bytes) {
+            const remaining = length - body_already_read_bytes;
             debugLog("recv: forwarding body remaining={d}", .{remaining});
             // TigerStyle: Use Socket abstraction for unified TLS/plaintext handling.
             total_body_bytes += try forwardBody(upstream_socket, client_socket, remaining);
@@ -207,8 +208,8 @@ pub fn receiveHeaders(
     assert(result.header_end <= result.total_bytes);
 
     return .{
-        .header_len = result.total_bytes,
-        .header_end = result.header_end,
+        .header_len = @intCast(result.total_bytes),
+        .header_end = @intCast(result.header_end),
     };
 }
 
@@ -244,8 +245,8 @@ test "HeadersResult: correct structure layout" {
         .header_len = 100,
         .header_end = 50,
     };
-    try testing.expectEqual(@as(usize, 100), result.header_len);
-    try testing.expectEqual(@as(usize, 50), result.header_end);
+    try testing.expectEqual(@as(u32, 100), result.header_len);
+    try testing.expectEqual(@as(u32, 50), result.header_end);
 
     // Verify invariant: header_end <= header_len
     try testing.expect(result.header_end <= result.header_len);
@@ -257,8 +258,8 @@ test "HeadersResult: zero values valid" {
         .header_len = 0,
         .header_end = 0,
     };
-    try testing.expectEqual(@as(usize, 0), result.header_len);
-    try testing.expectEqual(@as(usize, 0), result.header_end);
+    try testing.expectEqual(@as(u32, 0), result.header_len);
+    try testing.expectEqual(@as(u32, 0), result.header_end);
 }
 
 test "HeadersResult: body bytes calculation" {
@@ -267,8 +268,8 @@ test "HeadersResult: body bytes calculation" {
         .header_len = 150,
         .header_end = 100,
     };
-    const body_already_read = result.header_len - result.header_end;
-    try testing.expectEqual(@as(usize, 50), body_already_read);
+    const body_already_read_bytes = result.header_len - result.header_end;
+    try testing.expectEqual(@as(u32, 50), body_already_read_bytes);
 }
 
 // -----------------------------------------------------------------------------

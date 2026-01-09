@@ -62,7 +62,8 @@ pub const ResponseHeaders = struct {
     body_framing: BodyFraming,
     /// Bytes consumed from header_buf (where body starts in buffer).
     /// This is the offset after \r\n\r\n in header_buf.
-    header_bytes: usize,
+    /// TigerStyle S2: Use u32 for bounded values (max is MAX_HEADER_SIZE_BYTES = 8192).
+    header_bytes: u32,
 };
 
 // =============================================================================
@@ -188,7 +189,8 @@ pub fn readResponseHeaders(
     assert(result.header_end <= result.total_bytes);
 
     // Parse the headers
-    return parseResponseHeaders(header_buf[0..result.total_bytes], result.header_end);
+    // TigerStyle S2: Cast to u32 - header_end is bounded by MAX_HEADER_SIZE_BYTES (8192).
+    return parseResponseHeaders(header_buf[0..result.total_bytes], @intCast(result.header_end));
 }
 
 /// Parse already-buffered response headers.
@@ -199,9 +201,10 @@ pub fn readResponseHeaders(
 /// TigerStyle:
 /// - S1: Precondition assertions
 /// - S2: Postcondition assertions on parsed values
+/// - S2: Use u32 for bounded header_bytes (max is MAX_HEADER_SIZE_BYTES = 8192)
 fn parseResponseHeaders(
     buffer: []const u8,
-    header_bytes: usize,
+    header_bytes: u32,
 ) ResponseError!ResponseHeaders {
     // S1: Preconditions
     assert(buffer.len >= header_bytes);
@@ -483,10 +486,10 @@ test "parseResponseHeaders valid response" {
         "Content-Type: text/plain\r\n" ++
         "\r\n";
 
-    const result = try parseResponseHeaders(response, response.len);
+    const result = try parseResponseHeaders(response, @intCast(response.len));
 
     try std.testing.expectEqual(@as(u16, 200), result.status);
-    try std.testing.expectEqual(@as(usize, response.len), result.header_bytes);
+    try std.testing.expectEqual(@as(u32, response.len), result.header_bytes);
     try std.testing.expect(result.body_framing == .content_length);
     try std.testing.expectEqual(@as(u64, 13), result.body_framing.getContentLength().?);
     try std.testing.expectEqualStrings("13", result.headers.getContentLength().?);
@@ -499,7 +502,7 @@ test "parseResponseHeaders chunked response" {
         "Transfer-Encoding: chunked\r\n" ++
         "\r\n";
 
-    const result = try parseResponseHeaders(response, response.len);
+    const result = try parseResponseHeaders(response, @intCast(response.len));
 
     try std.testing.expectEqual(@as(u16, 200), result.status);
     try std.testing.expect(result.body_framing == .chunked);
@@ -511,7 +514,7 @@ test "parseResponseHeaders 204 No Content" {
         "HTTP/1.1 204 No Content\r\n" ++
         "\r\n";
 
-    const result = try parseResponseHeaders(response, response.len);
+    const result = try parseResponseHeaders(response, @intCast(response.len));
 
     try std.testing.expectEqual(@as(u16, 204), result.status);
     try std.testing.expect(result.body_framing == .none);
@@ -523,7 +526,7 @@ test "parseResponseHeaders 304 Not Modified" {
         "ETag: \"abc123\"\r\n" ++
         "\r\n";
 
-    const result = try parseResponseHeaders(response, response.len);
+    const result = try parseResponseHeaders(response, @intCast(response.len));
 
     try std.testing.expectEqual(@as(u16, 304), result.status);
     try std.testing.expect(result.body_framing == .none);
@@ -534,26 +537,26 @@ test "parseResponseHeaders invalid status - too short" {
     // parseStatusCode requires at least 12 characters ("HTTP/1.1 200")
     const response = "X\r\n\r\n";
 
-    try std.testing.expectError(error.InvalidResponseStatus, parseResponseHeaders(response, response.len));
+    try std.testing.expectError(error.InvalidResponseStatus, parseResponseHeaders(response, @intCast(response.len)));
 }
 
 test "parseResponseHeaders invalid status - non-numeric code" {
     const response = "HTTP/1.1 ABC OK\r\n\r\n";
 
-    try std.testing.expectError(error.InvalidResponseStatus, parseResponseHeaders(response, response.len));
+    try std.testing.expectError(error.InvalidResponseStatus, parseResponseHeaders(response, @intCast(response.len)));
 }
 
 test "parseResponseHeaders invalid status - out of range" {
     const response = "HTTP/1.1 999 Invalid\r\n\r\n";
 
     // Status 999 is out of valid range (100-599)
-    try std.testing.expectError(error.InvalidResponseStatus, parseResponseHeaders(response, response.len));
+    try std.testing.expectError(error.InvalidResponseStatus, parseResponseHeaders(response, @intCast(response.len)));
 }
 
 test "parseResponseHeaders no headers" {
     const response = "HTTP/1.1 200 OK\r\n\r\n";
 
-    const result = try parseResponseHeaders(response, response.len);
+    const result = try parseResponseHeaders(response, @intCast(response.len));
 
     try std.testing.expectEqual(@as(u16, 200), result.status);
     try std.testing.expectEqual(@as(u8, 0), result.headers.count);
@@ -569,7 +572,7 @@ test "parseResponseHeaders multiple headers" {
         "X-Request-Id: abc123\r\n" ++
         "\r\n";
 
-    const result = try parseResponseHeaders(response, response.len);
+    const result = try parseResponseHeaders(response, @intCast(response.len));
 
     try std.testing.expectEqual(@as(u16, 200), result.status);
     try std.testing.expectEqual(@as(u8, 4), result.headers.count);
@@ -599,7 +602,7 @@ test "ResponseHeaders struct layout" {
 
     try std.testing.expectEqual(@as(u16, 200), headers.status);
     try std.testing.expect(headers.body_framing == .none);
-    try std.testing.expectEqual(@as(usize, 0), headers.header_bytes);
+    try std.testing.expectEqual(@as(u32, 0), headers.header_bytes);
     try std.testing.expectEqual(@as(u8, 0), headers.headers.count);
 }
 
