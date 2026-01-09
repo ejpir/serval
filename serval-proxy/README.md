@@ -78,7 +78,7 @@ Timing fields default to 0 for backward compatibility. Use these for detailed Pi
 | `mod.zig` | Public API re-exports |
 | `types.zig` | ForwardError, ForwardResult, BodyInfo, Protocol |
 | `forwarder.zig` | Forwarder struct, pool coordination, timing |
-| `connect.zig` | TCP connect, socket options, protocol negotiation |
+| `connect.zig` | Connection wrapper (delegates to serval-client) |
 | `h1/mod.zig` | HTTP/1.1 module exports |
 | `h1/request.zig` | HTTP/1.1 request adapter (delegates to serval-client) |
 | `h1/response.zig` | HTTP/1.1 response receiving, header parsing |

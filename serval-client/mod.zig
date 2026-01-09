@@ -10,6 +10,7 @@
 pub const client = @import("client.zig");
 pub const Client = client.Client;
 pub const ClientError = client.ClientError;
+pub const ConnectResult = client.ConnectResult;
 pub const RequestResult = client.RequestResult;
 pub const Connection = client.Connection;
 

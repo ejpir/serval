@@ -78,6 +78,22 @@ pub const ClientError = error{
 // Result Types
 // =============================================================================
 
+/// Result of connecting to an upstream server.
+/// Includes timing information for observability.
+/// TigerStyle: Explicit struct with timing fields.
+pub const ConnectResult = struct {
+    /// Connection to upstream (caller must release to pool or close).
+    conn: Connection,
+    /// Duration of DNS resolution in nanoseconds (0 if cached or IP address).
+    dns_duration_ns: u64,
+    /// Duration of TCP connect in nanoseconds.
+    tcp_connect_duration_ns: u64,
+    /// Duration of TLS handshake in nanoseconds (0 if plaintext).
+    tls_handshake_duration_ns: u64,
+    /// Local port of the connection.
+    local_port: u16,
+};
+
 /// Result of a complete HTTP request (connect + send + read headers).
 /// TigerStyle: Explicit struct with owned connection.
 pub const RequestResult = struct {
@@ -140,17 +156,19 @@ pub const Client = struct {
 
     /// Connect to an upstream server.
     /// Performs DNS resolution, TCP connection, and optional TLS handshake.
+    /// Returns ConnectResult with timing information for observability.
     /// TigerStyle S1: ~2 assertions, S3: bounded operations via Io.
     pub fn connect(
         self: *Client,
         upstream: Upstream,
         io: Io,
-    ) ClientError!Connection {
+    ) ClientError!ConnectResult {
         // S1: preconditions
         assert(upstream.host.len > 0); // S1: non-empty host
         assert(upstream.port > 0); // S1: valid port
 
-        // Step 1: DNS resolution
+        // Step 1: DNS resolution (timed)
+        const dns_start_ns = time.monotonicNanos();
         const resolve_result = self.dns_resolver.resolve(
             upstream.host,
             upstream.port,
@@ -158,22 +176,32 @@ pub const Client = struct {
         ) catch {
             return ClientError.DnsResolutionFailed;
         };
+        const dns_end_ns = time.monotonicNanos();
+        const dns_duration_ns = time.elapsedNanos(dns_start_ns, dns_end_ns);
 
         // S2: postcondition - resolved address has correct port
         assert(resolve_result.address.getPort() == upstream.port);
 
-        // Step 2: TCP connection
+        // Step 2: TCP connection (timed)
+        const tcp_start_ns = time.monotonicNanos();
         const fd = tcpConnect(resolve_result.address, io) catch |err| {
             return mapConnectError(err);
         };
+        const tcp_end_ns = time.monotonicNanos();
+        const tcp_connect_duration_ns = time.elapsedNanos(tcp_start_ns, tcp_end_ns);
 
         // S2: postcondition - valid fd
         assert(fd >= 0);
 
         // Configure socket for low latency
         _ = net.setTcpNoDelay(fd);
+        _ = net.setTcpKeepAlive(fd, 60, 10, 3);
 
-        // Step 3: Optional TLS handshake
+        // Get local port for observability
+        const local_port = getLocalPort(fd);
+
+        // Step 3: Optional TLS handshake (timed)
+        const tls_start_ns = time.monotonicNanos();
         const socket: Socket = if (upstream.tls) blk: {
             // TLS required - client_ctx must be set
             const ctx = self.client_ctx orelse {
@@ -197,13 +225,26 @@ pub const Client = struct {
             // Plaintext connection
             break :blk Socket.Plain.initClient(fd);
         };
+        const tls_end_ns = time.monotonicNanos();
+        const tls_handshake_duration_ns = if (upstream.tls)
+            time.elapsedNanos(tls_start_ns, tls_end_ns)
+        else
+            0;
 
         // Build connection with timestamps
         const now_ns = time.monotonicNanos();
-        return Connection{
+        const conn = Connection{
             .socket = socket,
             .created_ns = now_ns,
             .last_used_ns = now_ns,
+        };
+
+        return ConnectResult{
+            .conn = conn,
+            .dns_duration_ns = dns_duration_ns,
+            .tcp_connect_duration_ns = tcp_connect_duration_ns,
+            .tls_handshake_duration_ns = tls_handshake_duration_ns,
+            .local_port = local_port,
         };
     }
 
@@ -261,20 +302,20 @@ pub const Client = struct {
         assert(header_buf.len > 0); // S1: non-empty buffer
 
         // Step 1: Connect
-        var conn = try self.connect(upstream, io);
-        errdefer conn.close();
+        var connect_result = try self.connect(upstream, io);
+        errdefer connect_result.conn.close();
 
         // Step 2: Send request
-        try self.sendRequest(&conn, req, null);
+        try self.sendRequest(&connect_result.conn, req, null);
 
         // Step 3: Read response headers
-        const response = try self.readResponseHeaders(&conn, header_buf);
+        const response = try self.readResponseHeaders(&connect_result.conn, header_buf);
 
         // S2: postcondition - valid response status
         assert(response.status >= 100 and response.status <= 599);
 
         return .{
-            .conn = conn,
+            .conn = connect_result.conn,
             .response = response,
         };
     }
@@ -283,6 +324,22 @@ pub const Client = struct {
 // =============================================================================
 // Internal Functions
 // =============================================================================
+
+/// Get local port from connected socket.
+/// Returns 0 if unable to retrieve (non-fatal).
+/// TigerStyle: Graceful fallback, no panic on failure.
+fn getLocalPort(fd: i32) u16 {
+    assert(fd >= 0);
+
+    var addr: posix.sockaddr.in = std.mem.zeroes(posix.sockaddr.in);
+    var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+
+    posix.getsockname(fd, @ptrCast(&addr), &addr_len) catch {
+        return 0;
+    };
+
+    return std.mem.bigToNative(u16, addr.port);
+}
 
 /// Perform TCP connection using Io async API.
 /// TigerStyle: Bounded via Io cancellation, explicit error return.

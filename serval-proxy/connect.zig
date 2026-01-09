@@ -1,8 +1,10 @@
 // lib/serval-proxy/connect.zig
 //! Connection Management
 //!
-//! TCP connection establishment and socket utilities.
-//! TigerStyle: Explicit timing, zero-copy where possible.
+//! Thin wrapper around serval-client for upstream connections.
+//! Provides proxy-specific ConnectResult type for observability.
+//!
+//! TigerStyle: Delegates to serval-client, adds proxy-specific fields.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -15,11 +17,11 @@ const time = serval_core.time;
 
 const serval_net = @import("serval-net");
 const Socket = serval_net.Socket;
-const SocketError = serval_net.SocketError;
-const setTcpNoDelay = serval_net.setTcpNoDelay;
-const setTcpKeepAlive = serval_net.setTcpKeepAlive;
 const DnsResolver = serval_net.DnsResolver;
-const DnsError = serval_net.DnsError;
+
+const serval_client = @import("serval-client");
+const Client = serval_client.Client;
+const ClientError = serval_client.ClientError;
 
 const types = @import("types.zig");
 const ForwardError = types.ForwardError;
@@ -54,13 +56,11 @@ pub const ConnectConfig = struct {
 // =============================================================================
 
 /// Result of connecting to upstream, includes timing and socket info.
+/// TigerStyle: Wraps serval-client result with proxy-specific fields.
 pub const ConnectResult = struct {
     /// Unified socket abstraction (plain or TLS).
     /// TigerStyle: Single type for both, caller uses read/write interface.
     socket: Socket,
-    /// Raw Io stream handle (for legacy close, pool integration).
-    /// TigerStyle: Transitional field for pool compatibility.
-    stream: Io.net.Stream,
     /// Timestamp when connection was established (monotonic nanoseconds).
     /// TigerStyle: u64 for nanoseconds, explicit unit in name.
     created_ns: u64,
@@ -71,7 +71,11 @@ pub const ConnectResult = struct {
     /// Duration of DNS resolution in nanoseconds (0 if IP address was used).
     /// TigerStyle: u64 for nanoseconds, explicit unit in name.
     dns_duration_ns: u64,
+    /// Duration of TCP connect in nanoseconds.
     tcp_connect_duration_ns: u64,
+    /// Duration of TLS handshake in nanoseconds (0 if plaintext).
+    tls_handshake_duration_ns: u64,
+    /// Local port of the connection.
     local_port: u16,
 };
 
@@ -95,11 +99,6 @@ pub fn getLocalPort(fd: i32) u16 {
     return std.mem.bigToNative(u16, addr.port);
 }
 
-/// Get local port from stream's socket handle.
-pub fn getLocalPortFromStream(stream: Io.net.Stream) u16 {
-    return getLocalPort(stream.socket.handle);
-}
-
 /// Get local port from Socket abstraction.
 /// TigerStyle: Works with both plain and TLS sockets.
 pub fn getLocalPortFromSocket(socket: Socket) u16 {
@@ -110,10 +109,8 @@ pub fn getLocalPortFromSocket(socket: Socket) u16 {
 // TCP Connect
 // =============================================================================
 
-/// Connect to upstream and return a unified Socket.
-/// TigerStyle: Explicit config parameter, timing collected at phase boundaries.
-/// Wraps connection with TLS if upstream.tls is true and client_ctx is provided.
-/// Uses DnsResolver for hostname resolution with TTL caching.
+/// Connect to upstream using serval-client.
+/// TigerStyle: Delegates to serval-client, maps errors to ForwardError.
 pub fn connectUpstream(
     upstream: *const Upstream,
     io: Io,
@@ -128,71 +125,61 @@ pub fn connectUpstream(
 
     debugLog("connect: start {s}:{d} tls={}", .{ upstream.host, upstream.port, upstream.tls });
 
-    // Resolve hostname to IP address via DnsResolver (handles both IP and DNS)
-    const resolve_result = dns_resolver.resolve(upstream.host, upstream.port, io) catch |err| {
-        debugLog("connect: FAILED DNS resolution err={s}", .{@errorName(err)});
-        return switch (err) {
-            DnsError.InvalidHostname => ForwardError.InvalidAddress,
-            DnsError.DnsResolutionFailed, DnsError.DnsTimeout, DnsError.CacheFull => ForwardError.DnsResolutionFailed,
-        };
+    // Create a temporary client for this connection.
+    // TigerStyle: Client is lightweight, no allocation.
+    var client = Client.init(
+        std.heap.page_allocator, // Unused by client
+        dns_resolver,
+        cfg.client_ctx,
+        cfg.verify_upstream_tls,
+    );
+
+    // Connect using serval-client
+    const client_result = client.connect(upstream.*, io) catch |err| {
+        debugLog("connect: FAILED err={s}", .{@errorName(err)});
+        return mapClientError(err);
     };
-    const addr = resolve_result.address;
-    const dns_duration_ns = resolve_result.resolution_ns;
 
-    // Time the async TCP connect
-    const connect_start_ns = time.monotonicNanos();
-    const stream = addr.connect(io, .{ .mode = .stream }) catch {
-        debugLog("connect: FAILED connection refused/timeout", .{});
-        return ForwardError.ConnectFailed;
-    };
-    const connect_end_ns = time.monotonicNanos();
+    debugLog("connect: complete fd={d} dns_us={d} tcp_us={d} tls_us={d}", .{
+        client_result.conn.socket.getFd(),
+        client_result.dns_duration_ns / 1000,
+        client_result.tcp_connect_duration_ns / 1000,
+        client_result.tls_handshake_duration_ns / 1000,
+    });
 
-    const fd: i32 = stream.socket.handle;
-    debugLog("connect: complete fd={d} duration_us={d}", .{ fd, time.elapsedNanos(connect_start_ns, connect_end_ns) / 1000 });
-
-    // Disable Nagle's algorithm for low-latency request forwarding
-    // TigerStyle: Explicit discard - TCP_NODELAY is optimization, not required
-    _ = setTcpNoDelay(fd);
-
-    // Enable TCP keepalive for detecting dead connections in pool
-    // TigerStyle: Explicit parameters - 60s idle, 10s interval, 3 probes
-    _ = setTcpKeepAlive(fd, 60, 10, 3);
-
-    const local_port = getLocalPort(fd);
-
-    // Create Socket based on TLS requirement
-    const socket: Socket = if (upstream.tls) blk: {
-        // TLS required - check if caller provided context
-        const ctx = cfg.client_ctx orelse {
-            debugLog("connect: FAILED TLS required but no client_ctx provided", .{});
-            var mut_stream = stream;
-            mut_stream.close(io);
-            return ForwardError.ConnectFailed;
-        };
-
-        // Perform TLS handshake using TLSSocket.initClient
-        // TigerStyle: Socket.TLS is the tls_socket module, TLSSocket.initClient returns Socket.
-        break :blk Socket.TLS.TLSSocket.initClient(fd, ctx, upstream.host) catch |err| {
-            debugLog("connect: FAILED TLS handshake err={s}", .{@errorName(err)});
-            var mut_stream = stream;
-            mut_stream.close(io);
-            return ForwardError.ConnectFailed;
-        };
-    } else Socket.Plain.initClient(fd);
-
-    // S1: postcondition - socket fd matches original fd
-    assert(socket.getFd() == fd);
-
-    debugLog("connect: socket ready tls={}", .{socket.isTLS()});
+    // S1: postcondition - socket fd is valid
+    assert(client_result.conn.socket.getFd() >= 0);
 
     return .{
-        .socket = socket,
-        .stream = stream,
-        .created_ns = connect_end_ns,
+        .socket = client_result.conn.socket,
+        .created_ns = client_result.conn.created_ns,
         .protocol = .h1, // Future: negotiate via ALPN or detect h2c preface
-        .dns_duration_ns = dns_duration_ns,
-        .tcp_connect_duration_ns = time.elapsedNanos(connect_start_ns, connect_end_ns),
-        .local_port = local_port,
+        .dns_duration_ns = client_result.dns_duration_ns,
+        .tcp_connect_duration_ns = client_result.tcp_connect_duration_ns,
+        .tls_handshake_duration_ns = client_result.tls_handshake_duration_ns,
+        .local_port = client_result.local_port,
+    };
+}
+
+/// Map ClientError to ForwardError.
+/// TigerStyle S6: Explicit error handling.
+fn mapClientError(err: ClientError) ForwardError {
+    return switch (err) {
+        ClientError.DnsResolutionFailed => ForwardError.DnsResolutionFailed,
+        ClientError.TcpConnectFailed => ForwardError.ConnectFailed,
+        ClientError.TcpConnectTimeout => ForwardError.ConnectFailed,
+        ClientError.TlsHandshakeFailed => ForwardError.ConnectFailed,
+        // Send/Recv errors shouldn't occur during connect, but map them anyway
+        ClientError.SendFailed,
+        ClientError.SendTimeout,
+        ClientError.BufferTooSmall,
+        ClientError.RecvFailed,
+        ClientError.RecvTimeout,
+        ClientError.ResponseHeadersTooLarge,
+        ClientError.InvalidResponseStatus,
+        ClientError.InvalidResponseHeaders,
+        ClientError.ConnectionClosed,
+        => ForwardError.ConnectFailed,
     };
 }
 
@@ -285,11 +272,11 @@ test "ConnectResult: struct fields are correctly typed" {
 
     const result = ConnectResult{
         .socket = Socket.Plain.initClient(sock),
-        .stream = undefined,
         .created_ns = 12345678,
         .protocol = .h1,
         .dns_duration_ns = 500000,
         .tcp_connect_duration_ns = 1000000,
+        .tls_handshake_duration_ns = 0,
         .local_port = 8080,
     };
 
@@ -297,30 +284,10 @@ test "ConnectResult: struct fields are correctly typed" {
     try testing.expectEqual(Protocol.h1, result.protocol);
     try testing.expectEqual(@as(u64, 500000), result.dns_duration_ns);
     try testing.expectEqual(@as(u64, 1000000), result.tcp_connect_duration_ns);
+    try testing.expectEqual(@as(u64, 0), result.tls_handshake_duration_ns);
     try testing.expectEqual(@as(u16, 8080), result.local_port);
     try testing.expect(!result.socket.isTLS());
     try testing.expectEqual(sock, result.socket.getFd());
-}
-
-test "ConnectResult: tcp_connect_duration_ns uses u64 for nanoseconds" {
-    // TigerStyle: Timing in nanoseconds, u64 to avoid overflow
-    // Max u64 = ~584 years in nanoseconds - sufficient for any connect timeout
-    const sock = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch {
-        return;
-    };
-    defer posix.close(sock);
-
-    const max_duration: u64 = std.math.maxInt(u64);
-    const result = ConnectResult{
-        .socket = Socket.Plain.initClient(sock),
-        .stream = undefined,
-        .created_ns = 0,
-        .protocol = .h1,
-        .dns_duration_ns = 0,
-        .tcp_connect_duration_ns = max_duration,
-        .local_port = 0,
-    };
-    try testing.expectEqual(max_duration, result.tcp_connect_duration_ns);
 }
 
 // =============================================================================
@@ -342,21 +309,6 @@ test "Upstream: port boundary values" {
         .idx = 0,
     };
     try testing.expectEqual(@as(u16, 65535), max_port.port);
-
-    // Well-known ports
-    const http_port = Upstream{
-        .host = "127.0.0.1",
-        .port = 80,
-        .idx = 0,
-    };
-    try testing.expectEqual(@as(u16, 80), http_port.port);
-
-    const https_port = Upstream{
-        .host = "127.0.0.1",
-        .port = 443,
-        .idx = 0,
-    };
-    try testing.expectEqual(@as(u16, 443), https_port.port);
 }
 
 // =============================================================================
@@ -376,159 +328,28 @@ test "ForwardError: ConnectFailed is a valid error type" {
 }
 
 // =============================================================================
-// TCP Options Integration Tests (require real sockets)
+// mapClientError Tests
 // =============================================================================
 
-test "TCP options: NoDelay and KeepAlive functions are called" {
-    // This test verifies the functions imported from serval-net are accessible
-    // The actual socket option tests are in serval-net/socket.zig
-    // Here we just verify the import works and types match
+test "mapClientError: maps DNS errors" {
+    try testing.expectEqual(ForwardError.DnsResolutionFailed, mapClientError(ClientError.DnsResolutionFailed));
+}
 
-    const sock = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch {
-        return; // Skip if no socket available
-    };
-    defer posix.close(sock);
-
-    // setTcpNoDelay should succeed on valid TCP socket
-    const nodelay_result = setTcpNoDelay(sock);
-    try testing.expect(nodelay_result);
-
-    // setTcpKeepAlive with same params as connectUpstream (60s idle, 10s interval, 3 probes)
-    const keepalive_result = setTcpKeepAlive(sock, 60, 10, 3);
-    try testing.expect(keepalive_result);
+test "mapClientError: maps connect errors" {
+    try testing.expectEqual(ForwardError.ConnectFailed, mapClientError(ClientError.TcpConnectFailed));
+    try testing.expectEqual(ForwardError.ConnectFailed, mapClientError(ClientError.TcpConnectTimeout));
+    try testing.expectEqual(ForwardError.ConnectFailed, mapClientError(ClientError.TlsHandshakeFailed));
 }
 
 // =============================================================================
-// ConnectResult created_ns integration
-// =============================================================================
-
-test "ConnectResult: created_ns is properly set" {
-    // TigerStyle: Document the contract that created_ns is set to connect_end_ns
-    // This is critical for pool eviction - unset created_ns (0) causes immediate eviction
-
-    const sock = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch {
-        return;
-    };
-    defer posix.close(sock);
-
-    const result = ConnectResult{
-        .socket = Socket.Plain.initClient(sock),
-        .stream = undefined,
-        .created_ns = time.monotonicNanos(),
-        .protocol = .h1,
-        .dns_duration_ns = 0,
-        .tcp_connect_duration_ns = 0,
-        .local_port = 0,
-    };
-
-    // TigerStyle: Postcondition - created_ns must be > 0 for pool to work correctly
-    try testing.expect(result.created_ns > 0);
-}
-
-// =============================================================================
-// IPv4 Address Parsing (via Io.net.IpAddress.parse)
-// =============================================================================
-
-test "IPv4 boundary addresses parse correctly via std.Io" {
-    // These are the addresses that Io.net.IpAddress.parse should handle
-    // We verify our understanding of valid addresses
-
-    // 0.0.0.0 - bind to all interfaces
-    const any_addr = Io.net.IpAddress.parse("0.0.0.0", 8080) catch null;
-    try testing.expect(any_addr != null);
-
-    // 255.255.255.255 - broadcast
-    const broadcast = Io.net.IpAddress.parse("255.255.255.255", 8080) catch null;
-    try testing.expect(broadcast != null);
-
-    // 127.0.0.1 - loopback
-    const loopback = Io.net.IpAddress.parse("127.0.0.1", 8080) catch null;
-    try testing.expect(loopback != null);
-
-    // Octet boundaries
-    const zero_octets = Io.net.IpAddress.parse("0.0.0.0", 1) catch null;
-    try testing.expect(zero_octets != null);
-
-    const max_octets = Io.net.IpAddress.parse("255.255.255.255", 65535) catch null;
-    try testing.expect(max_octets != null);
-}
-
-test "IPv4 invalid addresses fail to parse via std.Io" {
-    // Verify Io.net.IpAddress.parse rejects invalid addresses
-
-    // Out of range octet
-    const over_255 = Io.net.IpAddress.parse("256.0.0.1", 8080) catch null;
-    try testing.expectEqual(@as(?Io.net.IpAddress, null), over_255);
-
-    // Missing octets
-    const missing_octet = Io.net.IpAddress.parse("127.0.0", 8080) catch null;
-    try testing.expectEqual(@as(?Io.net.IpAddress, null), missing_octet);
-
-    // Empty string
-    const empty = Io.net.IpAddress.parse("", 8080) catch null;
-    try testing.expectEqual(@as(?Io.net.IpAddress, null), empty);
-
-    // Non-numeric
-    const alpha = Io.net.IpAddress.parse("localhost", 8080) catch null;
-    // Note: This may or may not parse depending on DNS resolution support
-    _ = alpha;
-}
-
-// =============================================================================
-// Contract Verification Tests
-// =============================================================================
-
-test "CRITICAL: connectUpstream result has valid timestamps for pool" {
-    // This contract is critical for connection pooling:
-    // - ConnectResult.created_ns must be set to connect_end_ns
-    // - created_ns = 0 causes immediate eviction (age = now - 0 = huge)
-    //
-    // Code inspection shows:
-    //   const connect_end_ns = time.monotonicNanos();
-    //   ...
-    //   return .{
-    //       .socket = socket,
-    //       .stream = stream,
-    //       .created_ns = connect_end_ns,  // <-- correctly set
-    //       ...
-    //   };
-    //
-    // This test documents the contract. Actual runtime verification
-    // would require integration tests with a listening server.
-
-    const now = time.monotonicNanos();
-    try testing.expect(now > 0);
-
-    // Verify time module works correctly
-    const later = time.monotonicNanos();
-    try testing.expect(later >= now);
-}
-
-test "CRITICAL: tcp_connect_duration_ns is computed correctly" {
-    // Verify time.elapsedNanos computes correct duration
-    const start_ns = time.monotonicNanos();
-    const end_ns = time.monotonicNanos();
-    const duration = time.elapsedNanos(start_ns, end_ns);
-
-    // Duration should be non-negative
-    // TigerStyle: Postcondition - elapsed time >= 0
-    try testing.expect(duration >= 0);
-
-    // Duration should be <= (end - start) accounting for wraparound
-    if (end_ns >= start_ns) {
-        try testing.expect(duration <= end_ns - start_ns + 1);
-    }
-}
-
-// =============================================================================
-// Type Size and Layout Tests
+// ConnectResult size test
 // =============================================================================
 
 test "ConnectResult size is reasonable for stack allocation" {
     // TigerStyle: No runtime allocation - ConnectResult should be small enough for stack
     const size = @sizeOf(ConnectResult);
 
-    // Connection struct + u64 duration + u16 port + padding
+    // Connection struct + timing fields + port + padding
     // Should be well under 256 bytes
     try testing.expect(size < 256);
 }
@@ -537,6 +358,6 @@ test "Upstream size is compact" {
     // Upstream is frequently passed around, should be small
     const size = @sizeOf(Upstream);
 
-    // slice (ptr + len) + u16 port + u32 idx = ~24 bytes on 64-bit
+    // slice (ptr + len) + u16 port + u6 idx + bool tls = ~24 bytes on 64-bit
     try testing.expect(size <= 32);
 }

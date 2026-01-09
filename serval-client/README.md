@@ -57,16 +57,22 @@ defer result.conn.close();
 ### Low-Level API (Explicit Lifecycle)
 
 ```zig
-// Step 1: Connect
-var conn = try client.connect(upstream, io);
-errdefer conn.close();
+// Step 1: Connect (returns timing info for observability)
+var connect_result = try client.connect(upstream, io);
+errdefer connect_result.conn.close();
+
+// Timing info available:
+// - connect_result.dns_duration_ns
+// - connect_result.tcp_connect_duration_ns
+// - connect_result.tls_handshake_duration_ns
+// - connect_result.local_port
 
 // Step 2: Send request
-try client.sendRequest(&conn, &request, null);
+try client.sendRequest(&connect_result.conn, &request, null);
 
 // Step 3: Read response headers
 var header_buf: [8192]u8 = undefined;
-const response = try client.readResponseHeaders(&conn, &header_buf);
+const response = try client.readResponseHeaders(&connect_result.conn, &header_buf);
 
 // Step 4: Handle body based on response.body_framing
 // - Caller can buffer small body
@@ -74,7 +80,7 @@ const response = try client.readResponseHeaders(&conn, &header_buf);
 // - Caller can stream with callback
 
 // Step 5: Close when done
-conn.close();
+connect_result.conn.close();
 ```
 
 ### Path Rewriting
@@ -95,10 +101,22 @@ try client.sendRequest(&conn, &request, "/users");
 pub const Client = struct {
     pub fn init(allocator, dns_resolver, client_ctx, verify_tls) Client;
     pub fn deinit(self) void;
-    pub fn connect(self, upstream, io) ClientError!Connection;
+    pub fn connect(self, upstream, io) ClientError!ConnectResult;
     pub fn sendRequest(self, conn, request, effective_path) ClientError!void;
     pub fn readResponseHeaders(self, conn, header_buf) ClientError!ResponseHeaders;
     pub fn request(self, upstream, request, header_buf, io) ClientError!RequestResult;
+};
+```
+
+### ConnectResult
+
+```zig
+pub const ConnectResult = struct {
+    conn: Connection,              // Connection with socket
+    dns_duration_ns: u64,          // DNS resolution time
+    tcp_connect_duration_ns: u64,  // TCP handshake time
+    tls_handshake_duration_ns: u64, // TLS handshake time (0 if plaintext)
+    local_port: u16,               // Ephemeral port
 };
 ```
 
