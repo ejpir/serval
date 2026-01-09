@@ -48,6 +48,20 @@ pub const MAX_SERVICES: u32 = 256;
 pub const MAX_ENDPOINTS: u32 = 256;
 pub const MAX_SECRETS: u32 = 64;
 
+/// Maximum string length for names/namespaces in parsed config.
+/// K8s DNS-1123 subdomain max is 253 chars.
+pub const MAX_NAME_LEN: u32 = 253;
+
+/// Maximum hostname length (matches K8s DNS-1123).
+pub const MAX_HOSTNAME_LEN: u32 = 253;
+
+/// Maximum path value length in route matches.
+pub const MAX_PATH_VALUE_LEN: u32 = 512;
+
+/// Maximum number of iteration passes for JSON array parsing.
+/// Prevents unbounded loops when parsing malformed input.
+pub const MAX_JSON_ARRAY_ITERATIONS: u32 = 1000;
+
 /// Reconnection backoff configuration (milliseconds).
 /// TigerStyle: Named constants with units in names.
 pub const INITIAL_BACKOFF_MS: u32 = 1000;
@@ -289,6 +303,286 @@ pub fn ResourceStore(comptime capacity: u32) type {
 }
 
 // =============================================================================
+// Parsed Config Storage
+// =============================================================================
+
+/// Fixed-size storage for a name string.
+/// TigerStyle: Bounded storage, no allocation after init.
+pub const NameStorage = struct {
+    data: [MAX_NAME_LEN]u8,
+    len: u8,
+
+    pub fn init() NameStorage {
+        return .{
+            .data = std.mem.zeroes([MAX_NAME_LEN]u8),
+            .len = 0,
+        };
+    }
+
+    pub fn set(self: *NameStorage, value: []const u8) void {
+        assert(value.len <= MAX_NAME_LEN); // S1: precondition
+        const copy_len: u8 = @intCast(@min(value.len, MAX_NAME_LEN));
+        @memcpy(self.data[0..copy_len], value[0..copy_len]);
+        self.len = copy_len;
+    }
+
+    pub fn slice(self: *const NameStorage) []const u8 {
+        return self.data[0..self.len];
+    }
+};
+
+/// Fixed-size storage for a hostname string.
+pub const HostnameStorage = struct {
+    data: [MAX_HOSTNAME_LEN]u8,
+    len: u8,
+
+    pub fn init() HostnameStorage {
+        return .{
+            .data = std.mem.zeroes([MAX_HOSTNAME_LEN]u8),
+            .len = 0,
+        };
+    }
+
+    pub fn set(self: *HostnameStorage, value: []const u8) void {
+        assert(value.len <= MAX_HOSTNAME_LEN); // S1: precondition
+        const copy_len: u8 = @intCast(@min(value.len, MAX_HOSTNAME_LEN));
+        @memcpy(self.data[0..copy_len], value[0..copy_len]);
+        self.len = copy_len;
+    }
+
+    pub fn slice(self: *const HostnameStorage) []const u8 {
+        return self.data[0..self.len];
+    }
+};
+
+/// Fixed-size storage for a path value string.
+pub const PathStorage = struct {
+    data: [MAX_PATH_VALUE_LEN]u8,
+    len: u16,
+
+    pub fn init() PathStorage {
+        return .{
+            .data = std.mem.zeroes([MAX_PATH_VALUE_LEN]u8),
+            .len = 0,
+        };
+    }
+
+    pub fn set(self: *PathStorage, value: []const u8) void {
+        assert(value.len <= MAX_PATH_VALUE_LEN); // S1: precondition
+        const copy_len: u16 = @intCast(@min(value.len, MAX_PATH_VALUE_LEN));
+        @memcpy(self.data[0..copy_len], value[0..copy_len]);
+        self.len = copy_len;
+    }
+
+    pub fn slice(self: *const PathStorage) []const u8 {
+        return self.data[0..self.len];
+    }
+};
+
+/// Stored path match with inline storage.
+pub const StoredPathMatch = struct {
+    match_type: config.PathMatch.Type,
+    value: PathStorage,
+    active: bool,
+
+    pub fn init() StoredPathMatch {
+        return .{
+            .match_type = .PathPrefix,
+            .value = PathStorage.init(),
+            .active = false,
+        };
+    }
+
+    /// Convert to config.PathMatch (returns slice into internal storage).
+    pub fn toPathMatch(self: *const StoredPathMatch) config.PathMatch {
+        return .{
+            .type = self.match_type,
+            .value = self.value.slice(),
+        };
+    }
+};
+
+/// Stored path rewrite with inline storage.
+pub const StoredPathRewrite = struct {
+    rewrite_type: config.PathRewrite.Type,
+    value: PathStorage,
+    active: bool,
+
+    pub fn init() StoredPathRewrite {
+        return .{
+            .rewrite_type = .ReplacePrefixMatch,
+            .value = PathStorage.init(),
+            .active = false,
+        };
+    }
+
+    /// Convert to config.PathRewrite (returns slice into internal storage).
+    pub fn toPathRewrite(self: *const StoredPathRewrite) config.PathRewrite {
+        return .{
+            .type = self.rewrite_type,
+            .value = self.value.slice(),
+        };
+    }
+};
+
+/// Stored URL rewrite with inline storage.
+pub const StoredURLRewrite = struct {
+    path: StoredPathRewrite,
+    has_path: bool,
+
+    pub fn init() StoredURLRewrite {
+        return .{
+            .path = StoredPathRewrite.init(),
+            .has_path = false,
+        };
+    }
+};
+
+/// Stored HTTP route filter with inline storage.
+pub const StoredHTTPRouteFilter = struct {
+    filter_type: config.HTTPRouteFilter.Type,
+    url_rewrite: StoredURLRewrite,
+    active: bool,
+
+    pub fn init() StoredHTTPRouteFilter {
+        return .{
+            .filter_type = .URLRewrite,
+            .url_rewrite = StoredURLRewrite.init(),
+            .active = false,
+        };
+    }
+};
+
+/// Stored HTTP route match with inline storage.
+pub const StoredHTTPRouteMatch = struct {
+    path: StoredPathMatch,
+    has_path: bool,
+    active: bool,
+
+    pub fn init() StoredHTTPRouteMatch {
+        return .{
+            .path = StoredPathMatch.init(),
+            .has_path = false,
+            .active = false,
+        };
+    }
+};
+
+/// Stored backend reference with inline storage.
+pub const StoredBackendRef = struct {
+    name: NameStorage,
+    namespace: NameStorage,
+    port: u16,
+    weight: u16,
+    active: bool,
+
+    pub fn init() StoredBackendRef {
+        return .{
+            .name = NameStorage.init(),
+            .namespace = NameStorage.init(),
+            .port = 0,
+            .weight = 1,
+            .active = false,
+        };
+    }
+};
+
+/// Stored HTTP route rule with inline storage.
+pub const StoredHTTPRouteRule = struct {
+    matches: [config.MAX_MATCHES]StoredHTTPRouteMatch,
+    matches_count: u8,
+    filters: [config.MAX_FILTERS]StoredHTTPRouteFilter,
+    filters_count: u8,
+    backend_refs: [config.MAX_BACKEND_REFS]StoredBackendRef,
+    backend_refs_count: u8,
+    active: bool,
+
+    pub fn init() StoredHTTPRouteRule {
+        var rule = StoredHTTPRouteRule{
+            .matches = undefined,
+            .matches_count = 0,
+            .filters = undefined,
+            .filters_count = 0,
+            .backend_refs = undefined,
+            .backend_refs_count = 0,
+            .active = false,
+        };
+        for (&rule.matches) |*m| m.* = StoredHTTPRouteMatch.init();
+        for (&rule.filters) |*f| f.* = StoredHTTPRouteFilter.init();
+        for (&rule.backend_refs) |*b| b.* = StoredBackendRef.init();
+        return rule;
+    }
+};
+
+/// Stored HTTP route with inline storage.
+pub const StoredHTTPRoute = struct {
+    name: NameStorage,
+    namespace: NameStorage,
+    hostnames: [config.MAX_HOSTNAMES]HostnameStorage,
+    hostnames_count: u8,
+    rules: [config.MAX_RULES]StoredHTTPRouteRule,
+    rules_count: u8,
+    active: bool,
+
+    pub fn init() StoredHTTPRoute {
+        var route = StoredHTTPRoute{
+            .name = NameStorage.init(),
+            .namespace = NameStorage.init(),
+            .hostnames = undefined,
+            .hostnames_count = 0,
+            .rules = undefined,
+            .rules_count = 0,
+            .active = false,
+        };
+        for (&route.hostnames) |*h| h.* = HostnameStorage.init();
+        for (&route.rules) |*r| r.* = StoredHTTPRouteRule.init();
+        return route;
+    }
+};
+
+/// Stored listener with inline storage.
+pub const StoredListener = struct {
+    name: NameStorage,
+    port: u16,
+    protocol: config.Listener.Protocol,
+    hostname: HostnameStorage,
+    has_hostname: bool,
+    active: bool,
+
+    pub fn init() StoredListener {
+        return .{
+            .name = NameStorage.init(),
+            .port = 0,
+            .protocol = .HTTP,
+            .hostname = HostnameStorage.init(),
+            .has_hostname = false,
+            .active = false,
+        };
+    }
+};
+
+/// Stored gateway with inline storage.
+pub const StoredGateway = struct {
+    name: NameStorage,
+    namespace: NameStorage,
+    listeners: [config.MAX_LISTENERS]StoredListener,
+    listeners_count: u8,
+    active: bool,
+
+    pub fn init() StoredGateway {
+        var gw = StoredGateway{
+            .name = NameStorage.init(),
+            .namespace = NameStorage.init(),
+            .listeners = undefined,
+            .listeners_count = 0,
+            .active = false,
+        };
+        for (&gw.listeners) |*l| l.* = StoredListener.init();
+        return gw;
+    }
+};
+
+// =============================================================================
 // Watcher
 // =============================================================================
 
@@ -310,6 +604,32 @@ pub const Watcher = struct {
     services: ResourceStore(MAX_SERVICES),
     endpoints: ResourceStore(MAX_ENDPOINTS),
     secrets: ResourceStore(MAX_SECRETS),
+
+    /// Parsed Gateway storage (populated by reconcile).
+    parsed_gateways: [MAX_GATEWAYS]StoredGateway,
+    parsed_gateways_count: u8,
+
+    /// Parsed HTTPRoute storage (populated by reconcile).
+    parsed_http_routes: [MAX_HTTP_ROUTES]StoredHTTPRoute,
+    parsed_http_routes_count: u8,
+
+    /// Temporary slices for building GatewayConfig return value.
+    /// These point into parsed_* storage and are valid until next reconcile().
+    temp_gateways: [MAX_GATEWAYS]config.Gateway,
+    temp_http_routes: [MAX_HTTP_ROUTES]config.HTTPRoute,
+
+    /// Storage for temporary hostname slices per route.
+    temp_hostnames: [MAX_HTTP_ROUTES][config.MAX_HOSTNAMES][]const u8,
+    /// Storage for temporary rules slices per route.
+    temp_rules: [MAX_HTTP_ROUTES][config.MAX_RULES]config.HTTPRouteRule,
+    /// Storage for temporary matches slices per rule.
+    temp_matches: [MAX_HTTP_ROUTES][config.MAX_RULES][config.MAX_MATCHES]config.HTTPRouteMatch,
+    /// Storage for temporary filters slices per rule.
+    temp_filters: [MAX_HTTP_ROUTES][config.MAX_RULES][config.MAX_FILTERS]config.HTTPRouteFilter,
+    /// Storage for temporary backend_refs slices per rule.
+    temp_backend_refs: [MAX_HTTP_ROUTES][config.MAX_RULES][config.MAX_BACKEND_REFS]config.BackendRef,
+    /// Storage for temporary listeners slices per gateway.
+    temp_listeners: [MAX_GATEWAYS][config.MAX_LISTENERS]config.Listener,
 
     /// Line buffer for parsing watch events.
     /// TigerStyle: Pre-allocated, bounded buffer.
@@ -348,9 +668,25 @@ pub const Watcher = struct {
             .services = ResourceStore(MAX_SERVICES).init(),
             .endpoints = ResourceStore(MAX_ENDPOINTS).init(),
             .secrets = ResourceStore(MAX_SECRETS).init(),
+            .parsed_gateways = undefined,
+            .parsed_gateways_count = 0,
+            .parsed_http_routes = undefined,
+            .parsed_http_routes_count = 0,
+            .temp_gateways = undefined,
+            .temp_http_routes = undefined,
+            .temp_hostnames = undefined,
+            .temp_rules = undefined,
+            .temp_matches = undefined,
+            .temp_filters = undefined,
+            .temp_backend_refs = undefined,
+            .temp_listeners = undefined,
             .line_buffer = line_buffer,
             .current_backoff_ms = INITIAL_BACKOFF_MS,
         };
+
+        // Initialize parsed storage arrays.
+        for (&self.parsed_gateways) |*gw| gw.* = StoredGateway.init();
+        for (&self.parsed_http_routes) |*route| route.* = StoredHTTPRoute.init();
 
         return self;
     }
@@ -561,15 +897,193 @@ pub const Watcher = struct {
     }
 
     /// Reconcile stored resources into a GatewayConfig.
-    /// TigerStyle: Pure function that builds config from current state.
+    /// Parses raw JSON from ResourceStores into typed config structs.
+    ///
+    /// TigerStyle:
+    /// - S1: Preconditions checked on entry
+    /// - S2: Postconditions verified on exit
+    /// - S3: All loops bounded by MAX_* constants
+    /// - No allocation after init (uses pre-allocated storage arrays)
     pub fn reconcile(self: *Self) WatcherError!config.GatewayConfig {
-        // For now, return empty config.
-        // Full implementation would parse Gateway/HTTPRoute JSON and build typed config.
-        // This is intentionally minimal - full JSON parsing is a separate enhancement.
-        _ = self;
+        // Reset parsed counts.
+        self.parsed_gateways_count = 0;
+        self.parsed_http_routes_count = 0;
+
+        // Phase 1: Parse raw JSON into typed storage.
+        try self.parseStoredGateways();
+        try self.parseStoredHTTPRoutes();
+
+        // Phase 2: Build config slices from parsed storage.
+        self.buildGatewayConfigs();
+        self.buildHTTPRouteConfigs();
+
+        // S2: Postconditions
+        assert(self.parsed_gateways_count <= MAX_GATEWAYS);
+        assert(self.parsed_http_routes_count <= MAX_HTTP_ROUTES);
+
         return config.GatewayConfig{
-            .gateways = &[_]config.Gateway{},
-            .http_routes = &[_]config.HTTPRoute{},
+            .gateways = self.temp_gateways[0..self.parsed_gateways_count],
+            .http_routes = self.temp_http_routes[0..self.parsed_http_routes_count],
+        };
+    }
+
+    /// Parse Gateway resources from ResourceStore into typed storage.
+    /// TigerStyle: Bounded loop, explicit error handling.
+    fn parseStoredGateways(self: *Self) WatcherError!void {
+        var iteration: u32 = 0;
+        const items = self.gateways.items;
+
+        while (iteration < MAX_GATEWAYS) : (iteration += 1) {
+            if (!items[iteration].active) continue;
+
+            const raw_json = items[iteration].raw_json;
+            if (raw_json.len == 0) continue;
+
+            if (self.parsed_gateways_count >= MAX_GATEWAYS) {
+                return WatcherError.BufferOverflow;
+            }
+
+            const idx = self.parsed_gateways_count;
+            try parseGatewayJson(raw_json, &self.parsed_gateways[idx]);
+            self.parsed_gateways[idx].active = true;
+            self.parsed_gateways_count += 1;
+        }
+
+        // S2: Postcondition
+        assert(self.parsed_gateways_count <= MAX_GATEWAYS);
+    }
+
+    /// Parse HTTPRoute resources from ResourceStore into typed storage.
+    /// TigerStyle: Bounded loop, explicit error handling.
+    fn parseStoredHTTPRoutes(self: *Self) WatcherError!void {
+        var iteration: u32 = 0;
+        const items = self.http_routes.items;
+
+        while (iteration < MAX_HTTP_ROUTES) : (iteration += 1) {
+            if (!items[iteration].active) continue;
+
+            const raw_json = items[iteration].raw_json;
+            if (raw_json.len == 0) continue;
+
+            if (self.parsed_http_routes_count >= MAX_HTTP_ROUTES) {
+                return WatcherError.BufferOverflow;
+            }
+
+            const idx = self.parsed_http_routes_count;
+            try parseHTTPRouteJson(raw_json, &self.parsed_http_routes[idx]);
+            self.parsed_http_routes[idx].active = true;
+            self.parsed_http_routes_count += 1;
+        }
+
+        // S2: Postcondition
+        assert(self.parsed_http_routes_count <= MAX_HTTP_ROUTES);
+    }
+
+    /// Build config.Gateway slices from parsed storage.
+    /// TigerStyle: Bounded loops, no allocation.
+    fn buildGatewayConfigs(self: *Self) void {
+        var gw_idx: u8 = 0;
+
+        while (gw_idx < self.parsed_gateways_count) : (gw_idx += 1) {
+            const stored = &self.parsed_gateways[gw_idx];
+
+            // Build listeners slice for this gateway.
+            var listener_idx: u8 = 0;
+            while (listener_idx < stored.listeners_count) : (listener_idx += 1) {
+                const stored_listener = &stored.listeners[listener_idx];
+                self.temp_listeners[gw_idx][listener_idx] = config.Listener{
+                    .name = stored_listener.name.slice(),
+                    .port = stored_listener.port,
+                    .protocol = stored_listener.protocol,
+                    .hostname = if (stored_listener.has_hostname) stored_listener.hostname.slice() else null,
+                    .tls = null, // TLS config parsing not implemented yet
+                };
+            }
+
+            self.temp_gateways[gw_idx] = config.Gateway{
+                .name = stored.name.slice(),
+                .namespace = stored.namespace.slice(),
+                .listeners = self.temp_listeners[gw_idx][0..stored.listeners_count],
+            };
+        }
+    }
+
+    /// Build config.HTTPRoute slices from parsed storage.
+    /// TigerStyle: Bounded loops, no allocation.
+    fn buildHTTPRouteConfigs(self: *Self) void {
+        var route_idx: u8 = 0;
+
+        while (route_idx < self.parsed_http_routes_count) : (route_idx += 1) {
+            const stored = &self.parsed_http_routes[route_idx];
+
+            // Build hostnames slice.
+            var hostname_idx: u8 = 0;
+            while (hostname_idx < stored.hostnames_count) : (hostname_idx += 1) {
+                self.temp_hostnames[route_idx][hostname_idx] = stored.hostnames[hostname_idx].slice();
+            }
+
+            // Build rules slice.
+            var rule_idx: u8 = 0;
+            while (rule_idx < stored.rules_count) : (rule_idx += 1) {
+                self.buildRuleConfig(route_idx, rule_idx, &stored.rules[rule_idx]);
+            }
+
+            self.temp_http_routes[route_idx] = config.HTTPRoute{
+                .name = stored.name.slice(),
+                .namespace = stored.namespace.slice(),
+                .hostnames = self.temp_hostnames[route_idx][0..stored.hostnames_count],
+                .rules = self.temp_rules[route_idx][0..stored.rules_count],
+            };
+        }
+    }
+
+    /// Build a single HTTPRouteRule config from stored rule.
+    /// TigerStyle: Helper to keep buildHTTPRouteConfigs under 70 lines.
+    fn buildRuleConfig(self: *Self, route_idx: u8, rule_idx: u8, stored_rule: *const StoredHTTPRouteRule) void {
+        // S1: Preconditions
+        assert(route_idx < config.MAX_HTTP_ROUTES);
+        assert(rule_idx < config.MAX_RULES);
+
+        // Build matches slice.
+        var match_idx: u8 = 0;
+        while (match_idx < stored_rule.matches_count) : (match_idx += 1) {
+            const stored_match = &stored_rule.matches[match_idx];
+            self.temp_matches[route_idx][rule_idx][match_idx] = config.HTTPRouteMatch{
+                .path = if (stored_match.has_path) stored_match.path.toPathMatch() else null,
+            };
+        }
+
+        // Build filters slice.
+        var filter_idx: u8 = 0;
+        while (filter_idx < stored_rule.filters_count) : (filter_idx += 1) {
+            const stored_filter = &stored_rule.filters[filter_idx];
+            const url_rewrite: ?config.URLRewrite = if (stored_filter.url_rewrite.has_path)
+                config.URLRewrite{ .path = stored_filter.url_rewrite.path.toPathRewrite() }
+            else
+                null;
+
+            self.temp_filters[route_idx][rule_idx][filter_idx] = config.HTTPRouteFilter{
+                .type = stored_filter.filter_type,
+                .url_rewrite = url_rewrite,
+            };
+        }
+
+        // Build backend_refs slice.
+        var backend_idx: u8 = 0;
+        while (backend_idx < stored_rule.backend_refs_count) : (backend_idx += 1) {
+            const stored_backend = &stored_rule.backend_refs[backend_idx];
+            self.temp_backend_refs[route_idx][rule_idx][backend_idx] = config.BackendRef{
+                .name = stored_backend.name.slice(),
+                .namespace = stored_backend.namespace.slice(),
+                .port = stored_backend.port,
+                .weight = stored_backend.weight,
+            };
+        }
+
+        self.temp_rules[route_idx][rule_idx] = config.HTTPRouteRule{
+            .matches = self.temp_matches[route_idx][rule_idx][0..stored_rule.matches_count],
+            .filters = self.temp_filters[route_idx][rule_idx][0..stored_rule.filters_count],
+            .backend_refs = self.temp_backend_refs[route_idx][rule_idx][0..stored_rule.backend_refs_count],
         };
     }
 
@@ -720,6 +1234,512 @@ fn findObjectField(json: []const u8, field_name: []const u8) ?[]const u8 {
     }
 
     return null;
+}
+
+/// Find the start of a JSON array field.
+/// Returns slice starting at the opening bracket of the array value.
+fn findArrayField(json: []const u8, field_name: []const u8) ?[]const u8 {
+    // Build search pattern: "fieldName":[
+    var pattern_buf: [128]u8 = undefined;
+    const pattern = std.fmt.bufPrint(&pattern_buf, "\"{s}\":[", .{field_name}) catch return null;
+
+    // Find pattern in JSON.
+    const pattern_start = std.mem.indexOf(u8, json, pattern) orelse return null;
+    const array_start = pattern_start + pattern.len - 1; // Include opening bracket.
+
+    // Find matching closing bracket.
+    var depth: u32 = 0;
+    var pos: usize = array_start;
+    var iteration: u32 = 0;
+    const max_iterations: u32 = 65536; // TigerStyle: bounded loop
+
+    while (pos < json.len and iteration < max_iterations) : ({
+        pos += 1;
+        iteration += 1;
+    }) {
+        const c = json[pos];
+        if (c == '[') {
+            depth += 1;
+        } else if (c == ']') {
+            if (depth == 1) {
+                return json[array_start .. pos + 1];
+            }
+            depth -= 1;
+        }
+    }
+
+    return null;
+}
+
+/// Extract an integer value from JSON by field name.
+/// Returns null if field not found or not a valid integer.
+fn extractJsonInt(json: []const u8, field_name: []const u8) ?u16 {
+    // Build search pattern: "fieldName":
+    var pattern_buf: [128]u8 = undefined;
+    const pattern = std.fmt.bufPrint(&pattern_buf, "\"{s}\":", .{field_name}) catch return null;
+
+    // Scan through JSON tracking brace depth to find pattern at top level only.
+    var depth: u32 = 0;
+    var pos: usize = 0;
+    var iteration: u32 = 0;
+    const max_iterations: u32 = 65536; // TigerStyle: bounded loop
+
+    while (pos < json.len and iteration < max_iterations) : ({
+        pos += 1;
+        iteration += 1;
+    }) {
+        const c = json[pos];
+
+        if (c == '{') {
+            depth += 1;
+        } else if (c == '}') {
+            if (depth > 0) depth -= 1;
+        }
+
+        // Only match pattern when at depth 1 (top-level fields).
+        if (depth == 1 and pos + pattern.len <= json.len) {
+            if (std.mem.eql(u8, json[pos .. pos + pattern.len], pattern)) {
+                const value_start = pos + pattern.len;
+
+                // Find end of number (next comma, brace, or bracket).
+                var end_pos: usize = value_start;
+                var inner_iteration: u32 = 0;
+                const max_inner_iterations: u32 = 32; // TigerStyle: bounded loop
+
+                while (end_pos < json.len and inner_iteration < max_inner_iterations) : ({
+                    end_pos += 1;
+                    inner_iteration += 1;
+                }) {
+                    const end_c = json[end_pos];
+                    if (end_c == ',' or end_c == '}' or end_c == ']' or end_c == ' ') {
+                        const num_str = json[value_start..end_pos];
+                        return std.fmt.parseInt(u16, num_str, 10) catch return null;
+                    }
+                }
+
+                return null;
+            }
+        }
+    }
+
+    return null;
+}
+
+/// Iterate over objects in a JSON array.
+/// Calls callback for each object, stopping early on error.
+/// Returns the number of objects found (bounded by max_count).
+fn iterateJsonArray(
+    array_json: []const u8,
+    comptime max_count: u8,
+    callback: anytype,
+    callback_arg: anytype,
+) WatcherError!u8 {
+    assert(array_json.len >= 2); // S1: at least "[]"
+    assert(array_json[0] == '['); // S1: starts with bracket
+
+    var count: u8 = 0;
+    var pos: usize = 1; // Skip opening bracket.
+    var iteration: u32 = 0;
+
+    while (pos < array_json.len and iteration < MAX_JSON_ARRAY_ITERATIONS) : (iteration += 1) {
+        // Skip whitespace and commas.
+        while (pos < array_json.len and (array_json[pos] == ' ' or
+            array_json[pos] == ',' or
+            array_json[pos] == '\n' or
+            array_json[pos] == '\r' or
+            array_json[pos] == '\t'))
+        {
+            pos += 1;
+        }
+
+        if (pos >= array_json.len or array_json[pos] == ']') break;
+
+        if (count >= max_count) {
+            return WatcherError.BufferOverflow;
+        }
+
+        // Found start of object or string.
+        const obj_start = pos;
+
+        if (array_json[pos] == '{') {
+            // Find matching closing brace.
+            var depth: u32 = 0;
+            var inner_iteration: u32 = 0;
+            while (pos < array_json.len and inner_iteration < MAX_JSON_ARRAY_ITERATIONS) : ({
+                pos += 1;
+                inner_iteration += 1;
+            }) {
+                const c = array_json[pos];
+                if (c == '{') {
+                    depth += 1;
+                } else if (c == '}') {
+                    depth -= 1;
+                    if (depth == 0) {
+                        pos += 1;
+                        break;
+                    }
+                }
+            }
+        } else if (array_json[pos] == '"') {
+            // String value - find closing quote.
+            pos += 1; // Skip opening quote.
+            var inner_iteration: u32 = 0;
+            while (pos < array_json.len and inner_iteration < MAX_JSON_ARRAY_ITERATIONS) : ({
+                pos += 1;
+                inner_iteration += 1;
+            }) {
+                if (array_json[pos] == '"' and array_json[pos - 1] != '\\') {
+                    pos += 1;
+                    break;
+                }
+            }
+        } else {
+            // Primitive value - skip to next delimiter.
+            while (pos < array_json.len and array_json[pos] != ',' and array_json[pos] != ']') {
+                pos += 1;
+            }
+        }
+
+        const obj_end = pos;
+        const object_json = array_json[obj_start..obj_end];
+
+        // Call callback with the object.
+        try callback(callback_arg, object_json, count);
+        count += 1;
+    }
+
+    return count;
+}
+
+// =============================================================================
+// Gateway JSON Parsing
+// =============================================================================
+
+/// Parse a Gateway resource from raw K8s JSON into StoredGateway.
+///
+/// Expected JSON structure:
+/// ```json
+/// {
+///   "metadata": {"name": "my-gw", "namespace": "default"},
+///   "spec": {
+///     "listeners": [
+///       {"name": "http", "port": 80, "protocol": "HTTP", "hostname": "*.example.com"}
+///     ]
+///   }
+/// }
+/// ```
+///
+/// TigerStyle: Bounded parsing, explicit error handling, no allocation.
+pub fn parseGatewayJson(json: []const u8, out: *StoredGateway) WatcherError!void {
+    assert(json.len > 0); // S1: precondition
+
+    // Reset output.
+    out.* = StoredGateway.init();
+
+    // Parse metadata.
+    const metadata = findObjectField(json, "metadata") orelse return WatcherError.MissingField;
+    const name = extractJsonString(metadata, "name") orelse return WatcherError.MissingField;
+    const namespace = extractJsonString(metadata, "namespace") orelse "default";
+
+    if (name.len > MAX_NAME_LEN or namespace.len > MAX_NAME_LEN) {
+        return WatcherError.InvalidJson;
+    }
+
+    out.name.set(name);
+    out.namespace.set(namespace);
+
+    // Parse spec.listeners.
+    const spec = findObjectField(json, "spec") orelse return WatcherError.MissingField;
+    const listeners_array = findArrayField(spec, "listeners") orelse {
+        // No listeners is valid (empty gateway).
+        out.listeners_count = 0;
+        return;
+    };
+
+    // Parse each listener.
+    const ListenerParseContext = struct {
+        out: *StoredGateway,
+    };
+    var ctx = ListenerParseContext{ .out = out };
+
+    out.listeners_count = try iterateJsonArray(
+        listeners_array,
+        config.MAX_LISTENERS,
+        struct {
+            fn parse(c: *ListenerParseContext, listener_json: []const u8, idx: u8) WatcherError!void {
+                try parseListenerJson(listener_json, &c.out.listeners[idx]);
+                c.out.listeners[idx].active = true;
+            }
+        }.parse,
+        &ctx,
+    );
+
+    // S2: Postconditions
+    assert(out.name.len > 0);
+    assert(out.listeners_count <= config.MAX_LISTENERS);
+}
+
+/// Parse a single Listener from JSON.
+fn parseListenerJson(json: []const u8, out: *StoredListener) WatcherError!void {
+    assert(json.len > 0); // S1: precondition
+
+    out.* = StoredListener.init();
+
+    // Extract name.
+    const name = extractJsonString(json, "name") orelse return WatcherError.MissingField;
+    if (name.len > MAX_NAME_LEN) return WatcherError.InvalidJson;
+    out.name.set(name);
+
+    // Extract port.
+    out.port = extractJsonInt(json, "port") orelse return WatcherError.MissingField;
+
+    // Extract protocol.
+    const protocol_str = extractJsonString(json, "protocol") orelse "HTTP";
+    out.protocol = config.Listener.Protocol.fromString(protocol_str) orelse .HTTP;
+
+    // Extract optional hostname.
+    if (extractJsonString(json, "hostname")) |hostname| {
+        if (hostname.len <= MAX_HOSTNAME_LEN) {
+            out.hostname.set(hostname);
+            out.has_hostname = true;
+        }
+    }
+
+    out.active = true;
+}
+
+// =============================================================================
+// HTTPRoute JSON Parsing
+// =============================================================================
+
+/// Parse an HTTPRoute resource from raw K8s JSON into StoredHTTPRoute.
+///
+/// Expected JSON structure:
+/// ```json
+/// {
+///   "metadata": {"name": "route", "namespace": "default"},
+///   "spec": {
+///     "hostnames": ["api.example.com"],
+///     "rules": [{
+///       "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+///       "filters": [{"type": "URLRewrite", "urlRewrite": {"path": {"type": "ReplacePrefixMatch", "replacePrefixMatch": "/"}}}],
+///       "backendRefs": [{"name": "svc", "namespace": "default", "port": 8080}]
+///     }]
+///   }
+/// }
+/// ```
+///
+/// TigerStyle: Bounded parsing, explicit error handling, no allocation.
+pub fn parseHTTPRouteJson(json: []const u8, out: *StoredHTTPRoute) WatcherError!void {
+    assert(json.len > 0); // S1: precondition
+
+    // Reset output.
+    out.* = StoredHTTPRoute.init();
+
+    // Parse metadata.
+    const metadata = findObjectField(json, "metadata") orelse return WatcherError.MissingField;
+    const name = extractJsonString(metadata, "name") orelse return WatcherError.MissingField;
+    const namespace = extractJsonString(metadata, "namespace") orelse "default";
+
+    if (name.len > MAX_NAME_LEN or namespace.len > MAX_NAME_LEN) {
+        return WatcherError.InvalidJson;
+    }
+
+    out.name.set(name);
+    out.namespace.set(namespace);
+
+    // Parse spec.
+    const spec = findObjectField(json, "spec") orelse return WatcherError.MissingField;
+
+    // Parse hostnames array.
+    if (findArrayField(spec, "hostnames")) |hostnames_array| {
+        out.hostnames_count = try iterateJsonArray(
+            hostnames_array,
+            config.MAX_HOSTNAMES,
+            struct {
+                fn parse(route: *StoredHTTPRoute, hostname_json: []const u8, idx: u8) WatcherError!void {
+                    // hostname_json is a quoted string like "api.example.com"
+                    if (hostname_json.len >= 2 and hostname_json[0] == '"') {
+                        const hostname = hostname_json[1 .. hostname_json.len - 1];
+                        if (hostname.len <= MAX_HOSTNAME_LEN) {
+                            route.hostnames[idx].set(hostname);
+                        }
+                    }
+                }
+            }.parse,
+            out,
+        );
+    }
+
+    // Parse rules array.
+    const rules_array = findArrayField(spec, "rules") orelse {
+        // No rules is valid (empty route).
+        out.rules_count = 0;
+        return;
+    };
+
+    const RuleParseContext = struct {
+        out: *StoredHTTPRoute,
+    };
+    var ctx = RuleParseContext{ .out = out };
+
+    out.rules_count = try iterateJsonArray(
+        rules_array,
+        config.MAX_RULES,
+        struct {
+            fn parse(c: *RuleParseContext, rule_json: []const u8, idx: u8) WatcherError!void {
+                try parseRuleJson(rule_json, &c.out.rules[idx]);
+                c.out.rules[idx].active = true;
+            }
+        }.parse,
+        &ctx,
+    );
+
+    // S2: Postconditions
+    assert(out.name.len > 0);
+    assert(out.rules_count <= config.MAX_RULES);
+}
+
+/// Parse a single HTTPRouteRule from JSON.
+fn parseRuleJson(json: []const u8, out: *StoredHTTPRouteRule) WatcherError!void {
+    assert(json.len > 0); // S1: precondition
+
+    out.* = StoredHTTPRouteRule.init();
+
+    // Parse matches array.
+    if (findArrayField(json, "matches")) |matches_array| {
+        const MatchParseContext = struct {
+            out: *StoredHTTPRouteRule,
+        };
+        var ctx = MatchParseContext{ .out = out };
+
+        out.matches_count = try iterateJsonArray(
+            matches_array,
+            config.MAX_MATCHES,
+            struct {
+                fn parse(c: *MatchParseContext, match_json: []const u8, idx: u8) WatcherError!void {
+                    try parseMatchJson(match_json, &c.out.matches[idx]);
+                    c.out.matches[idx].active = true;
+                }
+            }.parse,
+            &ctx,
+        );
+    }
+
+    // Parse filters array.
+    if (findArrayField(json, "filters")) |filters_array| {
+        const FilterParseContext = struct {
+            out: *StoredHTTPRouteRule,
+        };
+        var ctx = FilterParseContext{ .out = out };
+
+        out.filters_count = try iterateJsonArray(
+            filters_array,
+            config.MAX_FILTERS,
+            struct {
+                fn parse(c: *FilterParseContext, filter_json: []const u8, idx: u8) WatcherError!void {
+                    try parseFilterJson(filter_json, &c.out.filters[idx]);
+                    c.out.filters[idx].active = true;
+                }
+            }.parse,
+            &ctx,
+        );
+    }
+
+    // Parse backendRefs array.
+    if (findArrayField(json, "backendRefs")) |backends_array| {
+        const BackendParseContext = struct {
+            out: *StoredHTTPRouteRule,
+        };
+        var ctx = BackendParseContext{ .out = out };
+
+        out.backend_refs_count = try iterateJsonArray(
+            backends_array,
+            config.MAX_BACKEND_REFS,
+            struct {
+                fn parse(c: *BackendParseContext, backend_json: []const u8, idx: u8) WatcherError!void {
+                    try parseBackendRefJson(backend_json, &c.out.backend_refs[idx]);
+                    c.out.backend_refs[idx].active = true;
+                }
+            }.parse,
+            &ctx,
+        );
+    }
+
+    out.active = true;
+}
+
+/// Parse a single HTTPRouteMatch from JSON.
+fn parseMatchJson(json: []const u8, out: *StoredHTTPRouteMatch) WatcherError!void {
+    out.* = StoredHTTPRouteMatch.init();
+
+    // Parse path match.
+    if (findObjectField(json, "path")) |path_json| {
+        const path_type_str = extractJsonString(path_json, "type") orelse "PathPrefix";
+        const path_value = extractJsonString(path_json, "value") orelse "/";
+
+        if (path_value.len <= MAX_PATH_VALUE_LEN) {
+            out.path.match_type = config.PathMatch.Type.fromString(path_type_str) orelse .PathPrefix;
+            out.path.value.set(path_value);
+            out.path.active = true;
+            out.has_path = true;
+        }
+    }
+
+    out.active = true;
+}
+
+/// Parse a single HTTPRouteFilter from JSON.
+fn parseFilterJson(json: []const u8, out: *StoredHTTPRouteFilter) WatcherError!void {
+    out.* = StoredHTTPRouteFilter.init();
+
+    // Get filter type.
+    const filter_type_str = extractJsonString(json, "type") orelse return;
+    out.filter_type = config.HTTPRouteFilter.Type.fromString(filter_type_str) orelse return;
+
+    // Parse URLRewrite filter.
+    if (out.filter_type == .URLRewrite) {
+        if (findObjectField(json, "urlRewrite")) |rewrite_json| {
+            if (findObjectField(rewrite_json, "path")) |path_json| {
+                const rewrite_type_str = extractJsonString(path_json, "type") orelse "ReplacePrefixMatch";
+                // K8s uses "replacePrefixMatch" field for the value in ReplacePrefixMatch type.
+                const rewrite_value = extractJsonString(path_json, "replacePrefixMatch") orelse
+                    extractJsonString(path_json, "replaceFullPath") orelse "/";
+
+                if (rewrite_value.len <= MAX_PATH_VALUE_LEN) {
+                    out.url_rewrite.path.rewrite_type = config.PathRewrite.Type.fromString(rewrite_type_str) orelse .ReplacePrefixMatch;
+                    out.url_rewrite.path.value.set(rewrite_value);
+                    out.url_rewrite.path.active = true;
+                    out.url_rewrite.has_path = true;
+                }
+            }
+        }
+    }
+
+    out.active = true;
+}
+
+/// Parse a single BackendRef from JSON.
+fn parseBackendRefJson(json: []const u8, out: *StoredBackendRef) WatcherError!void {
+    out.* = StoredBackendRef.init();
+
+    // Extract name (required).
+    const name = extractJsonString(json, "name") orelse return;
+    if (name.len > MAX_NAME_LEN) return;
+    out.name.set(name);
+
+    // Extract namespace (defaults to route's namespace, but we use "default" here).
+    const namespace = extractJsonString(json, "namespace") orelse "default";
+    if (namespace.len > MAX_NAME_LEN) return;
+    out.namespace.set(namespace);
+
+    // Extract port (required).
+    out.port = extractJsonInt(json, "port") orelse return;
+
+    // Extract weight (optional, defaults to 1).
+    out.weight = extractJsonInt(json, "weight") orelse 1;
+
+    out.active = true;
 }
 
 // =============================================================================
@@ -1036,4 +2056,445 @@ test "K8s API paths are correct" {
     try std.testing.expect(std.mem.startsWith(u8, SERVICES_PATH, "/api/v1/"));
     try std.testing.expect(std.mem.startsWith(u8, ENDPOINTS_PATH, "/api/v1/"));
     try std.testing.expect(std.mem.startsWith(u8, SECRETS_PATH, "/api/v1/"));
+}
+
+// =============================================================================
+// Gateway/HTTPRoute Parsing Tests
+// =============================================================================
+
+test "findArrayField - basic array" {
+    const json =
+        \\{"items":["a","b","c"]}
+    ;
+    const array = findArrayField(json, "items").?;
+    try std.testing.expect(std.mem.startsWith(u8, array, "["));
+    try std.testing.expect(std.mem.endsWith(u8, array, "]"));
+    try std.testing.expect(std.mem.indexOf(u8, array, "\"a\"") != null);
+}
+
+test "findArrayField - nested arrays" {
+    const json =
+        \\{"outer":{"inner":[1,2,3]}}
+    ;
+    const outer = findObjectField(json, "outer").?;
+    const inner = findArrayField(outer, "inner").?;
+    try std.testing.expect(std.mem.startsWith(u8, inner, "["));
+    try std.testing.expect(std.mem.indexOf(u8, inner, "1") != null);
+}
+
+test "findArrayField - missing field" {
+    const json =
+        \\{"other":"value"}
+    ;
+    try std.testing.expect(findArrayField(json, "missing") == null);
+}
+
+test "extractJsonInt - basic" {
+    const json =
+        \\{"port":8080,"count":42}
+    ;
+    try std.testing.expectEqual(@as(u16, 8080), extractJsonInt(json, "port").?);
+    try std.testing.expectEqual(@as(u16, 42), extractJsonInt(json, "count").?);
+}
+
+test "extractJsonInt - nested" {
+    const json =
+        \\{"metadata":{"port":9090}}
+    ;
+    // Top-level extraction should not find nested fields.
+    try std.testing.expect(extractJsonInt(json, "port") == null);
+
+    // Extract from nested object.
+    const metadata = findObjectField(json, "metadata").?;
+    try std.testing.expectEqual(@as(u16, 9090), extractJsonInt(metadata, "port").?);
+}
+
+test "extractJsonInt - missing field" {
+    const json =
+        \\{"name":"test"}
+    ;
+    try std.testing.expect(extractJsonInt(json, "port") == null);
+}
+
+test "iterateJsonArray - object array" {
+    const json = "[{\"name\":\"a\"},{\"name\":\"b\"}]";
+    var names: [2][]const u8 = undefined;
+    var count: u8 = 0;
+
+    const ArrayContext = struct {
+        names: *[2][]const u8,
+        count: *u8,
+    };
+    var ctx = ArrayContext{ .names = &names, .count = &count };
+
+    _ = try iterateJsonArray(
+        json,
+        2,
+        struct {
+            fn parse(c: *ArrayContext, obj: []const u8, idx: u8) WatcherError!void {
+                c.names[idx] = extractJsonString(obj, "name") orelse "?";
+                c.count.* = idx + 1;
+            }
+        }.parse,
+        &ctx,
+    );
+
+    try std.testing.expectEqual(@as(u8, 2), count);
+    try std.testing.expectEqualStrings("a", names[0]);
+    try std.testing.expectEqualStrings("b", names[1]);
+}
+
+test "iterateJsonArray - string array" {
+    const json = "[\"api.example.com\",\"www.example.com\"]";
+    var hostnames: [2][]const u8 = undefined;
+    var count: u8 = 0;
+
+    const ArrayContext = struct {
+        hostnames: *[2][]const u8,
+        count: *u8,
+    };
+    var ctx = ArrayContext{ .hostnames = &hostnames, .count = &count };
+
+    _ = try iterateJsonArray(
+        json,
+        2,
+        struct {
+            fn parse(c: *ArrayContext, item: []const u8, idx: u8) WatcherError!void {
+                if (item.len >= 2 and item[0] == '"') {
+                    c.hostnames[idx] = item[1 .. item.len - 1];
+                }
+                c.count.* = idx + 1;
+            }
+        }.parse,
+        &ctx,
+    );
+
+    try std.testing.expectEqual(@as(u8, 2), count);
+    try std.testing.expectEqualStrings("api.example.com", hostnames[0]);
+    try std.testing.expectEqualStrings("www.example.com", hostnames[1]);
+}
+
+test "iterateJsonArray - empty array" {
+    const json = "[]";
+    var count: u8 = 0;
+
+    _ = try iterateJsonArray(
+        json,
+        10,
+        struct {
+            fn parse(cnt: *u8, _: []const u8, _: u8) WatcherError!void {
+                cnt.* += 1;
+            }
+        }.parse,
+        &count,
+    );
+
+    try std.testing.expectEqual(@as(u8, 0), count);
+}
+
+test "parseGatewayJson - basic gateway" {
+    const json =
+        \\{
+        \\  "metadata": {"name": "my-gateway", "namespace": "production"},
+        \\  "spec": {
+        \\    "listeners": [
+        \\      {"name": "http", "port": 80, "protocol": "HTTP"},
+        \\      {"name": "https", "port": 443, "protocol": "HTTPS", "hostname": "*.example.com"}
+        \\    ]
+        \\  }
+        \\}
+    ;
+
+    var gw = StoredGateway.init();
+    try parseGatewayJson(json, &gw);
+
+    try std.testing.expectEqualStrings("my-gateway", gw.name.slice());
+    try std.testing.expectEqualStrings("production", gw.namespace.slice());
+    try std.testing.expectEqual(@as(u8, 2), gw.listeners_count);
+
+    // Check first listener
+    try std.testing.expectEqualStrings("http", gw.listeners[0].name.slice());
+    try std.testing.expectEqual(@as(u16, 80), gw.listeners[0].port);
+    try std.testing.expectEqual(config.Listener.Protocol.HTTP, gw.listeners[0].protocol);
+    try std.testing.expect(!gw.listeners[0].has_hostname);
+
+    // Check second listener
+    try std.testing.expectEqualStrings("https", gw.listeners[1].name.slice());
+    try std.testing.expectEqual(@as(u16, 443), gw.listeners[1].port);
+    try std.testing.expectEqual(config.Listener.Protocol.HTTPS, gw.listeners[1].protocol);
+    try std.testing.expect(gw.listeners[1].has_hostname);
+    try std.testing.expectEqualStrings("*.example.com", gw.listeners[1].hostname.slice());
+}
+
+test "parseGatewayJson - no listeners" {
+    const json =
+        \\{
+        \\  "metadata": {"name": "empty-gw", "namespace": "default"},
+        \\  "spec": {}
+        \\}
+    ;
+
+    var gw = StoredGateway.init();
+    try parseGatewayJson(json, &gw);
+
+    try std.testing.expectEqualStrings("empty-gw", gw.name.slice());
+    try std.testing.expectEqual(@as(u8, 0), gw.listeners_count);
+}
+
+test "parseGatewayJson - default namespace" {
+    const json =
+        \\{
+        \\  "metadata": {"name": "gw"},
+        \\  "spec": {"listeners": []}
+        \\}
+    ;
+
+    var gw = StoredGateway.init();
+    try parseGatewayJson(json, &gw);
+
+    try std.testing.expectEqualStrings("gw", gw.name.slice());
+    try std.testing.expectEqualStrings("default", gw.namespace.slice());
+}
+
+test "parseGatewayJson - missing metadata" {
+    const json =
+        \\{
+        \\  "spec": {"listeners": []}
+        \\}
+    ;
+
+    var gw = StoredGateway.init();
+    const result = parseGatewayJson(json, &gw);
+    try std.testing.expectError(WatcherError.MissingField, result);
+}
+
+test "parseGatewayJson - missing name" {
+    const json =
+        \\{
+        \\  "metadata": {"namespace": "default"},
+        \\  "spec": {"listeners": []}
+        \\}
+    ;
+
+    var gw = StoredGateway.init();
+    const result = parseGatewayJson(json, &gw);
+    try std.testing.expectError(WatcherError.MissingField, result);
+}
+
+test "parseHTTPRouteJson - full route" {
+    const json =
+        \\{
+        \\  "metadata": {"name": "api-route", "namespace": "prod"},
+        \\  "spec": {
+        \\    "hostnames": ["api.example.com", "www.example.com"],
+        \\    "rules": [
+        \\      {
+        \\        "matches": [
+        \\          {"path": {"type": "PathPrefix", "value": "/api/"}}
+        \\        ],
+        \\        "filters": [
+        \\          {"type": "URLRewrite", "urlRewrite": {"path": {"type": "ReplacePrefixMatch", "replacePrefixMatch": "/"}}}
+        \\        ],
+        \\        "backendRefs": [
+        \\          {"name": "api-svc", "namespace": "prod", "port": 8080, "weight": 90},
+        \\          {"name": "api-svc-canary", "port": 8080, "weight": 10}
+        \\        ]
+        \\      }
+        \\    ]
+        \\  }
+        \\}
+    ;
+
+    var route = StoredHTTPRoute.init();
+    try parseHTTPRouteJson(json, &route);
+
+    // Check metadata
+    try std.testing.expectEqualStrings("api-route", route.name.slice());
+    try std.testing.expectEqualStrings("prod", route.namespace.slice());
+
+    // Check hostnames
+    try std.testing.expectEqual(@as(u8, 2), route.hostnames_count);
+    try std.testing.expectEqualStrings("api.example.com", route.hostnames[0].slice());
+    try std.testing.expectEqualStrings("www.example.com", route.hostnames[1].slice());
+
+    // Check rules
+    try std.testing.expectEqual(@as(u8, 1), route.rules_count);
+
+    const rule = &route.rules[0];
+
+    // Check matches
+    try std.testing.expectEqual(@as(u8, 1), rule.matches_count);
+    try std.testing.expect(rule.matches[0].has_path);
+    try std.testing.expectEqual(config.PathMatch.Type.PathPrefix, rule.matches[0].path.match_type);
+    try std.testing.expectEqualStrings("/api/", rule.matches[0].path.value.slice());
+
+    // Check filters
+    try std.testing.expectEqual(@as(u8, 1), rule.filters_count);
+    try std.testing.expectEqual(config.HTTPRouteFilter.Type.URLRewrite, rule.filters[0].filter_type);
+    try std.testing.expect(rule.filters[0].url_rewrite.has_path);
+    try std.testing.expectEqual(config.PathRewrite.Type.ReplacePrefixMatch, rule.filters[0].url_rewrite.path.rewrite_type);
+    try std.testing.expectEqualStrings("/", rule.filters[0].url_rewrite.path.value.slice());
+
+    // Check backend refs
+    try std.testing.expectEqual(@as(u8, 2), rule.backend_refs_count);
+    try std.testing.expectEqualStrings("api-svc", rule.backend_refs[0].name.slice());
+    try std.testing.expectEqualStrings("prod", rule.backend_refs[0].namespace.slice());
+    try std.testing.expectEqual(@as(u16, 8080), rule.backend_refs[0].port);
+    try std.testing.expectEqual(@as(u16, 90), rule.backend_refs[0].weight);
+
+    try std.testing.expectEqualStrings("api-svc-canary", rule.backend_refs[1].name.slice());
+    try std.testing.expectEqualStrings("default", rule.backend_refs[1].namespace.slice()); // defaults
+    try std.testing.expectEqual(@as(u16, 10), rule.backend_refs[1].weight);
+}
+
+test "parseHTTPRouteJson - minimal route" {
+    const json =
+        \\{
+        \\  "metadata": {"name": "minimal"},
+        \\  "spec": {}
+        \\}
+    ;
+
+    var route = StoredHTTPRoute.init();
+    try parseHTTPRouteJson(json, &route);
+
+    try std.testing.expectEqualStrings("minimal", route.name.slice());
+    try std.testing.expectEqualStrings("default", route.namespace.slice());
+    try std.testing.expectEqual(@as(u8, 0), route.hostnames_count);
+    try std.testing.expectEqual(@as(u8, 0), route.rules_count);
+}
+
+test "parseHTTPRouteJson - exact path match" {
+    const json =
+        \\{
+        \\  "metadata": {"name": "exact-route", "namespace": "default"},
+        \\  "spec": {
+        \\    "rules": [
+        \\      {
+        \\        "matches": [
+        \\          {"path": {"type": "Exact", "value": "/health"}}
+        \\        ],
+        \\        "backendRefs": [
+        \\          {"name": "health-svc", "port": 8080}
+        \\        ]
+        \\      }
+        \\    ]
+        \\  }
+        \\}
+    ;
+
+    var route = StoredHTTPRoute.init();
+    try parseHTTPRouteJson(json, &route);
+
+    try std.testing.expectEqual(@as(u8, 1), route.rules_count);
+    const match = &route.rules[0].matches[0];
+    try std.testing.expectEqual(config.PathMatch.Type.Exact, match.path.match_type);
+    try std.testing.expectEqualStrings("/health", match.path.value.slice());
+}
+
+test "parseHTTPRouteJson - missing spec" {
+    const json =
+        \\{
+        \\  "metadata": {"name": "no-spec"}
+        \\}
+    ;
+
+    var route = StoredHTTPRoute.init();
+    const result = parseHTTPRouteJson(json, &route);
+    try std.testing.expectError(WatcherError.MissingField, result);
+}
+
+test "parseBackendRefJson - full backend" {
+    const json =
+        \\{"name": "my-svc", "namespace": "ns", "port": 9000, "weight": 50}
+    ;
+
+    var backend = StoredBackendRef.init();
+    try parseBackendRefJson(json, &backend);
+
+    try std.testing.expectEqualStrings("my-svc", backend.name.slice());
+    try std.testing.expectEqualStrings("ns", backend.namespace.slice());
+    try std.testing.expectEqual(@as(u16, 9000), backend.port);
+    try std.testing.expectEqual(@as(u16, 50), backend.weight);
+    try std.testing.expect(backend.active);
+}
+
+test "parseBackendRefJson - defaults" {
+    const json =
+        \\{"name": "svc", "port": 8080}
+    ;
+
+    var backend = StoredBackendRef.init();
+    try parseBackendRefJson(json, &backend);
+
+    try std.testing.expectEqualStrings("default", backend.namespace.slice());
+    try std.testing.expectEqual(@as(u16, 1), backend.weight);
+}
+
+test "parseFilterJson - URLRewrite with ReplaceFullPath" {
+    const json =
+        \\{"type": "URLRewrite", "urlRewrite": {"path": {"type": "ReplaceFullPath", "replaceFullPath": "/new/path"}}}
+    ;
+
+    var filter = StoredHTTPRouteFilter.init();
+    try parseFilterJson(json, &filter);
+
+    try std.testing.expectEqual(config.HTTPRouteFilter.Type.URLRewrite, filter.filter_type);
+    try std.testing.expect(filter.url_rewrite.has_path);
+    try std.testing.expectEqual(config.PathRewrite.Type.ReplaceFullPath, filter.url_rewrite.path.rewrite_type);
+    try std.testing.expectEqualStrings("/new/path", filter.url_rewrite.path.value.slice());
+}
+
+test "NameStorage - basic operations" {
+    var storage = NameStorage.init();
+    try std.testing.expectEqual(@as(u8, 0), storage.len);
+
+    storage.set("test-name");
+    try std.testing.expectEqual(@as(u8, 9), storage.len);
+    try std.testing.expectEqualStrings("test-name", storage.slice());
+
+    storage.set("another");
+    try std.testing.expectEqualStrings("another", storage.slice());
+}
+
+test "PathStorage - basic operations" {
+    var storage = PathStorage.init();
+    try std.testing.expectEqual(@as(u16, 0), storage.len);
+
+    storage.set("/api/v1/users");
+    try std.testing.expectEqualStrings("/api/v1/users", storage.slice());
+}
+
+test "StoredPathMatch - toPathMatch" {
+    var stored = StoredPathMatch.init();
+    stored.match_type = .Exact;
+    stored.value.set("/exact/path");
+    stored.active = true;
+
+    const path_match = stored.toPathMatch();
+    try std.testing.expectEqual(config.PathMatch.Type.Exact, path_match.type);
+    try std.testing.expectEqualStrings("/exact/path", path_match.value);
+}
+
+test "StoredHTTPRouteRule init" {
+    const rule = StoredHTTPRouteRule.init();
+    try std.testing.expectEqual(@as(u8, 0), rule.matches_count);
+    try std.testing.expectEqual(@as(u8, 0), rule.filters_count);
+    try std.testing.expectEqual(@as(u8, 0), rule.backend_refs_count);
+    try std.testing.expect(!rule.active);
+}
+
+test "StoredGateway init" {
+    const gw = StoredGateway.init();
+    try std.testing.expectEqual(@as(u8, 0), gw.name.len);
+    try std.testing.expectEqual(@as(u8, 0), gw.listeners_count);
+    try std.testing.expect(!gw.active);
+}
+
+test "StoredHTTPRoute init" {
+    const route = StoredHTTPRoute.init();
+    try std.testing.expectEqual(@as(u8, 0), route.name.len);
+    try std.testing.expectEqual(@as(u8, 0), route.hostnames_count);
+    try std.testing.expectEqual(@as(u8, 0), route.rules_count);
+    try std.testing.expect(!route.active);
 }

@@ -13,30 +13,23 @@ Status: **Data Plane Integrated** - K8s API integration works, translator and re
 - **Resolver integration** maps Service names to pod IPs
 - **pushConfigToDataPlane()** sends config to router_example admin API
 - **Atomic config swap** in router_example with double-buffering
+- **reconcile()** parses Gateway/HTTPRoute JSON into typed structs
 
-## Next Step: Implement `reconcile()`
+## ~~Next Step: Implement `reconcile()`~~ COMPLETED
 
-**File:** `serval-gateway/k8s/watcher.zig:565-574`
+**File:** `serval-gateway/k8s/watcher.zig:899-1052`
 
-The watcher stores raw JSON from K8s watch events but `reconcile()` currently returns an empty config:
+**Status:** Implemented. The `reconcile()` function now:
+1. Parses Gateway raw JSON into `StoredGateway` structs
+2. Parses HTTPRoute raw JSON into `StoredHTTPRoute` structs
+3. Builds typed `GatewayConfig` from parsed resources
+4. Uses fixed-size storage arrays (TigerStyle: no allocation after init)
 
-```zig
-pub fn reconcile(self: *Self) WatcherError!config.GatewayConfig {
-    // For now, return empty config.
-    // Full implementation would parse Gateway/HTTPRoute JSON and build typed config.
-    _ = self;
-    return config.GatewayConfig{
-        .gateways = &[_]config.Gateway{},
-        .http_routes = &[_]config.HTTPRoute{},
-    };
-}
-```
-
-**Required work:**
-1. Parse stored `http_routes` raw JSON → `[]HTTPRoute` typed structs
-2. Parse stored `gateways` raw JSON → `[]Gateway` typed structs
-3. Parse stored `services`/`endpoints` raw JSON → update Resolver
-4. Build complete `GatewayConfig` from parsed resources
+**Implementation details:**
+- Added storage types: `StoredGateway`, `StoredHTTPRoute`, `StoredHTTPRouteRule`, etc.
+- Added JSON parsing helpers: `parseGatewayJson()`, `parseHTTPRouteJson()`
+- Added utility functions: `findArrayField()`, `extractJsonInt()`, `iterateJsonArray()`
+- Comprehensive unit tests for all parsing functions
 
 **Data flow:**
 ```
@@ -215,6 +208,7 @@ Current implementation polls K8s API repeatedly. Should use proper watch with:
 - [x] Config updates without restart (atomic swap)
 - [x] Translator converts HTTPRoute to Router config
 - [x] Resolver maps Service to pod IPs
+- [x] reconcile() parses Gateway/HTTPRoute JSON into typed structs
 - [ ] Handles backend failures (health probing)
 - [ ] TLS termination
 - [ ] Metrics exposed
