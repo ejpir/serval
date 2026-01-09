@@ -564,12 +564,15 @@ pub fn build(b: *std.Build) void {
         .root_module = otel_test_mod,
     });
     const build_otel_test = b.addInstallArtifact(otel_test, .{});
-    _ = build_otel_test;
 
     const run_otel_test = b.addRunArtifact(otel_test);
     const run_otel_test_step = b.step("run-otel-test", "Run OTLP export test");
     run_otel_test_step.dependOn(&run_otel_test.step);
 
-    // Default step
-    b.default_step = &build_lb_example.step;
+    // Default step - build all examples
+    b.default_step.dependOn(&build_lb_example.step);
+    b.default_step.dependOn(&build_router_example.step);
+    b.default_step.dependOn(&build_gateway_example.step);
+    b.default_step.dependOn(&build_echo_backend.step);
+    b.default_step.dependOn(&build_otel_test.step);
 }

@@ -115,13 +115,13 @@ fn forwardBodySplice(upstream_fd: i32, client_fd: i32, length_bytes: u64) Forwar
         posix.close(pipe_fds[1]);
     }
 
-    var forwarded: u64 = 0;
+    var forwarded_bytes: u64 = 0;
     const max_iterations: u32 = 1024 * 1024;
     var iterations: u32 = 0;
 
-    while (forwarded < length_bytes and iterations < max_iterations) : (iterations += 1) {
-        const remaining = length_bytes - forwarded;
-        const chunk_size: usize = @intCast(@min(remaining, SPLICE_CHUNK_SIZE_BYTES));
+    while (forwarded_bytes < length_bytes and iterations < max_iterations) : (iterations += 1) {
+        const remaining_bytes = length_bytes - forwarded_bytes;
+        const chunk_size: usize = @intCast(@min(remaining_bytes, SPLICE_CHUNK_SIZE_BYTES));
 
         // Splice from upstream to pipe
         const to_pipe = spliceSyscall(upstream_fd, pipe_fds[1], chunk_size, SPLICE_F_MOVE | SPLICE_F_MORE);
@@ -130,22 +130,29 @@ fn forwardBodySplice(upstream_fd: i32, client_fd: i32, length_bytes: u64) Forwar
         if (to_pipe < 0) return ForwardError.SpliceFailed;
 
         // Splice from pipe to client
-        var pipe_sent: u64 = 0;
+        var pipe_sent_bytes: u64 = 0;
         var pipe_iterations: u32 = 0;
         const max_pipe_iterations: u32 = 1024;
-        const to_pipe_u64: u64 = @intCast(to_pipe);
-        while (pipe_sent < to_pipe_u64 and pipe_iterations < max_pipe_iterations) : (pipe_iterations += 1) {
-            const from_pipe = spliceSyscall(pipe_fds[0], client_fd, @intCast(to_pipe_u64 - pipe_sent), SPLICE_F_MOVE | SPLICE_F_MORE);
+        const to_pipe_bytes: u64 = @intCast(to_pipe);
+
+        // Check if this is the last chunk - don't set SPLICE_F_MORE on final write
+        // to avoid TCP cork delay. SPLICE_F_MORE tells kernel to expect more data,
+        // which can cause ~200ms delay waiting for the cork timeout.
+        const is_last_chunk = (forwarded_bytes + to_pipe_bytes >= length_bytes);
+        const splice_flags: u32 = if (is_last_chunk) SPLICE_F_MOVE else SPLICE_F_MOVE | SPLICE_F_MORE;
+
+        while (pipe_sent_bytes < to_pipe_bytes and pipe_iterations < max_pipe_iterations) : (pipe_iterations += 1) {
+            const from_pipe = spliceSyscall(pipe_fds[0], client_fd, @intCast(to_pipe_bytes - pipe_sent_bytes), splice_flags);
             if (from_pipe == 0) return ForwardError.SendFailed;
             if (from_pipe < 0) return ForwardError.SpliceFailed;
-            pipe_sent += @intCast(from_pipe);
+            pipe_sent_bytes += @intCast(from_pipe);
         }
 
-        forwarded += to_pipe_u64;
+        forwarded_bytes += to_pipe_bytes;
     }
 
-    assert(forwarded <= length_bytes);
-    return forwarded;
+    assert(forwarded_bytes <= length_bytes);
+    return forwarded_bytes;
 }
 
 // =============================================================================
@@ -153,20 +160,20 @@ fn forwardBodySplice(upstream_fd: i32, client_fd: i32, length_bytes: u64) Forwar
 // =============================================================================
 
 /// Forward body using Socket read/write (handles both TLS and plaintext).
-/// TigerStyle: Bounded loops, fixed buffer size.
+/// TigerStyle: Bounded loops, fixed buffer size, Y3 _bytes suffix.
 fn forwardBodyCopy(upstream: *Socket, client: *Socket, length_bytes: u64) ForwardError!u64 {
     // Precondition: sockets have valid fds.
     assert(upstream.getFd() >= 0);
     assert(client.getFd() >= 0);
 
     var buffer: [COPY_CHUNK_SIZE_BYTES]u8 = std.mem.zeroes([COPY_CHUNK_SIZE_BYTES]u8);
-    var forwarded: u64 = 0;
+    var forwarded_bytes: u64 = 0;
     const max_iterations: u32 = 1024 * 1024;
     var iterations: u32 = 0;
 
-    while (forwarded < length_bytes and iterations < max_iterations) : (iterations += 1) {
-        const remaining = length_bytes - forwarded;
-        const to_read: usize = @intCast(@min(remaining, buffer.len));
+    while (forwarded_bytes < length_bytes and iterations < max_iterations) : (iterations += 1) {
+        const remaining_bytes = length_bytes - forwarded_bytes;
+        const to_read: usize = @intCast(@min(remaining_bytes, buffer.len));
 
         // Read from upstream via Socket abstraction (TLS or plaintext).
         const n = upstream.read(buffer[0..to_read]) catch {
@@ -179,11 +186,11 @@ fn forwardBodyCopy(upstream: *Socket, client: *Socket, length_bytes: u64) Forwar
             return ForwardError.SendFailed;
         };
 
-        forwarded += n;
+        forwarded_bytes += n;
     }
 
-    assert(forwarded <= length_bytes);
-    return forwarded;
+    assert(forwarded_bytes <= length_bytes);
+    return forwarded_bytes;
 }
 
 // =============================================================================

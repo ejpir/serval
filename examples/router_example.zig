@@ -39,7 +39,7 @@ const RouterExtra = struct {
 };
 
 /// Maximum number of upstreams per pool.
-const MAX_UPSTREAMS_PER_POOL: u8 = 16;
+const MAX_UPSTREAMS_PER_POOL: u8 = 100;
 
 const UpstreamIndex = serval.config.UpstreamIndex;
 

@@ -80,7 +80,7 @@ pub const DIRECT_RESPONSE_HEADER_SIZE_BYTES: u32 = 1024;
 // =============================================================================
 
 /// Maximum connections per upstream in SimplePool
-pub const MAX_CONNS_PER_UPSTREAM: u8 = 16;
+pub const MAX_CONNS_PER_UPSTREAM: u8 = 50;
 
 /// Maximum number of upstreams in SimplePool
 pub const MAX_UPSTREAMS: u8 = 64;

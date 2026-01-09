@@ -222,7 +222,7 @@ pub const Router = struct {
     fn findRoute(self: *const Self, request: *const Request) *const Route {
         assert(self.routes.len <= MAX_ROUTES); // S1: Bounded
 
-        const host = request.headers.get("Host");
+        const host = request.headers.getHost(); // O(1) cached lookup
         const path = request.path;
 
         // TigerStyle S3: Bounded loop, explicit exit

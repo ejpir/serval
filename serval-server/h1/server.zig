@@ -187,11 +187,16 @@ pub fn Server(
             defer group.cancel(io);
 
             while (!shutdown.load(.acquire)) {
+                const accept_start_ns = realtimeNanos();
                 const stream = tcp_server.accept(io) catch |err| {
                     if (shutdown.load(.acquire)) break;
                     std.log.err("Accept failed: {s}", .{@errorName(err)});
                     continue;
                 };
+                const accept_elapsed_ns = realtimeNanos() - accept_start_ns;
+                const accept_us: u64 = if (accept_elapsed_ns >= 0) @intCast(@divFloor(accept_elapsed_ns, 1000)) else 0;
+                const accept_done_ns = realtimeNanos();
+                debugLog("server: accept completed accept_us={d} timestamp={d}", .{ accept_us, @as(u64, @intCast(accept_done_ns)) });
 
                 group.concurrent(io, handleConnectionImpl, .{
                     self.handler,
@@ -593,6 +598,9 @@ pub fn Server(
                 parser.reset();
 
                 // Pipelining: reuse leftover data or read new data
+                const handler_start_ns = realtimeNanos();
+                debugLog("server: conn={d} waiting for request handler_start={d}", .{ connection_id, @as(u64, @intCast(handler_start_ns)) });
+                const read_start_ns = realtimeNanos();
                 if (buffer_offset >= buffer_len) {
                     const n = connectionRead(maybe_tls_ptr, &io_mut, stream, &recv_buf) orelse return;
                     buffer_len = n;
@@ -601,6 +609,9 @@ pub fn Server(
 
                 // Accumulate reads until complete headers received
                 if (!accumulateHeaders(maybe_tls_ptr, &io_mut, stream, &recv_buf, buffer_offset, &buffer_len, cfg)) return;
+                const read_elapsed_ns = realtimeNanos() - read_start_ns;
+                const read_duration_us: u64 = if (read_elapsed_ns >= 0) @intCast(@divFloor(read_elapsed_ns, 1000)) else 0;
+                debugLog("server: conn={d} received bytes={d} read_us={d}", .{ connection_id, buffer_len - buffer_offset, read_duration_us });
 
                 ctx.bytes_received = @intCast(buffer_len - buffer_offset);
                 metrics.requestStart();

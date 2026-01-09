@@ -241,26 +241,26 @@ pub const Socket = union(enum) {
         assert(min_bytes > 0); // Zero min_bytes is programmer error
         assert(min_bytes <= buffer.len); // min_bytes cannot exceed buffer capacity
 
-        var total: usize = 0;
+        var total_bytes: usize = 0;
         var iterations: u32 = 0;
 
         // S3: Bounded loop with explicit maximum
-        while (total < min_bytes and iterations < MAX_READ_ITERATIONS) : (iterations += 1) {
-            const n = try self.read(buffer[total..]);
+        while (total_bytes < min_bytes and iterations < MAX_READ_ITERATIONS) : (iterations += 1) {
+            const n = try self.read(buffer[total_bytes..]);
 
             // Zero read means EOF before min_bytes reached
             if (n == 0) return SocketError.ConnectionClosed;
 
-            total += n;
+            total_bytes += n;
         }
 
         // Check if loop exited due to iteration limit
-        if (total < min_bytes) return SocketError.Unexpected;
+        if (total_bytes < min_bytes) return SocketError.Unexpected;
 
         // S2: Postcondition - read at least min_bytes
-        assert(total >= min_bytes);
-        assert(total <= buffer.len);
-        return total;
+        assert(total_bytes >= min_bytes);
+        assert(total_bytes <= buffer.len);
+        return total_bytes;
     }
 };
 

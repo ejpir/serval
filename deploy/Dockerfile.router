@@ -4,7 +4,7 @@ FROM debian:bookworm-slim
 
 # Install OpenSSL runtime (required by serval TLS)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libssl3 \
+    libssl3 curl netcat-openbsd strace \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 

@@ -138,7 +138,7 @@ fn forwardChunkData(
     assert(chunk_size > 0); // Caller handles last-chunk case.
 
     var bytes_remaining = chunk_size;
-    var forwarded: u64 = 0;
+    var forwarded_bytes: u64 = 0;
 
     // Forward any buffered data first.
     if (buffer_len.* > 0) {
@@ -146,40 +146,41 @@ fn forwardChunkData(
         dest.writeAll(buffer[0..to_send]) catch {
             return ForwardError.SendFailed;
         };
-        forwarded += to_send;
+        forwarded_bytes += to_send;
         bytes_remaining -= to_send;
         shiftBuffer(buffer, buffer_len, to_send);
     }
 
     // Forward remaining chunk data directly from source.
-    forwarded += try forwardBytes(source, dest, bytes_remaining, buffer);
+    forwarded_bytes += try forwardBytes(source, dest, bytes_remaining, buffer);
 
     // Forward trailing CRLF after chunk data.
-    forwarded += try forwardCRLF(source, dest, buffer, buffer_len);
+    forwarded_bytes += try forwardCRLF(source, dest, buffer, buffer_len);
 
-    assert(forwarded == chunk_size + 2);
-    return forwarded;
+    assert(forwarded_bytes == chunk_size + 2);
+    return forwarded_bytes;
 }
 
-/// Forward exactly byte_count bytes from source to destination.
+/// Forward exactly length_bytes bytes from source to destination.
 /// Uses buffer for intermediate storage.
 /// Returns bytes forwarded.
+/// TigerStyle Y3: Parameter uses _bytes suffix for byte count.
 fn forwardBytes(
     source: *Socket,
     dest: *Socket,
-    byte_count: u64,
+    length_bytes: u64,
     buffer: *[CHUNK_BUFFER_SIZE_BYTES]u8,
 ) ForwardError!u64 {
     assert(source.getFd() >= 0);
     assert(dest.getFd() >= 0);
 
-    var remaining = byte_count;
-    var forwarded: u64 = 0;
+    var remaining_bytes = length_bytes;
+    var forwarded_bytes: u64 = 0;
     var iterations: u32 = 0;
     const max_iterations: u32 = MAX_CHUNK_ITERATIONS;
 
-    while (remaining > 0 and iterations < max_iterations) : (iterations += 1) {
-        const to_read: usize = @intCast(@min(remaining, CHUNK_BUFFER_SIZE_BYTES));
+    while (remaining_bytes > 0 and iterations < max_iterations) : (iterations += 1) {
+        const to_read: usize = @intCast(@min(remaining_bytes, CHUNK_BUFFER_SIZE_BYTES));
 
         // Read from source socket.
         const n = source.read(buffer[0..to_read]) catch {
@@ -192,12 +193,12 @@ fn forwardBytes(
         dest.writeAll(buffer[0..n]) catch {
             return ForwardError.SendFailed;
         };
-        forwarded += n;
-        remaining -= n;
+        forwarded_bytes += n;
+        remaining_bytes -= n;
     }
 
-    assert(forwarded == byte_count);
-    return forwarded;
+    assert(forwarded_bytes == length_bytes);
+    return forwarded_bytes;
 }
 
 /// Forward CRLF sequence (reads from buffer or source as needed).
@@ -251,7 +252,7 @@ fn forwardTrailerSection(
     assert(source.getFd() >= 0);
     assert(dest.getFd() >= 0);
 
-    var forwarded: u64 = 0;
+    var forwarded_bytes: u64 = 0;
     var iterations: u32 = 0;
     const max_iterations: u32 = 256; // Limit trailer parsing iterations.
 
@@ -271,7 +272,7 @@ fn forwardTrailerSection(
                 return ForwardError.SendFailed;
             };
             shiftBuffer(buffer, buffer_len, 2);
-            forwarded += 2;
+            forwarded_bytes += 2;
             break;
         }
 
@@ -290,8 +291,8 @@ fn forwardTrailerSection(
     }
 
     // Postcondition: forwarded at least the final CRLF.
-    assert(forwarded >= 2);
-    return forwarded;
+    assert(forwarded_bytes >= 2);
+    return forwarded_bytes;
 }
 
 /// Read data from source socket into buffer at given offset.
