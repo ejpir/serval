@@ -22,17 +22,12 @@ const ChunkParseError = chunked.ChunkParseError;
 const net = @import("serval-net");
 const Socket = net.Socket;
 
-// =============================================================================
-// Constants
-// =============================================================================
+const core = @import("serval-core");
+const config = core.config;
 
-/// Maximum chunk iterations to prevent infinite loops on malformed input.
-/// 1M chunks is far beyond any legitimate use case.
-pub const MAX_CHUNK_ITERATIONS: u32 = 1024 * 1024;
-
-/// Buffer size for reading chunk data from upstream.
-/// 8KB balances memory usage with syscall efficiency.
-pub const CHUNK_BUFFER_SIZE_BYTES: u32 = 8192;
+// Re-export from config for backward compatibility.
+pub const MAX_CHUNK_ITERATIONS = config.MAX_CHUNK_ITERATIONS;
+pub const CHUNK_BUFFER_SIZE_BYTES = config.CHUNK_BUFFER_SIZE_BYTES;
 
 // =============================================================================
 // Public API

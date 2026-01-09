@@ -58,6 +58,14 @@ pub const SPLICE_CHUNK_SIZE_BYTES: u32 = 65536;
 /// Buffer size for portable copy fallback (non-Linux platforms)
 pub const COPY_CHUNK_SIZE_BYTES: u32 = 4096;
 
+/// Buffer size for chunked transfer encoding forwarding.
+/// 8KB balances memory usage with syscall efficiency.
+pub const CHUNK_BUFFER_SIZE_BYTES: u32 = 8192;
+
+/// Maximum iterations for chunked body forwarding loop.
+/// TigerStyle S3: Bounded loop limit.
+pub const MAX_CHUNK_ITERATIONS: u32 = 1024 * 1024;
+
 /// Buffer size for direct response handlers (echo backends, health checks, etc.)
 /// Only allocated when handler implements onRequest hook.
 /// TigerStyle: Sized for typical API/debug responses, bounded.
