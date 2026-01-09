@@ -24,6 +24,8 @@ pub const response = @import("response.zig");
 pub const ResponseHeaders = response.ResponseHeaders;
 pub const ResponseError = response.ResponseError;
 pub const readResponseHeaders = response.readResponseHeaders;
+pub const HeaderBytesResult = response.HeaderBytesResult;
+pub const readHeaderBytes = response.readHeaderBytes;
 
 test {
     _ = @import("client.zig");

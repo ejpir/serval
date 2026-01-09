@@ -60,6 +60,11 @@ pub const monotonicNanos = time.monotonicNanos;
 pub const elapsedNanos = time.elapsedNanos;
 pub const elapsedSince = time.elapsedSince;
 
+// String utilities
+pub const strings = @import("strings.zig");
+pub const eqlIgnoreCase = strings.eqlIgnoreCase;
+pub const containsIgnoreCase = strings.containsIgnoreCase;
+
 test {
     _ = @import("header_map.zig");
     _ = @import("types.zig");
@@ -70,4 +75,5 @@ test {
     _ = @import("hooks.zig");
     _ = @import("time.zig");
     _ = @import("span_handle.zig");
+    _ = @import("strings.zig");
 }

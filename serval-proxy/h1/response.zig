@@ -12,6 +12,8 @@ const serval_core = @import("serval-core");
 const config = serval_core.config;
 const debugLog = serval_core.debugLog;
 const time = serval_core.time;
+const eqlIgnoreCase = serval_core.eqlIgnoreCase;
+const containsIgnoreCase = serval_core.containsIgnoreCase;
 
 const serval_http = @import("serval-http");
 const parseStatusCode = serval_http.parseStatusCode;
@@ -38,6 +40,11 @@ const Socket = net.Socket;
 
 const serval_tls = @import("serval-tls");
 const TLSStream = serval_tls.TLSStream;
+
+const serval_client = @import("serval-client");
+const readHeaderBytes = serval_client.readHeaderBytes;
+const ResponseError = serval_client.ResponseError;
+const HeaderBytesResult = serval_client.HeaderBytesResult;
 
 // For tests: Import all parsing functions to verify contracts
 const parseContentLengthValue = serval_http.parseContentLengthValue;
@@ -81,7 +88,7 @@ pub fn isChunkedResponse(header: []const u8) bool {
         // "Transfer-Encoding:" is 18 characters.
         if (line.len >= 18) {
             const header_name = "transfer-encoding:";
-            if (asciiEqualIgnoreCase(line[0..18], header_name)) {
+            if (eqlIgnoreCase(line[0..18], header_name)) {
                 // Extract value after colon, trim whitespace.
                 const value_start = 18;
                 const value = std.mem.trim(u8, line[value_start..], " \t");
@@ -99,49 +106,6 @@ pub fn isChunkedResponse(header: []const u8) bool {
 
     // Postcondition: loop terminated within bounds.
     assert(iterations <= max_iterations);
-    return false;
-}
-
-/// Case-insensitive ASCII slice comparison.
-/// TigerStyle: Only handles ASCII (HTTP headers are ASCII), bounded by slice length.
-fn asciiEqualIgnoreCase(a: []const u8, b: []const u8) bool {
-    // Precondition: slices are bounded (HTTP headers have max size).
-    assert(a.len <= config.MAX_HEADER_SIZE_BYTES);
-    assert(b.len <= config.MAX_HEADER_SIZE_BYTES);
-
-    if (a.len != b.len) return false;
-    if (a.len == 0) return true;
-
-    for (a, b) |ac, bc| {
-        const a_lower = if (ac >= 'A' and ac <= 'Z') ac + 32 else ac;
-        const b_lower = if (bc >= 'A' and bc <= 'Z') bc + 32 else bc;
-        if (a_lower != b_lower) return false;
-    }
-    // Postcondition: if we reach here, all characters matched case-insensitively.
-    return true;
-}
-
-/// Check if haystack contains needle (case-insensitive).
-/// TigerStyle: Bounded search, ASCII only.
-fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    // Precondition: needle must be non-empty to search.
-    assert(needle.len > 0);
-    // Precondition: haystack bounded by header size.
-    assert(haystack.len <= config.MAX_HEADER_SIZE_BYTES);
-
-    if (haystack.len < needle.len) return false;
-
-    // Bounded: max iterations = haystack.len - needle.len + 1
-    const max_pos = haystack.len - needle.len + 1;
-    var pos: usize = 0;
-    while (pos < max_pos) : (pos += 1) {
-        if (asciiEqualIgnoreCase(haystack[pos .. pos + needle.len], needle)) {
-            // Postcondition: match found at valid position within haystack.
-            assert(pos + needle.len <= haystack.len);
-            return true;
-        }
-    }
-    // Postcondition: exhausted all positions, no match found.
     return false;
 }
 
@@ -219,7 +183,8 @@ pub fn forwardResponse(
 }
 
 /// Receive HTTP response headers from upstream using Socket abstraction.
-/// TigerStyle: Explicit io parameter, stale detection for pooled connections.
+/// TigerStyle: Delegates to serval-client for header reading, maps errors for stale detection.
+/// Uses readHeaderBytes from serval-client for the core read loop.
 pub fn receiveHeaders(
     conn: *Connection,
     io: Io,
@@ -232,34 +197,35 @@ pub fn receiveHeaders(
     // Precondition: buffer is provided (not null via pointer).
     assert(buffer.len == config.MAX_HEADER_SIZE_BYTES);
 
-    var header_len: usize = 0;
-    const max_iterations: usize = config.MAX_HEADER_SIZE_BYTES;
-    var iterations: usize = 0;
+    // Delegate to serval-client for header reading.
+    // TigerStyle: Reuse code from serval-client, handle error mapping locally.
+    const result = readHeaderBytes(&conn.socket, buffer) catch |err| {
+        return mapResponseErrorToForwardError(err, is_pooled);
+    };
 
-    // Use Socket abstraction for unified TLS/plaintext header reading.
-    while (header_len < buffer.len and iterations < max_iterations) : (iterations += 1) {
-        const remaining = buffer[header_len..];
-        const n = conn.socket.read(remaining) catch {
-            if (is_pooled and header_len == 0) return ForwardError.StaleConnection;
-            return ForwardError.RecvFailed;
-        };
+    // S2: Postcondition - header_end is within total_bytes
+    assert(result.header_end <= result.total_bytes);
 
-        if (n == 0) {
-            if (is_pooled and header_len == 0) return ForwardError.StaleConnection;
-            return ForwardError.RecvFailed;
-        }
+    return .{
+        .header_len = result.total_bytes,
+        .header_end = result.header_end,
+    };
+}
 
-        header_len += n;
-
-        // Check for end of headers
-        if (std.mem.indexOf(u8, buffer[0..header_len], "\r\n\r\n")) |end_pos| {
-            const header_end = end_pos + 4;
-            assert(header_end <= header_len);
-            return .{ .header_len = header_len, .header_end = header_end };
-        }
-    }
-
-    return ForwardError.HeadersTooLarge;
+/// Map ResponseError from serval-client to ForwardError.
+/// TigerStyle S6: Explicit error handling, maps stale connections for pooled connections.
+fn mapResponseErrorToForwardError(err: ResponseError, is_pooled: bool) ForwardError {
+    return switch (err) {
+        // Connection closed before headers complete - stale if pooled, otherwise recv failed.
+        // Pooled connections may be closed by upstream during idle time.
+        ResponseError.ConnectionClosed => if (is_pooled) ForwardError.StaleConnection else ForwardError.RecvFailed,
+        ResponseError.RecvFailed => ForwardError.RecvFailed,
+        ResponseError.RecvTimeout => ForwardError.RecvFailed,
+        ResponseError.ResponseHeadersTooLarge => ForwardError.HeadersTooLarge,
+        // These shouldn't occur from readHeaderBytes (it doesn't parse), but handle explicitly.
+        ResponseError.InvalidResponseStatus => ForwardError.InvalidResponse,
+        ResponseError.InvalidResponseHeaders => ForwardError.InvalidResponse,
+    };
 }
 
 // =============================================================================

@@ -7,6 +7,8 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const config = @import("config.zig");
+const strings = @import("strings.zig");
+const eqlIgnoreCase = strings.eqlIgnoreCase;
 
 // =============================================================================
 // Header
@@ -147,14 +149,6 @@ pub const HeaderMap = struct {
         self.transfer_encoding_idx = null;
     }
 };
-
-fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |ac, bc| {
-        if (std.ascii.toLower(ac) != std.ascii.toLower(bc)) return false;
-    }
-    return true;
-}
 
 // =============================================================================
 // Tests

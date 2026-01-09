@@ -10,6 +10,7 @@ const assert = std.debug.assert;
 const serval_core = @import("serval-core");
 const types = serval_core.types;
 const config = serval_core.config;
+const containsIgnoreCase = serval_core.containsIgnoreCase;
 const HeaderMap = types.HeaderMap;
 const BodyFraming = types.BodyFraming;
 
@@ -76,25 +77,36 @@ pub const ResponseHeaders = struct {
 const MAX_READ_ITERATIONS: u32 = 10_000;
 
 // =============================================================================
-// Response Parsing Functions
+// Header Byte Reading (Low-Level)
 // =============================================================================
 
-/// Read and parse HTTP response headers from socket.
+/// Result of reading header bytes from a socket.
+/// TigerStyle: Explicit struct with clear naming.
+pub const HeaderBytesResult = struct {
+    /// Total bytes read into buffer (headers + any partial body).
+    total_bytes: usize,
+    /// Position where headers end (after \r\n\r\n).
+    /// Body data starts at this offset in the buffer.
+    header_end: usize,
+};
+
+/// Read response header bytes from socket until \r\n\r\n is found.
 ///
-/// Reads data into header_buf until finding \r\n\r\n (end of headers).
-/// Parses status line and headers, returning parsed ResponseHeaders.
+/// This is a low-level function that just reads bytes and finds the header
+/// terminator. It does not parse the headers. Use readResponseHeaders for
+/// full parsing, or call this directly when you only need the raw bytes.
 ///
 /// TigerStyle:
 /// - S1: Precondition assertions on parameters
 /// - S3: Bounded read loop with MAX_READ_ITERATIONS
 /// - S4: Explicit error handling for all socket operations
 ///
-/// Returns: ResponseHeaders with parsed data
-/// Errors: ResponseError on parsing or I/O failure
-pub fn readResponseHeaders(
+/// Returns: HeaderBytesResult with total bytes read and header end position
+/// Errors: ResponseError on I/O failure or headers too large
+pub fn readHeaderBytes(
     socket: *Socket,
     header_buf: []u8,
-) ResponseError!ResponseHeaders {
+) ResponseError!HeaderBytesResult {
     // S1: Preconditions
     assert(header_buf.len > 0);
     assert(header_buf.len <= config.MAX_HEADER_SIZE_BYTES);
@@ -107,9 +119,14 @@ pub fn readResponseHeaders(
         // Check if we've already found the header terminator
         if (total_read >= 4) {
             if (findHeaderEnd(header_buf[0..total_read])) |end_pos| {
-                // Found \r\n\r\n, parse the headers
-                const header_bytes = end_pos + 4; // Include the \r\n\r\n
-                return parseResponseHeaders(header_buf[0..total_read], header_bytes);
+                // Found \r\n\r\n
+                const header_end = end_pos + 4; // Include the \r\n\r\n
+                // S2: Postcondition - header_end is within bounds
+                assert(header_end <= total_read);
+                return .{
+                    .total_bytes = total_read,
+                    .header_end = header_end,
+                };
             }
         }
 
@@ -138,6 +155,40 @@ pub fn readResponseHeaders(
     // S3: Bounded loop exhausted - should not happen with correct limits
     // If we hit this, headers are too large or malformed
     return error.ResponseHeadersTooLarge;
+}
+
+// =============================================================================
+// Response Parsing Functions
+// =============================================================================
+
+/// Read and parse HTTP response headers from socket.
+///
+/// Reads data into header_buf until finding \r\n\r\n (end of headers).
+/// Parses status line and headers, returning parsed ResponseHeaders.
+///
+/// TigerStyle:
+/// - S1: Precondition assertions on parameters
+/// - Delegates to readHeaderBytes for bounded I/O loop
+/// - S4: Explicit error handling for all socket operations
+///
+/// Returns: ResponseHeaders with parsed data
+/// Errors: ResponseError on parsing or I/O failure
+pub fn readResponseHeaders(
+    socket: *Socket,
+    header_buf: []u8,
+) ResponseError!ResponseHeaders {
+    // S1: Preconditions
+    assert(header_buf.len > 0);
+    assert(header_buf.len <= config.MAX_HEADER_SIZE_BYTES);
+
+    // Read header bytes from socket
+    const result = try readHeaderBytes(socket, header_buf);
+
+    // S2: Postcondition - header_end is within total_bytes
+    assert(result.header_end <= result.total_bytes);
+
+    // Parse the headers
+    return parseResponseHeaders(header_buf[0..result.total_bytes], result.header_end);
 }
 
 /// Parse already-buffered response headers.
@@ -312,32 +363,6 @@ fn findHeaderEnd(buffer: []const u8) ?usize {
     return std.mem.indexOf(u8, buffer, "\r\n\r\n");
 }
 
-/// Case-insensitive substring search.
-///
-/// Returns true if needle is found within haystack (case-insensitive).
-/// TigerStyle: Bounded loop - iterations limited by haystack length.
-fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (haystack.len < needle.len) return false;
-
-    const max_start = haystack.len - needle.len + 1;
-    for (0..max_start) |i| {
-        var matches = true;
-        for (0..needle.len) |j| {
-            const h = haystack[i + j];
-            const n = needle[j];
-            const h_lower = if (h >= 'A' and h <= 'Z') h + 32 else h;
-            const n_lower = if (n >= 'A' and n <= 'Z') n + 32 else n;
-            if (h_lower != n_lower) {
-                matches = false;
-                break;
-            }
-        }
-        if (matches) return true;
-    }
-    return false;
-}
-
 /// Map SocketError to ResponseError.
 /// TigerStyle S6: Explicit error handling, no catch {}.
 fn mapSocketError(err: SocketError) ResponseError {
@@ -392,21 +417,6 @@ test "findHeaderEnd returns null when not found" {
     try std.testing.expect(findHeaderEnd("HTTP/1.1 200 OK\r\n") == null);
     try std.testing.expect(findHeaderEnd("\r\n") == null);
     try std.testing.expect(findHeaderEnd("\r\n\r") == null);
-}
-
-test "containsIgnoreCase matches" {
-    try std.testing.expect(containsIgnoreCase("chunked", "chunked"));
-    try std.testing.expect(containsIgnoreCase("CHUNKED", "chunked"));
-    try std.testing.expect(containsIgnoreCase("Chunked", "chunked"));
-    try std.testing.expect(containsIgnoreCase("gzip, chunked", "chunked"));
-    try std.testing.expect(containsIgnoreCase("chunked, gzip", "chunked"));
-    try std.testing.expect(containsIgnoreCase("abc", ""));
-}
-
-test "containsIgnoreCase no match" {
-    try std.testing.expect(!containsIgnoreCase("gzip", "chunked"));
-    try std.testing.expect(!containsIgnoreCase("", "chunked"));
-    try std.testing.expect(!containsIgnoreCase("chunk", "chunked"));
 }
 
 test "determineBodyFraming 1xx has no body" {

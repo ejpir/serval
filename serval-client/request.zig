@@ -10,6 +10,7 @@ const assert = std.debug.assert;
 const serval_core = @import("serval-core");
 const config = serval_core.config;
 const types = serval_core.types;
+const eqlIgnoreCase = serval_core.eqlIgnoreCase;
 
 const Request = types.Request;
 const Method = types.Method;
@@ -65,20 +66,6 @@ pub fn isHopByHopHeader(name: []const u8) bool {
         if (eqlIgnoreCase(name, hop_header)) return true;
     }
     return false;
-}
-
-/// Case-insensitive string comparison for header names.
-/// TigerStyle: Bounded loop over string length.
-pub fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-
-    // TigerStyle: Loop bounded by string length (checked at entry)
-    for (a, b) |ac, bc| {
-        const lower_a = if (ac >= 'A' and ac <= 'Z') ac + 32 else ac;
-        const lower_b = if (bc >= 'A' and bc <= 'Z') bc + 32 else bc;
-        if (lower_a != lower_b) return false;
-    }
-    return true;
 }
 
 // =============================================================================
@@ -239,37 +226,6 @@ test "methodToString - all HTTP methods" {
     try std.testing.expectEqualStrings("OPTIONS", methodToString(.OPTIONS));
     try std.testing.expectEqualStrings("TRACE", methodToString(.TRACE));
     try std.testing.expectEqualStrings("PATCH", methodToString(.PATCH));
-}
-
-test "eqlIgnoreCase - exact match" {
-    try std.testing.expect(eqlIgnoreCase("Connection", "Connection"));
-    try std.testing.expect(eqlIgnoreCase("Host", "Host"));
-    try std.testing.expect(eqlIgnoreCase("a", "a"));
-}
-
-test "eqlIgnoreCase - case insensitive" {
-    try std.testing.expect(eqlIgnoreCase("CONNECTION", "connection"));
-    try std.testing.expect(eqlIgnoreCase("connection", "CONNECTION"));
-    try std.testing.expect(eqlIgnoreCase("CoNnEcTiOn", "cOnNeCtIoN"));
-    try std.testing.expect(eqlIgnoreCase("HOST", "host"));
-    try std.testing.expect(eqlIgnoreCase("Content-Type", "content-type"));
-}
-
-test "eqlIgnoreCase - different strings" {
-    try std.testing.expect(!eqlIgnoreCase("Host", "Connection"));
-    try std.testing.expect(!eqlIgnoreCase("Hosts", "Host"));
-    try std.testing.expect(!eqlIgnoreCase("Accept", "Content-Type"));
-}
-
-test "eqlIgnoreCase - different lengths" {
-    try std.testing.expect(!eqlIgnoreCase("Host", "Hos"));
-    try std.testing.expect(!eqlIgnoreCase("Ho", "Host"));
-    try std.testing.expect(!eqlIgnoreCase("", "a"));
-    try std.testing.expect(!eqlIgnoreCase("a", ""));
-}
-
-test "eqlIgnoreCase - empty strings" {
-    try std.testing.expect(eqlIgnoreCase("", ""));
 }
 
 test "isHopByHopHeader - RFC 7230 hop-by-hop headers" {
