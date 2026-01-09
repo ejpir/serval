@@ -6,7 +6,7 @@
 > Gateway translates HTTPRoute resources to Router config via the translator module.
 > Runtime config updates are pushed to router_example via `pushConfigToDataPlane()`.
 
-Kubernetes Gateway API ingress controller for serval.
+Kubernetes Gateway API ingress controller for serval — can be used as an **AWS ALB Controller replacement**.
 
 ## What is this?
 
@@ -22,39 +22,118 @@ Gateway API is the newer, more expressive replacement for the Ingress API:
 | URL rewriting | Annotations | Native |
 | TLS per-route | No | Yes |
 
-## Architecture
+## Architecture Overview
+
+serval-gateway follows a **control plane / data plane separation**:
 
 ```
-                                    ┌─────────────────────────────────────────┐
-                                    │           serval-gateway                │
-                                    │                                         │
-┌─────────────┐                     │  ┌─────────────┐    ┌───────────────┐  │
-│  K8s API    │──watch──────────────┼─▶│  Watcher    │───▶│ serval-router │──┼───▶ Backend Pods
-│             │                     │  │  (control)  │    │ (data plane)  │  │
-└─────────────┘                     │  └─────────────┘    └───────────────┘  │
-      │                             │                            │            │
-      ▼                             │                     Admin API (9901)    │
- Gateway API Resources              │                     - /healthz          │
- - GatewayClass                     │                     - /readyz           │
- - Gateway                          │                     - /config           │
- - HTTPRoute                        │                     - /metrics          │
- - Services/Endpoints               │                     - /reload           │
- - Secrets (TLS)                    └─────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────┐
+│                 serval-gateway (Control Plane)                 │
+│                                                                │
+│  k8s/client.zig        k8s/watcher.zig         gateway.zig    │
+│  ┌──────────────┐     ┌───────────────┐     ┌──────────────┐  │
+│  │ K8s HTTP     │     │ Watch Loop    │     │ Translate    │  │
+│  │ - Bearer auth│────▶│ - Gateway     │────▶│ GatewayConfig│  │
+│  │ - TLS        │     │ - HTTPRoute   │     │ to Routes    │  │
+│  │ - SA token   │     │ - Service     │     │              │  │
+│  └──────────────┘     │ - Endpoints   │     │ Push to      │──┼──▶
+│                       │ - Secrets     │     │ Data Plane   │  │
+│                       │               │     └──────────────┘  │
+│                       │ on_config_    │                       │
+│                       │ change()      │                       │
+│                       └───────────────┘                       │
+└────────────────────────────────────────────────────────────────┘
+                                                                 │
+                          POST /routes/update                    │
+                                                                 ▼
+┌────────────────────────────────────────────────────────────────┐
+│                 router_example (Data Plane)                    │
+│                                                                │
+│    Admin API :9901 ────▶ Atomic Swap ────▶ Router             │
+│    Traffic :8080 ───────────────────────▶ Backends            │
+└────────────────────────────────────────────────────────────────┘
 ```
 
-**Control plane**: Watches Gateway API resources and translates them into routing config via the `translator` module
+### Component Breakdown
 
-**Data plane**: Uses `serval-router` (via `router_example`) to route HTTP traffic based on:
-- Hostname matching (`api.example.com`)
-- Path matching (`/api/v1/*`, exact or prefix)
-- URL rewriting (strip `/api` prefix before forwarding)
+| Component | File | Description |
+|-----------|------|-------------|
+| **K8s HTTP client** | `k8s/client.zig` | HTTP client with ServiceAccount auth |
+| **ServiceAccount auth** | `k8s/client.zig:31-33` | Bearer token from pod mount |
+| **Watch stream** | `k8s/client.zig:466-507` | WatchStream for K8s watch API |
+| **Resource watcher** | `k8s/watcher.zig` | Watches all Gateway API resource types |
+| **Event parsing** | `k8s/watcher.zig:598-631` | JSON parsing for watch events |
+| **Resource stores** | `k8s/watcher.zig:157-289` | Bounded storage for tracked resources |
+| **Reconnect backoff** | `k8s/watcher.zig:577-586` | Exponential backoff on disconnect |
+| **Config translation** | `gateway.zig:803-840` | GatewayConfig → Router Routes |
+| **Push to data plane** | `gateway.zig:442-522` | HTTP POST with retry to router_example |
 
-**Integration**: Gateway pushes config to router_example via `pushConfigToDataPlane()`:
+### Control Plane (serval-gateway)
+
+Watches Kubernetes Gateway API resources and pushes configuration to data planes:
+
+- **k8s/client.zig**: HTTP client for K8s API with ServiceAccount authentication
+  - `initInCluster()` - reads token from `/var/run/secrets/kubernetes.io/serviceaccount/token`
+  - `get()` - GET requests with Bearer auth header
+  - `watch()` - returns WatchStream for streaming events
+
+- **k8s/watcher.zig**: Resource watcher with reconnection
+  - Watches: Gateway, HTTPRoute, Service, Endpoints, Secrets
+  - Parses JSON watch events (ADDED, MODIFIED, DELETED, BOOKMARK, ERROR)
+  - `on_config_change` callback triggers reconciliation
+  - Exponential backoff on connection failure
+
+- **gateway.zig**: Config translation and data plane management
+  - `updateConfig()` - translates GatewayConfig and pushes to data plane
+  - `pushConfigToDataPlane()` - HTTP POST to router_example admin API
+  - Admin API for health/readiness probes
+
+### Data Plane (router_example)
+
+Handles actual HTTP traffic routing:
+
+- **examples/router_example.zig**: HTTP server with dynamic routing
+  - Admin API on port 9901 receives config updates
+  - Atomic double-buffered config swap (zero-downtime updates)
+  - Uses `serval-router` for path/host matching
+
+### Integration Flow
+
+```
 1. K8s watcher detects HTTPRoute/Service/Endpoints changes
-2. Translator converts Gateway API resources to Router config
-3. Resolver maps Service names to pod IP addresses
-4. Gateway POSTs JSON config to router_example admin API (port 9901)
-5. Router performs atomic config swap with double-buffering
+       │
+       ▼
+2. Watcher calls on_config_change() callback
+       │
+       ▼
+3. gateway.updateConfig() translates GatewayConfig → Routes
+       │
+       ▼
+4. gateway.pushConfigToDataPlane() POSTs JSON to router_example
+       │
+       ▼
+5. router_example performs atomic config swap (double-buffer)
+       │
+       ▼
+6. New routes take effect immediately (no restart needed)
+```
+
+## Using as AWS ALB Controller Replacement
+
+Deploy serval-gateway + router_example behind an AWS NLB for full ALB replacement:
+
+```
+Internet ──▶ NLB (TCP/TLS passthrough) ──▶ serval fleet ──▶ Backend Services
+                                               ▲
+                                        Control Plane
+                                     (watches K8s, pushes config)
+```
+
+**Advantages over AWS ALB Controller:**
+- No AWS API calls for route changes (faster updates)
+- Full control over routing logic
+- Works in any environment (not just AWS)
+- TigerStyle: zero allocation after init, bounded buffers
 
 ## Features
 

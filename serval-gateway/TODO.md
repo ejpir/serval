@@ -14,6 +14,47 @@ Status: **Data Plane Integrated** - K8s API integration works, translator and re
 - **pushConfigToDataPlane()** sends config to router_example admin API
 - **Atomic config swap** in router_example with double-buffering
 
+## Next Step: Implement `reconcile()`
+
+**File:** `serval-gateway/k8s/watcher.zig:565-574`
+
+The watcher stores raw JSON from K8s watch events but `reconcile()` currently returns an empty config:
+
+```zig
+pub fn reconcile(self: *Self) WatcherError!config.GatewayConfig {
+    // For now, return empty config.
+    // Full implementation would parse Gateway/HTTPRoute JSON and build typed config.
+    _ = self;
+    return config.GatewayConfig{
+        .gateways = &[_]config.Gateway{},
+        .http_routes = &[_]config.HTTPRoute{},
+    };
+}
+```
+
+**Required work:**
+1. Parse stored `http_routes` raw JSON → `[]HTTPRoute` typed structs
+2. Parse stored `gateways` raw JSON → `[]Gateway` typed structs
+3. Parse stored `services`/`endpoints` raw JSON → update Resolver
+4. Build complete `GatewayConfig` from parsed resources
+
+**Data flow:**
+```
+ResourceStore.items[].raw_json  (raw K8s JSON)
+        │
+        ▼
+    reconcile()  ────▶  GatewayConfig (typed structs)
+        │
+        ▼
+on_config_change() callback
+        │
+        ▼
+gateway.updateConfig()
+        │
+        ▼
+pushConfigToDataPlane()  ────▶  router_example
+```
+
 ## Shortcuts Taken
 
 ### 1. Insecure TLS (No Certificate Verification)
