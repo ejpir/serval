@@ -20,6 +20,7 @@ const core_config = core.config;
 const gw_config = @import("config.zig");
 const resolver_mod = @import("resolver.zig");
 const Resolver = resolver_mod.Resolver;
+const translator = @import("translator.zig");
 
 // ============================================================================
 // Constants (TigerStyle: Named constants with units)
@@ -84,6 +85,26 @@ pub const GatewayError = error{
     NotReady,
     /// Allocator error.
     OutOfMemory,
+};
+
+/// Errors when pushing config to data plane.
+pub const DataPlanePushError = error{
+    /// No gateway config available to push.
+    NoConfig,
+    /// Failed to translate config to JSON.
+    TranslationFailed,
+    /// HTTP request buffer overflow.
+    RequestTooLarge,
+    /// Failed to connect to data plane admin port.
+    ConnectionFailed,
+    /// Failed to send request to data plane.
+    SendFailed,
+    /// Failed to receive response from data plane.
+    ReceiveFailed,
+    /// Empty response from data plane.
+    EmptyResponse,
+    /// Data plane rejected the config (non-200 response).
+    DataPlaneRejected,
 };
 
 // ============================================================================
@@ -193,6 +214,14 @@ pub const Gateway = struct {
     /// Metrics counters.
     metrics: Metrics,
 
+    /// Data plane admin port (where router_example listens).
+    /// Default: 9901 from core_config.DEFAULT_ADMIN_PORT.
+    data_plane_admin_port: u16,
+
+    /// Current gateway configuration (for pushConfigToDataPlane).
+    /// Updated by updateConfig(), read by pushConfigToDataPlane().
+    gateway_config: ?*const gw_config.GatewayConfig,
+
     const Self = @This();
 
     /// Gateway metrics.
@@ -222,6 +251,8 @@ pub const Gateway = struct {
             .admin_thread = null,
             .running = std.atomic.Value(bool).init(false),
             .metrics = Metrics{},
+            .data_plane_admin_port = core_config.DEFAULT_ADMIN_PORT,
+            .gateway_config = null,
         };
     }
 
@@ -248,6 +279,7 @@ pub const Gateway = struct {
     ///
     /// Performs atomic swap - old config cleaned up after grace period.
     /// Thread-safe: can be called from watcher thread while admin serves requests.
+    /// Also pushes the new config to the data plane via admin API.
     pub fn updateConfig(self: *Self, cfg: *const gw_config.GatewayConfig) GatewayError!void {
         // Preconditions
         assert(cfg.gateways.len > 0 or cfg.http_routes.len > 0);
@@ -265,6 +297,9 @@ pub const Gateway = struct {
             self.metrics.config_reload_failures.fetchAdd(1, .monotonic);
             return err;
         };
+
+        // Store the gateway config reference (for pushConfigToDataPlane)
+        self.gateway_config = cfg;
 
         // Atomic swap
         const old_ptr = self.current_config.swap(@intFromPtr(new_config), .acq_rel);
@@ -287,6 +322,13 @@ pub const Gateway = struct {
             // Note: Actual grace period cleanup would need a timer or deferred task.
             // For now, cleanup happens on next updateConfig call.
         }
+
+        // Push config to data plane with retry
+        self.pushConfigToDataPlaneWithRetry() catch |err| {
+            std.log.warn("Failed to push config to data plane: {s}", .{@errorName(err)});
+            // Note: We don't fail the config update if data plane push fails.
+            // The config is stored locally and can be retried.
+        };
 
         // Postcondition
         assert(self.ready.load(.acquire));
@@ -385,6 +427,196 @@ pub const Gateway = struct {
 
         // Postcondition
         assert(!self.running.load(.acquire));
+    }
+
+    // ========================================================================
+    // Data Plane Integration
+    // ========================================================================
+
+    /// Push current config to data plane via admin API.
+    ///
+    /// Translates GatewayConfig to JSON and POSTs to http://127.0.0.1:{admin_port}/routes/update.
+    /// Uses simple blocking TCP socket (suitable for control plane).
+    ///
+    /// TigerStyle: Bounded buffers, explicit error handling, assertions.
+    pub fn pushConfigToDataPlane(self: *Self) DataPlanePushError!void {
+        // S1: Precondition - must have a config to push
+        const cfg = self.gateway_config orelse {
+            return error.NoConfig;
+        };
+
+        // Translate config to JSON
+        var json_buf: [translator.MAX_JSON_SIZE]u8 = undefined;
+        const json_len = translator.translateToJson(
+            cfg,
+            &self.resolver,
+            &json_buf,
+        ) catch |err| {
+            std.log.err("Config translation failed: {s}", .{@errorName(err)});
+            return error.TranslationFailed;
+        };
+
+        // S1: Postcondition - JSON must be non-empty
+        assert(json_len > 0);
+        const json_body = json_buf[0..json_len];
+
+        // Build HTTP request
+        // TigerStyle: Bounded buffer for request header + body reference
+        var request_header_buf: [512]u8 = undefined;
+        const request_header = std.fmt.bufPrint(
+            &request_header_buf,
+            "POST /routes/update HTTP/1.1\r\n" ++
+                "Host: 127.0.0.1:{d}\r\n" ++
+                "Content-Type: application/json\r\n" ++
+                "Content-Length: {d}\r\n" ++
+                "Connection: close\r\n" ++
+                "\r\n",
+            .{ self.data_plane_admin_port, json_len },
+        ) catch {
+            return error.RequestTooLarge;
+        };
+
+        // Connect to data plane admin port
+        const sock = self.connectToDataPlane() catch |err| {
+            std.log.err("Failed to connect to data plane at 127.0.0.1:{d}: {s}", .{
+                self.data_plane_admin_port,
+                @errorName(err),
+            });
+            return error.ConnectionFailed;
+        };
+        defer posix.close(sock);
+
+        // Send request header
+        _ = posix.write(sock, request_header) catch |err| {
+            std.log.err("Failed to send request header: {s}", .{@errorName(err)});
+            return error.SendFailed;
+        };
+
+        // Send request body (JSON)
+        _ = posix.write(sock, json_body) catch |err| {
+            std.log.err("Failed to send request body: {s}", .{@errorName(err)});
+            return error.SendFailed;
+        };
+
+        // Read response
+        var response_buf: [1024]u8 = undefined;
+        const bytes_read = posix.read(sock, &response_buf) catch |err| {
+            std.log.err("Failed to read response: {s}", .{@errorName(err)});
+            return error.ReceiveFailed;
+        };
+
+        if (bytes_read == 0) {
+            return error.EmptyResponse;
+        }
+
+        // Parse response status (simple check for "200")
+        const response = response_buf[0..bytes_read];
+        if (std.mem.indexOf(u8, response, "200") == null) {
+            std.log.err("Data plane returned non-200 response: {s}", .{
+                response[0..@min(bytes_read, 100)],
+            });
+            return error.DataPlaneRejected;
+        }
+
+        std.log.info("Successfully pushed config ({d} bytes) to data plane", .{json_len});
+    }
+
+    /// Push config to data plane with exponential backoff retry.
+    ///
+    /// Retries up to MAX_CONFIG_PUSH_RETRIES times with exponential backoff.
+    ///
+    /// TigerStyle: Bounded retries, explicit backoff calculation.
+    pub fn pushConfigToDataPlaneWithRetry(self: *Self) DataPlanePushError!void {
+        var attempt: u8 = 0;
+        var backoff_ms: u64 = core_config.CONFIG_PUSH_BACKOFF_BASE_MS;
+
+        // S3: Bounded loop with explicit limit
+        while (attempt < core_config.MAX_CONFIG_PUSH_RETRIES) : (attempt += 1) {
+            self.pushConfigToDataPlane() catch |err| {
+                std.log.warn("Config push failed (attempt {d}/{d}): {s}", .{
+                    attempt + 1,
+                    core_config.MAX_CONFIG_PUSH_RETRIES,
+                    @errorName(err),
+                });
+
+                // Check if more retries available
+                if (attempt + 1 < core_config.MAX_CONFIG_PUSH_RETRIES) {
+                    // S3: Bounded sleep with exponential backoff
+                    std.time.sleep(backoff_ms * std.time.ns_per_ms);
+                    backoff_ms = @min(backoff_ms * 2, core_config.MAX_CONFIG_PUSH_BACKOFF_MS);
+                    continue;
+                }
+
+                // Last attempt failed
+                return err;
+            };
+
+            // Success
+            return;
+        }
+
+        // Should not reach here due to return in loop
+        unreachable;
+    }
+
+    /// Connect to data plane admin port.
+    ///
+    /// Creates a TCP socket and connects to 127.0.0.1:{data_plane_admin_port}.
+    ///
+    /// TigerStyle: Explicit error handling, errdefer for cleanup.
+    fn connectToDataPlane(self: *Self) !posix.socket_t {
+        // S1: Precondition
+        assert(self.data_plane_admin_port > 0);
+
+        const sock = try posix.socket(
+            posix.AF.INET,
+            posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
+            0,
+        );
+        errdefer posix.close(sock);
+
+        // Set socket timeout for connect/read/write
+        // TigerStyle: Explicit timeout from config
+        const timeout_s: i32 = @intCast(@divFloor(
+            core_config.CONFIG_PUSH_TIMEOUT_NS,
+            std.time.ns_per_s,
+        ));
+        const timeval = posix.timeval{
+            .sec = timeout_s,
+            .usec = 0,
+        };
+
+        posix.setsockopt(
+            sock,
+            posix.SOL.SOCKET,
+            posix.SO.RCVTIMEO,
+            std.mem.asBytes(&timeval),
+        ) catch |err| {
+            std.log.warn("Failed to set SO_RCVTIMEO: {s}", .{@errorName(err)});
+        };
+
+        posix.setsockopt(
+            sock,
+            posix.SOL.SOCKET,
+            posix.SO.SNDTIMEO,
+            std.mem.asBytes(&timeval),
+        ) catch |err| {
+            std.log.warn("Failed to set SO_SNDTIMEO: {s}", .{@errorName(err)});
+        };
+
+        // Connect to localhost data plane
+        const addr = posix.sockaddr.in{
+            .family = posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, self.data_plane_admin_port),
+            .addr = std.mem.nativeToBig(u32, 0x7F000001), // 127.0.0.1
+        };
+
+        try posix.connect(sock, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
+
+        // S2: Postcondition - socket is valid and connected
+        assert(sock >= 0);
+
+        return sock;
     }
 
     /// Admin server accept loop (runs in background thread).
@@ -1003,4 +1235,39 @@ test "constants are reasonable" {
     try std.testing.expect(MAX_ROUTES <= 255);
     try std.testing.expect(MAX_POOLS <= 255);
     try std.testing.expect(MAX_UPSTREAMS_PER_POOL <= 255);
+}
+
+test "Gateway data_plane_admin_port default" {
+    var gateway = Gateway.init(std.testing.allocator);
+    defer gateway.deinit();
+
+    // Should default to core_config.DEFAULT_ADMIN_PORT
+    try std.testing.expectEqual(core_config.DEFAULT_ADMIN_PORT, gateway.data_plane_admin_port);
+}
+
+test "Gateway pushConfigToDataPlane without config returns NoConfig" {
+    var gateway = Gateway.init(std.testing.allocator);
+    defer gateway.deinit();
+
+    // No config set - should return NoConfig error
+    try std.testing.expectError(error.NoConfig, gateway.pushConfigToDataPlane());
+}
+
+test "DataPlanePushError error set" {
+    // Ensure error types are properly defined
+    const errors = [_]DataPlanePushError{
+        error.NoConfig,
+        error.TranslationFailed,
+        error.RequestTooLarge,
+        error.ConnectionFailed,
+        error.SendFailed,
+        error.ReceiveFailed,
+        error.EmptyResponse,
+        error.DataPlaneRejected,
+    };
+
+    // All errors should be valid
+    for (errors) |err| {
+        _ = @errorName(err);
+    }
 }

@@ -8,6 +8,8 @@
 // Core gateway
 const gateway_mod = @import("gateway.zig");
 pub const Gateway = gateway_mod.Gateway;
+pub const GatewayError = gateway_mod.GatewayError;
+pub const DataPlanePushError = gateway_mod.DataPlanePushError;
 pub const ADMIN_PORT = gateway_mod.ADMIN_PORT;
 
 // Configuration types
@@ -23,6 +25,10 @@ pub const k8s = @import("k8s/mod.zig");
 const resolver_mod = @import("resolver.zig");
 pub const Resolver = resolver_mod.Resolver;
 
+// Translator (Gateway API -> Router JSON)
+pub const translator = @import("translator.zig");
+pub const translateToJson = translator.translateToJson;
+
 test {
     // Run tests from all submodules
     @import("std").testing.refAllDecls(@This());
@@ -30,4 +36,5 @@ test {
     _ = config;
     _ = k8s;
     _ = resolver_mod;
+    _ = translator;
 }

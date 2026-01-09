@@ -75,6 +75,12 @@ pub const DIRECT_RESPONSE_BUFFER_SIZE_BYTES: u32 = 8192;
 /// TigerStyle: Explicit limit, prevents unbounded formatting.
 pub const DIRECT_RESPONSE_HEADER_SIZE_BYTES: u32 = 1024;
 
+/// Buffer size for reading request body in direct response handlers.
+/// Only allocated when handler implements onRequest hook.
+/// Bodies larger than this receive 413 Payload Too Large response.
+/// TigerStyle: Stack-safe size (64KB), bounded.
+pub const DIRECT_REQUEST_BODY_SIZE_BYTES: u32 = 65536;
+
 // =============================================================================
 // Connection Pool Limits
 // =============================================================================
@@ -100,6 +106,11 @@ pub const MAX_ROUTES: u8 = 128;
 /// Maximum upstreams per pool.
 /// TigerStyle: Bounded array per pool.
 pub const MAX_UPSTREAMS_PER_POOL: u8 = 64;
+
+/// Maximum string storage for router config in bytes (64KB).
+/// For route names, paths, pool names, upstream hosts.
+/// TigerStyle: Bounded buffer for all config strings, avoids use-after-free.
+pub const ROUTER_STRING_STORAGE_BYTES: u32 = 64 * 1024;
 
 // =============================================================================
 // Type Aliases for Bounds (TigerStyle: Single source of truth)
@@ -236,6 +247,51 @@ pub const DNS_DEFAULT_TTL_NS: u64 = 60 * std.time.ns_per_s;
 
 /// DNS resolution timeout in nanoseconds (5 seconds).
 pub const DNS_TIMEOUT_NS: u64 = 5 * std.time.ns_per_s;
+
+// =============================================================================
+// Admin API Configuration (for reconfigurable data planes)
+// =============================================================================
+
+/// Default admin API port for data plane management.
+pub const DEFAULT_ADMIN_PORT: u16 = 9901;
+
+/// Maximum request body size for admin API endpoints (1MB).
+pub const MAX_ADMIN_REQUEST_BYTES: u32 = 1024 * 1024;
+
+/// Maximum response body size for admin API endpoints (1MB).
+pub const MAX_ADMIN_RESPONSE_BYTES: u32 = 1024 * 1024;
+
+/// Admin request read timeout in nanoseconds (5 seconds).
+pub const ADMIN_READ_TIMEOUT_NS: u64 = 5 * std.time.ns_per_s;
+
+/// Admin response write timeout in nanoseconds (5 seconds).
+pub const ADMIN_WRITE_TIMEOUT_NS: u64 = 5 * std.time.ns_per_s;
+
+/// Maximum accept iterations per cycle for admin server.
+pub const MAX_ADMIN_ACCEPT_ITERATIONS: u32 = 100;
+
+// =============================================================================
+// Dynamic Configuration Updates
+// =============================================================================
+
+/// Grace period after config swap before old config cleanup (milliseconds).
+/// Allows in-flight requests using old config to complete.
+pub const CONFIG_SWAP_GRACE_MS: u64 = 1000;
+
+/// Number of router slots for atomic double-buffering.
+pub const MAX_ROUTER_SLOTS: u8 = 2;
+
+/// Maximum retries for pushing config to data plane.
+pub const MAX_CONFIG_PUSH_RETRIES: u8 = 3;
+
+/// Timeout for config push to data plane in nanoseconds (5 seconds).
+pub const CONFIG_PUSH_TIMEOUT_NS: u64 = 5 * std.time.ns_per_s;
+
+/// Base delay for exponential backoff on config push retry (milliseconds).
+pub const CONFIG_PUSH_BACKOFF_BASE_MS: u64 = 100;
+
+/// Maximum backoff delay for config push retry (milliseconds).
+pub const MAX_CONFIG_PUSH_BACKOFF_MS: u64 = 5000;
 
 // =============================================================================
 // HTTP Client

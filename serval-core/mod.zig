@@ -43,6 +43,8 @@ pub const ErrorContext = errors.ErrorContext;
 // Context
 pub const context = @import("context.zig");
 pub const Context = context.Context;
+pub const BodyReader = context.BodyReader;
+pub const BodyReadError = context.BodyReadError;
 
 // Handler hook verification
 pub const hooks = @import("hooks.zig");

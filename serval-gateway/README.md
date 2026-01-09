@@ -1,10 +1,10 @@
 # serval-gateway
 
-> **Status: Work In Progress**
+> **Status: Data Plane Integration Implemented**
 >
-> The control plane (K8s watcher) is functional but needs code review and cleanup.
-> The data plane currently uses `serval-router` with hardcoded config via `deploy/serval-router.yaml`.
-> Runtime config updates from K8s watches are not yet implemented.
+> Control plane (K8s watcher) and data plane (router_example) are integrated.
+> Gateway translates HTTPRoute resources to Router config via the translator module.
+> Runtime config updates are pushed to router_example via `pushConfigToDataPlane()`.
 
 Kubernetes Gateway API ingress controller for serval.
 
@@ -42,12 +42,19 @@ Gateway API is the newer, more expressive replacement for the Ingress API:
  - Secrets (TLS)                    └─────────────────────────────────────────┘
 ```
 
-**Control plane**: Watches Gateway API resources and translates them into routing config
+**Control plane**: Watches Gateway API resources and translates them into routing config via the `translator` module
 
-**Data plane**: Uses `serval-router` to route HTTP traffic based on:
+**Data plane**: Uses `serval-router` (via `router_example`) to route HTTP traffic based on:
 - Hostname matching (`api.example.com`)
 - Path matching (`/api/v1/*`, exact or prefix)
 - URL rewriting (strip `/api` prefix before forwarding)
+
+**Integration**: Gateway pushes config to router_example via `pushConfigToDataPlane()`:
+1. K8s watcher detects HTTPRoute/Service/Endpoints changes
+2. Translator converts Gateway API resources to Router config
+3. Resolver maps Service names to pod IP addresses
+4. Gateway POSTs JSON config to router_example admin API (port 9901)
+5. Router performs atomic config swap with double-buffering
 
 ## Features
 
@@ -79,7 +86,67 @@ gateway.k8s.EventType     // Watch event types (ADDED, MODIFIED, DELETED)
 
 // Resolution
 gateway.Resolver          // Service/Secret resolver
+
+// Translation (Gateway API -> Router config)
+gateway.translator.TranslatedConfig     // Output config for router_example
+gateway.translator.TranslatedRoute      // Single route configuration
+gateway.translator.TranslatedPool       // Backend pool with upstreams
+gateway.translator.translateConfig      // Main translation function
 ```
+
+## Translator Module
+
+The translator converts Gateway API resources into Router-compatible configuration:
+
+```zig
+// serval-gateway/translator.zig
+
+// Translate HTTPRoutes to router config
+pub fn translateConfig(
+    gw_config: *const GatewayConfig,
+    resolver: *const Resolver,
+) TranslateError!TranslatedConfig
+
+// Output structures match router_example admin API format
+pub const TranslatedConfig = struct {
+    routes: [MAX_ROUTES]TranslatedRoute,
+    route_count: u32,
+    pools: [MAX_POOLS]TranslatedPool,
+    pool_count: u32,
+    default_route: TranslatedRoute,
+};
+```
+
+**Translation rules:**
+- HTTPRoute path matches -> Route path_prefix
+- HTTPRoute hostnames -> Route host filter
+- URLRewrite filter -> Route strip_prefix flag
+- BackendRef -> Pool with resolved pod IPs
+
+## pushConfigToDataPlane Flow
+
+When K8s resources change, gateway pushes config to router_example:
+
+```
+1. Watcher callback fires (HTTPRoute/Service change)
+       |
+       v
+2. translateConfig(gw_config, resolver) -> TranslatedConfig
+       |
+       v
+3. serializeConfig(config) -> JSON bytes
+       |
+       v
+4. POST http://127.0.0.1:9901/routes/update
+       |
+       v
+5. router_example performs atomic swap (double-buffer)
+```
+
+**Retry behavior:**
+- 3 retry attempts with exponential backoff
+- Base delay: 100ms, max delay: 5000ms
+- On failure: keep previous config, log warning
 
 ## Usage
 
@@ -204,6 +271,9 @@ See `deploy/examples/` for example Gateway and HTTPRoute resources:
 | Admin API | Implemented |
 | Atomic config swap | Implemented |
 | Watch reconnection | Implemented |
+| **Translator module** | **Implemented** |
+| **pushConfigToDataPlane()** | **Implemented** |
+| **Resolver integration** | **Implemented** |
 | TLS termination | Planned |
 | Header matching | Planned |
 | Request/Response header modification | Planned |

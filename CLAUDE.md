@@ -153,6 +153,46 @@
     <reject>Implicit behavior (make all defaults explicit)</reject>
   </rejection-criteria>
 
+  <completion-gate>
+    <CRITICAL>BEFORE saying "ready to commit", "done", or "all tests pass", you MUST output this verification block:</CRITICAL>
+
+    <required-output>
+      ## Completion Verification
+
+      ### Files Changed
+      [List EVERY modified file from git status]
+
+      ### Each File Reviewed
+      | File | TigerStyle | Tests | Docs |
+      |------|-----------|-------|------|
+      | path/to/file.zig | ✓ S1-S7, P1-P4, C1-C5, Y1-Y6 checked | ✓ or N/A | ✓ or N/A |
+
+      ### Verification Commands Run
+      ```
+      zig build              # Exit code: 0
+      zig build test         # Exit code: 0
+      ```
+
+      ### Checklist
+      - [ ] All TigerStyle rules checked (not delegated to subagent without verification)
+      - [ ] All modified files listed and reviewed
+      - [ ] Tests pass (with actual output shown)
+      - [ ] README.md updated for affected modules
+      - [ ] No usize where bounded type would work
+      - [ ] No catch {}
+      - [ ] Assertions in every function (~2 per function)
+    </required-output>
+
+    <forbidden>
+      DO NOT use phrases like "ready to commit", "done", "all set", "looks good"
+      without FIRST outputting the verification block above.
+
+      DO NOT trust subagent reviews without spot-checking their findings yourself.
+
+      DO NOT declare completion after fixing an issue - re-verify the ENTIRE changeset.
+    </forbidden>
+  </completion-gate>
+
   <examples>
     <bad-example>
       // BAD: Missing timeout, no assertions, catch {}

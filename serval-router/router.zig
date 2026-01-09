@@ -68,7 +68,8 @@ pub const Router = struct {
     /// Initialize router with routes and backend pools.
     ///
     /// TigerStyle C3: Out-pointer for stable addresses (LbHandler has prober thread).
-    /// Caller must ensure routes and pool_configs remain valid for Router lifetime.
+    /// IMPORTANT: Caller must ensure routes, pool_configs, and all referenced strings
+    /// remain valid for the lifetime of this Router instance.
     ///
     /// Arguments:
     ///   self: Out-pointer for Router instance (caller owns storage).
@@ -124,10 +125,11 @@ pub const Router = struct {
             }
         }
 
+        // Store route pointers (caller ensures data remains valid).
         self.routes = routes;
         self.default_route = default_route;
 
-        // Initialize pools with embedded LbHandlers
+        // Initialize pools with embedded LbHandlers.
         var initialized_count: usize = 0;
         errdefer {
             // Cleanup already-initialized pools on error
@@ -151,6 +153,7 @@ pub const Router = struct {
         self.pools = self.pool_storage[0..pool_configs.len];
 
         // Postconditions
+        assert(self.routes.len == routes.len); // S2: All routes copied
         assert(self.pools.len == pool_configs.len); // S2: All pools initialized
         assert(self.pools.len > 0); // S2: At least one pool
     }

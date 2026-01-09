@@ -54,6 +54,7 @@ const getBodyLength = reader.getBodyLength;
 const Request = types.Request;
 const Response = types.Response;
 const Context = context.Context;
+const BodyReader = context.BodyReader;
 const Config = config.Config;
 const posix = std.posix;
 
@@ -69,6 +70,7 @@ const ConnectionInfo = types.ConnectionInfo;
 // Buffer sizes from centralized config
 const REQUEST_BUFFER_SIZE_BYTES = config.REQUEST_BUFFER_SIZE_BYTES;
 const DIRECT_RESPONSE_BUFFER_SIZE_BYTES = config.DIRECT_RESPONSE_BUFFER_SIZE_BYTES;
+const DIRECT_REQUEST_BODY_SIZE_BYTES = config.DIRECT_REQUEST_BODY_SIZE_BYTES;
 
 // =============================================================================
 // Server
@@ -218,6 +220,26 @@ pub fn Server(
         // I/O Wrapper Functions (TLS or Plain)
         // TigerStyle: Abstract TLS vs plain socket I/O
         // =========================================================================
+
+        /// Context for BodyReader read operations.
+        /// Captures all state needed to read from TLS or plain socket.
+        /// TigerStyle: Stack-allocated, no runtime allocation.
+        const BodyReadContext = struct {
+            maybe_tls: ?*TLSStream,
+            io: *Io,
+            stream: Io.net.Stream,
+        };
+
+        /// Read function for BodyReader - reads from TLS or plain socket.
+        /// This function signature matches BodyReader.read_fn.
+        /// TigerStyle: Type-erased wrapper for connectionRead.
+        fn bodyReadFn(ctx_ptr: *anyopaque, buf: []u8) ?usize {
+            // S1: Preconditions (buf.len checked in connectionRead)
+            assert(@intFromPtr(ctx_ptr) != 0);
+
+            const ctx: *BodyReadContext = @ptrCast(@alignCast(ctx_ptr));
+            return connectionRead(ctx.maybe_tls, ctx.io, ctx.stream, buf);
+        }
 
         /// Read from connection (TLS or plain).
         /// TigerStyle: Runtime dispatch based on TLS availability.
@@ -592,6 +614,10 @@ pub fn Server(
                 std.mem.zeroes([DIRECT_RESPONSE_BUFFER_SIZE_BYTES]u8)
             else {};
 
+            // Note: Request body buffer removed - handlers use ctx.readBody() with their own buffer.
+            // This enables lazy body reading - body only read when handler explicitly requests it.
+            // TigerStyle: Caller provides buffer, bounded by Content-Length.
+
             while (request_count < cfg.max_requests_per_connection) {
                 request_count += 1;
                 ctx.reset();
@@ -650,6 +676,42 @@ pub fn Server(
 
                 // Call onRequest hook if present
                 if (comptime has_on_request) {
+                    // Set up lazy body reader for handlers to read body on demand.
+                    // Industry standard pattern: body only read when handler explicitly requests it.
+                    // TigerStyle: No eager reading, bounded by Content-Length when read.
+                    const body_length_for_offset = getBodyLength(&parser.request);
+
+                    // Calculate initial body bytes already in recv_buf (after headers)
+                    const headers_end = parser.headers_end;
+                    const data_after_headers = buffer_len - buffer_offset - headers_end;
+                    const initial_body_bytes: u64 = switch (parser.body_framing) {
+                        .content_length => |cl| @min(data_after_headers, cl),
+                        .chunked => data_after_headers,
+                        .none => 0,
+                    };
+
+                    // Set up BodyReadContext for the read function
+                    var body_read_ctx = BodyReadContext{
+                        .maybe_tls = maybe_tls_ptr,
+                        .io = &io_mut,
+                        .stream = stream,
+                    };
+
+                    // Set up BodyReader with lazy read capability
+                    var body_reader = BodyReader{
+                        .framing = parser.body_framing,
+                        .bytes_already_read = initial_body_bytes,
+                        .initial_body = if (initial_body_bytes > 0)
+                            recv_buf[buffer_offset + headers_end ..][0..@intCast(initial_body_bytes)]
+                        else
+                            &[_]u8{},
+                        .read_ctx = @ptrCast(&body_read_ctx),
+                        .read_fn = &bodyReadFn,
+                    };
+
+                    // Attach body reader to context for handler access
+                    ctx._body_reader = &body_reader;
+
                     switch (handler.onRequest(&ctx, &parser.request, &response_buf)) {
                         .continue_request => {}, // Fall through to selectUpstream
                         .send_response => |resp| {
@@ -658,8 +720,7 @@ pub fn Server(
                             const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
                             metrics.requestEnd(resp.status, duration_ns);
                             tracer.endSpan(span_handle, null);
-                            const body_length = getBodyLength(&parser.request);
-                            buffer_offset += parser.headers_end + body_length;
+                            buffer_offset += parser.headers_end + body_length_for_offset;
                             continue;
                         },
                         .reject => |reject| {
@@ -668,8 +729,7 @@ pub fn Server(
                             const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
                             metrics.requestEnd(reject.status, duration_ns);
                             tracer.endSpan(span_handle, reject.reason);
-                            const body_length = getBodyLength(&parser.request);
-                            buffer_offset += parser.headers_end + body_length;
+                            buffer_offset += parser.headers_end + body_length_for_offset;
                             continue;
                         },
                     }

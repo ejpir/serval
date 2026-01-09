@@ -74,6 +74,7 @@ const custom = headers.get("X-Custom");    // ?[]const u8
 
 ### Context
 - `Context` - Per-request context (timing, bytes, upstream, status)
+- `BodyReader` - Lazy request body reader for `onRequest` hooks
 
 ### Observability Types
 - `ConnectionInfo` - Client connection info for logging hooks
@@ -231,6 +232,30 @@ pub const DirectResponse = struct {
 
 **Note:** The `body` slice must reference memory in the `response_buf` parameter provided to the hook. The server owns this buffer and will send its contents after the hook returns.
 
+## BodyReader
+
+Lazy request body reading for `onRequest` hooks. The body is only read when explicitly requested via `ctx.readBody()`.
+
+```zig
+fn onRequest(ctx: *Context, request: *Request, response_buf: []u8) Action {
+    // Read body into caller-provided buffer (lazy - only reads if called)
+    var body_buf: [8192]u8 = undefined;
+    const body = ctx.readBody(&body_buf) catch |err| {
+        return .{ .reject = .{ .status = 400, .reason = "Failed to read body" } };
+    };
+
+    // Process body...
+    return .continue_request;
+}
+```
+
+**TigerStyle:** Industry-standard lazy evaluation pattern. Body is only read when handler needs it, avoiding unnecessary I/O for handlers that don't inspect bodies.
+
+**Errors:**
+- `BodyTooLarge` - Body exceeds `DIRECT_REQUEST_BODY_SIZE_BYTES` (64KB default)
+- `ReadFailed` - Network read error
+- `ChunkedNotSupported` - Chunked transfer encoding not yet supported for direct body reading
+
 ## Usage
 
 ```zig
@@ -248,6 +273,7 @@ const upstream = core.Upstream{ .host = "127.0.0.1", .port = 8080, .idx = 0 };
 | Config | ✅ Complete |
 | Errors | ✅ Complete |
 | Context | ✅ Complete |
+| BodyReader | ✅ Complete |
 | Logging | ✅ Complete |
 | Hook verification | ✅ Complete |
 

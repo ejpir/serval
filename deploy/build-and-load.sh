@@ -15,7 +15,7 @@ cd "$PROJECT_DIR"
 
 build_router() {
     echo "=== Building router ==="
-    zig build build-router-example
+    zig build -Doptimize=ReleaseFast build-router-example
     sudo docker build -f deploy/Dockerfile.router -t serval-router:latest .
     sudo docker save serval-router:latest | sudo k3s ctr images import -
     echo "Router image loaded"
@@ -23,7 +23,7 @@ build_router() {
 
 build_gateway() {
     echo "=== Building gateway ==="
-    zig build build-gateway-example
+    zig build -Doptimize=ReleaseFast build-gateway-example
     sudo docker build -f deploy/Dockerfile.gateway -t serval-gateway:latest .
     sudo docker save serval-gateway:latest | sudo k3s ctr images import -
     echo "Gateway image loaded"
@@ -31,7 +31,7 @@ build_gateway() {
 
 build_echo() {
     echo "=== Building echo-backend ==="
-    zig build
+    zig build -Doptimize=ReleaseFast
     sudo docker build -f deploy/Dockerfile.echo-backend -t echo-backend:latest .
     sudo docker save echo-backend:latest | sudo k3s ctr images import -
     echo "Echo-backend image loaded"

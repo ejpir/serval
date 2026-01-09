@@ -54,6 +54,8 @@ pub const LogEntry = core.LogEntry;
 // Context
 pub const context = core.context;
 pub const Context = core.Context;
+pub const BodyReader = core.BodyReader;
+pub const BodyReadError = core.BodyReadError;
 
 // Handler hook verification
 pub const hooks = core.hooks;

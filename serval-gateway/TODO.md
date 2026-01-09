@@ -1,6 +1,6 @@
 # serval-gateway TODO
 
-Status: **Proof of Concept** - K8s API integration works, data plane not implemented.
+Status: **Data Plane Integrated** - K8s API integration works, translator and resolver connected to router_example.
 
 ## What Works
 
@@ -9,6 +9,10 @@ Status: **Proof of Concept** - K8s API integration works, data plane not impleme
 - Admin API server responds to health probes (`/healthz`, `/readyz`)
 - TLS connection to K8s API using serval-tls (userspace mode)
 - Runs in k3s with proper RBAC permissions
+- **Translator module** converts HTTPRoute to Router config
+- **Resolver integration** maps Service names to pod IPs
+- **pushConfigToDataPlane()** sends config to router_example admin API
+- **Atomic config swap** in router_example with double-buffering
 
 ## Shortcuts Taken
 
@@ -45,13 +49,13 @@ gw.ready.store(true, .release);
 **Reason:** Watcher callback doesn't update gateway state.
 **Fix:** Wire up watcher → gateway config updates properly. Mark ready only after first successful config sync.
 
-### 5. No Data Plane
-The gateway watches K8s API but doesn't route any traffic.
-**Fix:** See "Data Plane Implementation" below.
+### ~~5. No Data Plane~~ RESOLVED
+~~The gateway watches K8s API but doesn't route any traffic.~~
+**Status:** Data plane integration implemented via translator + pushConfigToDataPlane().
 
-### 6. Service Resolution Not Implemented
-HTTPRoute references Services by name, but we don't resolve to ClusterIP/Endpoints.
-**Fix:** Watch Services and Endpoints resources, resolve backend refs to actual IPs.
+### ~~6. Service Resolution Not Implemented~~ RESOLVED
+~~HTTPRoute references Services by name, but we don't resolve to ClusterIP/Endpoints.~~
+**Status:** Resolver integration implemented - maps Service names to pod IPs via Endpoints.
 
 ### 7. Admin Server Binds to 0.0.0.0
 **File:** `serval-gateway/gateway.zig:342`
@@ -62,22 +66,28 @@ HTTPRoute references Services by name, but we don't resolve to ClusterIP/Endpoin
 
 ### High Priority
 
-#### Data Plane Implementation
-1. Add serval-server to gateway_example for HTTP traffic
-2. Translate HTTPRoute → serval-router routes dynamically
-3. Watch Endpoints to get pod IPs for backends
-4. Support path rewriting (`URLRewrite` filter)
-5. Support header matching/modification
+#### ~~Data Plane Implementation~~ COMPLETED
+~~1. Add serval-server to gateway_example for HTTP traffic~~
+~~2. Translate HTTPRoute → serval-router routes dynamically~~
+~~3. Watch Endpoints to get pod IPs for backends~~
+~~4. Support path rewriting (`URLRewrite` filter)~~
+~~5. Support header matching/modification~~
+
+**Status:** Implemented via:
+- `serval-gateway/translator.zig` - HTTPRoute to Router config translation
+- `serval-gateway/gateway.zig:pushConfigToDataPlane()` - Config push to router_example
+- `router_example.zig` - Admin API with atomic config swap
+- Resolver integration for Service -> pod IP resolution
 
 ```
 ┌─────────────┐     ┌──────────────────┐     ┌─────────────┐
-│   Client    │────▶│  serval-gateway  │────▶│   Backend   │
+│   Client    │────▶│  router_example  │────▶│   Backend   │
 │             │     │  (port 8080)     │     │   Pods      │
 └─────────────┘     └──────────────────┘     └─────────────┘
-                           │
+                           ▲
                     ┌──────┴──────┐
-                    │ serval-router│
-                    │ (dynamic)    │
+                    │serval-gateway│
+                    │(control plane)│
                     └─────────────┘
 ```
 
@@ -160,8 +170,10 @@ Current implementation polls K8s API repeatedly. Should use proper watch with:
 - [x] K8s API authentication works
 - [x] Health probes pass (pod becomes Ready)
 - [x] Watches Gateway API resources
-- [ ] Routes traffic to backends
-- [ ] Handles backend failures
-- [ ] Config updates without restart
+- [x] Routes traffic to backends (via router_example)
+- [x] Config updates without restart (atomic swap)
+- [x] Translator converts HTTPRoute to Router config
+- [x] Resolver maps Service to pod IPs
+- [ ] Handles backend failures (health probing)
 - [ ] TLS termination
 - [ ] Metrics exposed
