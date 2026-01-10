@@ -124,13 +124,30 @@ pub const Client = struct {
     /// TigerStyle: Explicit boolean, no implicit behavior.
     verify_tls: bool,
 
-    /// Initialize a new HTTP client.
+    /// Whether to enable kernel TLS offload for connections.
+    /// Default true for performance. Set false if kTLS causes EBADMSG errors
+    /// with specific servers (e.g., K8s API).
+    enable_ktls: bool,
+
+    /// Initialize a new HTTP client with kTLS enabled (default).
     /// TigerStyle S1: Assertions for preconditions.
     pub fn init(
         allocator: std.mem.Allocator,
         dns_resolver: *DnsResolver,
         client_ctx: ?*ssl.SSL_CTX,
         verify_tls: bool,
+    ) Client {
+        return initWithOptions(allocator, dns_resolver, client_ctx, verify_tls, true);
+    }
+
+    /// Initialize a new HTTP client with explicit kTLS control.
+    /// TigerStyle S1: Assertions for preconditions.
+    pub fn initWithOptions(
+        allocator: std.mem.Allocator,
+        dns_resolver: *DnsResolver,
+        client_ctx: ?*ssl.SSL_CTX,
+        verify_tls: bool,
+        enable_ktls: bool,
     ) Client {
         // S1: precondition - dns_resolver must be valid
         assert(@intFromPtr(dns_resolver) != 0);
@@ -143,6 +160,7 @@ pub const Client = struct {
             .dns_resolver = dns_resolver,
             .client_ctx = client_ctx,
             .verify_tls = verify_tls,
+            .enable_ktls = enable_ktls,
         };
     }
 
@@ -211,10 +229,16 @@ pub const Client = struct {
             };
 
             // Perform TLS handshake with SNI
-            const tls_socket = Socket.TLS.TLSSocket.initClient(
+            // Strip trailing dot from hostname for SNI (FQDN dots are not valid in SNI)
+            const sni_host = if (std.mem.endsWith(u8, upstream.host, "."))
+                upstream.host[0 .. upstream.host.len - 1]
+            else
+                upstream.host;
+            const tls_socket = Socket.TLS.TLSSocket.initClientWithOptions(
                 fd,
                 ctx,
-                upstream.host,
+                sni_host,
+                self.enable_ktls,
             ) catch {
                 posix.close(fd);
                 return ClientError.TlsHandshakeFailed;

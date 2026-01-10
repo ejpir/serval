@@ -17,6 +17,7 @@ const serval_core = @import("serval-core");
 const config = serval_core.config;
 const types = serval_core.types;
 const BodyFraming = types.BodyFraming;
+const debugLog = serval_core.debugLog;
 
 const serval_net = @import("serval-net");
 const Socket = serval_net.Socket;
@@ -418,51 +419,68 @@ pub const BodyReader = struct {
     /// Read and parse chunk size line.
     fn readChunkSize(self: *Self) BodyError!u64 {
         // Read bytes until we have a complete chunk size line
-        while (self.chunk_header_len < self.chunk_header_buf.len) {
-            // Try to parse what we have
+        // TigerStyle: Bounded loop with explicit iteration limit
+        var iterations: u32 = 0;
+        const max_iterations: u32 = 100;
+
+        while (iterations < max_iterations) : (iterations += 1) {
+            // Try to parse what we have (need at least 3 bytes: "0\r\n")
             if (self.chunk_header_len >= 3) {
                 const header_slice = self.chunk_header_buf[0..self.chunk_header_len];
-                const parse_result = parseChunkSize(header_slice) catch |err| {
-                    // If incomplete, read more
+                if (parseChunkSize(header_slice)) |parse_result| {
+                    // Successfully parsed - save unconsumed bytes
+                    const consumed = parse_result.consumed;
+                    const remaining = self.chunk_header_len - @as(u8, @intCast(consumed));
+                    if (remaining > 0) {
+                        std.mem.copyForwards(
+                            u8,
+                            self.chunk_header_buf[0..remaining],
+                            self.chunk_header_buf[consumed..self.chunk_header_len],
+                        );
+                    }
+                    self.chunk_header_len = remaining;
+
+                    return parse_result.size;
+                } else |err| {
+                    // If incomplete and buffer not full, read more
                     if (err == ChunkParseError.IncompleteChunk) {
-                        // Fall through to read more
+                        if (self.chunk_header_len >= self.chunk_header_buf.len) {
+                            // Buffer full but chunk incomplete - protocol error
+                            debugLog("chunked: buffer full, incomplete chunk", .{});
+                            return BodyError.InvalidChunkedEncoding;
+                        }
+                        // Fall through to read more data below
                     } else {
+                        // Debug: log the invalid chunk header bytes
+                        debugLog("chunked: parse error {s}, header_len={d}, bytes={any}", .{
+                            @errorName(err),
+                            self.chunk_header_len,
+                            header_slice[0..@min(header_slice.len, 32)],
+                        });
                         return BodyError.InvalidChunkedEncoding;
                     }
-                    // Need more data, continue reading
-                    const n = self.socket.read(self.chunk_header_buf[self.chunk_header_len..]) catch |sock_err| {
-                        return mapSocketError(sock_err);
-                    };
-                    if (n == 0) return BodyError.UnexpectedEof;
-                    self.chunk_header_len += @intCast(n);
-                    continue;
-                };
-
-                // Successfully parsed - save unconsumed bytes
-                const consumed = parse_result.consumed;
-                const remaining = self.chunk_header_len - @as(u8, @intCast(consumed));
-                if (remaining > 0) {
-                    std.mem.copyForwards(
-                        u8,
-                        self.chunk_header_buf[0..remaining],
-                        self.chunk_header_buf[consumed..self.chunk_header_len],
-                    );
                 }
-                self.chunk_header_len = remaining;
+            }
 
-                return parse_result.size;
+            // Check if buffer has space for more data
+            if (self.chunk_header_len >= self.chunk_header_buf.len) {
+                debugLog("chunked: buffer full before valid parse, bytes={any}", .{
+                    self.chunk_header_buf[0..@min(self.chunk_header_buf.len, 32)],
+                });
+                return BodyError.InvalidChunkedEncoding;
             }
 
             // Read more data
             const n = self.socket.read(self.chunk_header_buf[self.chunk_header_len..]) catch |err| {
+                debugLog("chunked: socket read error: {s}", .{@errorName(err)});
                 return mapSocketError(err);
             };
             if (n == 0) return BodyError.UnexpectedEof;
             self.chunk_header_len += @intCast(n);
         }
 
-        // Buffer full but no valid chunk size found
-        return BodyError.InvalidChunkedEncoding;
+        // Exceeded iteration limit
+        return BodyError.IterationLimitExceeded;
     }
 
     /// Skip CRLF after chunk data.

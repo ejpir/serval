@@ -554,19 +554,154 @@ pub const Client = struct {
         return body;
     }
 
-    /// Start a watch request to the K8s API (simplified - single response).
-    /// Returns a WatchStream for reading events.
+    /// Start a watch request to the K8s API.
+    /// Opens a streaming connection and returns a WatchStream for reading events.
+    /// The caller must call stream.close() when done.
     ///
     /// Preconditions:
     /// - path must start with '/' and include watch=true parameter
-    pub fn watch(self: *Self, path: []const u8) WatchStream {
+    ///
+    /// TigerStyle: Explicit error handling, connection ownership transferred.
+    pub fn watchStream(
+        self: *Self,
+        path: []const u8,
+        line_buffer: []u8,
+        io: Io,
+    ) ClientError!WatchStream {
+        assert(path.len > 0); // S1: path must be non-empty
+        assert(path[0] == '/'); // S1: path must start with /
+        assert(line_buffer.len > 0); // S1: buffer must have capacity
+
+        // Build request with authentication.
+        var request = Request{
+            .method = .GET,
+            .path = path,
+            .version = .@"HTTP/1.1",
+            .headers = .{},
+        };
+
+        // Add required headers.
+        request.headers.put("Host", self.api_server) catch return ClientError.HeaderError;
+
+        // Build Bearer token header.
+        const token_slice = self.token[0..self.token_len];
+        var auth_buf: [BEARER_PREFIX.len + MAX_TOKEN_SIZE_BYTES]u8 = undefined;
+        const auth_len = BEARER_PREFIX.len + token_slice.len;
+        @memcpy(auth_buf[0..BEARER_PREFIX.len], BEARER_PREFIX);
+        @memcpy(auth_buf[BEARER_PREFIX.len..auth_len], token_slice);
+        request.headers.put("Authorization", auth_buf[0..auth_len]) catch return ClientError.HeaderError;
+
+        request.headers.put("Accept", "application/json") catch return ClientError.HeaderError;
+        // Note: Do NOT set "Connection: close" - we want to keep the connection open.
+
+        // Create upstream for K8s API server.
+        const upstream = Upstream{
+            .host = self.api_server,
+            .port = self.api_port,
+            .tls = true,
+            .idx = 0,
+        };
+
+        debugLog("watcher: opening watch stream to {s}:{d} path={s}", .{
+            self.api_server,
+            self.api_port,
+            path,
+        });
+
+        // Make request using serval-client.
+        var result = self.http_client.request(upstream, &request, self.header_buffer, io) catch |err| {
+            debugLog("watcher: watch request failed: {s}", .{@errorName(err)});
+            return mapClientError(err);
+        };
+
+        debugLog("watcher: got response status {d}", .{result.response.status});
+
+        // Check status code.
+        if (result.response.status >= 400) {
+            result.conn.socket.close();
+            return ClientError.HttpError;
+        }
+
+        // Create body reader for incremental reading.
+        const body_reader = serval_client.BodyReader.init(&result.conn.socket, result.response.body_framing);
+
+        debugLog("watcher: stream opened, framing={s}", .{@tagName(result.response.body_framing)});
+
+        return WatchStream{
+            .conn = result.conn,
+            .body_reader = body_reader,
+            .line_buffer = line_buffer,
+            .line_pos = 0,
+            .done = false,
+        };
+    }
+
+    /// Start a watch request with lazy connection initialization.
+    /// Opens the connection on first readEvent() call.
+    /// The caller must call stream.close() when done to free resources.
+    ///
+    /// Preconditions:
+    /// - path must start with '/' and include watch=true parameter
+    ///
+    /// TigerStyle: Lazy initialization, explicit cleanup.
+    pub fn watch(self: *Self, path: []const u8) LazyWatchStream {
         assert(path.len > 0); // S1: path must be non-empty
         assert(path[0] == '/'); // S1: path must start with /
 
-        return WatchStream{
-            .client = self,
+        return LazyWatchStream.init(self, path, self.allocator);
+    }
+};
+
+/// Lazy watch stream that opens connection on first readEvent call.
+/// This maintains backward compatibility with existing watcher code.
+/// Allocates its own internal line buffer for proper streaming.
+pub const LazyWatchStream = struct {
+    client: *Client,
+    path: []const u8,
+    stream: ?WatchStream,
+    /// Internal line buffer for accumulating partial events.
+    /// Allocated on first readEvent, freed on close.
+    internal_buffer: ?[]u8,
+    allocator: std.mem.Allocator,
+
+    const Self = @This();
+
+    pub fn init(client: *Client, path: []const u8, allocator: std.mem.Allocator) Self {
+        return Self{
+            .client = client,
             .path = path,
+            .stream = null,
+            .internal_buffer = null,
+            .allocator = allocator,
         };
+    }
+
+    pub fn readEvent(self: *Self, buffer: []u8, io: Io) ClientError!?[]const u8 {
+        // Allocate internal buffer on first call if needed.
+        if (self.internal_buffer == null) {
+            self.internal_buffer = self.allocator.alloc(u8, MAX_WATCH_EVENT_SIZE) catch {
+                return ClientError.OutOfMemory;
+            };
+        }
+
+        // Open stream on first call.
+        if (self.stream == null) {
+            self.stream = self.client.watchStream(self.path, self.internal_buffer.?, io) catch |err| {
+                return err;
+            };
+        }
+
+        return self.stream.?.readEvent(buffer, io);
+    }
+
+    pub fn close(self: *Self) void {
+        if (self.stream) |*s| {
+            s.close();
+        }
+        if (self.internal_buffer) |buf| {
+            self.allocator.free(buf);
+            self.internal_buffer = null;
+        }
     }
 };
 
@@ -574,32 +709,137 @@ pub const Client = struct {
 // Watch Stream
 // =============================================================================
 
-/// Represents a watch stream for K8s resources.
-/// Simplified implementation - makes a new request each time.
+/// Maximum size of a single watch event line (K8s events are typically <64KB).
+const MAX_WATCH_EVENT_SIZE: u32 = 128 * 1024;
+
+/// Maximum iterations for reading chunks in a single readEvent call.
+const MAX_CHUNK_READ_ITERATIONS: u32 = 1000;
+
+/// Represents a streaming watch connection to K8s API.
+/// Maintains an open connection and reads newline-delimited JSON events.
+/// TigerStyle: Pre-allocated buffer, bounded operations.
 pub const WatchStream = struct {
-    client: *Client,
-    path: []const u8,
+    /// Connection to K8s API (owned, must be closed by caller).
+    conn: serval_client.client.Connection,
+    /// Body reader for incremental chunked reading.
+    body_reader: serval_client.BodyReader,
+    /// Buffer for accumulating partial lines.
+    line_buffer: []u8,
+    /// Current position in line_buffer (data from 0..line_pos).
+    line_pos: u32,
+    /// Whether the stream has ended.
+    done: bool,
 
     const Self = @This();
 
-    /// Read events from the watch stream.
-    /// Returns the raw JSON response, or null if stream ended.
-    /// Requires an Io runtime for async operations.
+    /// Read the next event from the watch stream.
+    /// Returns a complete JSON line (one event), or null if stream ended.
+    /// The returned slice points into the provided buffer.
+    ///
+    /// TigerStyle: Bounded iterations, explicit error handling.
     pub fn readEvent(self: *Self, buffer: []u8, io: Io) ClientError!?[]const u8 {
         assert(buffer.len > 0); // S1: buffer must have capacity
+        _ = io; // Io runtime is embedded in connection's socket
 
-        // Make GET request (simplified - not true streaming)
-        const response = self.client.get(self.path, io) catch |err| {
-            return err;
-        };
+        if (self.done) return null;
 
-        if (response.len == 0) return null;
+        // Check if we already have a complete line in the buffer.
+        if (self.findNewline()) |newline_pos| {
+            return self.extractLine(buffer, newline_pos);
+        }
 
-        // Copy to provided buffer
-        const copy_len = @min(response.len, buffer.len);
-        @memcpy(buffer[0..copy_len], response[0..copy_len]);
+        // Read more data until we get a complete line.
+        var iterations: u32 = 0;
+        while (iterations < MAX_CHUNK_READ_ITERATIONS) : (iterations += 1) {
+            // Read next chunk from body.
+            const remaining_space = self.line_buffer.len - self.line_pos;
+            if (remaining_space == 0) {
+                // Buffer full but no newline found - event too large.
+                debugLog("watcher: event exceeds buffer size", .{});
+                return ClientError.ResponseTooLarge;
+            }
 
-        return buffer[0..copy_len];
+            const chunk = self.body_reader.readChunk(self.line_buffer[self.line_pos..]) catch |err| {
+                debugLog("watcher: chunk read error: {s}", .{@errorName(err)});
+                self.done = true;
+                return switch (err) {
+                    error.UnexpectedEof => null, // Stream ended gracefully.
+                    error.BufferTooSmall => ClientError.ResponseTooLarge,
+                    error.InvalidChunkedEncoding => ClientError.ResponseParseFailed,
+                    error.ChunkTooLarge => ClientError.ResponseTooLarge,
+                    error.ReadFailed => ClientError.RequestFailed,
+                    error.IterationLimitExceeded => ClientError.ReadIterationsExceeded,
+                    error.WriteFailed, error.SpliceFailed, error.PipeCreationFailed => ClientError.RequestFailed,
+                };
+            };
+
+            if (chunk) |data| {
+                self.line_pos += @intCast(data.len);
+                debugLog("watcher: read chunk len={d} total={d}", .{ data.len, self.line_pos });
+
+                // Check for complete line.
+                if (self.findNewline()) |newline_pos| {
+                    return self.extractLine(buffer, newline_pos);
+                }
+            } else {
+                // Stream ended.
+                debugLog("watcher: stream ended", .{});
+                self.done = true;
+
+                // Return any remaining data as final event (if non-empty).
+                if (self.line_pos > 0) {
+                    const len = @min(self.line_pos, @as(u32, @intCast(buffer.len)));
+                    @memcpy(buffer[0..len], self.line_buffer[0..len]);
+                    self.line_pos = 0;
+                    return buffer[0..len];
+                }
+                return null;
+            }
+        }
+
+        // Too many iterations without finding a newline.
+        debugLog("watcher: max iterations without complete event", .{});
+        return ClientError.ReadIterationsExceeded;
+    }
+
+    /// Find the position of the first newline in the buffer.
+    fn findNewline(self: *Self) ?u32 {
+        var i: u32 = 0;
+        while (i < self.line_pos) : (i += 1) {
+            if (self.line_buffer[i] == '\n') {
+                return i;
+            }
+        }
+        return null;
+    }
+
+    /// Extract a complete line from the buffer and copy to output.
+    /// Shifts remaining data to start of buffer.
+    fn extractLine(self: *Self, buffer: []u8, newline_pos: u32) []const u8 {
+        // Copy line to output buffer (excluding newline).
+        const line_len = @min(newline_pos, @as(u32, @intCast(buffer.len)));
+        @memcpy(buffer[0..line_len], self.line_buffer[0..line_len]);
+
+        // Shift remaining data to start of buffer.
+        const remaining = self.line_pos - newline_pos - 1;
+        if (remaining > 0) {
+            const src_start = newline_pos + 1;
+            // Use a loop instead of memcpy for overlapping regions.
+            var j: u32 = 0;
+            while (j < remaining) : (j += 1) {
+                self.line_buffer[j] = self.line_buffer[src_start + j];
+            }
+        }
+        self.line_pos = remaining;
+
+        debugLog("watcher: extracted event len={d} remaining={d}", .{ line_len, remaining });
+        return buffer[0..line_len];
+    }
+
+    /// Close the watch stream connection.
+    pub fn close(self: *Self) void {
+        self.conn.socket.close();
+        self.done = true;
     }
 };
 

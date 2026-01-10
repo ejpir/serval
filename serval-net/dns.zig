@@ -15,8 +15,10 @@ const std = @import("std");
 const Io = std.Io;
 const assert = std.debug.assert;
 
-const config = @import("serval-core").config;
-const time = @import("serval-core").time;
+const serval_core = @import("serval-core");
+const config = serval_core.config;
+const time = serval_core.time;
+const debugLog = serval_core.debugLog;
 
 // =============================================================================
 // Errors
@@ -193,6 +195,8 @@ pub const DnsResolver = struct {
         // Cache miss - resolve (outside lock to avoid blocking other threads)
         const start_ns = time.monotonicNanos();
         const address = self.doResolve(hostname, port, io) catch |err| {
+            // Log actual error for debugging
+            debugLog("DNS resolve failed for '{s}': {s}", .{ hostname, @errorName(err) });
             // Map HostName errors to DnsError
             return switch (err) {
                 error.UnknownHostName,
@@ -323,18 +327,29 @@ pub const DnsResolver = struct {
 
         // First try parsing as IP address directly (common case for upstreams)
         if (Io.net.IpAddress.parse(hostname, port)) |addr| {
+            debugLog("DNS: '{s}' parsed as IP address directly", .{hostname});
             return addr;
         } else |_| {
             // Not a numeric IP, proceed with DNS lookup
         }
 
+        // Debug: Read and log resolv.conf contents
+        logResolvConf(io);
+
+        debugLog("DNS: starting lookup for '{s}' port={d}", .{ hostname, port });
+
         // Create HostName for DNS lookup
-        const host = try Io.net.HostName.init(hostname);
+        const host = Io.net.HostName.init(hostname) catch |err| {
+            std.log.err("DNS: HostName.init failed for '{s}': {s}", .{ hostname, @errorName(err) });
+            return err;
+        };
 
         // Use lookup to get addresses
         var canonical_name_buffer: [Io.net.HostName.max_len]u8 = undefined;
         var lookup_buffer: [16]Io.net.HostName.LookupResult = undefined;
         var lookup_queue: Io.Queue(Io.net.HostName.LookupResult) = .init(&lookup_buffer);
+
+        debugLog("DNS: calling Io.net.HostName.lookup", .{});
 
         // Start async lookup
         var lookup_future = io.async(Io.net.HostName.lookup, .{
@@ -348,20 +363,67 @@ pub const DnsResolver = struct {
         });
         defer lookup_future.cancel(io) catch {};
 
+        debugLog("DNS: waiting for lookup results", .{});
+
         // Get first address result
+        var result_count: u32 = 0;
         while (lookup_queue.getOne(io)) |result| {
+            result_count += 1;
             switch (result) {
-                .address => |addr| return addr,
-                .canonical_name => continue,
+                .address => |addr| {
+                    debugLog("DNS: got address result #{d}: {}", .{ result_count, addr });
+                    return addr;
+                },
+                .canonical_name => |cn| {
+                    debugLog("DNS: got canonical_name result #{d}: {s}", .{ result_count, cn.bytes });
+                    continue;
+                },
             }
         } else |err| {
+            debugLog("DNS: lookup_queue.getOne returned error: {s} after {d} results", .{ @errorName(err), result_count });
             switch (err) {
                 error.Canceled => return error.Canceled,
                 error.Closed => {
                     // No addresses found - check if lookup had an error
-                    lookup_future.await(io) catch |lookup_err| return lookup_err;
+                    debugLog("DNS: queue closed, awaiting lookup_future for final error", .{});
+                    lookup_future.await(io) catch |lookup_err| {
+                        std.log.err("DNS: lookup_future.await returned error: {s}", .{@errorName(lookup_err)});
+                        return lookup_err;
+                    };
+                    debugLog("DNS: lookup_future.await succeeded but no addresses found", .{});
                     return error.UnknownHostName;
                 },
+            }
+        }
+    }
+
+    /// Debug helper: read and log /etc/resolv.conf contents using posix
+    fn logResolvConf(io: Io) void {
+        _ = io;
+        const fd = std.posix.open("/etc/resolv.conf", .{}, 0) catch |err| {
+            std.log.warn("DNS debug: cannot open /etc/resolv.conf: {s}", .{@errorName(err)});
+            return;
+        };
+        defer std.posix.close(fd);
+
+        var buf: [1024]u8 = undefined;
+        const bytes_read = std.posix.read(fd, &buf) catch |err| {
+            std.log.warn("DNS debug: cannot read /etc/resolv.conf: {s}", .{@errorName(err)});
+            return;
+        };
+
+        debugLog("DNS debug: /etc/resolv.conf ({d} bytes):", .{bytes_read});
+        // Log each line
+        var iter = std.mem.splitScalar(u8, buf[0..bytes_read], '\n');
+        var line_count: u32 = 0;
+        while (iter.next()) |line| {
+            line_count += 1;
+            if (line_count > 20) {
+                debugLog("DNS debug:   ... (truncated)", .{});
+                break;
+            }
+            if (line.len > 0) {
+                debugLog("DNS debug:   {s}", .{line});
             }
         }
     }

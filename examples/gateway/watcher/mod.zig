@@ -257,18 +257,26 @@ pub const Watcher = struct {
         assert(self.running.load(.acquire)); // S1: precondition - running flag should be set
         assert(@intFromPtr(self.client) != 0); // S1: precondition - client initialized
 
+        std.log.debug("watcher: watchLoop starting", .{});
+
         // Initialize Io runtime for HTTP client.
         // TigerStyle: One-time initialization at thread start.
         var io_runtime = Io.Threaded.init(self.allocator, .{});
         defer io_runtime.deinit();
         const io = io_runtime.io();
 
+        std.log.debug("watcher: Io runtime initialized", .{});
+
         var reconnect_attempts: u32 = 0;
 
         while (self.running.load(.acquire) and reconnect_attempts < MAX_RECONNECT_ATTEMPTS) {
+            std.log.debug("watcher: watchLoop iteration, attempt={d}", .{reconnect_attempts});
+
             // Watch each resource type.
             // TigerStyle: Explicit iteration over resource types.
             const watch_success = self.watchAllResources(io);
+
+            std.log.debug("watcher: watchAllResources returned success={}", .{watch_success});
 
             if (watch_success) {
                 // Reset backoff on success.
@@ -284,6 +292,7 @@ pub const Watcher = struct {
         if (reconnect_attempts >= MAX_RECONNECT_ATTEMPTS) {
             std.log.err("watcher: max reconnection attempts ({d}) exceeded", .{MAX_RECONNECT_ATTEMPTS});
         }
+        std.log.debug("watcher: watchLoop exiting", .{});
     }
 
     /// Watch all resource types.
@@ -291,31 +300,46 @@ pub const Watcher = struct {
     fn watchAllResources(self: *Self, io: Io) bool {
         assert(@intFromPtr(self) != 0); // S1: precondition - valid self
 
+        std.log.debug("watcher: watchAllResources starting", .{});
+
         // Watch GatewayClass resources first (needed for filtering Gateways).
         // GatewayClass is cluster-scoped (no namespace in path).
+        std.log.debug("watcher: watching GatewayClass at {s}", .{GATEWAY_CLASS_PATH});
         const gc_success = self.watchResourceType(GATEWAY_CLASS_PATH, .gateway_class, io);
+        std.log.debug("watcher: GatewayClass watch result={}", .{gc_success});
         if (!gc_success) return false;
 
         // Watch Gateway resources.
+        std.log.debug("watcher: watching Gateway at {s}", .{GATEWAY_PATH});
         const gateway_success = self.watchResourceType(GATEWAY_PATH, .gateway, io);
+        std.log.debug("watcher: Gateway watch result={}", .{gateway_success});
         if (!gateway_success) return false;
 
         // Watch HTTPRoute resources.
+        std.log.debug("watcher: watching HTTPRoute at {s}", .{HTTP_ROUTE_PATH});
         const route_success = self.watchResourceType(HTTP_ROUTE_PATH, .http_route, io);
+        std.log.debug("watcher: HTTPRoute watch result={}", .{route_success});
         if (!route_success) return false;
 
         // Watch Service resources.
+        std.log.debug("watcher: watching Service at {s}", .{SERVICES_PATH});
         const service_success = self.watchResourceType(SERVICES_PATH, .service, io);
+        std.log.debug("watcher: Service watch result={}", .{service_success});
         if (!service_success) return false;
 
         // Watch Endpoints resources.
+        std.log.debug("watcher: watching Endpoints at {s}", .{ENDPOINTS_PATH});
         const endpoint_success = self.watchResourceType(ENDPOINTS_PATH, .endpoints, io);
+        std.log.debug("watcher: Endpoints watch result={}", .{endpoint_success});
         if (!endpoint_success) return false;
 
         // Watch Secret resources.
+        std.log.debug("watcher: watching Secret at {s}", .{SECRETS_PATH});
         const secret_success = self.watchResourceType(SECRETS_PATH, .secret, io);
+        std.log.debug("watcher: Secret watch result={}", .{secret_success});
         if (!secret_success) return false;
 
+        std.log.debug("watcher: watchAllResources completed successfully", .{});
         return true;
     }
 
@@ -346,6 +370,8 @@ pub const Watcher = struct {
             .secret => self.secrets.getLatestResourceVersion(),
         };
 
+        std.log.debug("watcher: watchResourceType path={s} rv={s}", .{ path, if (rv.len > 0) rv else "(none)" });
+
         const watch_url = if (rv.len > 0)
             std.fmt.bufPrint(&url_buffer, "{s}?watch=true&resourceVersion={s}", .{ path, rv }) catch {
                 std.log.err("watcher: URL buffer overflow for {s}", .{path});
@@ -357,8 +383,13 @@ pub const Watcher = struct {
                 return false;
             };
 
+        std.log.debug("watcher: starting watch stream URL={s}", .{watch_url});
+
         // Start watch stream.
         var stream = self.client.watch(watch_url);
+        defer stream.close(); // TigerStyle: Explicit cleanup paired with creation.
+
+        std.log.debug("watcher: watch stream created, reading events...", .{});
 
         // Process events until stream ends or error.
         var events_processed: u32 = 0;
@@ -370,6 +401,7 @@ pub const Watcher = struct {
             };
 
             if (event_data) |data| {
+                std.log.debug("watcher: received event data len={d}", .{data.len});
                 // Parse and handle event.
                 self.handleEvent(data, resource_type, io) catch |err| {
                     std.log.debug("watcher: event handling error: {s}", .{@errorName(err)});
@@ -378,10 +410,12 @@ pub const Watcher = struct {
                 events_processed += 1;
             } else {
                 // Stream ended normally.
+                std.log.debug("watcher: stream ended normally for {s}, events={d}", .{ path, events_processed });
                 break;
             }
         }
 
+        std.log.debug("watcher: watchResourceType done, processed {d} events", .{events_processed});
         return true;
     }
 
@@ -391,10 +425,13 @@ pub const Watcher = struct {
 
         const event = try parseEvent(data);
 
+        std.log.debug("watcher: handleEvent type={s} resource={s}", .{ @tagName(event.event_type), @tagName(resource_type) });
+
         // Handle based on event type.
         switch (event.event_type) {
             .ADDED, .MODIFIED => {
                 const meta = try parsing.extractResourceMeta(event.raw_object);
+                std.log.debug("watcher: {s} {s}/{s}", .{ @tagName(event.event_type), meta.namespace, meta.name });
                 switch (resource_type) {
                     .gateway_class => try self.gateway_classes.upsert(meta, event.raw_object),
                     .gateway => try self.gateways.upsert(meta, event.raw_object),
@@ -404,6 +441,7 @@ pub const Watcher = struct {
                     .secret => try self.secrets.upsert(meta, event.raw_object),
                 }
                 // Trigger reconciliation.
+                std.log.debug("watcher: triggering reconciliation", .{});
                 self.triggerReconciliation(io);
             },
             .DELETED => {
@@ -444,14 +482,23 @@ pub const Watcher = struct {
     fn triggerReconciliation(self: *Self, io: Io) void {
         assert(@intFromPtr(self.on_config_change) != 0); // S1: precondition - callback set
 
+        std.log.debug("watcher: triggerReconciliation starting", .{});
+
         // Build GatewayConfig from stored resources.
         var gateway_config = self.reconcile() catch |err| {
             std.log.err("watcher: reconciliation failed: {s}", .{@errorName(err)});
             return;
         };
 
+        std.log.debug("watcher: reconcile complete, gateways={d} routes={d}", .{
+            gateway_config.gateways.len,
+            gateway_config.http_routes.len,
+        });
+
         // Invoke callback with context, new config, and Io for async operations.
+        std.log.debug("watcher: invoking on_config_change callback", .{});
         self.on_config_change(self.callback_context, &gateway_config, io);
+        std.log.debug("watcher: on_config_change callback returned", .{});
     }
 
     /// Reconcile stored resources into a GatewayConfig.
@@ -464,6 +511,8 @@ pub const Watcher = struct {
     /// - S3: All loops bounded by MAX_* constants
     /// - No allocation after init (uses pre-allocated storage arrays)
     pub fn reconcile(self: *Self) WatcherError!gw_config.GatewayConfig {
+        std.log.debug("watcher: reconcile starting", .{});
+
         // Reset parsed counts.
         self.parsed_gateway_classes_count = 0;
         self.parsed_gateways_count = 0;
@@ -471,14 +520,18 @@ pub const Watcher = struct {
 
         // Phase 1: Parse GatewayClasses first (needed for filtering).
         try self.parseStoredGatewayClasses();
+        std.log.debug("watcher: parsed {d} GatewayClasses", .{self.parsed_gateway_classes_count});
 
         // Phase 2: Find GatewayClass names that match our controller_name.
         var matching_class_names: [MAX_GATEWAY_CLASSES][]const u8 = undefined;
         const matching_count = self.findMatchingGatewayClasses(&matching_class_names);
+        std.log.debug("watcher: {d} GatewayClasses match our controller", .{matching_count});
 
         // Phase 3: Parse Gateways and filter by matching GatewayClasses.
         try self.parseStoredGatewaysFiltered(matching_class_names[0..matching_count]);
+        std.log.debug("watcher: parsed {d} Gateways after filtering", .{self.parsed_gateways_count});
         try self.parseStoredHTTPRoutes();
+        std.log.debug("watcher: parsed {d} HTTPRoutes", .{self.parsed_http_routes_count});
 
         // Phase 4: Build config slices from parsed storage.
         self.buildGatewayConfigs();
@@ -489,6 +542,7 @@ pub const Watcher = struct {
         assert(self.parsed_gateways_count <= MAX_GATEWAYS);
         assert(self.parsed_http_routes_count <= MAX_HTTP_ROUTES);
 
+        std.log.debug("watcher: reconcile done", .{});
         return gw_config.GatewayConfig{
             .gateways = self.temp_gateways[0..self.parsed_gateways_count],
             .http_routes = self.temp_http_routes[0..self.parsed_http_routes_count],
@@ -527,6 +581,8 @@ pub const Watcher = struct {
     fn findMatchingGatewayClasses(self: *Self, out_names: *[MAX_GATEWAY_CLASSES][]const u8) u8 {
         assert(self.controller_name.len > 0); // S1: precondition - controller name set
 
+        std.log.debug("watcher: findMatchingGatewayClasses, our_controller={s}", .{self.controller_name.slice()});
+
         var match_count: u8 = 0;
         var idx: u8 = 0;
 
@@ -534,12 +590,20 @@ pub const Watcher = struct {
             const gc = &self.parsed_gateway_classes[idx];
             if (!gc.active) continue;
 
+            std.log.debug("watcher: checking GatewayClass name={s} controllerName={s}", .{
+                gc.name.slice(),
+                gc.controller_name.slice(),
+            });
+
             // Check if controllerName matches our controller_name.
             if (std.mem.eql(u8, gc.controller_name.slice(), self.controller_name.slice())) {
+                std.log.debug("watcher: GatewayClass {s} MATCHES", .{gc.name.slice()});
                 if (match_count < MAX_GATEWAY_CLASSES) {
                     out_names[match_count] = gc.name.slice();
                     match_count += 1;
                 }
+            } else {
+                std.log.debug("watcher: GatewayClass {s} does not match", .{gc.name.slice()});
             }
         }
 

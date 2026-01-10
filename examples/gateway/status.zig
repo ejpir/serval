@@ -244,6 +244,13 @@ pub const StatusManager = struct {
         assert(gateway_name.len > 0); // gateway_name must be non-empty
         assert(namespace.len > 0); // namespace must be non-empty
 
+        std.log.debug("status: updateGatewayStatus {s}/{s} accepted={} programmed={}", .{
+            namespace,
+            gateway_name,
+            result.accepted,
+            result.programmed,
+        });
+
         self.updateGatewayStatusImpl(gateway_name, namespace, result, io) catch |err| {
             std.log.warn("failed to update Gateway status {s}/{s}: {s}", .{
                 namespace,
@@ -251,6 +258,8 @@ pub const StatusManager = struct {
                 @errorName(err),
             });
         };
+
+        std.log.debug("status: updateGatewayStatus {s}/{s} complete", .{ namespace, gateway_name });
     }
 
     /// Update status for a GatewayClass resource.
@@ -334,8 +343,12 @@ pub const StatusManager = struct {
             return error.PathTooLong;
         };
 
+        std.log.debug("status: PATCH path={s}", .{path});
+        std.log.debug("status: PATCH json_len={d}", .{json_len});
+
         // PATCH status to K8s API
         self.k8s_client.patchStatus(path, self.json_buffer[0..json_len], io) catch |err| {
+            std.log.debug("status: patchStatus returned error={s}", .{@errorName(err)});
             if (err == ClientError.ConflictRetryable) {
                 // HTTP 409 - resource version mismatch, log and continue
                 std.log.debug("Gateway status update conflict (will retry on next reconcile)", .{});
@@ -343,7 +356,7 @@ pub const StatusManager = struct {
             return err;
         };
 
-        std.log.debug("updated Gateway status {s}/{s}", .{ namespace, gateway_name });
+        std.log.info("updated Gateway status {s}/{s}", .{ namespace, gateway_name });
     }
 
     /// Internal implementation of GatewayClass status update.

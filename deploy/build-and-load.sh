@@ -10,12 +10,13 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+ZIG_MODE="-Doptimize=Debug"
 
 cd "$PROJECT_DIR"
 
 build_router() {
     echo "=== Building router ==="
-    zig build -Doptimize=ReleaseFast build-router-example
+    zig build $ZIG_MODE build-router-example
     sudo docker build -f deploy/Dockerfile.router -t serval-router:latest .
     sudo docker save serval-router:latest | sudo k3s ctr images import -
     echo "Router image loaded"
@@ -23,7 +24,7 @@ build_router() {
 
 build_gateway() {
     echo "=== Building gateway ==="
-    zig build -Doptimize=ReleaseFast build-gateway-example
+    zig build $ZIG_MODE build-gateway-example
     sudo docker build -f deploy/Dockerfile.gateway -t serval-gateway:latest .
     sudo docker save serval-gateway:latest | sudo k3s ctr images import -
     echo "Gateway image loaded"
@@ -31,7 +32,7 @@ build_gateway() {
 
 build_echo() {
     echo "=== Building echo-backend ==="
-    zig build -Doptimize=ReleaseFast
+    zig build $ZIG_MODE
     sudo docker build -f deploy/Dockerfile.echo-backend -t echo-backend:latest .
     sudo docker save echo-backend:latest | sudo k3s ctr images import -
     echo "Echo-backend image loaded"
