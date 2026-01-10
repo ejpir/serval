@@ -8,7 +8,8 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
-const config = @import("config.zig");
+const gateway = @import("serval-gateway");
+const gw_config = gateway.config;
 
 // ============================================================================
 // Bounded Array Limits (TigerStyle: explicit bounds, no unbounded growth)
@@ -75,6 +76,8 @@ pub const ResolverError = error{
     IpTooLong,
     /// Output buffer too small.
     BufferTooSmall,
+    /// Service not found in resolver registry.
+    ServiceNotFound,
 };
 
 // ============================================================================
@@ -191,11 +194,11 @@ pub const ResolvedService = struct {
     _stored: *const StoredService,
 
     /// Get endpoint at index.
-    pub fn getEndpoint(self: *const ResolvedService, idx: u8) ?config.ResolvedEndpoint {
+    pub fn getEndpoint(self: *const ResolvedService, idx: u8) ?gw_config.ResolvedEndpoint {
         assert(idx < MAX_ENDPOINTS_PER_SERVICE);
         if (idx >= self.endpoints_count) return null;
         const stored_ep = &self._stored.endpoints[idx];
-        return config.ResolvedEndpoint{
+        return gw_config.ResolvedEndpoint{
             .address = stored_ep.ip(),
             .port = stored_ep.port,
         };
@@ -433,7 +436,7 @@ pub const Resolver = struct {
         self: *const Self,
         svc_name: []const u8,
         svc_namespace: []const u8,
-        out_endpoints: []config.ResolvedEndpoint,
+        out_endpoints: []gw_config.ResolvedEndpoint,
     ) u8 {
         assert(svc_name.len > 0);
         assert(svc_namespace.len > 0);
@@ -443,7 +446,7 @@ pub const Resolver = struct {
                 const count = @min(svc.endpoints_count, @as(u8, @intCast(out_endpoints.len)));
                 for (0..count) |i| {
                     const stored_ep = &svc.endpoints[i];
-                    out_endpoints[i] = config.ResolvedEndpoint{
+                    out_endpoints[i] = gw_config.ResolvedEndpoint{
                         .address = stored_ep.ip(),
                         .port = stored_ep.port,
                     };
@@ -477,8 +480,8 @@ pub const Resolver = struct {
     /// Copies resolved endpoints to output buffer, returns count.
     pub fn resolveBackendRef(
         self: *const Self,
-        backend_ref: *const config.BackendRef,
-        out_upstreams: []config.ResolvedEndpoint,
+        backend_ref: *const gw_config.BackendRef,
+        out_upstreams: []gw_config.ResolvedEndpoint,
     ) u8 {
         assert(backend_ref.name.len > 0);
         assert(backend_ref.namespace.len > 0);
@@ -489,7 +492,7 @@ pub const Resolver = struct {
                 for (0..count) |i| {
                     const stored_ep = &svc.endpoints[i];
                     // Use backend_ref.port as the target port (service port mapping)
-                    out_upstreams[i] = config.ResolvedEndpoint{
+                    out_upstreams[i] = gw_config.ResolvedEndpoint{
                         .address = stored_ep.ip(),
                         .port = backend_ref.port,
                     };
@@ -516,6 +519,67 @@ pub const Resolver = struct {
             if (sec.active) count += 1;
         }
         return count;
+    }
+
+    /// Find a service by name/namespace.
+    /// Returns the service index or null if not found.
+    fn findService(self: *const Self, svc_name: []const u8, svc_namespace: []const u8) ?usize {
+        assert(svc_name.len > 0); // S1: precondition
+        assert(svc_namespace.len > 0); // S1: precondition
+
+        for (&self.services, 0..) |*svc, idx| {
+            if (svc.matches(svc_name, svc_namespace)) {
+                return idx;
+            }
+        }
+        return null;
+    }
+
+    /// Resolve a backend reference to ResolvedBackend.
+    /// Used by data_plane.zig before calling translator.
+    ///
+    /// TigerStyle C3: Uses out pointer for large struct (~5KB), avoids stack copy.
+    /// TigerStyle S1: Assertions for pre/postconditions.
+    pub fn resolveBackend(
+        self: *const Self,
+        name: []const u8,
+        namespace: []const u8,
+        out: *gw_config.ResolvedBackend,
+    ) ResolverError!void {
+        assert(name.len > 0); // S1: precondition
+        assert(name.len <= gw_config.MAX_NAME_LEN);
+        assert(namespace.len <= gw_config.MAX_NAME_LEN);
+
+        // Find service in our registry
+        const service_idx = self.findService(name, namespace) orelse {
+            return error.ServiceNotFound;
+        };
+
+        const service = &self.services[service_idx];
+
+        // Copy name
+        @memcpy(out.name[0..name.len], name);
+        out.name_len = @intCast(name.len);
+
+        // Copy namespace
+        @memcpy(out.namespace[0..namespace.len], namespace);
+        out.namespace_len = @intCast(namespace.len);
+
+        // Copy endpoints
+        var ep_count: u8 = 0;
+        const max_eps = gw_config.MAX_RESOLVED_ENDPOINTS;
+        for (service.endpoints[0..service.endpoints_count]) |ep| {
+            if (ep_count >= max_eps) break;
+
+            const ip = ep.ip();
+            @memcpy(out.endpoints[ep_count].ip[0..ip.len], ip);
+            out.endpoints[ep_count].ip_len = @intCast(ip.len);
+            out.endpoints[ep_count].port = ep.port;
+            ep_count += 1;
+        }
+        out.endpoint_count = ep_count;
+
+        assert(out.endpoint_count > 0); // S1: postcondition - found at least one endpoint
     }
 };
 
@@ -775,7 +839,7 @@ test "Resolver getServiceEndpoints" {
 
     try resolver.updateService("api-service", "prod", endpoints_json);
 
-    var endpoints: [10]config.ResolvedEndpoint = undefined;
+    var endpoints: [10]gw_config.ResolvedEndpoint = undefined;
     const count = resolver.getServiceEndpoints("api-service", "prod", &endpoints);
 
     try std.testing.expectEqual(@as(u8, 3), count);
@@ -949,13 +1013,13 @@ test "Resolver resolveBackendRef" {
 
     try resolver.updateService("backend-svc", "prod", endpoints_json);
 
-    const backend_ref = config.BackendRef{
+    const backend_ref = gw_config.BackendRef{
         .name = "backend-svc",
         .namespace = "prod",
         .port = 9000, // Different from pod port - service port
     };
 
-    var upstreams: [10]config.ResolvedEndpoint = undefined;
+    var upstreams: [10]gw_config.ResolvedEndpoint = undefined;
     const count = resolver.resolveBackendRef(&backend_ref, &upstreams);
 
     try std.testing.expectEqual(@as(u8, 2), count);
@@ -969,13 +1033,13 @@ test "Resolver resolveBackendRef" {
 test "Resolver resolveBackendRef not found" {
     const resolver = Resolver.init();
 
-    const backend_ref = config.BackendRef{
+    const backend_ref = gw_config.BackendRef{
         .name = "nonexistent",
         .namespace = "ns",
         .port = 8080,
     };
 
-    var upstreams: [10]config.ResolvedEndpoint = undefined;
+    var upstreams: [10]gw_config.ResolvedEndpoint = undefined;
     const count = resolver.resolveBackendRef(&backend_ref, &upstreams);
 
     try std.testing.expectEqual(@as(u8, 0), count);
@@ -1178,4 +1242,44 @@ test "Resolver slot reuse after remove" {
     try resolver.updateService("svc2", "ns", json);
     try std.testing.expectEqual(@as(u8, 1), resolver.serviceCount());
     try std.testing.expect(resolver.getService("svc2", "ns") != null);
+}
+
+test "Resolver resolveBackend" {
+    var resolver = Resolver.init();
+
+    const endpoints_json =
+        \\{
+        \\  "subsets": [
+        \\    {
+        \\      "addresses": [
+        \\        { "ip": "10.0.1.1" },
+        \\        { "ip": "10.0.1.2" }
+        \\      ],
+        \\      "ports": [{ "port": 8080 }]
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    try resolver.updateService("backend-svc", "prod", endpoints_json);
+
+    var resolved: gw_config.ResolvedBackend = undefined;
+    try resolver.resolveBackend("backend-svc", "prod", &resolved);
+
+    try std.testing.expectEqualStrings("backend-svc", resolved.getName());
+    try std.testing.expectEqualStrings("prod", resolved.getNamespace());
+    try std.testing.expectEqual(@as(u8, 2), resolved.endpoint_count);
+
+    const endpoints = resolved.getEndpoints();
+    try std.testing.expectEqualStrings("10.0.1.1", endpoints[0].getIp());
+    try std.testing.expectEqual(@as(u16, 8080), endpoints[0].port);
+    try std.testing.expectEqualStrings("10.0.1.2", endpoints[1].getIp());
+    try std.testing.expectEqual(@as(u16, 8080), endpoints[1].port);
+}
+
+test "Resolver resolveBackend not found" {
+    const resolver = Resolver.init();
+
+    var resolved: gw_config.ResolvedBackend = undefined;
+    try std.testing.expectError(error.ServiceNotFound, resolver.resolveBackend("nonexistent", "ns", &resolved));
 }

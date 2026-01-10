@@ -11,8 +11,9 @@ const assert = std.debug.assert;
 const posix = std.posix;
 const Io = std.Io;
 
-const Client = @import("client.zig").Client;
-const config = @import("../config.zig");
+const gateway = @import("serval-gateway");
+const gw_config = gateway.config;
+const Client = @import("k8s_client.zig").Client;
 
 // =============================================================================
 // Constants (TigerStyle: Explicit bounds and paths)
@@ -42,13 +43,13 @@ pub const MAX_RECONNECT_ATTEMPTS: u32 = 100;
 
 /// Maximum number of resources to track per type.
 /// TigerStyle: Bounded storage prevents unbounded growth.
-pub const MAX_GATEWAYS: u32 = config.MAX_GATEWAYS;
-pub const MAX_HTTP_ROUTES: u32 = config.MAX_HTTP_ROUTES;
+pub const MAX_GATEWAYS: u32 = gw_config.MAX_GATEWAYS;
+pub const MAX_HTTP_ROUTES: u32 = gw_config.MAX_HTTP_ROUTES;
 pub const MAX_SERVICES: u32 = 256;
 pub const MAX_ENDPOINTS: u32 = 256;
 pub const MAX_SECRETS: u32 = 64;
 
-/// Maximum string length for names/namespaces in parsed config.
+/// Maximum string length for names/namespaces in parsed gw_config.
 /// K8s DNS-1123 subdomain max is 253 chars.
 pub const MAX_NAME_LEN: u32 = 253;
 
@@ -381,7 +382,7 @@ pub const PathStorage = struct {
 
 /// Stored path match with inline storage.
 pub const StoredPathMatch = struct {
-    match_type: config.PathMatch.Type,
+    match_type: gw_config.PathMatch.Type,
     value: PathStorage,
     active: bool,
 
@@ -393,8 +394,8 @@ pub const StoredPathMatch = struct {
         };
     }
 
-    /// Convert to config.PathMatch (returns slice into internal storage).
-    pub fn toPathMatch(self: *const StoredPathMatch) config.PathMatch {
+    /// Convert to gw_config.PathMatch (returns slice into internal storage).
+    pub fn toPathMatch(self: *const StoredPathMatch) gw_config.PathMatch {
         return .{
             .type = self.match_type,
             .value = self.value.slice(),
@@ -404,7 +405,7 @@ pub const StoredPathMatch = struct {
 
 /// Stored path rewrite with inline storage.
 pub const StoredPathRewrite = struct {
-    rewrite_type: config.PathRewrite.Type,
+    rewrite_type: gw_config.PathRewrite.Type,
     value: PathStorage,
     active: bool,
 
@@ -416,8 +417,8 @@ pub const StoredPathRewrite = struct {
         };
     }
 
-    /// Convert to config.PathRewrite (returns slice into internal storage).
-    pub fn toPathRewrite(self: *const StoredPathRewrite) config.PathRewrite {
+    /// Convert to gw_config.PathRewrite (returns slice into internal storage).
+    pub fn toPathRewrite(self: *const StoredPathRewrite) gw_config.PathRewrite {
         return .{
             .type = self.rewrite_type,
             .value = self.value.slice(),
@@ -440,7 +441,7 @@ pub const StoredURLRewrite = struct {
 
 /// Stored HTTP route filter with inline storage.
 pub const StoredHTTPRouteFilter = struct {
-    filter_type: config.HTTPRouteFilter.Type,
+    filter_type: gw_config.HTTPRouteFilter.Type,
     url_rewrite: StoredURLRewrite,
     active: bool,
 
@@ -489,11 +490,11 @@ pub const StoredBackendRef = struct {
 
 /// Stored HTTP route rule with inline storage.
 pub const StoredHTTPRouteRule = struct {
-    matches: [config.MAX_MATCHES]StoredHTTPRouteMatch,
+    matches: [gw_config.MAX_MATCHES]StoredHTTPRouteMatch,
     matches_count: u8,
-    filters: [config.MAX_FILTERS]StoredHTTPRouteFilter,
+    filters: [gw_config.MAX_FILTERS]StoredHTTPRouteFilter,
     filters_count: u8,
-    backend_refs: [config.MAX_BACKEND_REFS]StoredBackendRef,
+    backend_refs: [gw_config.MAX_BACKEND_REFS]StoredBackendRef,
     backend_refs_count: u8,
     active: bool,
 
@@ -518,9 +519,9 @@ pub const StoredHTTPRouteRule = struct {
 pub const StoredHTTPRoute = struct {
     name: NameStorage,
     namespace: NameStorage,
-    hostnames: [config.MAX_HOSTNAMES]HostnameStorage,
+    hostnames: [gw_config.MAX_HOSTNAMES]HostnameStorage,
     hostnames_count: u8,
-    rules: [config.MAX_RULES]StoredHTTPRouteRule,
+    rules: [gw_config.MAX_RULES]StoredHTTPRouteRule,
     rules_count: u8,
     active: bool,
 
@@ -544,7 +545,7 @@ pub const StoredHTTPRoute = struct {
 pub const StoredListener = struct {
     name: NameStorage,
     port: u16,
-    protocol: config.Listener.Protocol,
+    protocol: gw_config.Listener.Protocol,
     hostname: HostnameStorage,
     has_hostname: bool,
     active: bool,
@@ -565,7 +566,7 @@ pub const StoredListener = struct {
 pub const StoredGateway = struct {
     name: NameStorage,
     namespace: NameStorage,
-    listeners: [config.MAX_LISTENERS]StoredListener,
+    listeners: [gw_config.MAX_LISTENERS]StoredListener,
     listeners_count: u8,
     active: bool,
 
@@ -596,7 +597,7 @@ pub const Watcher = struct {
     /// Atomic flag for graceful shutdown.
     running: std.atomic.Value(bool),
     /// Callback invoked when configuration changes.
-    on_config_change: *const fn (*config.GatewayConfig) void,
+    on_config_change: *const fn (*gw_config.GatewayConfig) void,
 
     /// Resource stores for each watched type.
     gateways: ResourceStore(MAX_GATEWAYS),
@@ -615,21 +616,21 @@ pub const Watcher = struct {
 
     /// Temporary slices for building GatewayConfig return value.
     /// These point into parsed_* storage and are valid until next reconcile().
-    temp_gateways: [MAX_GATEWAYS]config.Gateway,
-    temp_http_routes: [MAX_HTTP_ROUTES]config.HTTPRoute,
+    temp_gateways: [MAX_GATEWAYS]gw_config.Gateway,
+    temp_http_routes: [MAX_HTTP_ROUTES]gw_config.HTTPRoute,
 
     /// Storage for temporary hostname slices per route.
-    temp_hostnames: [MAX_HTTP_ROUTES][config.MAX_HOSTNAMES][]const u8,
+    temp_hostnames: [MAX_HTTP_ROUTES][gw_config.MAX_HOSTNAMES][]const u8,
     /// Storage for temporary rules slices per route.
-    temp_rules: [MAX_HTTP_ROUTES][config.MAX_RULES]config.HTTPRouteRule,
+    temp_rules: [MAX_HTTP_ROUTES][gw_config.MAX_RULES]gw_config.HTTPRouteRule,
     /// Storage for temporary matches slices per rule.
-    temp_matches: [MAX_HTTP_ROUTES][config.MAX_RULES][config.MAX_MATCHES]config.HTTPRouteMatch,
+    temp_matches: [MAX_HTTP_ROUTES][gw_config.MAX_RULES][gw_config.MAX_MATCHES]gw_config.HTTPRouteMatch,
     /// Storage for temporary filters slices per rule.
-    temp_filters: [MAX_HTTP_ROUTES][config.MAX_RULES][config.MAX_FILTERS]config.HTTPRouteFilter,
+    temp_filters: [MAX_HTTP_ROUTES][gw_config.MAX_RULES][gw_config.MAX_FILTERS]gw_config.HTTPRouteFilter,
     /// Storage for temporary backend_refs slices per rule.
-    temp_backend_refs: [MAX_HTTP_ROUTES][config.MAX_RULES][config.MAX_BACKEND_REFS]config.BackendRef,
+    temp_backend_refs: [MAX_HTTP_ROUTES][gw_config.MAX_RULES][gw_config.MAX_BACKEND_REFS]gw_config.BackendRef,
     /// Storage for temporary listeners slices per gateway.
-    temp_listeners: [MAX_GATEWAYS][config.MAX_LISTENERS]config.Listener,
+    temp_listeners: [MAX_GATEWAYS][gw_config.MAX_LISTENERS]gw_config.Listener,
 
     /// Line buffer for parsing watch events.
     /// TigerStyle: Pre-allocated, bounded buffer.
@@ -648,7 +649,7 @@ pub const Watcher = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         client: *Client,
-        on_config_change: *const fn (*config.GatewayConfig) void,
+        on_config_change: *const fn (*gw_config.GatewayConfig) void,
     ) WatcherError!*Self {
         // S1: precondition - client must be valid (can't be null for pointer type)
 
@@ -892,7 +893,7 @@ pub const Watcher = struct {
             return;
         };
 
-        // Invoke callback with new config.
+        // Invoke callback with new gw_config.
         self.on_config_change(&gateway_config);
     }
 
@@ -904,7 +905,7 @@ pub const Watcher = struct {
     /// - S2: Postconditions verified on exit
     /// - S3: All loops bounded by MAX_* constants
     /// - No allocation after init (uses pre-allocated storage arrays)
-    pub fn reconcile(self: *Self) WatcherError!config.GatewayConfig {
+    pub fn reconcile(self: *Self) WatcherError!gw_config.GatewayConfig {
         // Reset parsed counts.
         self.parsed_gateways_count = 0;
         self.parsed_http_routes_count = 0;
@@ -921,7 +922,7 @@ pub const Watcher = struct {
         assert(self.parsed_gateways_count <= MAX_GATEWAYS);
         assert(self.parsed_http_routes_count <= MAX_HTTP_ROUTES);
 
-        return config.GatewayConfig{
+        return gw_config.GatewayConfig{
             .gateways = self.temp_gateways[0..self.parsed_gateways_count],
             .http_routes = self.temp_http_routes[0..self.parsed_http_routes_count],
         };
@@ -979,7 +980,7 @@ pub const Watcher = struct {
         assert(self.parsed_http_routes_count <= MAX_HTTP_ROUTES);
     }
 
-    /// Build config.Gateway slices from parsed storage.
+    /// Build gw_config.Gateway slices from parsed storage.
     /// TigerStyle: Bounded loops, no allocation.
     fn buildGatewayConfigs(self: *Self) void {
         var gw_idx: u8 = 0;
@@ -991,7 +992,7 @@ pub const Watcher = struct {
             var listener_idx: u8 = 0;
             while (listener_idx < stored.listeners_count) : (listener_idx += 1) {
                 const stored_listener = &stored.listeners[listener_idx];
-                self.temp_listeners[gw_idx][listener_idx] = config.Listener{
+                self.temp_listeners[gw_idx][listener_idx] = gw_config.Listener{
                     .name = stored_listener.name.slice(),
                     .port = stored_listener.port,
                     .protocol = stored_listener.protocol,
@@ -1000,7 +1001,7 @@ pub const Watcher = struct {
                 };
             }
 
-            self.temp_gateways[gw_idx] = config.Gateway{
+            self.temp_gateways[gw_idx] = gw_config.Gateway{
                 .name = stored.name.slice(),
                 .namespace = stored.namespace.slice(),
                 .listeners = self.temp_listeners[gw_idx][0..stored.listeners_count],
@@ -1008,7 +1009,7 @@ pub const Watcher = struct {
         }
     }
 
-    /// Build config.HTTPRoute slices from parsed storage.
+    /// Build gw_config.HTTPRoute slices from parsed storage.
     /// TigerStyle: Bounded loops, no allocation.
     fn buildHTTPRouteConfigs(self: *Self) void {
         var route_idx: u8 = 0;
@@ -1028,7 +1029,7 @@ pub const Watcher = struct {
                 self.buildRuleConfig(route_idx, rule_idx, &stored.rules[rule_idx]);
             }
 
-            self.temp_http_routes[route_idx] = config.HTTPRoute{
+            self.temp_http_routes[route_idx] = gw_config.HTTPRoute{
                 .name = stored.name.slice(),
                 .namespace = stored.namespace.slice(),
                 .hostnames = self.temp_hostnames[route_idx][0..stored.hostnames_count],
@@ -1041,14 +1042,14 @@ pub const Watcher = struct {
     /// TigerStyle: Helper to keep buildHTTPRouteConfigs under 70 lines.
     fn buildRuleConfig(self: *Self, route_idx: u8, rule_idx: u8, stored_rule: *const StoredHTTPRouteRule) void {
         // S1: Preconditions
-        assert(route_idx < config.MAX_HTTP_ROUTES);
-        assert(rule_idx < config.MAX_RULES);
+        assert(route_idx < gw_config.MAX_HTTP_ROUTES);
+        assert(rule_idx < gw_config.MAX_RULES);
 
         // Build matches slice.
         var match_idx: u8 = 0;
         while (match_idx < stored_rule.matches_count) : (match_idx += 1) {
             const stored_match = &stored_rule.matches[match_idx];
-            self.temp_matches[route_idx][rule_idx][match_idx] = config.HTTPRouteMatch{
+            self.temp_matches[route_idx][rule_idx][match_idx] = gw_config.HTTPRouteMatch{
                 .path = if (stored_match.has_path) stored_match.path.toPathMatch() else null,
             };
         }
@@ -1057,12 +1058,12 @@ pub const Watcher = struct {
         var filter_idx: u8 = 0;
         while (filter_idx < stored_rule.filters_count) : (filter_idx += 1) {
             const stored_filter = &stored_rule.filters[filter_idx];
-            const url_rewrite: ?config.URLRewrite = if (stored_filter.url_rewrite.has_path)
-                config.URLRewrite{ .path = stored_filter.url_rewrite.path.toPathRewrite() }
+            const url_rewrite: ?gw_config.URLRewrite = if (stored_filter.url_rewrite.has_path)
+                gw_config.URLRewrite{ .path = stored_filter.url_rewrite.path.toPathRewrite() }
             else
                 null;
 
-            self.temp_filters[route_idx][rule_idx][filter_idx] = config.HTTPRouteFilter{
+            self.temp_filters[route_idx][rule_idx][filter_idx] = gw_config.HTTPRouteFilter{
                 .type = stored_filter.filter_type,
                 .url_rewrite = url_rewrite,
             };
@@ -1072,7 +1073,7 @@ pub const Watcher = struct {
         var backend_idx: u8 = 0;
         while (backend_idx < stored_rule.backend_refs_count) : (backend_idx += 1) {
             const stored_backend = &stored_rule.backend_refs[backend_idx];
-            self.temp_backend_refs[route_idx][rule_idx][backend_idx] = config.BackendRef{
+            self.temp_backend_refs[route_idx][rule_idx][backend_idx] = gw_config.BackendRef{
                 .name = stored_backend.name.slice(),
                 .namespace = stored_backend.namespace.slice(),
                 .port = stored_backend.port,
@@ -1080,7 +1081,7 @@ pub const Watcher = struct {
             };
         }
 
-        self.temp_rules[route_idx][rule_idx] = config.HTTPRouteRule{
+        self.temp_rules[route_idx][rule_idx] = gw_config.HTTPRouteRule{
             .matches = self.temp_matches[route_idx][rule_idx][0..stored_rule.matches_count],
             .filters = self.temp_filters[route_idx][rule_idx][0..stored_rule.filters_count],
             .backend_refs = self.temp_backend_refs[route_idx][rule_idx][0..stored_rule.backend_refs_count],
@@ -1464,7 +1465,7 @@ pub fn parseGatewayJson(json: []const u8, out: *StoredGateway) WatcherError!void
 
     out.listeners_count = try iterateJsonArray(
         listeners_array,
-        config.MAX_LISTENERS,
+        gw_config.MAX_LISTENERS,
         struct {
             fn parse(c: *ListenerParseContext, listener_json: []const u8, idx: u8) WatcherError!void {
                 try parseListenerJson(listener_json, &c.out.listeners[idx]);
@@ -1476,7 +1477,7 @@ pub fn parseGatewayJson(json: []const u8, out: *StoredGateway) WatcherError!void
 
     // S2: Postconditions
     assert(out.name.len > 0);
-    assert(out.listeners_count <= config.MAX_LISTENERS);
+    assert(out.listeners_count <= gw_config.MAX_LISTENERS);
 }
 
 /// Parse a single Listener from JSON.
@@ -1495,7 +1496,7 @@ fn parseListenerJson(json: []const u8, out: *StoredListener) WatcherError!void {
 
     // Extract protocol.
     const protocol_str = extractJsonString(json, "protocol") orelse "HTTP";
-    out.protocol = config.Listener.Protocol.fromString(protocol_str) orelse .HTTP;
+    out.protocol = gw_config.Listener.Protocol.fromString(protocol_str) orelse .HTTP;
 
     // Extract optional hostname.
     if (extractJsonString(json, "hostname")) |hostname| {
@@ -1555,7 +1556,7 @@ pub fn parseHTTPRouteJson(json: []const u8, out: *StoredHTTPRoute) WatcherError!
     if (findArrayField(spec, "hostnames")) |hostnames_array| {
         out.hostnames_count = try iterateJsonArray(
             hostnames_array,
-            config.MAX_HOSTNAMES,
+            gw_config.MAX_HOSTNAMES,
             struct {
                 fn parse(route: *StoredHTTPRoute, hostname_json: []const u8, idx: u8) WatcherError!void {
                     // hostname_json is a quoted string like "api.example.com"
@@ -1585,7 +1586,7 @@ pub fn parseHTTPRouteJson(json: []const u8, out: *StoredHTTPRoute) WatcherError!
 
     out.rules_count = try iterateJsonArray(
         rules_array,
-        config.MAX_RULES,
+        gw_config.MAX_RULES,
         struct {
             fn parse(c: *RuleParseContext, rule_json: []const u8, idx: u8) WatcherError!void {
                 try parseRuleJson(rule_json, &c.out.rules[idx]);
@@ -1597,7 +1598,7 @@ pub fn parseHTTPRouteJson(json: []const u8, out: *StoredHTTPRoute) WatcherError!
 
     // S2: Postconditions
     assert(out.name.len > 0);
-    assert(out.rules_count <= config.MAX_RULES);
+    assert(out.rules_count <= gw_config.MAX_RULES);
 }
 
 /// Parse a single HTTPRouteRule from JSON.
@@ -1615,7 +1616,7 @@ fn parseRuleJson(json: []const u8, out: *StoredHTTPRouteRule) WatcherError!void 
 
         out.matches_count = try iterateJsonArray(
             matches_array,
-            config.MAX_MATCHES,
+            gw_config.MAX_MATCHES,
             struct {
                 fn parse(c: *MatchParseContext, match_json: []const u8, idx: u8) WatcherError!void {
                     try parseMatchJson(match_json, &c.out.matches[idx]);
@@ -1635,7 +1636,7 @@ fn parseRuleJson(json: []const u8, out: *StoredHTTPRouteRule) WatcherError!void 
 
         out.filters_count = try iterateJsonArray(
             filters_array,
-            config.MAX_FILTERS,
+            gw_config.MAX_FILTERS,
             struct {
                 fn parse(c: *FilterParseContext, filter_json: []const u8, idx: u8) WatcherError!void {
                     try parseFilterJson(filter_json, &c.out.filters[idx]);
@@ -1655,7 +1656,7 @@ fn parseRuleJson(json: []const u8, out: *StoredHTTPRouteRule) WatcherError!void 
 
         out.backend_refs_count = try iterateJsonArray(
             backends_array,
-            config.MAX_BACKEND_REFS,
+            gw_config.MAX_BACKEND_REFS,
             struct {
                 fn parse(c: *BackendParseContext, backend_json: []const u8, idx: u8) WatcherError!void {
                     try parseBackendRefJson(backend_json, &c.out.backend_refs[idx]);
@@ -1679,7 +1680,7 @@ fn parseMatchJson(json: []const u8, out: *StoredHTTPRouteMatch) WatcherError!voi
         const path_value = extractJsonString(path_json, "value") orelse "/";
 
         if (path_value.len <= MAX_PATH_VALUE_LEN) {
-            out.path.match_type = config.PathMatch.Type.fromString(path_type_str) orelse .PathPrefix;
+            out.path.match_type = gw_config.PathMatch.Type.fromString(path_type_str) orelse .PathPrefix;
             out.path.value.set(path_value);
             out.path.active = true;
             out.has_path = true;
@@ -1695,7 +1696,7 @@ fn parseFilterJson(json: []const u8, out: *StoredHTTPRouteFilter) WatcherError!v
 
     // Get filter type.
     const filter_type_str = extractJsonString(json, "type") orelse return;
-    out.filter_type = config.HTTPRouteFilter.Type.fromString(filter_type_str) orelse return;
+    out.filter_type = gw_config.HTTPRouteFilter.Type.fromString(filter_type_str) orelse return;
 
     // Parse URLRewrite filter.
     if (out.filter_type == .URLRewrite) {
@@ -1707,7 +1708,7 @@ fn parseFilterJson(json: []const u8, out: *StoredHTTPRouteFilter) WatcherError!v
                     extractJsonString(path_json, "replaceFullPath") orelse "/";
 
                 if (rewrite_value.len <= MAX_PATH_VALUE_LEN) {
-                    out.url_rewrite.path.rewrite_type = config.PathRewrite.Type.fromString(rewrite_type_str) orelse .ReplacePrefixMatch;
+                    out.url_rewrite.path.rewrite_type = gw_config.PathRewrite.Type.fromString(rewrite_type_str) orelse .ReplacePrefixMatch;
                     out.url_rewrite.path.value.set(rewrite_value);
                     out.url_rewrite.path.active = true;
                     out.url_rewrite.has_path = true;
@@ -2215,13 +2216,13 @@ test "parseGatewayJson - basic gateway" {
     // Check first listener
     try std.testing.expectEqualStrings("http", gw.listeners[0].name.slice());
     try std.testing.expectEqual(@as(u16, 80), gw.listeners[0].port);
-    try std.testing.expectEqual(config.Listener.Protocol.HTTP, gw.listeners[0].protocol);
+    try std.testing.expectEqual(gw_config.Listener.Protocol.HTTP, gw.listeners[0].protocol);
     try std.testing.expect(!gw.listeners[0].has_hostname);
 
     // Check second listener
     try std.testing.expectEqualStrings("https", gw.listeners[1].name.slice());
     try std.testing.expectEqual(@as(u16, 443), gw.listeners[1].port);
-    try std.testing.expectEqual(config.Listener.Protocol.HTTPS, gw.listeners[1].protocol);
+    try std.testing.expectEqual(gw_config.Listener.Protocol.HTTPS, gw.listeners[1].protocol);
     try std.testing.expect(gw.listeners[1].has_hostname);
     try std.testing.expectEqualStrings("*.example.com", gw.listeners[1].hostname.slice());
 }
@@ -2325,14 +2326,14 @@ test "parseHTTPRouteJson - full route" {
     // Check matches
     try std.testing.expectEqual(@as(u8, 1), rule.matches_count);
     try std.testing.expect(rule.matches[0].has_path);
-    try std.testing.expectEqual(config.PathMatch.Type.PathPrefix, rule.matches[0].path.match_type);
+    try std.testing.expectEqual(gw_config.PathMatch.Type.PathPrefix, rule.matches[0].path.match_type);
     try std.testing.expectEqualStrings("/api/", rule.matches[0].path.value.slice());
 
     // Check filters
     try std.testing.expectEqual(@as(u8, 1), rule.filters_count);
-    try std.testing.expectEqual(config.HTTPRouteFilter.Type.URLRewrite, rule.filters[0].filter_type);
+    try std.testing.expectEqual(gw_config.HTTPRouteFilter.Type.URLRewrite, rule.filters[0].filter_type);
     try std.testing.expect(rule.filters[0].url_rewrite.has_path);
-    try std.testing.expectEqual(config.PathRewrite.Type.ReplacePrefixMatch, rule.filters[0].url_rewrite.path.rewrite_type);
+    try std.testing.expectEqual(gw_config.PathRewrite.Type.ReplacePrefixMatch, rule.filters[0].url_rewrite.path.rewrite_type);
     try std.testing.expectEqualStrings("/", rule.filters[0].url_rewrite.path.value.slice());
 
     // Check backend refs
@@ -2388,7 +2389,7 @@ test "parseHTTPRouteJson - exact path match" {
 
     try std.testing.expectEqual(@as(u8, 1), route.rules_count);
     const match = &route.rules[0].matches[0];
-    try std.testing.expectEqual(config.PathMatch.Type.Exact, match.path.match_type);
+    try std.testing.expectEqual(gw_config.PathMatch.Type.Exact, match.path.match_type);
     try std.testing.expectEqualStrings("/health", match.path.value.slice());
 }
 
@@ -2439,9 +2440,9 @@ test "parseFilterJson - URLRewrite with ReplaceFullPath" {
     var filter = StoredHTTPRouteFilter.init();
     try parseFilterJson(json, &filter);
 
-    try std.testing.expectEqual(config.HTTPRouteFilter.Type.URLRewrite, filter.filter_type);
+    try std.testing.expectEqual(gw_config.HTTPRouteFilter.Type.URLRewrite, filter.filter_type);
     try std.testing.expect(filter.url_rewrite.has_path);
-    try std.testing.expectEqual(config.PathRewrite.Type.ReplaceFullPath, filter.url_rewrite.path.rewrite_type);
+    try std.testing.expectEqual(gw_config.PathRewrite.Type.ReplaceFullPath, filter.url_rewrite.path.rewrite_type);
     try std.testing.expectEqualStrings("/new/path", filter.url_rewrite.path.value.slice());
 }
 
@@ -2472,7 +2473,7 @@ test "StoredPathMatch - toPathMatch" {
     stored.active = true;
 
     const path_match = stored.toPathMatch();
-    try std.testing.expectEqual(config.PathMatch.Type.Exact, path_match.type);
+    try std.testing.expectEqual(gw_config.PathMatch.Type.Exact, path_match.type);
     try std.testing.expectEqualStrings("/exact/path", path_match.value);
 }
 

@@ -1,734 +1,119 @@
 # serval-gateway
 
-> **Status: Data Plane Integration Implemented**
+> **Status: Library Implemented**
 >
-> Control plane (K8s watcher) and data plane (router_example) are integrated.
-> Gateway translates HTTPRoute resources to Router config via the translator module.
-> Runtime config updates are pushed to router_example via `pushConfigToDataPlane()`.
+> Gateway API types and translator to serval-router JSON config.
+> For a complete K8s controller implementation, see `examples/gateway/`.
 
-Kubernetes Gateway API ingress controller for serval — can be used as an **AWS ALB Controller replacement**.
+Gateway API library for serval — provides types and translation for building ingress controllers.
 
 ## What is this?
 
-**serval-gateway is an ingress controller** — it routes external traffic into your Kubernetes cluster based on [Gateway API](https://gateway-api.sigs.k8s.io/) resources.
+**serval-gateway is a library**, not a controller. It provides:
 
-Gateway API is the newer, more expressive replacement for the Ingress API:
+1. **Gateway API types** (config.zig) — Zig structs mirroring Kubernetes Gateway API resources
+2. **Translator** (translator.zig) — Converts GatewayConfig to JSON for serval-router admin API
 
-| Feature | Ingress | Gateway API |
-|---------|---------|-------------|
-| Role separation | No | Yes (GatewayClass → Gateway → HTTPRoute) |
-| Header matching | Limited | Full support |
-| Traffic splitting | No | Yes (weighted backends) |
-| URL rewriting | Annotations | Native |
-| TLS per-route | No | Yes |
+Use this library to build your own gateway controller that:
+- Watches Kubernetes resources (Gateway, HTTPRoute, Service, Endpoints)
+- Resolves Service references to pod IPs
+- Translates to serval-router config using this library
+- Pushes JSON to serval-router admin API
 
-## Architecture Overview
+For a complete Kubernetes controller implementation, see `examples/gateway/`.
 
-serval-gateway follows a **control plane / data plane separation**:
-
-```
-┌────────────────────────────────────────────────────────────────┐
-│                 serval-gateway (Control Plane)                 │
-│                                                                │
-│  k8s/client.zig        k8s/watcher.zig         gateway.zig    │
-│  ┌──────────────┐     ┌───────────────┐     ┌──────────────┐  │
-│  │ K8s HTTP     │     │ Watch Loop    │     │ Translate    │  │
-│  │ - Bearer auth│────▶│ - Gateway     │────▶│ GatewayConfig│  │
-│  │ - TLS        │     │ - HTTPRoute   │     │ to Routes    │  │
-│  │ - SA token   │     │ - Service     │     │              │  │
-│  └──────────────┘     │ - Endpoints   │     │ Push to      │──┼──▶
-│                       │ - Secrets     │     │ Data Plane   │  │
-│                       │               │     └──────────────┘  │
-│                       │ on_config_    │                       │
-│                       │ change()      │                       │
-│                       └───────────────┘                       │
-└────────────────────────────────────────────────────────────────┘
-                                                                 │
-                          POST /routes/update                    │
-                                                                 ▼
-┌────────────────────────────────────────────────────────────────┐
-│                 router_example (Data Plane)                    │
-│                                                                │
-│    Admin API :9901 ────▶ Atomic Swap ────▶ Router             │
-│    Traffic :8080 ───────────────────────▶ Backends            │
-└────────────────────────────────────────────────────────────────┘
-```
-
-### Component Breakdown
-
-| Component | File | Description |
-|-----------|------|-------------|
-| **K8s HTTP client** | `k8s/client.zig` | HTTP client with ServiceAccount auth |
-| **ServiceAccount auth** | `k8s/client.zig:31-33` | Bearer token from pod mount |
-| **Watch stream** | `k8s/client.zig:466-507` | WatchStream for K8s watch API |
-| **Resource watcher** | `k8s/watcher.zig` | Watches all Gateway API resource types |
-| **Event parsing** | `k8s/watcher.zig:598-631` | JSON parsing for watch events |
-| **Resource stores** | `k8s/watcher.zig:157-289` | Bounded storage for tracked resources |
-| **Reconnect backoff** | `k8s/watcher.zig:577-586` | Exponential backoff on disconnect |
-| **Config translation** | `gateway.zig:803-840` | GatewayConfig → Router Routes |
-| **Push to data plane** | `gateway.zig:442-522` | HTTP POST with retry to router_example |
-
-### Control Plane (serval-gateway)
-
-Watches Kubernetes Gateway API resources and pushes configuration to data planes:
-
-- **k8s/client.zig**: HTTP client for K8s API with ServiceAccount authentication
-  - `initInCluster()` - reads token from `/var/run/secrets/kubernetes.io/serviceaccount/token`
-  - `get()` - GET requests with Bearer auth header
-  - `watch()` - returns WatchStream for streaming events
-
-- **k8s/watcher.zig**: Resource watcher with reconnection
-  - Watches: Gateway, HTTPRoute, Service, Endpoints, Secrets
-  - Parses JSON watch events (ADDED, MODIFIED, DELETED, BOOKMARK, ERROR)
-  - `on_config_change` callback triggers reconciliation
-  - Exponential backoff on connection failure
-
-- **gateway.zig**: Config translation and data plane management
-  - `updateConfig()` - translates GatewayConfig and pushes to data plane
-  - `pushConfigToDataPlane()` - HTTP POST to router_example admin API
-  - Admin API for health/readiness probes
-
-### Data Plane (router_example)
-
-Handles actual HTTP traffic routing:
-
-- **examples/router_example.zig**: HTTP server with dynamic routing
-  - Admin API on port 9901 receives config updates
-  - Atomic double-buffered config swap (zero-downtime updates)
-  - Uses `serval-router` for path/host matching
-
-### Integration Flow
+## File Structure
 
 ```
-1. K8s watcher detects HTTPRoute/Service/Endpoints changes
-       │
-       ▼
-2. Watcher calls on_config_change() callback
-       │
-       ▼
-3. gateway.updateConfig() translates GatewayConfig → Routes
-       │
-       ▼
-4. gateway.pushConfigToDataPlane() POSTs JSON to router_example
-       │
-       ▼
-5. router_example performs atomic config swap (double-buffer)
-       │
-       ▼
-6. New routes take effect immediately (no restart needed)
+serval-gateway/
+├── config.zig      # Gateway API types (GatewayConfig, HTTPRoute, etc.)
+├── translator.zig  # GatewayConfig → Router JSON translation
+└── mod.zig         # Module exports
 ```
-
-## Using as AWS ALB Controller Replacement
-
-Deploy serval-gateway + router_example as a full ALB replacement.
-
-### Deployment Options
-
-**You don't always need a load balancer.** Choose based on your requirements:
-
-```
-Option A: Direct (single instance, simplest)
-┌──────────┐     ┌────────────────┐     ┌──────────┐
-│  Client  │────▶│ serval-router  │────▶│ Backends │
-│          │     │ (EC2/ECS/K8s)  │     │          │
-└──────────┘     │ Public IP/DNS  │     └──────────┘
-                 └────────────────┘
-
-Option B: Behind NLB (HA, multiple instances)
-┌──────────┐     ┌─────┐     ┌────────────────┐     ┌──────────┐
-│  Client  │────▶│ NLB │────▶│ serval-router  │────▶│ Backends │
-│          │     │     │     │ (multiple)     │     │          │
-└──────────┘     └─────┘     └────────────────┘     └──────────┘
-
-Option C: Behind existing ALB (serval as internal router)
-┌──────────┐     ┌─────┐     ┌────────────────┐     ┌──────────┐
-│  Client  │────▶│ ALB │────▶│ serval-router  │────▶│ Backends │
-│          │     │     │     │ (internal)     │     │          │
-└──────────┘     └─────┘     └────────────────┘     └──────────┘
-```
-
-| Scenario | Load Balancer | Why |
-|----------|---------------|-----|
-| Single instance | None | Direct access, simplest setup |
-| High availability | NLB | Distribute across multiple instances |
-| Need AWS WAF | ALB | NLB doesn't support WAF |
-| WebSockets/gRPC | NLB | ALB has idle timeouts |
-| Maximum performance | NLB | Lower latency than ALB |
-| Already have ALB | Keep ALB | serval as internal router |
-
-### Simplest AWS Setup (No Load Balancer)
-
-```bash
-# 1. Launch EC2 with security group allowing 8080, 9901
-# 2. Run serval
-./router_example &
-
-# 3. Push config
-curl -X PUT http://your-ec2-ip:9901/config \
-  -H "Content-Type: application/json" \
-  -d '{
-    "routes": [{"name": "api", "match": {"path_prefix": "/api"}, "pool": "backend"}],
-    "pools": [{"name": "backend", "upstreams": [{"host": "10.0.1.5", "port": 8080}]}],
-    "default_pool": "backend"
-  }'
-
-# 4. Point Route53 to EC2 public IP
-# 5. Done - clients access directly
-```
-
-### How It Gets Triggered
-
-There's no explicit "trigger" — it's **event-driven via K8s watch API**:
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              Kubernetes Cluster                              │
-│                                                                              │
-│  1. User applies HTTPRoute           2. K8s API notifies watcher            │
-│     ┌──────────────┐                    ┌─────────────────────┐             │
-│     │ kubectl apply│───────────────────▶│   K8s API Server    │             │
-│     │ httproute.yaml                    │                     │             │
-│     └──────────────┘                    └──────────┬──────────┘             │
-│                                                    │ watch stream           │
-│                                                    ▼                        │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │                     serval-gateway (Control Plane)                   │   │
-│  │                                                                      │   │
-│  │  3. Watcher receives     4. reconcile()        5. Push config       │   │
-│  │     ADDED event             parses JSON           to data plane     │   │
-│  │     ┌──────────┐         ┌──────────┐         ┌──────────────┐     │   │
-│  │     │ Watcher  │────────▶│reconcile │────────▶│pushConfigTo- │     │   │
-│  │     │          │         │          │         │DataPlane()   │     │   │
-│  │     └──────────┘         └──────────┘         └──────┬───────┘     │   │
-│  └──────────────────────────────────────────────────────┼──────────────┘   │
-│                                                         │                   │
-│                                            POST /routes/update              │
-│                                                         │                   │
-│  ┌──────────────────────────────────────────────────────▼──────────────┐   │
-│  │                     router_example (Data Plane)                      │   │
-│  │                                                                      │   │
-│  │  6. Receive config    7. Atomic swap         8. Route traffic       │   │
-│  │     ┌──────────┐      ┌──────────┐          ┌──────────────┐       │   │
-│  │     │Admin API │─────▶│ConfigSwap│─────────▶│   Router     │       │   │
-│  │     │  :9901   │      │          │          │              │       │   │
-│  │     └──────────┘      └──────────┘          └──────┬───────┘       │   │
-│  └──────────────────────────────────────────────────────┼──────────────┘   │
-│                                                         │                   │
-└─────────────────────────────────────────────────────────┼───────────────────┘
-                                                          │
-                     Internet ◀───── NLB ◀────────────────┘
-                         │
-                         ▼
-                    Your Users
-```
-
-**Event Flow:**
-
-1. **User creates HTTPRoute** via `kubectl apply -f httproute.yaml`
-2. **K8s API Server** stores the resource and notifies all watchers
-3. **Watcher** has an open HTTP connection: `GET /apis/gateway.networking.k8s.io/v1/httproutes?watch=true`
-4. K8s sends newline-delimited JSON: `{"type":"ADDED","object":{...}}`
-5. **`reconcile()`** parses JSON into typed config structs
-6. **`pushConfigToDataPlane()`** POSTs to router_example admin API
-7. **Router atomically swaps** config → new routes active immediately
-
-### Kubernetes Deployment
-
-```yaml
-# Control Plane (watches K8s, pushes config)
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: serval-gateway
-spec:
-  replicas: 2  # HA - both watch, only leader pushes
-  template:
-    spec:
-      serviceAccountName: serval-gateway
-      containers:
-      - name: gateway
-        image: serval-gateway:latest
-        env:
-        - name: DATA_PLANE_URL
-          value: "http://serval-router:9901"
----
-# Data Plane (handles actual traffic)
-apiVersion: apps/v1
-kind: DaemonSet  # Run on every node for low latency
-metadata:
-  name: serval-router
-spec:
-  template:
-    spec:
-      containers:
-      - name: router
-        image: serval-router:latest
-        ports:
-        - containerPort: 8080  # traffic
-        - containerPort: 9901  # admin API
----
-# Expose data plane via NLB (TCP passthrough)
-apiVersion: v1
-kind: Service
-metadata:
-  name: serval-router
-  annotations:
-    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
-    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
-spec:
-  type: LoadBalancer
-  ports:
-  - port: 80
-    targetPort: 8080
-  selector:
-    app: serval-router
-```
-
-### Testing Without Kubernetes
-
-You can test the data plane directly by simulating what the control plane does:
-
-```bash
-# Terminal 1: Start data plane
-zig build run-router-example
-
-# Terminal 2: Push config (simulates control plane)
-curl -X PUT http://localhost:9901/config \
-  -H "Content-Type: application/json" \
-  -d '{
-    "routes": [
-      {"name": "api", "match": {"path_prefix": "/api"}, "pool": "api-pool"}
-    ],
-    "pools": [
-      {"name": "api-pool", "upstreams": [{"host": "httpbin.org", "port": 80}]}
-    ],
-    "default_pool": "api-pool"
-  }'
-
-# Terminal 2: Verify config was applied
-curl http://localhost:9901/routes
-
-# Terminal 2: Test routing (proxies to httpbin.org)
-curl http://localhost:8080/api/get
-```
-
-### Testing in Kubernetes (k3s)
-
-```bash
-# Start k3s
-k3s server &
-
-# Deploy serval
-kubectl apply -f deploy/serval-gateway.yaml
-
-# Create an HTTPRoute
-kubectl apply -f - <<EOF
-apiVersion: gateway.networking.k8s.io/v1
-kind: HTTPRoute
-metadata:
-  name: test-route
-spec:
-  hostnames: ["test.example.com"]
-  rules:
-  - matches:
-    - path:
-        type: PathPrefix
-        value: /api
-    backendRefs:
-    - name: echo-server
-      port: 8080
-EOF
-
-# Check if config was pushed to data plane
-kubectl exec -it deploy/serval-router -- curl localhost:9901/routes
-
-# Test traffic (via NodePort or port-forward)
-kubectl port-forward svc/serval-router 8080:80 &
-curl -H "Host: test.example.com" http://localhost:8080/api/test
-```
-
-### Advantages over AWS ALB Controller
-
-| Feature | AWS ALB Controller | serval-gateway |
-|---------|-------------------|----------------|
-| Config update speed | ~30s (AWS API) | <100ms (direct push) |
-| AWS dependency | Yes | No |
-| Works outside AWS | No | Yes |
-| Memory allocations | Runtime | Zero after init |
-| Observability | CloudWatch | Built-in metrics |
-
-### Migrating from ALB + Envoy
-
-Common architecture to replace:
-
-```
-Current:
-┌─────┐     ┌─────┐     ┌───────────────────┐     ┌──────────┐
-│ CDN │────▶│ ALB │────▶│ Envoy (K8s)       │────▶│ Backends │
-└─────┘     └─────┘     │ Fargate/Karpenter │     └──────────┘
-                        └───────────────────┘
-```
-
-**Recommended: CDN Direct to Nodes (No ALB)**
-
-Your CDN (Akamai, CloudFront, Cloudflare, Fastly) can route directly to serval-router pods via Elastic IPs:
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              INTERNET                                        │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         Your CDN (Akamai, etc.)                              │
-│                                                                              │
-│  Origin: origin.example.com   ◄── points to a hostname, not IPs            │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼ DNS lookup
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              Route53                                         │
-│                                                                              │
-│  origin.example.com  A  1.2.3.4       ◄── registered by router pod 1       │
-│                      A  5.6.7.8       ◄── registered by router pod 2       │
-│                      A  9.10.11.12    ◄── registered by router pod 3       │
-│                                                                              │
-│  Health checks auto-remove unhealthy IPs                                    │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                    │
-                     Resolves to healthy node EIPs
-                                    │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              Kubernetes                                      │
-│                                                                              │
-│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐             │
-│  │ Node 1          │  │ Node 2          │  │ Node 3          │             │
-│  │ EIP: 1.2.3.4    │  │ EIP: 5.6.7.8    │  │ EIP: 9.10.11.12 │             │
-│  │                 │  │                 │  │                 │             │
-│  │ ┌─────────────┐ │  │ ┌─────────────┐ │  │ ┌─────────────┐ │             │
-│  │ │serval-router│ │  │ │serval-router│ │  │ │serval-router│ │             │
-│  │ │ DaemonSet   │ │  │ │ DaemonSet   │ │  │ │ DaemonSet   │ │             │
-│  │ │ hostNetwork │ │  │ │ hostNetwork │ │  │ │ hostNetwork │ │             │
-│  │ │             │ │  │ │             │ │  │ │             │ │             │
-│  │ │ On start:   │ │  │ │ On start:   │ │  │ │ On start:   │ │             │
-│  │ │ Register EIP│ │  │ │ Register EIP│ │  │ │ Register EIP│ │             │
-│  │ │ in Route53  │ │  │ │ in Route53  │ │  │ │ in Route53  │ │             │
-│  │ └──────┬──────┘ │  │ └──────┬──────┘ │  │ └──────┬──────┘ │             │
-│  └────────┼────────┘  └────────┼────────┘  └────────┼────────┘             │
-│           └────────────────────┼────────────────────┘                       │
-│                                ▼                                            │
-│                      ┌──────────────────┐                                   │
-│                      │   Backend Pods   │                                   │
-│                      └──────────────────┘                                   │
-│                                                                              │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │                    serval-gateway (Control Plane)                    │   │
-│  │                                                                      │   │
-│  │  Watches K8s HTTPRoute/Gateway ──▶ Pushes config to serval-routers  │   │
-│  │  (Does NOT manage Route53 - each router pod does that itself)       │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-**How it works:**
-
-| Component | Role | Replaces |
-|-----------|------|----------|
-| **Your CDN** | Internet ingress, caching, origin failover | - |
-| **serval-router** | L7 routing + self-registration in Route53 | ALB + Envoy |
-| **serval-gateway** | Watches K8s, pushes route config to routers | - |
-| **Route53** | DNS with health checks, hostname for CDN | ALB DNS |
-| **Elastic IPs** | Stable IPs attached to nodes | ALB target group |
-
-**Why no ALB needed:**
-
-- CDN points to a hostname (`origin.example.com`)
-- Route53 resolves hostname to healthy node EIPs
-- Each serval-router pod self-registers its EIP in Route53
-- Route53 health checks auto-remove unhealthy nodes
-
-**Akamai configuration example:**
-
-```
-Origin Server 1: 1.2.3.4:80   (EIP on K8s node 1)
-Origin Server 2: 5.6.7.8:80   (EIP on K8s node 2)
-Origin Server 3: 9.10.11.12:80 (EIP on K8s node 3)
-
-Health Check Path: /healthz
-Health Check Interval: 30s
-Failover: Remove unhealthy origins from rotation
-```
-
-**Self-Registration Model** (each router pod manages itself):
-
-Your CDN points to a hostname (e.g., `origin.example.com`). Each serval-router pod registers/deregisters itself in Route53:
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         serval-router pod                                │
-│                                                                          │
-│  On startup:                                                             │
-│    1. Get my node's EIP (EC2 metadata / instance API)                   │
-│    2. Register in Route53: origin.example.com → my EIP                  │
-│    3. Start serving traffic                                              │
-│                                                                          │
-│  On shutdown (SIGTERM from K8s):                                         │
-│    1. Deregister from Route53: remove my A record                       │
-│    2. Drain connections                                                  │
-│    3. Exit                                                               │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-**No central node watcher needed.** Each pod is responsible for itself.
-
-```yaml
-# DaemonSet with node info via Downward API
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: serval-router
-spec:
-  template:
-    spec:
-      hostNetwork: true
-      containers:
-      - name: router
-        env:
-        - name: NODE_NAME
-          valueFrom:
-            fieldRef:
-              fieldPath: spec.nodeName
-        - name: ROUTE53_ZONE_ID
-          value: "Z1234567890"
-        - name: ROUTE53_HOSTNAME
-          value: "origin.example.com"
-```
-
-**Failsafe:** Route53 health checks automatically remove unhealthy IPs even if pod crashes without clean shutdown:
-
-```
-Route53 Health Check:
-  Path: /healthz
-  Interval: 30s
-  Failure threshold: 3
-
-Pod crashes → Health check fails → Route53 removes IP from DNS
-```
-
-**Cost:** ~$13/mo (3 EIPs + Route53 zone + health checks) vs ~$16+/mo for NLB
-
-**Alternative: Keep NLB**
-
-If you prefer AWS-managed load balancing:
-
-```
-┌─────┐     ┌─────┐     ┌───────────────────┐     ┌──────────┐
-│ CDN │────▶│ NLB │────▶│ serval-router     │────▶│ Backends │
-└─────┘     └─────┘     │ (K8s)             │     └──────────┘
-                        └───────────────────┘
-```
-
-NLB does TCP passthrough, serval handles L7 routing. Simpler but costs more.
-
-### Migration Path
-
-```
-Phase 1: Current
-  CDN → ALB → Envoy → Backends
-
-Phase 2: Deploy serval alongside (shadow/canary)
-  CDN → ALB → Envoy → Backends
-                ↓
-          serval-router (shadow traffic, compare responses)
-
-Phase 3: Switch traffic
-  CDN → NLB → serval-router → Backends
-
-Phase 4: Cleanup
-  - Remove ALB
-  - Remove Envoy pods
-  - Optional: Remove NLB if CDN supports direct origin
-```
-
-### CDN Compatibility
-
-| CDN | Skip NLB? | How |
-|-----|-----------|-----|
-| CloudFront | Yes | Origin group with multiple IPs + health checks |
-| Cloudflare | Yes | Load balancing across origins |
-| Fastly | Yes | Multiple backends with health checks |
-| Akamai | Yes | Origin failover groups |
-
-### Cost Comparison
-
-| Component | Hourly Cost (us-east-1) |
-|-----------|------------------------|
-| ALB | ~$0.0225/hr + LCU |
-| NLB | ~$0.0225/hr + LCU |
-| serval on Fargate | ~$0.01/hr (256MB) |
-| serval hostNetwork | $0 (runs on existing nodes) |
-
-Eliminating ALB/NLB saves ~$16-20/month per load balancer plus LCU charges.
-
-## Features
-
-- **Gateway API v1 Support**: Watches GatewayClass, Gateway, and HTTPRoute resources
-- **Service Resolution**: Resolves Service references to Endpoints (pod IPs)
-- **Secret Resolution**: Resolves TLS certificate Secrets for HTTPS listeners
-- **Atomic Config Updates**: Lock-free config swap for zero-downtime updates
-- **Admin API**: Health checks, metrics, and config inspection on port 9901
-- **Reconnection with Backoff**: Exponential backoff for K8s API watch reconnection
 
 ## Exports
 
 ```zig
 const gateway = @import("serval-gateway");
 
-// Core types
-gateway.Gateway           // Main gateway controller
-gateway.ADMIN_PORT        // Admin API port (9901)
-
-// Configuration types
+// Configuration types (Gateway API)
 gateway.GatewayConfig     // Complete Gateway API config snapshot
-gateway.HTTPRoute         // HTTPRoute resource
-gateway.Listener          // Gateway listener config
+gateway.Gateway           // Gateway resource (listeners)
+gateway.HTTPRoute         // HTTPRoute resource (routing rules)
+gateway.HTTPRouteRule     // Rule within HTTPRoute
+gateway.HTTPRouteMatch    // Match conditions (path, headers)
+gateway.HTTPRouteFilter   // Filters (URLRewrite, etc.)
+gateway.BackendRef        // Reference to backend service
+gateway.Listener          // Gateway listener (port, protocol)
 
-// K8s integration
-gateway.k8s.Client        // K8s API HTTP client
-gateway.k8s.Watcher       // Resource watcher with reconnection
-gateway.k8s.EventType     // Watch event types (ADDED, MODIFIED, DELETED)
+// Resolved types (for translator API)
+gateway.ResolvedBackend       // Backend with resolved endpoints
+gateway.FixedResolvedEndpoint // Single endpoint (host:port)
 
-// Resolution
-gateway.Resolver          // Service/Secret resolver
-
-// Translation (Gateway API -> Router config)
-gateway.translator.TranslatedConfig     // Output config for router_example
-gateway.translator.TranslatedRoute      // Single route configuration
-gateway.translator.TranslatedPool       // Backend pool with upstreams
-gateway.translator.translateConfig      // Main translation function
+// Translation
+gateway.translator.translateToJson  // GatewayConfig → JSON bytes
+gateway.TranslatorError             // Translation errors
 ```
-
-## Translator Module
-
-The translator converts Gateway API resources into Router-compatible configuration:
-
-```zig
-// serval-gateway/translator.zig
-
-// Translate HTTPRoutes to router config
-pub fn translateConfig(
-    gw_config: *const GatewayConfig,
-    resolver: *const Resolver,
-) TranslateError!TranslatedConfig
-
-// Output structures match router_example admin API format
-pub const TranslatedConfig = struct {
-    routes: [MAX_ROUTES]TranslatedRoute,
-    route_count: u32,
-    pools: [MAX_POOLS]TranslatedPool,
-    pool_count: u32,
-    default_route: TranslatedRoute,
-};
-```
-
-**Translation rules:**
-- HTTPRoute path matches -> Route path_prefix
-- HTTPRoute hostnames -> Route host filter
-- URLRewrite filter -> Route strip_prefix flag
-- BackendRef -> Pool with resolved pod IPs
-
-## pushConfigToDataPlane Flow
-
-When K8s resources change, gateway pushes config to router_example:
-
-```
-1. Watcher callback fires (HTTPRoute/Service change)
-       |
-       v
-2. translateConfig(gw_config, resolver) -> TranslatedConfig
-       |
-       v
-3. serializeConfig(config) -> JSON bytes
-       |
-       v
-4. POST http://127.0.0.1:9901/routes/update
-       |
-       v
-5. router_example performs atomic swap (double-buffer)
-```
-
-**Retry behavior:**
-- 3 retry attempts with exponential backoff
-- Base delay: 100ms, max delay: 5000ms
-- On failure: keep previous config, log warning
 
 ## Usage
 
-### In-Cluster Deployment
+### Building a Controller
 
 ```zig
 const std = @import("std");
 const gateway = @import("serval-gateway");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
-
-    // Initialize K8s client (reads ServiceAccount credentials)
-    const client = try gateway.k8s.Client.initInCluster(allocator);
-    defer client.deinit();
-
-    // Initialize gateway controller
-    var gw = gateway.Gateway.init(allocator);
-    defer gw.deinit();
-
-    // Start admin API
-    try gw.startAdminServer();
-
-    // Initialize watcher with config update callback
-    const watcher = try gateway.k8s.Watcher.init(
-        allocator,
-        client,
-        &onConfigChange,
+pub fn translateAndPush(
+    config: *const gateway.GatewayConfig,
+    resolved_backends: []const gateway.ResolvedBackend,
+    buffer: []u8,
+) !void {
+    // Translate to JSON
+    const json_len = try gateway.translateToJson(
+        config,
+        resolved_backends,
+        buffer,
     );
-    defer watcher.deinit();
 
-    // Start watching K8s resources
-    const watch_thread = try watcher.start();
-    watch_thread.join();
-}
+    const json = buffer[0..json_len];
 
-fn onConfigChange(config: *gateway.GatewayConfig) void {
-    // Handle config update - translate to router routes
-    std.log.info("Config updated: {d} gateways, {d} routes", .{
-        config.gateways.len,
-        config.http_routes.len,
-    });
+    // POST to serval-router admin API
+    // (use serval-client or your HTTP client)
+    try postToRouter("http://localhost:9901/routes/update", json);
 }
 ```
 
-### Testing Outside Cluster
+### JSON Output Format
 
-```zig
-// Initialize with explicit config for testing
-const client = try gateway.k8s.Client.initWithConfig(
-    allocator,
-    "https://localhost:6443",  // API server URL
-    "test-token",              // Bearer token
-    "default",                 // Namespace
-);
+The translator outputs JSON matching the serval-router admin API:
+
+```json
+{
+  "routes": [
+    {
+      "name": "api",
+      "host": "api.example.com",
+      "path_prefix": "/api/",
+      "pool_idx": 0,
+      "strip_prefix": true
+    }
+  ],
+  "default_route": {
+    "name": "default",
+    "path_prefix": "/",
+    "pool_idx": 0,
+    "strip_prefix": false
+  },
+  "pools": [
+    {
+      "name": "api-pool",
+      "upstreams": [
+        {"host": "10.0.1.5", "port": 8001, "idx": 0, "tls": false}
+      ]
+    }
+  ]
+}
 ```
-
-## Admin API Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/healthz` | GET | Liveness probe - always returns 200 OK |
-| `/readyz` | GET | Readiness probe - 200 if config loaded, 503 otherwise |
-| `/config` | GET | JSON dump of current routing config |
-| `/metrics` | GET | Prometheus-format metrics |
-| `/reload` | POST | Trigger config re-sync from K8s |
 
 ## Configuration Limits
 
@@ -744,67 +129,70 @@ const client = try gateway.k8s.Client.initWithConfig(
 | `MAX_POOLS` | 64 | Max backend pools |
 | `MAX_UPSTREAMS_PER_POOL` | 64 | Max upstreams per pool |
 
-## Kubernetes Deployment
+## Complete Controller Implementation
 
-See `deploy/serval-gateway.yaml` for complete deployment manifests including:
-- ServiceAccount with RBAC permissions
-- GatewayClass registration
-- Deployment with health probes
-- LoadBalancer Service
+For a full Kubernetes Gateway controller, see `examples/gateway/`:
 
-### Prerequisites
-
-Install Gateway API CRDs:
-```bash
-kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.0.0/standard-install.yaml
+```
+examples/gateway/
+├── main.zig          # Entry point
+├── controller.zig    # Orchestration and reconciliation
+├── k8s_client.zig    # K8s API HTTP client
+├── watcher.zig       # Resource watch with reconnection
+├── resolver.zig      # Service → Endpoints resolution
+├── data_plane.zig    # Push config to serval-router
+└── admin_handler.zig # Health/readiness endpoints
 ```
 
-### Deploy
+The example controller demonstrates:
+- ServiceAccount authentication (`/var/run/secrets/kubernetes.io/serviceaccount/token`)
+- Watch API for Gateway, HTTPRoute, Service, Endpoints
+- Exponential backoff on reconnection
+- Service → pod IP resolution
+- Atomic config push to data plane
 
-```bash
-kubectl apply -f deploy/serval-gateway.yaml
-```
+## Gateway API Resources
 
-### Example Resources
+This library supports the [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io/):
 
-See `deploy/examples/` for example Gateway and HTTPRoute resources:
-- `basic-gateway.yaml` - Simple HTTP gateway
-- `basic-httproute.yaml` - HTTPRoute with path matching and URL rewrite
+| Resource | Description |
+|----------|-------------|
+| Gateway | Defines listeners (ports/protocols) for accepting traffic |
+| HTTPRoute | Defines routing rules matching requests to backends |
+| BackendRef | References to upstream services |
+
+Gateway API is the newer, more expressive replacement for the Ingress API:
+
+| Feature | Ingress | Gateway API |
+|---------|---------|-------------|
+| Role separation | No | Yes (GatewayClass -> Gateway -> HTTPRoute) |
+| Header matching | Limited | Full support |
+| Traffic splitting | No | Yes (weighted backends) |
+| URL rewriting | Annotations | Native |
+| TLS per-route | No | Yes |
 
 ## Implementation Status
 
 | Feature | Status |
 |---------|--------|
-| GatewayClass watch | Implemented |
-| Gateway watch | Implemented |
-| HTTPRoute watch | Implemented |
-| Service/Endpoints resolution | Implemented |
-| Secret/TLS resolution | Implemented |
+| Gateway types | Implemented |
+| HTTPRoute types | Implemented |
+| Listener types | Implemented |
 | PathPrefix matching | Implemented |
 | Exact path matching | Implemented |
 | URLRewrite filter | Implemented |
-| Admin API | Implemented |
-| Atomic config swap | Implemented |
-| Watch reconnection | Implemented |
-| **Translator module** | **Implemented** |
-| **pushConfigToDataPlane()** | **Implemented** |
-| **Resolver integration** | **Implemented** |
-| TLS termination | Planned |
+| JSON translation | Implemented |
 | Header matching | Planned |
-| Request/Response header modification | Planned |
 | Traffic splitting | Planned |
 
 ## Dependencies
 
-- `serval-core`: Types, config, errors
-- `serval-router`: Route matching (future integration)
-- `std.http`: K8s API communication
+- `serval-core`: Types, config constants
 
 ## TigerStyle Compliance
 
-- Bounded storage with explicit MAX_* limits
+- Fixed-size types with explicit MAX_* limits
 - No allocation after initialization
-- Atomic operations for thread-safe config updates
 - Explicit error handling (no catch {})
 - All loops bounded with MAX_* iteration limits
-- Exponential backoff with MAX_BACKOFF_MS cap
+- Units in names (MAX_JSON_SIZE_BYTES)

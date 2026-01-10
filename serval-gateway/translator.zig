@@ -23,8 +23,6 @@ const assert = std.debug.assert;
 const core = @import("serval-core");
 const core_config = core.config;
 const gw_config = @import("config.zig");
-const resolver_mod = @import("resolver.zig");
-const Resolver = resolver_mod.Resolver;
 
 // ============================================================================
 // Constants (TigerStyle: Named constants with units)
@@ -76,12 +74,12 @@ pub const TranslatorError = error{
 
 /// Translate GatewayConfig to JSON for router admin API.
 ///
-/// Resolves backend references to pod IPs using the provided resolver.
+/// Takes pre-resolved backends (Service -> Endpoints already looked up).
 /// Output format matches POST /routes/update expected JSON.
 ///
 /// Arguments:
 ///   config: Gateway API configuration (HTTPRoutes).
-///   resolver: Resolver with Service -> Endpoints mappings.
+///   resolved_backends: Pre-resolved backend endpoints (from K8s or other source).
 ///   out_buf: Output buffer for JSON (must be at least MAX_JSON_SIZE_BYTES bytes).
 ///
 /// Returns:
@@ -90,7 +88,7 @@ pub const TranslatorError = error{
 /// TigerStyle: Bounded loops, explicit error handling, no allocation.
 pub fn translateToJson(
     config_ptr: *const gw_config.GatewayConfig,
-    resolver: *const Resolver,
+    resolved_backends: []const gw_config.ResolvedBackend,
     out_buf: *[MAX_JSON_SIZE_BYTES]u8,
 ) TranslatorError!usize {
     // S1: Preconditions
@@ -193,7 +191,7 @@ pub fn translateToJson(
                 writer.writeRaw(",") catch return error.BufferTooSmall;
             }
 
-            try writePool(&writer, http_route.name, rule.backend_refs, resolver, pool_count);
+            try writePool(&writer, http_route.name, rule.backend_refs, resolved_backends, pool_count);
             pool_count += 1;
         }
     }
@@ -267,17 +265,40 @@ fn writeRoute(
     writer.writeRaw("}") catch return error.BufferTooSmall;
 }
 
+/// Find resolved backend by name and namespace.
+/// TigerStyle S4: Bounded search (resolved_backends slice is bounded by caller).
+fn findResolvedBackend(
+    backends: []const gw_config.ResolvedBackend,
+    name: []const u8,
+    namespace: []const u8,
+) ?*const gw_config.ResolvedBackend {
+    // S1: Preconditions
+    assert(name.len > 0);
+    assert(namespace.len > 0);
+    assert(backends.len <= gw_config.MAX_RESOLVED_BACKENDS);
+
+    for (backends) |*backend| {
+        if (std.mem.eql(u8, backend.getName(), name) and
+            std.mem.eql(u8, backend.getNamespace(), namespace))
+        {
+            return backend;
+        }
+    }
+    return null;
+}
+
 /// Write a single pool object to JSON with resolved upstreams.
 fn writePool(
     writer: *JsonWriter,
     name: []const u8,
     backend_refs: []const gw_config.BackendRef,
-    resolver: *const Resolver,
+    resolved_backends: []const gw_config.ResolvedBackend,
     pool_idx: u8,
 ) TranslatorError!void {
     // S1: Preconditions
     assert(name.len > 0);
     assert(pool_idx < MAX_POOLS);
+    assert(resolved_backends.len <= gw_config.MAX_RESOLVED_BACKENDS);
 
     writer.writeRaw("{") catch return error.BufferTooSmall;
     writer.writeRaw("\"name\":\"") catch return error.BufferTooSmall;
@@ -293,18 +314,20 @@ fn writePool(
         // S3: Bounded loop check
         if (ref_i >= gw_config.MAX_BACKEND_REFS) break;
 
-        // Resolve backend ref to endpoints
-        var endpoints: [resolver_mod.MAX_ENDPOINTS_PER_SERVICE]gw_config.ResolvedEndpoint = undefined;
-        const ep_count = resolver.getServiceEndpoints(
+        // Look up resolved backend by name/namespace
+        const resolved = findResolvedBackend(
+            resolved_backends,
             backend_ref.name,
             backend_ref.namespace,
-            &endpoints,
-        );
+        ) orelse {
+            // Skip backends without resolved endpoints
+            continue;
+        };
 
         // Write each endpoint as an upstream
-        for (endpoints[0..ep_count], 0..) |ep, ep_i| {
+        for (resolved.getEndpoints(), 0..) |ep, ep_i| {
             // S3: Bounded loop check
-            if (ep_i >= resolver_mod.MAX_ENDPOINTS_PER_SERVICE) break;
+            if (ep_i >= gw_config.MAX_RESOLVED_ENDPOINTS) break;
 
             if (upstream_count >= MAX_UPSTREAMS_PER_POOL) {
                 return error.TooManyUpstreams;
@@ -314,7 +337,7 @@ fn writePool(
                 writer.writeRaw(",") catch return error.BufferTooSmall;
             }
 
-            try writeUpstream(writer, ep.address, backend_ref.port, global_upstream_idx + upstream_count);
+            try writeUpstream(writer, ep.getIp(), backend_ref.port, global_upstream_idx + upstream_count);
             upstream_count += 1;
         }
     }
@@ -392,7 +415,8 @@ const JsonWriter = struct {
         assert(data.len <= MAX_JSON_SIZE_BYTES);
 
         const data_len: u32 = @intCast(data.len);
-        if (self.pos + data_len > MAX_JSON_SIZE_BYTES) {
+        const buf_len: u32 = @intCast(self.buf.len);
+        if (self.pos + data_len > buf_len) {
             return error.BufferTooSmall;
         }
         @memcpy(self.buf[self.pos..][0..data.len], data);
@@ -404,16 +428,50 @@ const JsonWriter = struct {
 // Unit Tests
 // ============================================================================
 
+/// Helper to create a ResolvedBackend for tests.
+/// TigerStyle: Fixed-size buffer helper, no allocation.
+fn createTestBackend(
+    name: []const u8,
+    namespace: []const u8,
+    ips: []const []const u8,
+    port: u16,
+) gw_config.ResolvedBackend {
+    // S1: Preconditions
+    assert(name.len <= gw_config.MAX_NAME_LEN);
+    assert(namespace.len <= gw_config.MAX_NAME_LEN);
+    assert(ips.len <= gw_config.MAX_RESOLVED_ENDPOINTS);
+
+    var backend: gw_config.ResolvedBackend = undefined;
+
+    // Set name
+    @memcpy(backend.name[0..name.len], name);
+    backend.name_len = @intCast(name.len);
+
+    // Set namespace
+    @memcpy(backend.namespace[0..namespace.len], namespace);
+    backend.namespace_len = @intCast(namespace.len);
+
+    // Set endpoints
+    for (ips, 0..) |ip, i| {
+        @memcpy(backend.endpoints[i].ip[0..ip.len], ip);
+        backend.endpoints[i].ip_len = @intCast(ip.len);
+        backend.endpoints[i].port = port;
+    }
+    backend.endpoint_count = @intCast(ips.len);
+
+    return backend;
+}
+
 test "translateToJson empty config" {
     const config_data = gw_config.GatewayConfig{
         .gateways = &.{},
         .http_routes = &.{},
     };
 
-    var resolver = Resolver.init();
+    const resolved_backends = [_]gw_config.ResolvedBackend{};
     var out_buf: [MAX_JSON_SIZE_BYTES]u8 = undefined;
 
-    const len = try translateToJson(&config_data, &resolver, &out_buf);
+    const len = try translateToJson(&config_data, &resolved_backends, &out_buf);
 
     try std.testing.expect(len > 0);
 
@@ -452,20 +510,14 @@ test "translateToJson with simple HTTPRoute" {
         .http_routes = &http_routes,
     };
 
-    // Set up resolver with service endpoints
-    var resolver = Resolver.init();
-    const endpoints_json =
-        \\{
-        \\  "subsets": [{
-        \\    "addresses": [{ "ip": "10.0.1.1" }, { "ip": "10.0.1.2" }],
-        \\    "ports": [{ "port": 8080 }]
-        \\  }]
-        \\}
-    ;
-    try resolver.updateService("api-svc", "default", endpoints_json);
+    // Set up resolved backends with service endpoints
+    const ips = [_][]const u8{ "10.0.1.1", "10.0.1.2" };
+    var resolved_backends = [_]gw_config.ResolvedBackend{
+        createTestBackend("api-svc", "default", &ips, 8080),
+    };
 
     var out_buf: [MAX_JSON_SIZE_BYTES]u8 = undefined;
-    const len = try translateToJson(&config_data, &resolver, &out_buf);
+    const len = try translateToJson(&config_data, &resolved_backends, &out_buf);
 
     try std.testing.expect(len > 0);
 
@@ -511,19 +563,14 @@ test "translateToJson with host matching" {
         .http_routes = &http_routes,
     };
 
-    var resolver = Resolver.init();
-    const endpoints_json =
-        \\{
-        \\  "subsets": [{
-        \\    "addresses": [{ "ip": "10.0.1.1" }],
-        \\    "ports": [{ "port": 8080 }]
-        \\  }]
-        \\}
-    ;
-    try resolver.updateService("api-svc", "default", endpoints_json);
+    // Set up resolved backends with service endpoints
+    const ips = [_][]const u8{"10.0.1.1"};
+    var resolved_backends = [_]gw_config.ResolvedBackend{
+        createTestBackend("api-svc", "default", &ips, 8080),
+    };
 
     var out_buf: [MAX_JSON_SIZE_BYTES]u8 = undefined;
-    const len = try translateToJson(&config_data, &resolver, &out_buf);
+    const len = try translateToJson(&config_data, &resolved_backends, &out_buf);
 
     const json = out_buf[0..len];
 
@@ -567,19 +614,14 @@ test "translateToJson with URLRewrite filter" {
         .http_routes = &http_routes,
     };
 
-    var resolver = Resolver.init();
-    const endpoints_json =
-        \\{
-        \\  "subsets": [{
-        \\    "addresses": [{ "ip": "10.0.1.1" }],
-        \\    "ports": [{ "port": 8080 }]
-        \\  }]
-        \\}
-    ;
-    try resolver.updateService("api-svc", "default", endpoints_json);
+    // Set up resolved backends with service endpoints
+    const ips = [_][]const u8{"10.0.1.1"};
+    var resolved_backends = [_]gw_config.ResolvedBackend{
+        createTestBackend("api-svc", "default", &ips, 8080),
+    };
 
     var out_buf: [MAX_JSON_SIZE_BYTES]u8 = undefined;
-    const len = try translateToJson(&config_data, &resolver, &out_buf);
+    const len = try translateToJson(&config_data, &resolved_backends, &out_buf);
 
     const json = out_buf[0..len];
 
@@ -663,19 +705,14 @@ test "translateToJson full lb_config structure" {
         .http_routes = &http_routes,
     };
 
-    var resolver = Resolver.init();
-    const endpoints_json =
-        \\{
-        \\  "subsets": [{
-        \\    "addresses": [{ "ip": "10.0.1.5" }],
-        \\    "ports": [{ "port": 8080 }]
-        \\  }]
-        \\}
-    ;
-    try resolver.updateService("api-svc", "default", endpoints_json);
+    // Set up resolved backends with service endpoints
+    const ips = [_][]const u8{"10.0.1.5"};
+    var resolved_backends = [_]gw_config.ResolvedBackend{
+        createTestBackend("api-svc", "default", &ips, 8080),
+    };
 
     var out_buf: [MAX_JSON_SIZE_BYTES]u8 = undefined;
-    const len = try translateToJson(&config_data, &resolver, &out_buf);
+    const len = try translateToJson(&config_data, &resolved_backends, &out_buf);
 
     const json = out_buf[0..len];
 
@@ -684,4 +721,25 @@ test "translateToJson full lb_config structure" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"enable_probing\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"probe_interval_ms\":5000") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"health_path\":\"/\"") != null);
+}
+
+test "findResolvedBackend basic lookup" {
+    const ips = [_][]const u8{"10.0.0.1"};
+    var backends = [_]gw_config.ResolvedBackend{
+        createTestBackend("api-svc", "default", &ips, 8080),
+    };
+
+    // Should find the backend
+    const found = findResolvedBackend(&backends, "api-svc", "default");
+    try std.testing.expect(found != null);
+    try std.testing.expectEqualStrings("api-svc", found.?.getName());
+    try std.testing.expectEqualStrings("default", found.?.getNamespace());
+
+    // Should not find non-existent backend
+    const not_found = findResolvedBackend(&backends, "other-svc", "default");
+    try std.testing.expect(not_found == null);
+
+    // Should not find with wrong namespace
+    const wrong_ns = findResolvedBackend(&backends, "api-svc", "production");
+    try std.testing.expect(wrong_ns == null);
 }

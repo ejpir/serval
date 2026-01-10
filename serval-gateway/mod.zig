@@ -1,40 +1,41 @@
 //! serval-gateway
 //!
-//! Kubernetes Gateway API data plane for serval.
-//! Watches Gateway API resources and configures serval-router.
+//! Gateway API library for serval.
+//! Provides Gateway API types and translation to serval-router config.
 //!
-//! Layer 5 (Orchestration) - composes all serval modules
+//! Use this library to build your own gateway controller:
+//! - Define GatewayConfig with routes
+//! - Use translator to convert to JSON
+//! - POST to serval-router admin API
+//!
+//! See examples/gateway/ for a complete K8s controller implementation.
+//!
+//! Layer 4 (Strategy) - routing configuration
 
-// Core gateway
-const gateway_mod = @import("gateway.zig");
-pub const Gateway = gateway_mod.Gateway;
-pub const GatewayError = gateway_mod.GatewayError;
-pub const DataPlanePushError = gateway_mod.DataPlanePushError;
-pub const ADMIN_PORT = gateway_mod.ADMIN_PORT;
+const std = @import("std");
 
-// Configuration types
+// Configuration types (Gateway API)
 pub const config = @import("config.zig");
 pub const GatewayConfig = config.GatewayConfig;
+pub const Gateway = config.Gateway;
 pub const HTTPRoute = config.HTTPRoute;
+pub const HTTPRouteRule = config.HTTPRouteRule;
+pub const HTTPRouteMatch = config.HTTPRouteMatch;
+pub const HTTPRouteFilter = config.HTTPRouteFilter;
+pub const BackendRef = config.BackendRef;
 pub const Listener = config.Listener;
 
-// K8s integration
-pub const k8s = @import("k8s/mod.zig");
+// New resolved types (for translator API)
+pub const ResolvedBackend = config.ResolvedBackend;
+pub const FixedResolvedEndpoint = config.FixedResolvedEndpoint;
 
-// Resolution
-const resolver_mod = @import("resolver.zig");
-pub const Resolver = resolver_mod.Resolver;
-
-// Translator (Gateway API -> Router JSON)
+// Translator (GatewayConfig -> Router JSON)
 pub const translator = @import("translator.zig");
 pub const translateToJson = translator.translateToJson;
+pub const TranslatorError = translator.TranslatorError;
 
 test {
-    // Run tests from all submodules
-    @import("std").testing.refAllDecls(@This());
-    _ = gateway_mod;
+    std.testing.refAllDecls(@This());
     _ = config;
-    _ = k8s;
-    _ = resolver_mod;
     _ = translator;
 }

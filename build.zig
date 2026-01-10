@@ -496,7 +496,7 @@ pub fn build(b: *std.Build) void {
     // Gateway example (Kubernetes Gateway API controller)
     // Note: Links SSL libraries since serval-gateway depends on serval-server which depends on serval-tls
     const gateway_example_mod = b.createModule(.{
-        .root_source_file = b.path("examples/gateway_example.zig"),
+        .root_source_file = b.path("examples/gateway/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -505,6 +505,11 @@ pub fn build(b: *std.Build) void {
     gateway_example_mod.linkSystemLibrary("crypto", .{});
     gateway_example_mod.addImport("serval-gateway", serval_gateway_module);
     gateway_example_mod.addImport("serval-cli", serval_cli_module);
+    gateway_example_mod.addImport("serval-core", serval_core_module);
+    gateway_example_mod.addImport("serval-net", serval_net_module);
+    gateway_example_mod.addImport("serval-pool", serval_pool_module);
+    gateway_example_mod.addImport("serval-client", serval_client_module);
+    gateway_example_mod.addImport("serval-tls", serval_tls_module);
     const gateway_example = b.addExecutable(.{
         .name = "gateway_example",
         .root_module = gateway_example_mod,
