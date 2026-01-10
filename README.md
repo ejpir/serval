@@ -13,6 +13,19 @@ High-performance HTTP infrastructure for Zig — reverse proxies, load balancers
 - **Pluggable components** — Custom handlers, metrics, and tracing implementations
 - **No runtime allocation** — All memory allocated at startup
 
+## Performance
+
+Tested with `hey` against serval-router + echo backend:
+
+| Metric | Value |
+|--------|-------|
+| Requests/sec | 223,395 |
+| p50 latency | 0.1ms |
+| p99 latency | 29.6ms |
+| Concurrent connections | 1,000 |
+
+*AMD Strix Halo 395+, Linux 6.18, Zig 0.16-dev*
+
 ## Quick Start
 
 ```zig
