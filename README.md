@@ -76,6 +76,7 @@ exe.root_module.addImport("serval-lb", serval.module("serval-lb"));
 | `serval` | Umbrella module — re-exports everything |
 | `serval-core` | Types, config, errors, context |
 | `serval-http` | HTTP/1.1 request parser |
+| `serval-net` | Socket abstraction (plain TCP + TLS unified interface) |
 | `serval-client` | HTTP/1.1 client library for upstream connections |
 | `serval-tls` | TLS termination/origination with kTLS offload |
 | `serval-pool` | Connection pooling |
@@ -89,6 +90,15 @@ exe.root_module.addImport("serval-lb", serval.module("serval-lb"));
 | `serval-tracing` | Distributed tracing interfaces |
 | `serval-otel` | OpenTelemetry implementation |
 | `serval-cli` | CLI argument parsing |
+
+**Future modules (API gateway):**
+
+| Module | Purpose |
+|--------|---------|
+| `serval-ratelimit` | Rate limiting (token bucket, sliding window) |
+| `serval-waf` | Web Application Firewall (SQLi, XSS detection) |
+| `serval-cache` | Response caching (keys, TTL, eviction) |
+| `serval-auth` | Authentication/authorization (JWT, API keys) |
 
 ## Handler Interface
 
@@ -116,10 +126,12 @@ const MyHandler = struct {
 ## Building
 
 ```bash
-zig build                       # Build lb_example (default)
-zig build build-echo-backend    # Build echo backend
-zig build build-router-example  # Build router example
-zig build build-gateway-example # Build gateway example (K8s controller)
+zig build                       # Build all examples
+zig build run-lb-example        # Run load balancer
+zig build run-router-example    # Run content-based router
+zig build run-llm-example       # Run LLM streaming example
+zig build run-echo-backend      # Run echo backend
+zig build build-gateway-example # Build K8s gateway controller
 zig build test                  # Run all tests
 ```
 
@@ -300,6 +312,42 @@ spec:
 
 See [serval-k8s-gateway/README.md](serval-k8s-gateway/README.md) for library documentation.
 
+### Streaming Responses (SSE / LLM-style)
+
+Handlers can stream responses incrementally using `Action.stream` and `nextChunk()`:
+
+```bash
+# Run the LLM streaming example
+zig build run-llm-example
+
+# Test streaming endpoint
+curl -X POST http://localhost:8080/v1/chat/completions
+```
+
+```zig
+const StreamHandler = struct {
+    token_idx: u32 = 0,
+
+    pub fn onRequest(self: *@This(), ctx: *serval.Context, req: *serval.Request, buf: []u8) serval.Action {
+        _ = ctx; _ = req; _ = buf;
+        self.token_idx = 0;
+        return .{ .stream = .{
+            .status = 200,
+            .content_type = "text/event-stream",
+        } };
+    }
+
+    pub fn nextChunk(self: *@This(), ctx: *serval.Context, buf: []u8) !?usize {
+        _ = ctx;
+        if (self.token_idx >= TOKENS.len) return null; // Done
+        const token = TOKENS[self.token_idx];
+        self.token_idx += 1;
+        const msg = std.fmt.bufPrint(buf, "data: {s}\n\n", .{token}) catch return error.BufferTooSmall;
+        return msg.len;
+    }
+};
+```
+
 ### Direct Response Handler
 
 Handlers can respond directly without forwarding using `DirectResponse`:
@@ -366,6 +414,7 @@ zig build run-echo-backend -- --help
 | Connection pooling | Complete |
 | Zero-copy (splice) | Complete |
 | Request body streaming | Complete |
+| Streaming responses (SSE, chunked) | Complete |
 | Metrics collection | Complete |
 | OpenTelemetry tracing | Complete |
 | Health tracking | Complete |
@@ -376,7 +425,9 @@ zig build run-echo-backend -- --help
 | Chunked encoding | Complete |
 | Content-based routing | Complete |
 | Path rewriting | Complete |
-| Gateway API controller | In progress |
+| K8s Gateway API types | Complete |
+| Rate limiting | Planned |
+| WAF | Planned |
 | HTTP/2 | Not implemented |
 
 ## License
