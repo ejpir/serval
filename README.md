@@ -1,6 +1,6 @@
 # Serval
 
-HTTP server framework for Zig — build backends, proxies, load balancers, API gateways, and sidecars. Built-in observability with metrics and OpenTelemetry tracing. Inspired by TigerBeetle and Pingora.
+High-performance HTTP infrastructure for Zig — reverse proxies, load balancers, API gateways, and streaming services. Features TLS with kTLS kernel offload, zero-copy forwarding, content-based routing, and OpenTelemetry observability. Production-grade with TigerStyle safety.
 
 ## Features
 
