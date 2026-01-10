@@ -41,7 +41,7 @@ serval (umbrella - re-exports all modules)
 Standalone modules:
 ├── serval-lb       # Load balancer handler (round-robin)
 ├── serval-router   # Content-based router (host/path matching, per-pool LB)
-├── serval-gateway  # Kubernetes Gateway API controller (ingress controller)
+├── serval-gateway  # Gateway API types + translation (library, not controller)
 └── serval-cli      # CLI argument parsing utilities
 ```
 
@@ -116,7 +116,7 @@ Layer 5 (Orchestration):                                    │      │
 Standalone:
   serval-core ←── serval-lb (load balancer handler, depends on serval-health, serval-prober)
   serval-core ←── serval-router (content-based router, depends on serval-lb, serval-health, serval-prober)
-  serval-core ←── serval-gateway (K8s Gateway API controller, depends on serval-router)
+  serval-core ←── serval-gateway (Gateway API types + translator, minimal deps)
   serval-core ←── serval-cli (CLI utilities)
 ```
 
@@ -138,8 +138,166 @@ Standalone:
 | serval-server | HTTP/1.1 server | `Server`, `MinimalServer` |
 | serval-lb | Load balancing | `LbHandler` (health-aware round-robin with background probing) |
 | serval-router | Content-based routing | `Router`, `Route`, `RouteMatcher`, `PathMatch`, `PoolConfig` |
-| serval-gateway | K8s Gateway API controller | `Gateway`, `k8s.Client`, `k8s.Watcher`, `GatewayConfig` |
+| serval-gateway | Gateway API types + translation | `GatewayConfig`, `HTTPRoute`, `translateToJson` |
 | serval-cli | CLI argument parsing | `Args`, `ParseResult`, comptime generics |
+
+### Module Purpose Clarifications
+
+Some modules have similar names but serve very different purposes:
+
+| Module | Layer | What It Does | Handles Traffic? |
+|--------|-------|--------------|------------------|
+| **serval-server** | 5 (Orchestration) | HTTP server: accept loop, connection handling, dispatch to handlers | **Yes** - actual HTTP requests |
+| **serval-gateway** | 4 (Strategy) | Gateway API types and JSON translation | **No** - just data types |
+| **serval-router** | 4 (Strategy) | Routing decisions: match request → select backend | **Yes** - as a handler |
+| **serval-lb** | 4 (Strategy) | Load balancing: round-robin across upstreams | **Yes** - as a handler |
+
+**serval-server vs serval-gateway:**
+- `serval-server` = "the engine that runs" - accepts connections, parses HTTP, invokes handlers
+- `serval-gateway` = "the blueprint format" - Gateway API schema (GatewayConfig, HTTPRoute, etc.)
+
+**In practice:**
+```
+examples/gateway/              # K8s controller (control plane - no traffic)
+    └── uses serval-gateway types (GatewayConfig, HTTPRoute)
+    └── watches K8s API for changes
+    └── translates config and pushes to data plane
+
+examples/router_example.zig    # Data plane (handles traffic)
+    └── uses serval-server to accept HTTP connections
+    └── uses serval-router for routing decisions
+    └── receives config updates from gateway controller
+```
+
+**When to use which:**
+- Building an HTTP server/proxy → `serval-server` + `serval-router` or `serval-lb`
+- Building a K8s ingress controller → `serval-gateway` types + your own controller logic
+- Building a config-file-based gateway → `serval-gateway` types + file watcher
+
+### Control Plane vs Data Plane
+
+Serval separates configuration management (control plane) from traffic handling (data plane):
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                              CONTROL PLANE                               │
+│                                                                          │
+│   Your Controller (K8s watcher, API platform, file watcher, etc.)       │
+│         │                                                                │
+│         │ uses                                                           │
+│         ▼                                                                │
+│   ┌─────────────────┐                                                    │
+│   │ serval-gateway  │  ← Library: GatewayConfig types + translateToJson()│
+│   └────────┬────────┘                                                    │
+│            │ produces JSON                                               │
+│            ▼                                                             │
+│   POST /routes/update  ─────────────────────────────────────────────┐    │
+│   { "routes": [...], "pools": [...] }                               │    │
+└─────────────────────────────────────────────────────────────────────│────┘
+                                                                      │
+┌─────────────────────────────────────────────────────────────────────│────┐
+│                              DATA PLANE                             │    │
+│                                                                     ▼    │
+│   ┌─────────────────┐     ┌─────────────────┐     ┌──────────────┐      │
+│   │  serval-server  │────▶│  serval-router  │────▶│   Backends   │      │
+│   │  (HTTP server)  │     │  (routing logic)│     │              │      │
+│   └─────────────────┘     └─────────────────┘     └──────────────┘      │
+│         ▲                        ▲                                       │
+│         │                        │                                       │
+│    Accepts HTTP            Decides which                                 │
+│    connections             backend to use                                │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+**Module roles:**
+
+| Module | Role | Analogy |
+|--------|------|---------|
+| **serval-gateway** | Route definitions (types + JSON translation) | "The menu" |
+| **serval-router** | Route matching + backend selection | "The waiter" |
+| **serval-server** | Accept connections, parse HTTP, invoke handlers | "The restaurant" |
+
+**The config flow:**
+
+```
+1. Control Plane                    2. Translation                 3. Data Plane
+
+   GatewayConfig {                  JSON:                          Router receives:
+     http_routes: [{                {                              - routes[] with matchers
+       name: "api",                   "routes": [{                 - pools[] with upstreams
+       hostnames: ["api.com"],          "name": "api",             - default_route
+       rules: [{                        "host": "api.com",
+         matches: [{path: "/v1"}],      "path_prefix": "/v1",      Router.updateConfig()
+         backend_refs: [{               "pool_idx": 0              atomically swaps config
+           name: "api-svc",           }],
+           port: 8080                 "pools": [{                  Traffic now routes to
+         }]                             "name": "api-pool",        new backends
+       }]                               "upstreams": [...]
+     }]                               }]
+   }                                }
+
+   ─────────────────▶              ─────────────────▶
+   serval-gateway                  POST /routes/update
+   translateToJson()               to serval-router
+```
+
+### Building an API Platform
+
+Since serval-gateway is just a library with types, you can build any control plane:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    API Platform Control Plane                │
+├─────────────────────────────────────────────────────────────┤
+│  Management API (REST)     │  Developer Portal (Web UI)     │
+│  - CRUD routes/APIs        │  - Self-service onboarding     │
+│  - API key management      │  - Usage dashboards            │
+│  - Rate limit config       │  - API docs (OpenAPI)          │
+├─────────────────────────────────────────────────────────────┤
+│                         Database                             │
+│  - Routes, backends, API keys, rate limits, usage metrics   │
+├─────────────────────────────────────────────────────────────┤
+│           Config Pusher (uses serval-gateway)               │
+│  - Watches DB for changes                                    │
+│  - Builds GatewayConfig from DB rows                        │
+│  - Translates to JSON, pushes to data plane                 │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼ POST /routes/update
+┌─────────────────────────────────────────────────────────────┐
+│                    Data Plane (serval-router)                │
+│  - Receives config updates                                   │
+│  - Routes traffic to backends                                │
+│  - Enforces rate limits (per API key)                       │
+│  - Validates auth tokens                                     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Use cases for different control planes:**
+
+| Use Case | Control Plane | serval-gateway Usage |
+|----------|---------------|---------------------|
+| K8s Ingress | Watch K8s API | `examples/gateway/` |
+| API Platform | Database + REST API | Build `GatewayConfig` from DB |
+| Config Files | Watch YAML files | Parse YAML → `GatewayConfig` |
+| GitOps | Watch git repo | Parse manifests → `GatewayConfig` |
+| Multi-tenant SaaS | Per-tenant DB tables | Filter routes by tenant |
+
+**What serval-gateway provides vs what you build:**
+
+| Component | serval-gateway | You Build |
+|-----------|----------------|-----------|
+| Route types | `HTTPRoute`, `HTTPRouteRule`, `HTTPRouteMatch` | - |
+| Backend types | `HTTPBackendRef` | - |
+| Filter types | `HTTPRouteFilter` (rate limit, rewrite, headers) | - |
+| JSON translation | `translateToJson()` | - |
+| Storage | - | Database schema |
+| Management API | - | REST endpoints |
+| Auth/API keys | - | Validation logic |
+| Developer portal | - | Web UI |
+
+**Key insight:** serval-gateway defines **what a route looks like** (Gateway API spec). You choose **where the routes come from** (K8s, database, files, API). The translator converts to JSON, and you push to serval-router.
 
 ---
 
@@ -605,7 +763,8 @@ pub const WeightedHandler = struct {
 
 | Feature | Module | Status |
 |---------|--------|--------|
-| Gateway API controller | serval-gateway | K8s watch working, data plane integration pending |
+| Gateway refactor | serval-gateway | Refactoring to library-only (types + translator) |
+| K8s controller | examples/gateway/ | Moving K8s-specific code to example |
 
 ### Not Implemented
 
@@ -645,8 +804,8 @@ zig build run-lb-example -- --port 8080 --backends 127.0.0.1:9001,127.0.0.1:9002
 # Run router example (content-based routing)
 zig build run-router-example -- --port 8080 --api-backends 127.0.0.1:8001 --static-backends 127.0.0.1:8002
 
-# Build gateway example (K8s ingress controller)
-zig build build-gateway-example
+# Build gateway controller (K8s ingress controller)
+zig build build-gateway
 
 # Deploy to k3s (builds, creates Docker images, deploys)
 ./deploy/deploy-k3s.sh
