@@ -20,12 +20,15 @@ const EventType = types.EventType;
 const WatchEvent = types.WatchEvent;
 const ResourceMeta = types.ResourceMeta;
 const StoredGateway = types.StoredGateway;
+const StoredGatewayClass = types.StoredGatewayClass;
 const StoredHTTPRoute = types.StoredHTTPRoute;
 const StoredListener = types.StoredListener;
 const StoredHTTPRouteRule = types.StoredHTTPRouteRule;
 const StoredHTTPRouteMatch = types.StoredHTTPRouteMatch;
 const StoredHTTPRouteFilter = types.StoredHTTPRouteFilter;
 const StoredBackendRef = types.StoredBackendRef;
+const ControllerNameStorage = types.ControllerNameStorage;
+const MAX_CONTROLLER_NAME_LEN = types.MAX_CONTROLLER_NAME_LEN;
 
 // Import constants
 const MAX_NAME_LEN = types.MAX_NAME_LEN;
@@ -171,6 +174,50 @@ pub fn parseGatewayJson(json: []const u8, out: *StoredGateway) WatcherError!void
     // S2: Postconditions
     assert(out.name.len > 0);
     assert(out.listeners_count <= gw_config.MAX_LISTENERS);
+}
+
+/// Parse a GatewayClass from K8s watch event JSON.
+/// Extracts metadata.name and spec.controllerName.
+/// GatewayClass is cluster-scoped (no namespace field).
+pub fn parseGatewayClassJson(json: []const u8, out: *StoredGatewayClass) WatcherError!void {
+    assert(json.len > 0); // S1: precondition - non-empty JSON
+    assert(@intFromPtr(out) != 0); // S1: precondition - valid output pointer
+
+    // Reset output.
+    out.* = StoredGatewayClass.init();
+
+    const parsed = std.json.parseFromSlice(k8s_json.GatewayClassJson, std.heap.page_allocator, json, .{
+        .ignore_unknown_fields = true,
+    }) catch return WatcherError.ParseError;
+    defer parsed.deinit();
+
+    // Parse metadata (required).
+    const metadata = parsed.value.metadata orelse return WatcherError.MissingField;
+    const name = metadata.name orelse return WatcherError.MissingField;
+
+    // Validate name length.
+    if (name.len > MAX_NAME_LEN) {
+        return WatcherError.InvalidJson;
+    }
+
+    out.name.set(name);
+
+    // Parse spec (required for controllerName).
+    const spec = parsed.value.spec orelse return WatcherError.MissingField;
+    const controller_name = spec.controllerName orelse return WatcherError.MissingField;
+
+    // Validate controller name length.
+    if (controller_name.len > MAX_CONTROLLER_NAME_LEN) {
+        return WatcherError.InvalidJson;
+    }
+
+    out.controller_name.set(controller_name);
+    out.active = true;
+
+    // S2: Postconditions
+    assert(out.name.len > 0);
+    assert(out.controller_name.len > 0);
+    assert(out.active);
 }
 
 /// Parse a single Listener from JSON struct.
@@ -728,4 +775,142 @@ test "parseFilterFromJson - URLRewrite with ReplaceFullPath" {
     try std.testing.expect(filter.url_rewrite.has_path);
     try std.testing.expectEqual(gw_config.PathRewrite.Type.ReplaceFullPath, filter.url_rewrite.path.rewrite_type);
     try std.testing.expectEqualStrings("/new/path", filter.url_rewrite.path.value.slice());
+}
+
+// =============================================================================
+// GatewayClass Parsing Tests
+// =============================================================================
+
+test "parseGatewayClassJson - basic gateway class" {
+    const json =
+        \\{
+        \\  "apiVersion": "gateway.networking.k8s.io/v1",
+        \\  "kind": "GatewayClass",
+        \\  "metadata": {
+        \\    "name": "serval",
+        \\    "resourceVersion": "12345"
+        \\  },
+        \\  "spec": {
+        \\    "controllerName": "serval.dev/gateway-controller"
+        \\  }
+        \\}
+    ;
+
+    var gc = StoredGatewayClass.init();
+    try parseGatewayClassJson(json, &gc);
+
+    try std.testing.expectEqualStrings("serval", gc.name.slice());
+    try std.testing.expectEqualStrings("serval.dev/gateway-controller", gc.controller_name.slice());
+    try std.testing.expect(gc.active);
+}
+
+test "parseGatewayClassJson - minimal valid JSON" {
+    const json =
+        \\{
+        \\  "metadata": {"name": "minimal-class"},
+        \\  "spec": {"controllerName": "example.com/controller"}
+        \\}
+    ;
+
+    var gc = StoredGatewayClass.init();
+    try parseGatewayClassJson(json, &gc);
+
+    try std.testing.expectEqualStrings("minimal-class", gc.name.slice());
+    try std.testing.expectEqualStrings("example.com/controller", gc.controller_name.slice());
+    try std.testing.expect(gc.active);
+}
+
+test "parseGatewayClassJson - missing metadata" {
+    const json =
+        \\{
+        \\  "spec": {"controllerName": "example.com/controller"}
+        \\}
+    ;
+
+    var gc = StoredGatewayClass.init();
+    const result = parseGatewayClassJson(json, &gc);
+    try std.testing.expectError(WatcherError.MissingField, result);
+}
+
+test "parseGatewayClassJson - missing name" {
+    const json =
+        \\{
+        \\  "metadata": {"resourceVersion": "123"},
+        \\  "spec": {"controllerName": "example.com/controller"}
+        \\}
+    ;
+
+    var gc = StoredGatewayClass.init();
+    const result = parseGatewayClassJson(json, &gc);
+    try std.testing.expectError(WatcherError.MissingField, result);
+}
+
+test "parseGatewayClassJson - missing spec" {
+    const json =
+        \\{
+        \\  "metadata": {"name": "no-spec-class"}
+        \\}
+    ;
+
+    var gc = StoredGatewayClass.init();
+    const result = parseGatewayClassJson(json, &gc);
+    try std.testing.expectError(WatcherError.MissingField, result);
+}
+
+test "parseGatewayClassJson - missing controllerName" {
+    const json =
+        \\{
+        \\  "metadata": {"name": "no-controller-class"},
+        \\  "spec": {}
+        \\}
+    ;
+
+    var gc = StoredGatewayClass.init();
+    const result = parseGatewayClassJson(json, &gc);
+    try std.testing.expectError(WatcherError.MissingField, result);
+}
+
+test "parseGatewayClassJson - invalid JSON" {
+    const json = "not valid json";
+
+    var gc = StoredGatewayClass.init();
+    const result = parseGatewayClassJson(json, &gc);
+    try std.testing.expectError(WatcherError.ParseError, result);
+}
+
+test "parseGatewayClassJson - resets output before parsing" {
+    // Pre-populate the output with data
+    var gc = StoredGatewayClass.init();
+    gc.name.set("old-name");
+    gc.controller_name.set("old-controller");
+    gc.active = true;
+
+    const json =
+        \\{
+        \\  "metadata": {"name": "new-name"},
+        \\  "spec": {"controllerName": "new-controller"}
+        \\}
+    ;
+
+    try parseGatewayClassJson(json, &gc);
+
+    // Verify old data was replaced
+    try std.testing.expectEqualStrings("new-name", gc.name.slice());
+    try std.testing.expectEqualStrings("new-controller", gc.controller_name.slice());
+}
+
+test "parseGatewayClassJson - long controller name" {
+    // Test with a reasonably long but valid controller name
+    const json =
+        \\{
+        \\  "metadata": {"name": "gc"},
+        \\  "spec": {"controllerName": "very-long-domain.example.com/path/to/gateway-controller-implementation"}
+        \\}
+    ;
+
+    var gc = StoredGatewayClass.init();
+    try parseGatewayClassJson(json, &gc);
+
+    try std.testing.expectEqualStrings("gc", gc.name.slice());
+    try std.testing.expectEqualStrings("very-long-domain.example.com/path/to/gateway-controller-implementation", gc.controller_name.slice());
 }

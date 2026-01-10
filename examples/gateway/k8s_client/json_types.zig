@@ -96,3 +96,15 @@ pub const HTTPRouteJson = struct {
     metadata: ?MetadataJson = null,
     spec: ?HTTPRouteSpecJson = null,
 };
+
+/// K8s GatewayClass spec JSON structure.
+pub const GatewayClassSpecJson = struct {
+    controllerName: ?[]const u8 = null,
+};
+
+/// K8s GatewayClass JSON structure.
+/// GatewayClass is cluster-scoped (no namespace in metadata).
+pub const GatewayClassJson = struct {
+    metadata: ?MetadataJson = null,
+    spec: ?GatewayClassSpecJson = null,
+};
