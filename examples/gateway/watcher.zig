@@ -597,7 +597,10 @@ pub const Watcher = struct {
     /// Atomic flag for graceful shutdown.
     running: std.atomic.Value(bool),
     /// Callback invoked when configuration changes.
-    on_config_change: *const fn (*gw_config.GatewayConfig) void,
+    /// First arg is user context, second is new config.
+    on_config_change: *const fn (?*anyopaque, *gw_config.GatewayConfig) void,
+    /// User context passed to callback.
+    callback_context: ?*anyopaque,
 
     /// Resource stores for each watched type.
     gateways: ResourceStore(MAX_GATEWAYS),
@@ -649,7 +652,8 @@ pub const Watcher = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         client: *Client,
-        on_config_change: *const fn (*gw_config.GatewayConfig) void,
+        on_config_change: *const fn (?*anyopaque, *gw_config.GatewayConfig) void,
+        callback_context: ?*anyopaque,
     ) WatcherError!*Self {
         // S1: precondition - client must be valid (can't be null for pointer type)
 
@@ -664,6 +668,7 @@ pub const Watcher = struct {
             .allocator = allocator,
             .running = std.atomic.Value(bool).init(false),
             .on_config_change = on_config_change,
+            .callback_context = callback_context,
             .gateways = ResourceStore(MAX_GATEWAYS).init(),
             .http_routes = ResourceStore(MAX_HTTP_ROUTES).init(),
             .services = ResourceStore(MAX_SERVICES).init(),
@@ -893,8 +898,8 @@ pub const Watcher = struct {
             return;
         };
 
-        // Invoke callback with new gw_config.
-        self.on_config_change(&gateway_config);
+        // Invoke callback with context and new gw_config.
+        self.on_config_change(self.callback_context, &gateway_config);
     }
 
     /// Reconcile stored resources into a GatewayConfig.
