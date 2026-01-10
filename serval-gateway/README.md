@@ -120,7 +120,61 @@ Handles actual HTTP traffic routing:
 
 ## Using as AWS ALB Controller Replacement
 
-Deploy serval-gateway + router_example behind an AWS NLB for full ALB replacement.
+Deploy serval-gateway + router_example as a full ALB replacement.
+
+### Deployment Options
+
+**You don't always need a load balancer.** Choose based on your requirements:
+
+```
+Option A: Direct (single instance, simplest)
+┌──────────┐     ┌────────────────┐     ┌──────────┐
+│  Client  │────▶│ serval-router  │────▶│ Backends │
+│          │     │ (EC2/ECS/K8s)  │     │          │
+└──────────┘     │ Public IP/DNS  │     └──────────┘
+                 └────────────────┘
+
+Option B: Behind NLB (HA, multiple instances)
+┌──────────┐     ┌─────┐     ┌────────────────┐     ┌──────────┐
+│  Client  │────▶│ NLB │────▶│ serval-router  │────▶│ Backends │
+│          │     │     │     │ (multiple)     │     │          │
+└──────────┘     └─────┘     └────────────────┘     └──────────┘
+
+Option C: Behind existing ALB (serval as internal router)
+┌──────────┐     ┌─────┐     ┌────────────────┐     ┌──────────┐
+│  Client  │────▶│ ALB │────▶│ serval-router  │────▶│ Backends │
+│          │     │     │     │ (internal)     │     │          │
+└──────────┘     └─────┘     └────────────────┘     └──────────┘
+```
+
+| Scenario | Load Balancer | Why |
+|----------|---------------|-----|
+| Single instance | None | Direct access, simplest setup |
+| High availability | NLB | Distribute across multiple instances |
+| Need AWS WAF | ALB | NLB doesn't support WAF |
+| WebSockets/gRPC | NLB | ALB has idle timeouts |
+| Maximum performance | NLB | Lower latency than ALB |
+| Already have ALB | Keep ALB | serval as internal router |
+
+### Simplest AWS Setup (No Load Balancer)
+
+```bash
+# 1. Launch EC2 with security group allowing 8080, 9901
+# 2. Run serval
+./router_example &
+
+# 3. Push config
+curl -X PUT http://your-ec2-ip:9901/config \
+  -H "Content-Type: application/json" \
+  -d '{
+    "routes": [{"name": "api", "match": {"path_prefix": "/api"}, "pool": "backend"}],
+    "pools": [{"name": "backend", "upstreams": [{"host": "10.0.1.5", "port": 8080}]}],
+    "default_pool": "backend"
+  }'
+
+# 4. Point Route53 to EC2 public IP
+# 5. Done - clients access directly
+```
 
 ### How It Gets Triggered
 
