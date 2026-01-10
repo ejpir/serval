@@ -382,13 +382,21 @@ Your CDN (Akamai, CloudFront, Cloudflare, Fastly) can route directly to serval-r
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                         Your CDN (Akamai, etc.)                              │
 │                                                                              │
-│  Origin servers: 1.2.3.4, 5.6.7.8, 9.10.11.12  (Elastic IPs)               │
-│  Health checks: ✓  (CDN checks /healthz on each origin)                     │
-│  Failover: ✓  (CDN routes around unhealthy origins)                         │
-│  Load balancing: ✓  (CDN distributes across healthy origins)                │
+│  Origin: origin.example.com   ◄── points to a hostname, not IPs            │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │
-                     Direct to node EIPs (no ALB!)
+                                    ▼ DNS lookup
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              Route53                                         │
+│                                                                              │
+│  origin.example.com  A  1.2.3.4       ◄── registered by router pod 1       │
+│                      A  5.6.7.8       ◄── registered by router pod 2       │
+│                      A  9.10.11.12    ◄── registered by router pod 3       │
+│                                                                              │
+│  Health checks auto-remove unhealthy IPs                                    │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                     Resolves to healthy node EIPs
                                     │
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -400,8 +408,12 @@ Your CDN (Akamai, CloudFront, Cloudflare, Fastly) can route directly to serval-r
 │  │                 │  │                 │  │                 │             │
 │  │ ┌─────────────┐ │  │ ┌─────────────┐ │  │ ┌─────────────┐ │             │
 │  │ │serval-router│ │  │ │serval-router│ │  │ │serval-router│ │             │
-│  │ │ (DaemonSet) │ │  │ │ (DaemonSet) │ │  │ │ (DaemonSet) │ │             │
+│  │ │ DaemonSet   │ │  │ │ DaemonSet   │ │  │ │ DaemonSet   │ │             │
 │  │ │ hostNetwork │ │  │ │ hostNetwork │ │  │ │ hostNetwork │ │             │
+│  │ │             │ │  │ │             │ │  │ │             │ │             │
+│  │ │ On start:   │ │  │ │ On start:   │ │  │ │ On start:   │ │             │
+│  │ │ Register EIP│ │  │ │ Register EIP│ │  │ │ Register EIP│ │             │
+│  │ │ in Route53  │ │  │ │ in Route53  │ │  │ │ in Route53  │ │             │
 │  │ └──────┬──────┘ │  │ └──────┬──────┘ │  │ └──────┬──────┘ │             │
 │  └────────┼────────┘  └────────┼────────┘  └────────┼────────┘             │
 │           └────────────────────┼────────────────────┘                       │
@@ -413,8 +425,8 @@ Your CDN (Akamai, CloudFront, Cloudflare, Fastly) can route directly to serval-r
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
 │  │                    serval-gateway (Control Plane)                    │   │
 │  │                                                                      │   │
-│  │  Watches K8s nodes ───▶ Updates CloudFront origins (EIPs)           │   │
-│  │  Watches K8s routes ──▶ Pushes config to serval-router pods         │   │
+│  │  Watches K8s HTTPRoute/Gateway ──▶ Pushes config to serval-routers  │   │
+│  │  (Does NOT manage Route53 - each router pod does that itself)       │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -424,16 +436,17 @@ Your CDN (Akamai, CloudFront, Cloudflare, Fastly) can route directly to serval-r
 | Component | Role | Replaces |
 |-----------|------|----------|
 | **Your CDN** | Internet ingress, caching, origin failover | - |
-| **serval-router** | L7 routing to backends | ALB + Envoy |
-| **serval-gateway** | Updates CDN origins + router config | ALB target group |
-| **Elastic IPs** | Stable IPs for CDN origins | ALB DNS |
+| **serval-router** | L7 routing + self-registration in Route53 | ALB + Envoy |
+| **serval-gateway** | Watches K8s, pushes route config to routers | - |
+| **Route53** | DNS with health checks, hostname for CDN | ALB DNS |
+| **Elastic IPs** | Stable IPs attached to nodes | ALB target group |
 
 **Why no ALB needed:**
 
-- Your CDN already does health checks (origin failover)
-- Your CDN already does load balancing across origins
-- Elastic IPs provide stable endpoints for CDN to connect to
-- serval-gateway keeps CDN origins in sync with K8s nodes
+- CDN points to a hostname (`origin.example.com`)
+- Route53 resolves hostname to healthy node EIPs
+- Each serval-router pod self-registers its EIP in Route53
+- Route53 health checks auto-remove unhealthy nodes
 
 **Akamai configuration example:**
 
@@ -447,25 +460,63 @@ Health Check Interval: 30s
 Failover: Remove unhealthy origins from rotation
 ```
 
-**serval-gateway Origin Manager** (when nodes scale):
+**Self-Registration Model** (each router pod manages itself):
+
+Your CDN points to a hostname (e.g., `origin.example.com`). Each serval-router pod registers/deregisters itself in Route53:
 
 ```
-Karpenter adds node ──▶ serval-gateway sees Node ADDED
-                              │
-                              ▼
-                       Allocate Elastic IP
-                       Associate with node
-                       Update CDN origins (via CDN API)
-                              │
-                              ▼
-                       CDN routes to new node
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         serval-router pod                                │
+│                                                                          │
+│  On startup:                                                             │
+│    1. Get my node's EIP (EC2 metadata / instance API)                   │
+│    2. Register in Route53: origin.example.com → my EIP                  │
+│    3. Start serving traffic                                              │
+│                                                                          │
+│  On shutdown (SIGTERM from K8s):                                         │
+│    1. Deregister from Route53: remove my A record                       │
+│    2. Drain connections                                                  │
+│    3. Exit                                                               │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-serval-gateway would call your CDN's API to add/remove origins:
-- **Akamai**: Property Manager API
-- **CloudFront**: UpdateDistribution API
-- **Cloudflare**: Load Balancing API
-- **Fastly**: Backend API
+**No central node watcher needed.** Each pod is responsible for itself.
+
+```yaml
+# DaemonSet with node info via Downward API
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: serval-router
+spec:
+  template:
+    spec:
+      hostNetwork: true
+      containers:
+      - name: router
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: ROUTE53_ZONE_ID
+          value: "Z1234567890"
+        - name: ROUTE53_HOSTNAME
+          value: "origin.example.com"
+```
+
+**Failsafe:** Route53 health checks automatically remove unhealthy IPs even if pod crashes without clean shutdown:
+
+```
+Route53 Health Check:
+  Path: /healthz
+  Interval: 30s
+  Failure threshold: 3
+
+Pod crashes → Health check fails → Route53 removes IP from DNS
+```
+
+**Cost:** ~$13/mo (3 EIPs + Route53 zone + health checks) vs ~$16+/mo for NLB
 
 **Alternative: Keep NLB**
 
