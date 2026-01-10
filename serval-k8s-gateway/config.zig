@@ -56,6 +56,26 @@ pub const MAX_RESOLVED_ENDPOINTS: u8 = 64;
 /// TigerStyle: Matches MAX_HTTP_ROUTES * MAX_RULES for worst case.
 pub const MAX_RESOLVED_BACKENDS: u16 = 256;
 
+/// Maximum number of GatewayClass resources.
+/// TigerStyle: Explicit bound, typically 1-2 per cluster.
+pub const MAX_GATEWAY_CLASSES: u8 = 8;
+
+/// Maximum JSON size for status updates.
+/// TigerStyle: Explicit bound for buffer allocation.
+pub const MAX_STATUS_JSON_SIZE: u32 = 4096;
+
+/// Maximum conditions per status object.
+/// TigerStyle: Gateway API typically has 2-3 conditions per resource.
+pub const MAX_CONDITIONS: u8 = 8;
+
+/// Maximum length for condition reason field.
+/// TigerStyle: K8s convention is short CamelCase reasons.
+pub const MAX_REASON_LEN: u8 = 64;
+
+/// Maximum length for condition message field.
+/// TigerStyle: Human-readable message with context.
+pub const MAX_MESSAGE_LEN: u16 = 256;
+
 // ============================================================================
 // Top-Level Configuration
 // ============================================================================
@@ -80,6 +100,20 @@ pub const Gateway = struct {
     namespace: []const u8,
     /// Listeners define ports and protocols.
     listeners: []const Listener,
+};
+
+// ============================================================================
+// GatewayClass Resource
+// ============================================================================
+
+/// GatewayClass defines a class of Gateways managed by a controller.
+/// Maps to gateway.networking.k8s.io/GatewayClass.
+/// Cluster-scoped resource (no namespace).
+pub const GatewayClass = struct {
+    /// Resource name (metadata.name).
+    name: []const u8,
+    /// Controller that manages this class (spec.controllerName).
+    controller_name: []const u8,
 };
 
 /// Listener defines a port and protocol for accepting connections.
@@ -327,6 +361,108 @@ pub const BackendRef = struct {
     port: u16,
     /// Traffic weight for load balancing (1-100, default 1).
     weight: u16 = 1,
+};
+
+// ============================================================================
+// Status Types (for K8s status updates)
+// ============================================================================
+
+/// Status for a GatewayClass resource.
+/// Used to report whether the controller accepts the GatewayClass.
+pub const GatewayClassStatus = struct {
+    /// Status conditions for this GatewayClass.
+    conditions: []const Condition,
+};
+
+/// Status for a Gateway resource.
+/// Reports listener attachment and overall gateway health.
+pub const GatewayStatus = struct {
+    /// Overall status conditions for the Gateway.
+    conditions: []const Condition,
+    /// Per-listener status information.
+    listeners: []const ListenerStatus,
+};
+
+/// Status for an individual listener within a Gateway.
+pub const ListenerStatus = struct {
+    /// Listener name (matches Listener.name).
+    name: []const u8,
+    /// Number of routes attached to this listener.
+    attached_routes: u32,
+    /// Status conditions for this listener.
+    conditions: []const Condition,
+};
+
+/// Condition represents a status condition for Gateway API resources.
+/// Follows the standard K8s metav1.Condition format.
+pub const Condition = struct {
+    /// Type of condition (e.g., Accepted, Programmed).
+    type: ConditionType,
+    /// Status of the condition (True, False, Unknown).
+    status: ConditionStatus,
+    /// Machine-readable reason for the condition (CamelCase).
+    reason: []const u8,
+    /// Human-readable message with details.
+    message: []const u8,
+    /// RFC3339 timestamp of last transition.
+    last_transition_time: []const u8,
+    /// Generation of the resource this condition was observed at.
+    observed_generation: i64,
+};
+
+/// Type of status condition.
+/// Maps to Gateway API condition types.
+pub const ConditionType = enum {
+    /// Resource has been validated and accepted.
+    Accepted,
+    /// Resource has been programmed into the data plane.
+    Programmed,
+    /// All backend references have been resolved.
+    ResolvedRefs,
+
+    /// Parse condition type from string (case-insensitive).
+    pub fn fromString(s: []const u8) ?ConditionType {
+        if (std.ascii.eqlIgnoreCase(s, "Accepted")) return .Accepted;
+        if (std.ascii.eqlIgnoreCase(s, "Programmed")) return .Programmed;
+        if (std.ascii.eqlIgnoreCase(s, "ResolvedRefs")) return .ResolvedRefs;
+        return null;
+    }
+
+    /// Convert to string for serialization.
+    pub fn toString(self: ConditionType) []const u8 {
+        return switch (self) {
+            .Accepted => "Accepted",
+            .Programmed => "Programmed",
+            .ResolvedRefs => "ResolvedRefs",
+        };
+    }
+};
+
+/// Status value for a condition.
+pub const ConditionStatus = enum {
+    /// Condition is satisfied.
+    True,
+    /// Condition is not satisfied.
+    False,
+    /// Condition status is unknown.
+    Unknown,
+
+    /// Parse condition status from string (case-insensitive).
+    pub fn fromString(s: []const u8) ?ConditionStatus {
+        if (std.ascii.eqlIgnoreCase(s, "True")) return .True;
+        if (std.ascii.eqlIgnoreCase(s, "False")) return .False;
+        if (std.ascii.eqlIgnoreCase(s, "Unknown")) return .Unknown;
+        return null;
+    }
+
+    /// Convert to string for serialization.
+    pub fn toString(self: ConditionStatus) []const u8 {
+        return switch (self) {
+            .True => "True",
+            .False => "False",
+            .Unknown => "Unknown",
+        };
+    }
 };
 
 // ============================================================================
@@ -726,4 +862,205 @@ test "ResolvedBackend max name length" {
     backend.name_len = MAX_NAME_LEN;
 
     try std.testing.expectEqual(@as(usize, 63), backend.getName().len);
+}
+
+// ============================================================================
+// Status Types Unit Tests
+// ============================================================================
+
+test "ConditionType enum fromString" {
+    // Test valid condition types
+    try std.testing.expectEqual(ConditionType.Accepted, ConditionType.fromString("Accepted").?);
+    try std.testing.expectEqual(ConditionType.Programmed, ConditionType.fromString("Programmed").?);
+    try std.testing.expectEqual(ConditionType.ResolvedRefs, ConditionType.fromString("ResolvedRefs").?);
+
+    // Test case insensitivity
+    try std.testing.expectEqual(ConditionType.Accepted, ConditionType.fromString("accepted").?);
+    try std.testing.expectEqual(ConditionType.Programmed, ConditionType.fromString("PROGRAMMED").?);
+    try std.testing.expectEqual(ConditionType.ResolvedRefs, ConditionType.fromString("resolvedrefs").?);
+
+    // Test invalid condition type
+    try std.testing.expect(ConditionType.fromString("Ready") == null);
+    try std.testing.expect(ConditionType.fromString("") == null);
+    try std.testing.expect(ConditionType.fromString("Invalid") == null);
+}
+
+test "ConditionType enum toString" {
+    try std.testing.expectEqualStrings("Accepted", ConditionType.Accepted.toString());
+    try std.testing.expectEqualStrings("Programmed", ConditionType.Programmed.toString());
+    try std.testing.expectEqualStrings("ResolvedRefs", ConditionType.ResolvedRefs.toString());
+}
+
+test "ConditionStatus enum fromString" {
+    // Test valid condition statuses
+    try std.testing.expectEqual(ConditionStatus.True, ConditionStatus.fromString("True").?);
+    try std.testing.expectEqual(ConditionStatus.False, ConditionStatus.fromString("False").?);
+    try std.testing.expectEqual(ConditionStatus.Unknown, ConditionStatus.fromString("Unknown").?);
+
+    // Test case insensitivity
+    try std.testing.expectEqual(ConditionStatus.True, ConditionStatus.fromString("true").?);
+    try std.testing.expectEqual(ConditionStatus.False, ConditionStatus.fromString("FALSE").?);
+    try std.testing.expectEqual(ConditionStatus.Unknown, ConditionStatus.fromString("unknown").?);
+
+    // Test invalid condition status
+    try std.testing.expect(ConditionStatus.fromString("Yes") == null);
+    try std.testing.expect(ConditionStatus.fromString("") == null);
+    try std.testing.expect(ConditionStatus.fromString("1") == null);
+}
+
+test "ConditionStatus enum toString" {
+    try std.testing.expectEqualStrings("True", ConditionStatus.True.toString());
+    try std.testing.expectEqualStrings("False", ConditionStatus.False.toString());
+    try std.testing.expectEqualStrings("Unknown", ConditionStatus.Unknown.toString());
+}
+
+test "GatewayClass struct construction" {
+    const gateway_class = GatewayClass{
+        .name = "serval-gateway",
+        .controller_name = "example.com/serval-gateway-controller",
+    };
+
+    try std.testing.expectEqualStrings("serval-gateway", gateway_class.name);
+    try std.testing.expectEqualStrings("example.com/serval-gateway-controller", gateway_class.controller_name);
+}
+
+test "Condition struct construction" {
+    const condition = Condition{
+        .type = .Accepted,
+        .status = .True,
+        .reason = "Accepted",
+        .message = "Gateway class accepted by controller",
+        .last_transition_time = "2024-01-15T10:30:00Z",
+        .observed_generation = 1,
+    };
+
+    try std.testing.expectEqual(ConditionType.Accepted, condition.type);
+    try std.testing.expectEqual(ConditionStatus.True, condition.status);
+    try std.testing.expectEqualStrings("Accepted", condition.reason);
+    try std.testing.expectEqualStrings("Gateway class accepted by controller", condition.message);
+    try std.testing.expectEqualStrings("2024-01-15T10:30:00Z", condition.last_transition_time);
+    try std.testing.expectEqual(@as(i64, 1), condition.observed_generation);
+}
+
+test "GatewayClassStatus struct construction" {
+    var conditions = [_]Condition{
+        .{
+            .type = .Accepted,
+            .status = .True,
+            .reason = "Accepted",
+            .message = "Controller accepts this GatewayClass",
+            .last_transition_time = "2024-01-15T10:30:00Z",
+            .observed_generation = 1,
+        },
+    };
+
+    const status = GatewayClassStatus{
+        .conditions = &conditions,
+    };
+
+    try std.testing.expectEqual(@as(usize, 1), status.conditions.len);
+    try std.testing.expectEqual(ConditionType.Accepted, status.conditions[0].type);
+    try std.testing.expectEqual(ConditionStatus.True, status.conditions[0].status);
+}
+
+test "ListenerStatus struct construction" {
+    var conditions = [_]Condition{
+        .{
+            .type = .Accepted,
+            .status = .True,
+            .reason = "Accepted",
+            .message = "Listener is valid",
+            .last_transition_time = "2024-01-15T10:30:00Z",
+            .observed_generation = 2,
+        },
+        .{
+            .type = .Programmed,
+            .status = .True,
+            .reason = "Programmed",
+            .message = "Listener has been programmed",
+            .last_transition_time = "2024-01-15T10:30:01Z",
+            .observed_generation = 2,
+        },
+    };
+
+    const listener_status = ListenerStatus{
+        .name = "https",
+        .attached_routes = 5,
+        .conditions = &conditions,
+    };
+
+    try std.testing.expectEqualStrings("https", listener_status.name);
+    try std.testing.expectEqual(@as(u32, 5), listener_status.attached_routes);
+    try std.testing.expectEqual(@as(usize, 2), listener_status.conditions.len);
+}
+
+test "GatewayStatus struct construction" {
+    var gateway_conditions = [_]Condition{
+        .{
+            .type = .Accepted,
+            .status = .True,
+            .reason = "Accepted",
+            .message = "Gateway is valid",
+            .last_transition_time = "2024-01-15T10:30:00Z",
+            .observed_generation = 3,
+        },
+        .{
+            .type = .Programmed,
+            .status = .True,
+            .reason = "Programmed",
+            .message = "Gateway has been programmed",
+            .last_transition_time = "2024-01-15T10:30:01Z",
+            .observed_generation = 3,
+        },
+    };
+
+    var listener_conditions = [_]Condition{
+        .{
+            .type = .Accepted,
+            .status = .True,
+            .reason = "Accepted",
+            .message = "Listener accepted",
+            .last_transition_time = "2024-01-15T10:30:00Z",
+            .observed_generation = 3,
+        },
+    };
+
+    var listeners = [_]ListenerStatus{
+        .{
+            .name = "http",
+            .attached_routes = 3,
+            .conditions = &listener_conditions,
+        },
+        .{
+            .name = "https",
+            .attached_routes = 2,
+            .conditions = &listener_conditions,
+        },
+    };
+
+    const status = GatewayStatus{
+        .conditions = &gateway_conditions,
+        .listeners = &listeners,
+    };
+
+    try std.testing.expectEqual(@as(usize, 2), status.conditions.len);
+    try std.testing.expectEqual(@as(usize, 2), status.listeners.len);
+    try std.testing.expectEqualStrings("http", status.listeners[0].name);
+    try std.testing.expectEqual(@as(u32, 3), status.listeners[0].attached_routes);
+    try std.testing.expectEqualStrings("https", status.listeners[1].name);
+    try std.testing.expectEqual(@as(u32, 2), status.listeners[1].attached_routes);
+}
+
+test "Status constants are within bounds" {
+    // Verify status constants fit in their respective types (compile-time check)
+    comptime {
+        // u8 bounds
+        assert(MAX_GATEWAY_CLASSES <= 255);
+        assert(MAX_CONDITIONS <= 255);
+        assert(MAX_REASON_LEN <= 255);
+        // u16 bounds
+        assert(MAX_MESSAGE_LEN <= 65535);
+        // u32 bounds
+        assert(MAX_STATUS_JSON_SIZE <= 4294967295);
+    }
 }

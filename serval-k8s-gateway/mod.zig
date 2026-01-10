@@ -18,6 +18,7 @@ const std = @import("std");
 pub const config = @import("config.zig");
 pub const GatewayConfig = config.GatewayConfig;
 pub const Gateway = config.Gateway;
+pub const GatewayClass = config.GatewayClass;
 pub const HTTPRoute = config.HTTPRoute;
 pub const HTTPRouteRule = config.HTTPRouteRule;
 pub const HTTPRouteMatch = config.HTTPRouteMatch;
@@ -25,7 +26,22 @@ pub const HTTPRouteFilter = config.HTTPRouteFilter;
 pub const BackendRef = config.BackendRef;
 pub const Listener = config.Listener;
 
-// New resolved types (for translator API)
+// Status types (for K8s status updates)
+pub const GatewayClassStatus = config.GatewayClassStatus;
+pub const GatewayStatus = config.GatewayStatus;
+pub const ListenerStatus = config.ListenerStatus;
+pub const Condition = config.Condition;
+pub const ConditionType = config.ConditionType;
+pub const ConditionStatus = config.ConditionStatus;
+
+// Status constants
+pub const MAX_GATEWAY_CLASSES = config.MAX_GATEWAY_CLASSES;
+pub const MAX_STATUS_JSON_SIZE = config.MAX_STATUS_JSON_SIZE;
+pub const MAX_CONDITIONS = config.MAX_CONDITIONS;
+pub const MAX_REASON_LEN = config.MAX_REASON_LEN;
+pub const MAX_MESSAGE_LEN = config.MAX_MESSAGE_LEN;
+
+// Resolved types (for translator API)
 pub const ResolvedBackend = config.ResolvedBackend;
 pub const FixedResolvedEndpoint = config.FixedResolvedEndpoint;
 
