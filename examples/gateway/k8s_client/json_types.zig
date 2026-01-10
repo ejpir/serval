@@ -32,6 +32,7 @@ pub const ListenerJson = struct {
 
 /// K8s Gateway spec JSON structure.
 pub const GatewaySpecJson = struct {
+    gatewayClassName: ?[]const u8 = null,
     listeners: ?[]const ListenerJson = null,
 };
 

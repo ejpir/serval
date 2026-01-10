@@ -152,8 +152,17 @@ pub fn parseGatewayJson(json: []const u8, out: *StoredGateway) WatcherError!void
     out.name.set(name);
     out.namespace.set(namespace);
 
-    // Parse spec.listeners.
+    // Parse spec.
     const spec = parsed.value.spec orelse return WatcherError.MissingField;
+
+    // Parse spec.gatewayClassName (required for proper GatewayClass filtering).
+    if (spec.gatewayClassName) |gateway_class_name| {
+        if (gateway_class_name.len <= MAX_NAME_LEN) {
+            out.gateway_class_name.set(gateway_class_name);
+        }
+    }
+
+    // Parse spec.listeners.
     const listeners = spec.listeners orelse {
         // No listeners is valid (empty gateway).
         out.listeners_count = 0;
@@ -913,4 +922,78 @@ test "parseGatewayClassJson - long controller name" {
 
     try std.testing.expectEqualStrings("gc", gc.name.slice());
     try std.testing.expectEqualStrings("very-long-domain.example.com/path/to/gateway-controller-implementation", gc.controller_name.slice());
+}
+
+// =============================================================================
+// Gateway gatewayClassName Parsing Tests
+// =============================================================================
+
+test "parseGatewayJson - extracts gatewayClassName" {
+    const json =
+        \\{
+        \\  "metadata": {"name": "my-gw", "namespace": "production"},
+        \\  "spec": {
+        \\    "gatewayClassName": "serval",
+        \\    "listeners": [
+        \\      {"name": "http", "port": 80, "protocol": "HTTP"}
+        \\    ]
+        \\  }
+        \\}
+    ;
+
+    var gw = types.StoredGateway.init();
+    try parseGatewayJson(json, &gw);
+
+    try std.testing.expectEqualStrings("my-gw", gw.name.slice());
+    try std.testing.expectEqualStrings("production", gw.namespace.slice());
+    try std.testing.expectEqualStrings("serval", gw.gateway_class_name.slice());
+    try std.testing.expectEqual(@as(u8, 1), gw.listeners_count);
+}
+
+test "parseGatewayJson - missing gatewayClassName is empty" {
+    const json =
+        \\{
+        \\  "metadata": {"name": "my-gw", "namespace": "default"},
+        \\  "spec": {
+        \\    "listeners": [
+        \\      {"name": "http", "port": 80, "protocol": "HTTP"}
+        \\    ]
+        \\  }
+        \\}
+    ;
+
+    var gw = types.StoredGateway.init();
+    try parseGatewayJson(json, &gw);
+
+    try std.testing.expectEqualStrings("my-gw", gw.name.slice());
+    // gatewayClassName should be empty when not present in JSON
+    try std.testing.expectEqual(@as(u8, 0), gw.gateway_class_name.len);
+}
+
+test "parseGatewayJson - gatewayClassName with various values" {
+    // Test with different gatewayClassName values
+    const class_names = [_][]const u8{
+        "serval",
+        "nginx",
+        "istio",
+        "my-custom-class-name",
+    };
+
+    for (class_names) |class_name| {
+        var json_buf: [512]u8 = undefined;
+        const json = std.fmt.bufPrint(&json_buf,
+            \\{{
+            \\  "metadata": {{"name": "gw", "namespace": "ns"}},
+            \\  "spec": {{
+            \\    "gatewayClassName": "{s}",
+            \\    "listeners": []
+            \\  }}
+            \\}}
+        , .{class_name}) catch unreachable;
+
+        var gw = types.StoredGateway.init();
+        parseGatewayJson(json, &gw) catch unreachable;
+
+        try std.testing.expectEqualStrings(class_name, gw.gateway_class_name.slice());
+    }
 }

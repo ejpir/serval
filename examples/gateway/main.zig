@@ -17,6 +17,8 @@
 //!   --api-port <PORT>         K8s API port (default: 443)
 //!   --token <TOKEN>           Bearer token for K8s API
 //!   --namespace <NS>          Namespace to watch (default: "default")
+//!   --controller-name <NAME>  Controller name for GatewayClass filtering
+//!                             (default: "serval.dev/gateway-controller")
 //!
 //! TigerStyle Y1: Functions under 70 lines, extracted helpers.
 
@@ -43,12 +45,16 @@ const VERSION = "0.1.0";
 /// TigerStyle: Explicit struct with named fields.
 const CliConfig = struct {
     admin_port: u16 = 9901,
-    data_plane_host: []const u8 = "serval-router",
+    /// Trailing dot makes this an explicit FQDN, preventing search domain appending
+    data_plane_host: []const u8 = "serval-router.default.svc.cluster.local.",
     data_plane_port: u16 = 9901,
     api_server: ?[]const u8 = null,
     api_port: u16 = 443,
     token: ?[]const u8 = null,
     namespace: []const u8 = "default",
+    /// Controller name for GatewayClass filtering.
+    /// Only Gateways referencing GatewayClasses with this controllerName are managed.
+    controller_name: []const u8 = "serval.dev/gateway-controller",
 };
 
 /// Maximum number of CLI arguments to process.
@@ -94,6 +100,10 @@ fn parseArgs() CliConfig {
             if (args.next()) |val| {
                 config.namespace = val;
             }
+        } else if (std.mem.eql(u8, arg, "--controller-name")) {
+            if (args.next()) |val| {
+                config.controller_name = val;
+            }
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             std.process.exit(0);
@@ -115,12 +125,14 @@ fn printUsage() void {
         \\
         \\Options:
         \\  --admin-port <PORT>       Admin API port (default: 9901)
-        \\  --data-plane-host <HOST>  Data plane hostname (default: "serval-router")
+        \\  --data-plane-host <HOST>  Data plane hostname (default: "serval-router.default.svc.cluster.local.")
         \\  --data-plane-port <PORT>  Data plane admin port (default: 9901)
         \\  --api-server <URL>        K8s API server hostname (for out-of-cluster)
         \\  --api-port <PORT>         K8s API port (default: 443)
         \\  --token <TOKEN>           Bearer token for K8s API authentication
         \\  --namespace <NS>          Namespace to watch (default: "default")
+        \\  --controller-name <NAME>  Controller name for GatewayClass filtering
+        \\                            (default: "serval.dev/gateway-controller")
         \\  --help, -h                Show this help message
         \\
         \\When running inside a Kubernetes pod, credentials are read from
@@ -207,7 +219,7 @@ fn run(allocator: std.mem.Allocator, config: CliConfig) !void {
     std.log.info("K8s client initialized: {s}:{d}", .{ k8s_client.getApiServer(), k8s_client.api_port });
 
     // Initialize watcher and start watching
-    const watcher_result = initAndStartWatcher(allocator, k8s_client, ctrl, &shutdown_ctx) orelse return;
+    const watcher_result = initAndStartWatcher(allocator, k8s_client, ctrl, &shutdown_ctx, config.controller_name) orelse return;
     defer watcher_result.watcher.deinit();
 
     // Mark ready and run until shutdown
@@ -241,13 +253,16 @@ fn initAndStartWatcher(
     k8s_client: *K8sClient,
     ctrl: *Controller,
     shutdown_ctx: *const ShutdownContext,
+    controller_name: []const u8,
 ) ?WatcherResult {
     std.debug.assert(@intFromPtr(k8s_client) != 0); // S1: precondition
     std.debug.assert(@intFromPtr(ctrl) != 0); // S1: precondition
+    std.debug.assert(controller_name.len > 0); // S1: precondition
 
     std.log.info("watching namespace: {s}", .{k8s_client.getNamespace()});
+    std.log.info("controller name: {s}", .{controller_name});
 
-    const watcher = Watcher.init(allocator, k8s_client, onConfigChange, ctrl) catch |err| {
+    const watcher = Watcher.init(allocator, k8s_client, onConfigChange, ctrl, controller_name) catch |err| {
         std.log.err("failed to initialize watcher: {s}", .{@errorName(err)});
         shutdown_ctx.shutdownAdmin();
         return null;

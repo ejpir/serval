@@ -588,6 +588,8 @@ pub const StoredListener = struct {
 pub const StoredGateway = struct {
     name: NameStorage,
     namespace: NameStorage,
+    /// Gateway class name (spec.gatewayClassName) - references a GatewayClass.
+    gateway_class_name: NameStorage,
     listeners: [gw_config.MAX_LISTENERS]StoredListener,
     listeners_count: u8,
     active: bool,
@@ -596,6 +598,7 @@ pub const StoredGateway = struct {
         var gw = StoredGateway{
             .name = NameStorage.init(),
             .namespace = NameStorage.init(),
+            .gateway_class_name = NameStorage.init(),
             .listeners = undefined,
             .listeners_count = 0,
             .active = false,
@@ -784,4 +787,32 @@ test "MAX_CONTROLLER_NAME_LEN is sufficient for typical controller names" {
         assert(MAX_CONTROLLER_NAME_LEN >= 64); // Minimum reasonable size
         assert(MAX_CONTROLLER_NAME_LEN <= 255); // Fits in u8 length field
     }
+}
+
+// =============================================================================
+// StoredGateway Tests
+// =============================================================================
+
+test "StoredGateway init returns empty storage" {
+    const gw = StoredGateway.init();
+
+    try std.testing.expect(!gw.active);
+    try std.testing.expectEqual(@as(u8, 0), gw.name.len);
+    try std.testing.expectEqual(@as(u8, 0), gw.namespace.len);
+    try std.testing.expectEqual(@as(u8, 0), gw.gateway_class_name.len);
+    try std.testing.expectEqual(@as(u8, 0), gw.listeners_count);
+}
+
+test "StoredGateway gateway_class_name field" {
+    var gw = StoredGateway.init();
+
+    gw.name.set("my-gateway");
+    gw.namespace.set("production");
+    gw.gateway_class_name.set("serval");
+    gw.active = true;
+
+    try std.testing.expectEqualStrings("my-gateway", gw.name.slice());
+    try std.testing.expectEqualStrings("production", gw.namespace.slice());
+    try std.testing.expectEqualStrings("serval", gw.gateway_class_name.slice());
+    try std.testing.expect(gw.active);
 }

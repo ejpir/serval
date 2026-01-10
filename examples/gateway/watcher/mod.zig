@@ -25,6 +25,7 @@ const parsing = @import("parsing.zig");
 pub const parseEvent = parsing.parseEvent;
 pub const extractResourceMeta = parsing.extractResourceMeta;
 pub const parseGatewayJson = parsing.parseGatewayJson;
+pub const parseGatewayClassJson = parsing.parseGatewayClassJson;
 pub const parseHTTPRouteJson = parsing.parseHTTPRouteJson;
 pub const parseFilterFromJson = parsing.parseFilterFromJson;
 const types = watcher_types;
@@ -37,7 +38,9 @@ const ResourceMeta = types.ResourceMeta;
 const TrackedResource = types.TrackedResource;
 const ResourceStore = types.ResourceStore;
 const StoredGateway = types.StoredGateway;
+const StoredGatewayClass = types.StoredGatewayClass;
 const StoredHTTPRoute = types.StoredHTTPRoute;
+const ControllerNameStorage = types.ControllerNameStorage;
 const StoredListener = types.StoredListener;
 const StoredHTTPRouteRule = types.StoredHTTPRouteRule;
 const StoredHTTPRouteMatch = types.StoredHTTPRouteMatch;
@@ -60,10 +63,12 @@ const MAX_LINE_SIZE_BYTES = types.MAX_LINE_SIZE_BYTES;
 const MAX_EVENTS_PER_ITERATION = types.MAX_EVENTS_PER_ITERATION;
 const MAX_RECONNECT_ATTEMPTS = types.MAX_RECONNECT_ATTEMPTS;
 const MAX_GATEWAYS = types.MAX_GATEWAYS;
+const MAX_GATEWAY_CLASSES = types.MAX_GATEWAY_CLASSES;
 const MAX_HTTP_ROUTES = types.MAX_HTTP_ROUTES;
 const MAX_SERVICES = types.MAX_SERVICES;
 const MAX_ENDPOINTS = types.MAX_ENDPOINTS;
 const MAX_SECRETS = types.MAX_SECRETS;
+const MAX_CONTROLLER_NAME_LEN = types.MAX_CONTROLLER_NAME_LEN;
 const MAX_NAME_LEN = types.MAX_NAME_LEN;
 const MAX_HOSTNAME_LEN = types.MAX_HOSTNAME_LEN;
 const MAX_PATH_VALUE_LEN = types.MAX_PATH_VALUE_LEN;
@@ -89,13 +94,21 @@ pub const Watcher = struct {
     on_config_change: *const fn (?*anyopaque, *gw_config.GatewayConfig) void,
     /// User context passed to callback.
     callback_context: ?*anyopaque,
+    /// Controller name we manage (e.g., "serval.dev/gateway-controller").
+    /// Only Gateways referencing GatewayClasses with this controllerName are included.
+    controller_name: ControllerNameStorage,
 
     /// Resource stores for each watched type.
+    gateway_classes: ResourceStore(MAX_GATEWAY_CLASSES),
     gateways: ResourceStore(MAX_GATEWAYS),
     http_routes: ResourceStore(MAX_HTTP_ROUTES),
     services: ResourceStore(MAX_SERVICES),
     endpoints: ResourceStore(MAX_ENDPOINTS),
     secrets: ResourceStore(MAX_SECRETS),
+
+    /// Parsed GatewayClass storage (populated by reconcile).
+    parsed_gateway_classes: [MAX_GATEWAY_CLASSES]StoredGatewayClass,
+    parsed_gateway_classes_count: u8,
 
     /// Parsed Gateway storage (populated by reconcile).
     parsed_gateways: [MAX_GATEWAYS]StoredGateway,
@@ -132,19 +145,23 @@ pub const Watcher = struct {
 
     const Self = @This();
 
-    /// Initialize watcher with client and callback.
+    /// Initialize watcher with client, callback, and controller name.
     ///
     /// Preconditions:
     /// - client must be initialized and valid
     /// - on_config_change must be a valid function pointer
+    /// - controller_name must be non-empty and within bounds
     pub fn init(
         allocator: std.mem.Allocator,
         client: *Client,
         on_config_change: *const fn (?*anyopaque, *gw_config.GatewayConfig) void,
         callback_context: ?*anyopaque,
+        controller_name: []const u8,
     ) WatcherError!*Self {
         assert(@intFromPtr(client) != 0); // S1: precondition - valid client pointer
         assert(@intFromPtr(on_config_change) != 0); // S1: precondition - valid callback
+        assert(controller_name.len > 0); // S1: precondition - non-empty controller name
+        assert(controller_name.len <= MAX_CONTROLLER_NAME_LEN); // S1: precondition - controller name fits
 
         const self = allocator.create(Self) catch return WatcherError.OutOfMemory;
         errdefer allocator.destroy(self);
@@ -152,17 +169,25 @@ pub const Watcher = struct {
         const line_buffer = allocator.alloc(u8, MAX_LINE_SIZE_BYTES) catch return WatcherError.OutOfMemory;
         errdefer allocator.free(line_buffer);
 
+        // Initialize controller_name storage.
+        var ctrl_name_storage = ControllerNameStorage.init();
+        ctrl_name_storage.set(controller_name);
+
         self.* = .{
             .client = client,
             .allocator = allocator,
             .running = std.atomic.Value(bool).init(false),
             .on_config_change = on_config_change,
             .callback_context = callback_context,
+            .controller_name = ctrl_name_storage,
+            .gateway_classes = ResourceStore(MAX_GATEWAY_CLASSES).init(),
             .gateways = ResourceStore(MAX_GATEWAYS).init(),
             .http_routes = ResourceStore(MAX_HTTP_ROUTES).init(),
             .services = ResourceStore(MAX_SERVICES).init(),
             .endpoints = ResourceStore(MAX_ENDPOINTS).init(),
             .secrets = ResourceStore(MAX_SECRETS).init(),
+            .parsed_gateway_classes = undefined,
+            .parsed_gateway_classes_count = 0,
             .parsed_gateways = undefined,
             .parsed_gateways_count = 0,
             .parsed_http_routes = undefined,
@@ -180,11 +205,13 @@ pub const Watcher = struct {
         };
 
         // Initialize parsed storage arrays.
+        for (&self.parsed_gateway_classes) |*gc| gc.* = StoredGatewayClass.init();
         for (&self.parsed_gateways) |*gw| gw.* = StoredGateway.init();
         for (&self.parsed_http_routes) |*route| route.* = StoredHTTPRoute.init();
 
         assert(self.line_buffer.len == MAX_LINE_SIZE_BYTES); // S1: postcondition - buffer allocated
         assert(!self.running.load(.acquire)); // S1: postcondition - not running initially
+        assert(self.controller_name.len > 0); // S1: postcondition - controller name set
         return self;
     }
 
@@ -259,6 +286,11 @@ pub const Watcher = struct {
     fn watchAllResources(self: *Self, io: Io) bool {
         assert(@intFromPtr(self) != 0); // S1: precondition - valid self
 
+        // Watch GatewayClass resources first (needed for filtering Gateways).
+        // GatewayClass is cluster-scoped (no namespace in path).
+        const gc_success = self.watchResourceType(GATEWAY_CLASS_PATH, .gateway_class, io);
+        if (!gc_success) return false;
+
         // Watch Gateway resources.
         const gateway_success = self.watchResourceType(GATEWAY_PATH, .gateway, io);
         if (!gateway_success) return false;
@@ -284,6 +316,7 @@ pub const Watcher = struct {
 
     /// Resource type enum for dispatch.
     const ResourceType = enum {
+        gateway_class,
         gateway,
         http_route,
         service,
@@ -300,6 +333,7 @@ pub const Watcher = struct {
         // Build watch URL with resourceVersion for resumption.
         var url_buffer: [512]u8 = undefined;
         const rv = switch (resource_type) {
+            .gateway_class => self.gateway_classes.getLatestResourceVersion(),
             .gateway => self.gateways.getLatestResourceVersion(),
             .http_route => self.http_routes.getLatestResourceVersion(),
             .service => self.services.getLatestResourceVersion(),
@@ -357,6 +391,7 @@ pub const Watcher = struct {
             .ADDED, .MODIFIED => {
                 const meta = try parsing.extractResourceMeta(event.raw_object);
                 switch (resource_type) {
+                    .gateway_class => try self.gateway_classes.upsert(meta, event.raw_object),
                     .gateway => try self.gateways.upsert(meta, event.raw_object),
                     .http_route => try self.http_routes.upsert(meta, event.raw_object),
                     .service => try self.services.upsert(meta, event.raw_object),
@@ -369,6 +404,7 @@ pub const Watcher = struct {
             .DELETED => {
                 const meta = try parsing.extractResourceMeta(event.raw_object);
                 const removed = switch (resource_type) {
+                    .gateway_class => self.gateway_classes.remove(meta.name, meta.namespace),
                     .gateway => self.gateways.remove(meta.name, meta.namespace),
                     .http_route => self.http_routes.remove(meta.name, meta.namespace),
                     .service => self.services.remove(meta.name, meta.namespace),
@@ -383,6 +419,7 @@ pub const Watcher = struct {
                 // Bookmark events just update resource version, no reconciliation needed.
                 const meta = try parsing.extractResourceMeta(event.raw_object);
                 switch (resource_type) {
+                    .gateway_class => self.gateway_classes.updateResourceVersion(meta.resource_version),
                     .gateway => self.gateways.updateResourceVersion(meta.resource_version),
                     .http_route => self.http_routes.updateResourceVersion(meta.resource_version),
                     .service => self.services.updateResourceVersion(meta.resource_version),
@@ -413,6 +450,7 @@ pub const Watcher = struct {
 
     /// Reconcile stored resources into a GatewayConfig.
     /// Parses raw JSON from ResourceStores into typed config structs.
+    /// Only includes Gateways that reference GatewayClasses with our controller_name.
     ///
     /// TigerStyle:
     /// - S1: Preconditions checked on entry
@@ -421,18 +459,27 @@ pub const Watcher = struct {
     /// - No allocation after init (uses pre-allocated storage arrays)
     pub fn reconcile(self: *Self) WatcherError!gw_config.GatewayConfig {
         // Reset parsed counts.
+        self.parsed_gateway_classes_count = 0;
         self.parsed_gateways_count = 0;
         self.parsed_http_routes_count = 0;
 
-        // Phase 1: Parse raw JSON into typed storage.
-        try self.parseStoredGateways();
+        // Phase 1: Parse GatewayClasses first (needed for filtering).
+        try self.parseStoredGatewayClasses();
+
+        // Phase 2: Find GatewayClass names that match our controller_name.
+        var matching_class_names: [MAX_GATEWAY_CLASSES][]const u8 = undefined;
+        const matching_count = self.findMatchingGatewayClasses(&matching_class_names);
+
+        // Phase 3: Parse Gateways and filter by matching GatewayClasses.
+        try self.parseStoredGatewaysFiltered(matching_class_names[0..matching_count]);
         try self.parseStoredHTTPRoutes();
 
-        // Phase 2: Build config slices from parsed storage.
+        // Phase 4: Build config slices from parsed storage.
         self.buildGatewayConfigs();
         self.buildHTTPRouteConfigs();
 
         // S2: Postconditions
+        assert(self.parsed_gateway_classes_count <= MAX_GATEWAY_CLASSES);
         assert(self.parsed_gateways_count <= MAX_GATEWAYS);
         assert(self.parsed_http_routes_count <= MAX_HTTP_ROUTES);
 
@@ -442,9 +489,76 @@ pub const Watcher = struct {
         };
     }
 
-    /// Parse Gateway resources from ResourceStore into typed storage.
+    /// Parse GatewayClass resources from ResourceStore into typed storage.
     /// TigerStyle: Bounded loop, explicit error handling.
-    fn parseStoredGateways(self: *Self) WatcherError!void {
+    fn parseStoredGatewayClasses(self: *Self) WatcherError!void {
+        var iteration: u32 = 0;
+        const items = self.gateway_classes.items;
+
+        while (iteration < MAX_GATEWAY_CLASSES) : (iteration += 1) {
+            if (!items[iteration].active) continue;
+
+            const raw_json = items[iteration].raw_json;
+            if (raw_json.len == 0) continue;
+
+            if (self.parsed_gateway_classes_count >= MAX_GATEWAY_CLASSES) {
+                return WatcherError.BufferOverflow;
+            }
+
+            const idx = self.parsed_gateway_classes_count;
+            try parseGatewayClassJson(raw_json, &self.parsed_gateway_classes[idx]);
+            self.parsed_gateway_classes[idx].active = true;
+            self.parsed_gateway_classes_count += 1;
+        }
+
+        // S2: Postcondition
+        assert(self.parsed_gateway_classes_count <= MAX_GATEWAY_CLASSES);
+    }
+
+    /// Find GatewayClass names where spec.controllerName matches our controller_name.
+    /// Returns the count of matching class names.
+    /// TigerStyle: Bounded loop, returns count not slice to avoid allocation.
+    fn findMatchingGatewayClasses(self: *Self, out_names: *[MAX_GATEWAY_CLASSES][]const u8) u8 {
+        assert(self.controller_name.len > 0); // S1: precondition - controller name set
+
+        var match_count: u8 = 0;
+        var idx: u8 = 0;
+
+        while (idx < self.parsed_gateway_classes_count) : (idx += 1) {
+            const gc = &self.parsed_gateway_classes[idx];
+            if (!gc.active) continue;
+
+            // Check if controllerName matches our controller_name.
+            if (std.mem.eql(u8, gc.controller_name.slice(), self.controller_name.slice())) {
+                if (match_count < MAX_GATEWAY_CLASSES) {
+                    out_names[match_count] = gc.name.slice();
+                    match_count += 1;
+                }
+            }
+        }
+
+        assert(match_count <= MAX_GATEWAY_CLASSES); // S2: postcondition - count within bounds
+        return match_count;
+    }
+
+    /// Check if a Gateway's gatewayClassName is in our list of matching classes.
+    /// TigerStyle: Bounded loop, explicit comparison.
+    fn gatewayClassMatches(gateway_class_name: []const u8, our_classes: []const []const u8) bool {
+        if (gateway_class_name.len == 0) return false;
+
+        var idx: u32 = 0;
+        while (idx < our_classes.len) : (idx += 1) {
+            if (std.mem.eql(u8, gateway_class_name, our_classes[idx])) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Parse Gateway resources, filtering by matching GatewayClasses.
+    /// Only Gateways referencing one of our_classes are included.
+    /// TigerStyle: Bounded loop, explicit error handling.
+    fn parseStoredGatewaysFiltered(self: *Self, our_classes: []const []const u8) WatcherError!void {
         var iteration: u32 = 0;
         const items = self.gateways.items;
 
@@ -458,8 +572,19 @@ pub const Watcher = struct {
                 return WatcherError.BufferOverflow;
             }
 
+            // Parse into temporary storage first.
+            var temp_gateway = StoredGateway.init();
+            try parseGatewayJson(raw_json, &temp_gateway);
+
+            // Check if this Gateway's gatewayClassName matches one of our classes.
+            if (!gatewayClassMatches(temp_gateway.gateway_class_name.slice(), our_classes)) {
+                // Skip this Gateway - it doesn't belong to us.
+                continue;
+            }
+
+            // Include this Gateway.
             const idx = self.parsed_gateways_count;
-            try parseGatewayJson(raw_json, &self.parsed_gateways[idx]);
+            self.parsed_gateways[idx] = temp_gateway;
             self.parsed_gateways[idx].active = true;
             self.parsed_gateways_count += 1;
         }
@@ -818,6 +943,106 @@ test "StoredHTTPRouteRule init" {
 test "StoredGateway init" {
     const gw = StoredGateway.init();
     try std.testing.expectEqual(@as(u8, 0), gw.name.len);
+    try std.testing.expectEqual(@as(u8, 0), gw.gateway_class_name.len);
     try std.testing.expectEqual(@as(u8, 0), gw.listeners_count);
     try std.testing.expect(!gw.active);
+}
+
+test "StoredGateway gateway_class_name field" {
+    var gw = StoredGateway.init();
+    gw.gateway_class_name.set("serval");
+    try std.testing.expectEqualStrings("serval", gw.gateway_class_name.slice());
+}
+
+// =============================================================================
+// Gateway Filtering Tests
+// =============================================================================
+
+test "gatewayClassMatches - matching class" {
+    const our_classes = [_][]const u8{ "serval", "nginx" };
+    try std.testing.expect(Watcher.gatewayClassMatches("serval", &our_classes));
+    try std.testing.expect(Watcher.gatewayClassMatches("nginx", &our_classes));
+}
+
+test "gatewayClassMatches - non-matching class" {
+    const our_classes = [_][]const u8{ "serval", "nginx" };
+    try std.testing.expect(!Watcher.gatewayClassMatches("istio", &our_classes));
+    try std.testing.expect(!Watcher.gatewayClassMatches("contour", &our_classes));
+}
+
+test "gatewayClassMatches - empty class name" {
+    const our_classes = [_][]const u8{ "serval", "nginx" };
+    try std.testing.expect(!Watcher.gatewayClassMatches("", &our_classes));
+}
+
+test "gatewayClassMatches - empty our_classes" {
+    const empty_classes: []const []const u8 = &.{};
+    try std.testing.expect(!Watcher.gatewayClassMatches("serval", empty_classes));
+}
+
+test "parseGatewayJson - extracts gatewayClassName" {
+    const json =
+        \\{
+        \\  "metadata": {"name": "my-gateway", "namespace": "default"},
+        \\  "spec": {
+        \\    "gatewayClassName": "serval",
+        \\    "listeners": [
+        \\      {"name": "http", "port": 80, "protocol": "HTTP"}
+        \\    ]
+        \\  }
+        \\}
+    ;
+
+    var gw = StoredGateway.init();
+    try parseGatewayJson(json, &gw);
+
+    try std.testing.expectEqualStrings("my-gateway", gw.name.slice());
+    try std.testing.expectEqualStrings("default", gw.namespace.slice());
+    try std.testing.expectEqualStrings("serval", gw.gateway_class_name.slice());
+}
+
+test "parseGatewayJson - missing gatewayClassName" {
+    const json =
+        \\{
+        \\  "metadata": {"name": "my-gateway", "namespace": "default"},
+        \\  "spec": {
+        \\    "listeners": [
+        \\      {"name": "http", "port": 80, "protocol": "HTTP"}
+        \\    ]
+        \\  }
+        \\}
+    ;
+
+    var gw = StoredGateway.init();
+    try parseGatewayJson(json, &gw);
+
+    // gatewayClassName should be empty if not present
+    try std.testing.expectEqual(@as(u8, 0), gw.gateway_class_name.len);
+}
+
+test "StoredGatewayClass - basic operations" {
+    var gc = StoredGatewayClass.init();
+    gc.name.set("serval");
+    gc.controller_name.set("serval.dev/gateway-controller");
+    gc.active = true;
+
+    try std.testing.expectEqualStrings("serval", gc.name.slice());
+    try std.testing.expectEqualStrings("serval.dev/gateway-controller", gc.controller_name.slice());
+    try std.testing.expect(gc.active);
+}
+
+test "parseGatewayClassJson - full example" {
+    const json =
+        \\{
+        \\  "metadata": {"name": "serval", "resourceVersion": "12345"},
+        \\  "spec": {"controllerName": "serval.dev/gateway-controller"}
+        \\}
+    ;
+
+    var gc = StoredGatewayClass.init();
+    try parseGatewayClassJson(json, &gc);
+
+    try std.testing.expectEqualStrings("serval", gc.name.slice());
+    try std.testing.expectEqualStrings("serval.dev/gateway-controller", gc.controller_name.slice());
+    try std.testing.expect(gc.active);
 }
