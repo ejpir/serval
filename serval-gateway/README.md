@@ -369,7 +369,107 @@ Current:
                         └───────────────────┘
 ```
 
-**Option A: Replace ALB + Envoy with serval**
+**Recommended: CDN Direct to Nodes (No ALB)**
+
+Your CDN (Akamai, CloudFront, Cloudflare, Fastly) can route directly to serval-router pods via Elastic IPs:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              INTERNET                                        │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Your CDN (Akamai, etc.)                              │
+│                                                                              │
+│  Origin servers: 1.2.3.4, 5.6.7.8, 9.10.11.12  (Elastic IPs)               │
+│  Health checks: ✓  (CDN checks /healthz on each origin)                     │
+│  Failover: ✓  (CDN routes around unhealthy origins)                         │
+│  Load balancing: ✓  (CDN distributes across healthy origins)                │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                     Direct to node EIPs (no ALB!)
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              Kubernetes                                      │
+│                                                                              │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐             │
+│  │ Node 1          │  │ Node 2          │  │ Node 3          │             │
+│  │ EIP: 1.2.3.4    │  │ EIP: 5.6.7.8    │  │ EIP: 9.10.11.12 │             │
+│  │                 │  │                 │  │                 │             │
+│  │ ┌─────────────┐ │  │ ┌─────────────┐ │  │ ┌─────────────┐ │             │
+│  │ │serval-router│ │  │ │serval-router│ │  │ │serval-router│ │             │
+│  │ │ (DaemonSet) │ │  │ │ (DaemonSet) │ │  │ │ (DaemonSet) │ │             │
+│  │ │ hostNetwork │ │  │ │ hostNetwork │ │  │ │ hostNetwork │ │             │
+│  │ └──────┬──────┘ │  │ └──────┬──────┘ │  │ └──────┬──────┘ │             │
+│  └────────┼────────┘  └────────┼────────┘  └────────┼────────┘             │
+│           └────────────────────┼────────────────────┘                       │
+│                                ▼                                            │
+│                      ┌──────────────────┐                                   │
+│                      │   Backend Pods   │                                   │
+│                      └──────────────────┘                                   │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                    serval-gateway (Control Plane)                    │   │
+│  │                                                                      │   │
+│  │  Watches K8s nodes ───▶ Updates CloudFront origins (EIPs)           │   │
+│  │  Watches K8s routes ──▶ Pushes config to serval-router pods         │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**How it works:**
+
+| Component | Role | Replaces |
+|-----------|------|----------|
+| **Your CDN** | Internet ingress, caching, origin failover | - |
+| **serval-router** | L7 routing to backends | ALB + Envoy |
+| **serval-gateway** | Updates CDN origins + router config | ALB target group |
+| **Elastic IPs** | Stable IPs for CDN origins | ALB DNS |
+
+**Why no ALB needed:**
+
+- Your CDN already does health checks (origin failover)
+- Your CDN already does load balancing across origins
+- Elastic IPs provide stable endpoints for CDN to connect to
+- serval-gateway keeps CDN origins in sync with K8s nodes
+
+**Akamai configuration example:**
+
+```
+Origin Server 1: 1.2.3.4:80   (EIP on K8s node 1)
+Origin Server 2: 5.6.7.8:80   (EIP on K8s node 2)
+Origin Server 3: 9.10.11.12:80 (EIP on K8s node 3)
+
+Health Check Path: /healthz
+Health Check Interval: 30s
+Failover: Remove unhealthy origins from rotation
+```
+
+**serval-gateway Origin Manager** (when nodes scale):
+
+```
+Karpenter adds node ──▶ serval-gateway sees Node ADDED
+                              │
+                              ▼
+                       Allocate Elastic IP
+                       Associate with node
+                       Update CDN origins (via CDN API)
+                              │
+                              ▼
+                       CDN routes to new node
+```
+
+serval-gateway would call your CDN's API to add/remove origins:
+- **Akamai**: Property Manager API
+- **CloudFront**: UpdateDistribution API
+- **Cloudflare**: Load Balancing API
+- **Fastly**: Backend API
+
+**Alternative: Keep NLB**
+
+If you prefer AWS-managed load balancing:
 
 ```
 ┌─────┐     ┌─────┐     ┌───────────────────┐     ┌──────────┐
@@ -378,48 +478,7 @@ Current:
                         └───────────────────┘
 ```
 
-NLB does TCP passthrough, serval handles L7 routing.
-
-**Option B: Eliminate load balancer entirely**
-
-If your CDN supports multiple origin IPs (CloudFront, Cloudflare, Fastly):
-
-```
-┌─────┐     ┌───────────────────────────────┐     ┌──────────┐
-│ CDN │────▶│ serval-router (hostNetwork)   │────▶│ Backends │
-└─────┘     │ CDN points to node IPs        │     └──────────┘
-            └───────────────────────────────┘
-```
-
-```yaml
-# DaemonSet with hostNetwork - no NLB needed
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: serval-router
-spec:
-  template:
-    spec:
-      hostNetwork: true  # Binds to node IP directly
-      containers:
-      - name: router
-        ports:
-        - containerPort: 80
-          hostPort: 80
-```
-
-Configure CDN origin to your node IPs (Route53 health checks for failover).
-
-**Option C: Keep NLB, replace only Envoy**
-
-```
-┌─────┐     ┌─────┐     ┌───────────────────┐     ┌──────────┐
-│ CDN │────▶│ NLB │────▶│ serval-router     │────▶│ Backends │
-└─────┘     │(existing)│ │ (replaces Envoy)  │     └──────────┘
-            └─────┘     └───────────────────┘
-```
-
-Just swap Envoy pods for serval pods, keep existing NLB.
+NLB does TCP passthrough, serval handles L7 routing. Simpler but costs more.
 
 ### Migration Path
 
