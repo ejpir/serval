@@ -231,23 +231,28 @@ The router strips path prefixes before forwarding:
 - `/api/users` → api-pool receives `/users`
 - `/static/image.png` → static-pool receives `/image.png`
 
-### Choosing Between serval-router and serval-k8s-gateway
+### serval-router and serval-k8s-gateway
 
-| Use Case | Module | Description |
-|----------|--------|-------------|
-| **Direct configuration** | `serval-router` | Configure routes in code or via JSON API. Best for standalone gateways, API platforms, non-K8s deployments. |
-| **Kubernetes Gateway API** | `serval-k8s-gateway` | K8s Gateway API types + translation. Use with `examples/gateway/` controller for K8s ingress. |
+`serval-router` is the routing engine. `serval-k8s-gateway` translates K8s Gateway API resources into serval-router configuration.
 
-**Use serval-router directly when:**
-- Not running in Kubernetes
-- Building an API platform with database-driven routes
-- Using static configuration files
-- Need simple programmatic routing
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        serval-router                             │
+│                    (routing engine - always used)                │
+└─────────────────────────────────────────────────────────────────┘
+                              ▲
+              ┌───────────────┴───────────────┐
+              │                               │
+   ┌──────────┴──────────┐       ┌───────────┴───────────┐
+   │  Direct config      │       │  serval-k8s-gateway   │
+   │  (code, JSON API)   │       │  (K8s Gateway API)    │
+   └─────────────────────┘       └───────────────────────┘
+```
 
-**Use serval-k8s-gateway when:**
-- Building a Kubernetes ingress controller
-- Implementing the Gateway API specification
-- Need K8s-native resource watching
+| Deployment | What you use |
+|------------|--------------|
+| **Standalone** | `serval-router` with routes configured in code or JSON |
+| **Kubernetes** | `serval-k8s-gateway` + `serval-router` (gateway translates K8s resources → router config) |
 
 ### Kubernetes Gateway API (serval-k8s-gateway)
 
