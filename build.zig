@@ -577,10 +577,41 @@ pub fn build(b: *std.Build) void {
     const run_otel_test_step = b.step("run-otel-test", "Run OTLP export test");
     run_otel_test_step.dependOn(&run_otel_test.step);
 
+    // LLM streaming example (demonstrates Action.stream and nextChunk)
+    // Note: Links SSL libraries since serval depends on serval-server which depends on serval-tls
+    const llm_streaming_mod = b.createModule(.{
+        .root_source_file = b.path("examples/llm_streaming.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    llm_streaming_mod.linkSystemLibrary("ssl", .{});
+    llm_streaming_mod.linkSystemLibrary("crypto", .{});
+    llm_streaming_mod.addImport("serval", serval_module);
+    llm_streaming_mod.addImport("serval-net", serval_net_module);
+    llm_streaming_mod.addImport("serval-cli", serval_cli_module);
+    const llm_streaming = b.addExecutable(.{
+        .name = "llm_streaming",
+        .root_module = llm_streaming_mod,
+    });
+    const build_llm_streaming = b.addInstallArtifact(llm_streaming, .{});
+    const run_llm_streaming = b.addRunArtifact(llm_streaming);
+
+    if (b.args) |args| {
+        run_llm_streaming.addArgs(args);
+    }
+
+    const build_llm_streaming_step = b.step("build-llm-example", "Build LLM streaming example");
+    build_llm_streaming_step.dependOn(&build_llm_streaming.step);
+
+    const run_llm_streaming_step = b.step("run-llm-example", "Run LLM streaming example");
+    run_llm_streaming_step.dependOn(&run_llm_streaming.step);
+
     // Default step - build all examples
     b.default_step.dependOn(&build_lb_example.step);
     b.default_step.dependOn(&build_router_example.step);
     b.default_step.dependOn(&build_gateway_example.step);
     b.default_step.dependOn(&build_echo_backend.step);
     b.default_step.dependOn(&build_otel_test.step);
+    b.default_step.dependOn(&build_llm_streaming.step);
 }
