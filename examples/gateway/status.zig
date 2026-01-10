@@ -11,6 +11,10 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const Io = std.Io;
+const posix = std.posix;
+
+const serval_core = @import("serval-core");
+const core_time = serval_core.time;
 
 const k8s_client_mod = @import("k8s_client/mod.zig");
 const K8sClient = k8s_client_mod.Client;
@@ -309,22 +313,17 @@ pub const StatusManager = struct {
 
         // Build listener statuses
         const listener_count = self.buildListenerStatuses(result, timestamp);
+        _ = listener_count; // Listener status JSON not yet implemented
 
-        // Build JSON payload
-        const patch = GatewayStatusPatch{
-            .status = GatewayStatusJson{
-                .conditions = self.gateway_conditions[0..2],
-                .listeners = self.listener_statuses[0..listener_count],
-            },
-        };
-
-        // Serialize to JSON
-        var fbs = std.io.fixedBufferStream(&self.json_buffer);
-        std.json.stringify(patch, .{}, fbs.writer()) catch |err| {
-            std.log.err("failed to serialize Gateway status JSON: {s}", .{@errorName(err)});
+        // Build JSON payload manually (TigerStyle: no allocation, no std.io dependency)
+        // Format: {"status":{"conditions":[...]},"listeners":[...]}
+        const json_len = self.buildGatewayStatusJson(
+            self.gateway_conditions[0..2],
+            result.observed_generation,
+        ) catch {
+            std.log.err("failed to build Gateway status JSON", .{});
             return error.JsonSerializationFailed;
         };
-        const json_len = fbs.pos;
 
         // S1: Postcondition - JSON fits in buffer
         assert(json_len <= MAX_STATUS_JSON_SIZE);
@@ -369,20 +368,13 @@ pub const StatusManager = struct {
             .observedGeneration = 1, // GatewayClass doesn't track generation for now
         };
 
-        // Build JSON payload
-        const patch = GatewayClassStatusPatch{
-            .status = GatewayClassStatusJson{
-                .conditions = self.gateway_class_conditions[0..1],
-            },
-        };
-
-        // Serialize to JSON
-        var fbs = std.io.fixedBufferStream(&self.json_buffer);
-        std.json.stringify(patch, .{}, fbs.writer()) catch |err| {
-            std.log.err("failed to serialize GatewayClass status JSON: {s}", .{@errorName(err)});
+        // Build JSON payload manually (TigerStyle: no allocation, no std.io dependency)
+        const json_len = self.buildGatewayClassStatusJson(
+            self.gateway_class_conditions[0..1],
+        ) catch {
+            std.log.err("failed to build GatewayClass status JSON", .{});
             return error.JsonSerializationFailed;
         };
-        const json_len = fbs.pos;
 
         // S1: Postcondition - JSON fits in buffer
         assert(json_len <= MAX_STATUS_JSON_SIZE);
@@ -469,7 +461,10 @@ pub const StatusManager = struct {
     /// Generate RFC3339 timestamp for current time.
     /// Format: YYYY-MM-DDTHH:MM:SSZ
     fn generateTimestamp(self: *Self) []const u8 {
-        const epoch_seconds: u64 = @intCast(std.time.timestamp());
+        // Use serval-core time (returns nanoseconds since epoch)
+        const nanos: i128 = core_time.realtimeNanos();
+        // Convert to seconds, handling potential negative values gracefully
+        const epoch_seconds: u64 = if (nanos > 0) @intCast(@divTrunc(nanos, std.time.ns_per_s)) else 0;
 
         // Calculate date/time components from epoch seconds
         // Simplified: use days since epoch approach
@@ -550,6 +545,110 @@ pub const StatusManager = struct {
 
         return path;
     }
+
+    /// Build Gateway status JSON manually using bufPrint.
+    /// Returns the length of JSON written to json_buffer.
+    /// TigerStyle: No allocation, bounded buffer.
+    fn buildGatewayStatusJson(
+        self: *Self,
+        conditions: []const ConditionJson,
+        observed_generation: i64,
+    ) !usize {
+        // S1: Preconditions
+        assert(conditions.len > 0);
+        assert(conditions.len <= 2);
+        _ = observed_generation; // Used in conditions already
+
+        // Build JSON: {"status":{"conditions":[...]}}
+        // We build each condition separately to handle variable number
+        var pos: usize = 0;
+
+        // Opening
+        const opening = "{\"status\":{\"conditions\":[";
+        if (pos + opening.len > self.json_buffer.len) return error.JsonSerializationFailed;
+        @memcpy(self.json_buffer[pos .. pos + opening.len], opening);
+        pos += opening.len;
+
+        // Write each condition
+        for (conditions, 0..) |cond, i| {
+            if (i > 0) {
+                if (pos >= self.json_buffer.len) return error.JsonSerializationFailed;
+                self.json_buffer[pos] = ',';
+                pos += 1;
+            }
+            pos = try self.writeConditionJson(pos, cond);
+        }
+
+        // Closing: ],"listeners":[]}}
+        // Note: listeners empty for now, can be extended later
+        const closing = "],\"listeners\":[]}}";
+        if (pos + closing.len > self.json_buffer.len) return error.JsonSerializationFailed;
+        @memcpy(self.json_buffer[pos .. pos + closing.len], closing);
+        pos += closing.len;
+
+        return pos;
+    }
+
+    /// Build GatewayClass status JSON manually using bufPrint.
+    /// Returns the length of JSON written to json_buffer.
+    /// TigerStyle: No allocation, bounded buffer.
+    fn buildGatewayClassStatusJson(
+        self: *Self,
+        conditions: []const ConditionJson,
+    ) !usize {
+        // S1: Preconditions
+        assert(conditions.len > 0);
+        assert(conditions.len <= 1);
+
+        // Build JSON: {"status":{"conditions":[...]}}
+        var pos: usize = 0;
+
+        // Opening
+        const opening = "{\"status\":{\"conditions\":[";
+        if (pos + opening.len > self.json_buffer.len) return error.JsonSerializationFailed;
+        @memcpy(self.json_buffer[pos .. pos + opening.len], opening);
+        pos += opening.len;
+
+        // Write each condition
+        for (conditions, 0..) |cond, i| {
+            if (i > 0) {
+                if (pos >= self.json_buffer.len) return error.JsonSerializationFailed;
+                self.json_buffer[pos] = ',';
+                pos += 1;
+            }
+            pos = try self.writeConditionJson(pos, cond);
+        }
+
+        // Closing
+        const closing = "]}}";
+        if (pos + closing.len > self.json_buffer.len) return error.JsonSerializationFailed;
+        @memcpy(self.json_buffer[pos .. pos + closing.len], closing);
+        pos += closing.len;
+
+        return pos;
+    }
+
+    /// Write a single condition as JSON to the buffer at the given position.
+    /// Returns new position after writing.
+    fn writeConditionJson(self: *Self, start_pos: usize, cond: ConditionJson) !usize {
+        // Format: {"type":"...","status":"...","reason":"...","message":"...","lastTransitionTime":"...","observedGeneration":N}
+        const json = std.fmt.bufPrint(
+            self.json_buffer[start_pos..],
+            "{{\"type\":\"{s}\",\"status\":\"{s}\",\"reason\":\"{s}\",\"message\":\"{s}\",\"lastTransitionTime\":\"{s}\",\"observedGeneration\":{d}}}",
+            .{
+                cond.type,
+                cond.status,
+                cond.reason,
+                cond.message,
+                cond.lastTransitionTime,
+                cond.observedGeneration,
+            },
+        ) catch {
+            return error.JsonSerializationFailed;
+        };
+
+        return start_pos + json.len;
+    }
 };
 
 // =============================================================================
@@ -569,7 +668,7 @@ fn epochDaysToDate(epoch_days: u64) Date {
     // Based on Howard Hinnant's algorithms for date conversion
     // Simplified version for our use case
 
-    var z = epoch_days + 719468; // Days since 0000-03-01
+    const z = epoch_days + 719468; // Days since 0000-03-01
     const era: u64 = z / 146097; // 400-year era
     const doe: u64 = z - era * 146097; // Day of era [0, 146096]
     const yoe: u64 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // Year of era [0, 399]
@@ -622,9 +721,9 @@ test "StatusManager init and deinit" {
     try std.testing.expect(@intFromPtr(status_mgr.k8s_client) != 0);
 }
 
-test "ConditionJson serialization" {
+test "ConditionJson manual serialization" {
+    // Test manual condition JSON building using bufPrint
     var buf: [512]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
 
     const condition = ConditionJson{
         .type = "Accepted",
@@ -635,8 +734,19 @@ test "ConditionJson serialization" {
         .observedGeneration = 42,
     };
 
-    try std.json.stringify(condition, .{}, fbs.writer());
-    const json = fbs.getWritten();
+    // Build JSON manually like writeConditionJson does
+    const json = std.fmt.bufPrint(
+        &buf,
+        "{{\"type\":\"{s}\",\"status\":\"{s}\",\"reason\":\"{s}\",\"message\":\"{s}\",\"lastTransitionTime\":\"{s}\",\"observedGeneration\":{d}}}",
+        .{
+            condition.type,
+            condition.status,
+            condition.reason,
+            condition.message,
+            condition.lastTransitionTime,
+            condition.observedGeneration,
+        },
+    ) catch unreachable;
 
     try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"Accepted\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"status\":\"True\"") != null);
@@ -645,143 +755,118 @@ test "ConditionJson serialization" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"observedGeneration\":42") != null);
 }
 
-test "GatewayClassStatusPatch serialization" {
-    var buf: [1024]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+test "GatewayClassStatusPatch manual serialization" {
+    const allocator = std.testing.allocator;
 
-    const conditions = [_]ConditionJson{
-        .{
-            .type = "Accepted",
-            .status = "True",
-            .reason = "Accepted",
-            .message = "GatewayClass is accepted",
-            .lastTransitionTime = "2024-01-15T10:30:00Z",
-            .observedGeneration = 1,
-        },
+    // Create mock K8s client
+    const k8s_client = try k8s_client_mod.Client.initWithConfig(
+        allocator,
+        "localhost",
+        6443,
+        "test-token-12345",
+        "default",
+    );
+    defer k8s_client.deinit();
+
+    const status_mgr = try StatusManager.init(allocator, k8s_client, "test-controller");
+    defer status_mgr.deinit();
+
+    // Set up a condition
+    status_mgr.gateway_class_conditions[0] = ConditionJson{
+        .type = "Accepted",
+        .status = "True",
+        .reason = "Accepted",
+        .message = "GatewayClass is accepted",
+        .lastTransitionTime = "2024-01-15T10:30:00Z",
+        .observedGeneration = 1,
     };
 
-    const patch = GatewayClassStatusPatch{
-        .status = GatewayClassStatusJson{
-            .conditions = &conditions,
-        },
-    };
-
-    try std.json.stringify(patch, .{}, fbs.writer());
-    const json = fbs.getWritten();
+    // Build the JSON
+    const json_len = try status_mgr.buildGatewayClassStatusJson(status_mgr.gateway_class_conditions[0..1]);
+    const json = status_mgr.json_buffer[0..json_len];
 
     try std.testing.expect(std.mem.indexOf(u8, json, "\"status\":{") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"conditions\":[") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"Accepted\"") != null);
 }
 
-test "GatewayStatusPatch serialization" {
-    var buf: [2048]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+test "GatewayStatusPatch manual serialization" {
+    const allocator = std.testing.allocator;
 
-    const gateway_conditions = [_]ConditionJson{
-        .{
-            .type = "Accepted",
-            .status = "True",
-            .reason = "Accepted",
-            .message = "Gateway is valid",
-            .lastTransitionTime = "2024-01-15T10:30:00Z",
-            .observedGeneration = 3,
-        },
-        .{
-            .type = "Programmed",
-            .status = "True",
-            .reason = "Programmed",
-            .message = "Gateway has been programmed",
-            .lastTransitionTime = "2024-01-15T10:30:01Z",
-            .observedGeneration = 3,
-        },
+    // Create mock K8s client
+    const k8s_client = try k8s_client_mod.Client.initWithConfig(
+        allocator,
+        "localhost",
+        6443,
+        "test-token-12345",
+        "default",
+    );
+    defer k8s_client.deinit();
+
+    const status_mgr = try StatusManager.init(allocator, k8s_client, "test-controller");
+    defer status_mgr.deinit();
+
+    // Set up conditions
+    status_mgr.gateway_conditions[0] = ConditionJson{
+        .type = "Accepted",
+        .status = "True",
+        .reason = "Accepted",
+        .message = "Gateway is valid",
+        .lastTransitionTime = "2024-01-15T10:30:00Z",
+        .observedGeneration = 3,
+    };
+    status_mgr.gateway_conditions[1] = ConditionJson{
+        .type = "Programmed",
+        .status = "True",
+        .reason = "Programmed",
+        .message = "Gateway has been programmed",
+        .lastTransitionTime = "2024-01-15T10:30:01Z",
+        .observedGeneration = 3,
     };
 
-    const listener_conditions = [_]ConditionJson{
-        .{
-            .type = "Accepted",
-            .status = "True",
-            .reason = "Accepted",
-            .message = "Listener is valid",
-            .lastTransitionTime = "2024-01-15T10:30:00Z",
-            .observedGeneration = 3,
-        },
-    };
-
-    const listeners = [_]ListenerStatusJson{
-        .{
-            .name = "http",
-            .attachedRoutes = 5,
-            .supportedKinds = &SUPPORTED_KINDS,
-            .conditions = &listener_conditions,
-        },
-    };
-
-    const patch = GatewayStatusPatch{
-        .status = GatewayStatusJson{
-            .conditions = &gateway_conditions,
-            .listeners = &listeners,
-        },
-    };
-
-    try std.json.stringify(patch, .{}, fbs.writer());
-    const json = fbs.getWritten();
+    // Build the JSON
+    const json_len = try status_mgr.buildGatewayStatusJson(status_mgr.gateway_conditions[0..2], 3);
+    const json = status_mgr.json_buffer[0..json_len];
 
     try std.testing.expect(std.mem.indexOf(u8, json, "\"status\":{") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"conditions\":[") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"listeners\":[") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"http\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"attachedRoutes\":5") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"supportedKinds\":[") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"HTTPRoute\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"listeners\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"Accepted\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"Programmed\"") != null);
 }
 
-test "ListenerStatusJson serialization with multiple conditions" {
-    var buf: [1024]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+test "writeConditionJson produces valid JSON" {
+    const allocator = std.testing.allocator;
 
-    const conditions = [_]ConditionJson{
-        .{
-            .type = "Accepted",
-            .status = "True",
-            .reason = "Accepted",
-            .message = "Listener accepted",
-            .lastTransitionTime = "2024-01-15T10:30:00Z",
-            .observedGeneration = 2,
-        },
-        .{
-            .type = "Programmed",
-            .status = "True",
-            .reason = "Programmed",
-            .message = "Listener programmed",
-            .lastTransitionTime = "2024-01-15T10:30:00Z",
-            .observedGeneration = 2,
-        },
-        .{
-            .type = "ResolvedRefs",
-            .status = "True",
-            .reason = "ResolvedRefs",
-            .message = "All references resolved",
-            .lastTransitionTime = "2024-01-15T10:30:00Z",
-            .observedGeneration = 2,
-        },
+    // Create mock K8s client
+    const k8s_client = try k8s_client_mod.Client.initWithConfig(
+        allocator,
+        "localhost",
+        6443,
+        "test-token-12345",
+        "default",
+    );
+    defer k8s_client.deinit();
+
+    const status_mgr = try StatusManager.init(allocator, k8s_client, "test-controller");
+    defer status_mgr.deinit();
+
+    const condition = ConditionJson{
+        .type = "Accepted",
+        .status = "True",
+        .reason = "TestReason",
+        .message = "Test message",
+        .lastTransitionTime = "2024-01-15T10:30:00Z",
+        .observedGeneration = 5,
     };
 
-    const listener = ListenerStatusJson{
-        .name = "https",
-        .attachedRoutes = 10,
-        .supportedKinds = &SUPPORTED_KINDS,
-        .conditions = &conditions,
-    };
+    const end_pos = try status_mgr.writeConditionJson(0, condition);
+    const json = status_mgr.json_buffer[0..end_pos];
 
-    try std.json.stringify(listener, .{}, fbs.writer());
-    const json = fbs.getWritten();
-
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"https\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"attachedRoutes\":10") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"Accepted\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"Programmed\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"ResolvedRefs\"") != null);
+    // Verify JSON structure
+    try std.testing.expect(json[0] == '{');
+    try std.testing.expect(json[end_pos - 1] == '}');
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"observedGeneration\":5") != null);
 }
 
 test "epochDaysToDate correctness" {

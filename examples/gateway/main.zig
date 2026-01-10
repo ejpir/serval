@@ -189,8 +189,25 @@ fn run(allocator: std.mem.Allocator, config: CliConfig) !void {
 
     logStartupBanner(config);
 
+    // Initialize K8s client first (needed for Controller's StatusManager)
+    const k8s_client = initK8sClient(allocator, config) catch |err| {
+        std.log.err("failed to initialize K8s client: {s}", .{@errorName(err)});
+        std.log.info("hint: run inside a K8s pod or provide --api-server and --token", .{});
+        return;
+    };
+    defer k8s_client.deinit();
+    std.log.info("K8s client initialized: {s}:{d}", .{ k8s_client.getApiServer(), k8s_client.api_port });
+
     // Initialize controller (heap-allocated due to ~2.5MB size)
-    const ctrl = try Controller.create(allocator, config.admin_port, config.data_plane_host, config.data_plane_port);
+    // Controller now takes K8s client for status updates
+    const ctrl = try Controller.create(
+        allocator,
+        config.admin_port,
+        config.data_plane_host,
+        config.data_plane_port,
+        k8s_client,
+        config.controller_name,
+    );
     defer ctrl.destroy();
 
     // Start admin server thread for K8s health probes
@@ -206,17 +223,6 @@ fn run(allocator: std.mem.Allocator, config: CliConfig) !void {
         .admin_shutdown = &admin_shutdown,
         .admin_thread = admin_thread,
     };
-
-    // Initialize K8s client (optional - admin server stays up for liveness probes)
-    const k8s_client = initK8sClient(allocator, config) catch |err| {
-        std.log.err("failed to initialize K8s client: {s}", .{@errorName(err)});
-        std.log.info("hint: run inside a K8s pod or provide --api-server and --token", .{});
-        std.log.info("admin server remains running for liveness probes (readiness will fail)", .{});
-        shutdown_ctx.shutdownAdmin();
-        return;
-    };
-    defer k8s_client.deinit();
-    std.log.info("K8s client initialized: {s}:{d}", .{ k8s_client.getApiServer(), k8s_client.api_port });
 
     // Initialize watcher and start watching
     const watcher_result = initAndStartWatcher(allocator, k8s_client, ctrl, &shutdown_ctx, config.controller_name) orelse return;
@@ -280,12 +286,13 @@ fn initAndStartWatcher(
 
 /// Callback invoked when K8s watcher detects config changes.
 /// TigerStyle: Explicit error handling, logs failures.
-fn onConfigChange(ctx: ?*anyopaque, config_ptr: *gw_config.GatewayConfig) void {
+/// Receives Io from watcher thread for async operations (status updates).
+fn onConfigChange(ctx: ?*anyopaque, config_ptr: *gw_config.GatewayConfig, io: Io) void {
     std.debug.assert(ctx != null); // S1: precondition - context required
     std.debug.assert(@intFromPtr(config_ptr) != 0); // S1: precondition - valid config pointer
 
     const ctrl: *Controller = @ptrCast(@alignCast(ctx.?));
-    ctrl.updateConfig(config_ptr) catch |err| {
+    ctrl.updateConfig(config_ptr, io) catch |err| {
         std.log.err("config update failed: {s}", .{@errorName(err)});
     };
 }

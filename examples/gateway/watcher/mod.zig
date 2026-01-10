@@ -90,8 +90,8 @@ pub const Watcher = struct {
     /// Atomic flag for graceful shutdown.
     running: std.atomic.Value(bool),
     /// Callback invoked when configuration changes.
-    /// First arg is user context, second is new config.
-    on_config_change: *const fn (?*anyopaque, *gw_config.GatewayConfig) void,
+    /// Args: user context, new config, Io runtime for async operations.
+    on_config_change: *const fn (?*anyopaque, *gw_config.GatewayConfig, Io) void,
     /// User context passed to callback.
     callback_context: ?*anyopaque,
     /// Controller name we manage (e.g., "serval.dev/gateway-controller").
@@ -151,10 +151,15 @@ pub const Watcher = struct {
     /// - client must be initialized and valid
     /// - on_config_change must be a valid function pointer
     /// - controller_name must be non-empty and within bounds
+    ///
+    /// The callback receives:
+    /// - user context pointer
+    /// - new GatewayConfig
+    /// - Io runtime from watcher thread (for async operations like status updates)
     pub fn init(
         allocator: std.mem.Allocator,
         client: *Client,
-        on_config_change: *const fn (?*anyopaque, *gw_config.GatewayConfig) void,
+        on_config_change: *const fn (?*anyopaque, *gw_config.GatewayConfig, Io) void,
         callback_context: ?*anyopaque,
         controller_name: []const u8,
     ) WatcherError!*Self {
@@ -366,7 +371,7 @@ pub const Watcher = struct {
 
             if (event_data) |data| {
                 // Parse and handle event.
-                self.handleEvent(data, resource_type) catch |err| {
+                self.handleEvent(data, resource_type, io) catch |err| {
                     std.log.debug("watcher: event handling error: {s}", .{@errorName(err)});
                     // Continue processing despite parse errors.
                 };
@@ -381,7 +386,7 @@ pub const Watcher = struct {
     }
 
     /// Handle a single watch event.
-    fn handleEvent(self: *Self, data: []const u8, resource_type: ResourceType) WatcherError!void {
+    fn handleEvent(self: *Self, data: []const u8, resource_type: ResourceType, io: Io) WatcherError!void {
         assert(data.len > 0); // S1: precondition - non-empty event data
 
         const event = try parseEvent(data);
@@ -399,7 +404,7 @@ pub const Watcher = struct {
                     .secret => try self.secrets.upsert(meta, event.raw_object),
                 }
                 // Trigger reconciliation.
-                self.triggerReconciliation();
+                self.triggerReconciliation(io);
             },
             .DELETED => {
                 const meta = try parsing.extractResourceMeta(event.raw_object);
@@ -412,7 +417,7 @@ pub const Watcher = struct {
                     .secret => self.secrets.remove(meta.name, meta.namespace),
                 };
                 if (removed) {
-                    self.triggerReconciliation();
+                    self.triggerReconciliation(io);
                 }
             },
             .BOOKMARK => {
@@ -435,7 +440,8 @@ pub const Watcher = struct {
     }
 
     /// Trigger reconciliation by building config and calling callback.
-    fn triggerReconciliation(self: *Self) void {
+    /// Passes Io to callback for async operations (e.g., K8s status updates).
+    fn triggerReconciliation(self: *Self, io: Io) void {
         assert(@intFromPtr(self.on_config_change) != 0); // S1: precondition - callback set
 
         // Build GatewayConfig from stored resources.
@@ -444,8 +450,8 @@ pub const Watcher = struct {
             return;
         };
 
-        // Invoke callback with context and new gw_config.
-        self.on_config_change(self.callback_context, &gateway_config);
+        // Invoke callback with context, new config, and Io for async operations.
+        self.on_config_change(self.callback_context, &gateway_config, io);
     }
 
     /// Reconcile stored resources into a GatewayConfig.
