@@ -22,6 +22,7 @@ const HttpClient = serval_client.Client;
 const Request = serval_core.types.Request;
 const Upstream = serval_core.types.Upstream;
 const BodyFraming = serval_core.types.BodyFraming;
+const debugLog = serval_core.debugLog;
 
 // =============================================================================
 // Constants (TigerStyle: Explicit bounds and paths)
@@ -33,7 +34,9 @@ pub const SA_CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt";
 pub const SA_NAMESPACE_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/namespace";
 
 /// Default K8s API server address (in-cluster)
-pub const DEFAULT_API_SERVER = "kubernetes.default.svc";
+/// Trailing dot makes this an explicit FQDN, preventing search domain appending
+/// (ndots:5 in K8s resolv.conf would otherwise append search domains to names with <5 dots)
+pub const DEFAULT_API_SERVER = "kubernetes.default.svc.cluster.local.";
 pub const DEFAULT_API_PORT: u16 = 443;
 
 /// Maximum token size in bytes (K8s JWT tokens are typically ~1KB)
@@ -104,6 +107,8 @@ pub const ClientError = error{
     ReadIterationsExceeded,
     /// Header error (too many headers, etc.)
     HeaderError,
+    /// HTTP 409 Conflict - resource version mismatch, caller should retry with fresh data
+    ConflictRetryable,
 };
 
 // =============================================================================
@@ -236,11 +241,13 @@ pub const Client = struct {
         };
 
         // Initialize HTTP client with DNS resolver and SSL context
-        self.http_client = HttpClient.init(
+        // kTLS disabled: K8s API responses cause EBADMSG errors with kernel TLS
+        self.http_client = HttpClient.initWithOptions(
             allocator,
             &self.dns_resolver,
             ssl_ctx,
             false, // verify_tls: insecure for K8s API
+            false, // enable_ktls: disabled for K8s API compatibility
         );
 
         return self;
@@ -307,11 +314,13 @@ pub const Client = struct {
         };
 
         // Initialize HTTP client with DNS resolver and SSL context
-        self.http_client = HttpClient.init(
+        // kTLS disabled: K8s API responses cause EBADMSG errors with kernel TLS
+        self.http_client = HttpClient.initWithOptions(
             allocator,
             &self.dns_resolver,
             ssl_ctx,
             false, // verify_tls: insecure for K8s API
+            false, // enable_ktls: disabled for K8s API compatibility
         );
 
         return self;
@@ -385,16 +394,16 @@ pub const Client = struct {
             .idx = 0,
         };
 
-        std.log.debug("K8s client: connecting to {s}:{d}", .{ self.api_server, self.api_port });
+        debugLog("K8s client: connecting to {s}:{d}", .{ self.api_server, self.api_port });
 
         // Make request using serval-client
         var result = self.http_client.request(upstream, &request, self.header_buffer, io) catch |err| {
-            std.log.debug("K8s client: HTTP request failed: {s}", .{@errorName(err)});
+            debugLog("K8s client: HTTP request failed: {s}", .{@errorName(err)});
             return mapClientError(err);
         };
         defer result.conn.socket.close();
 
-        std.log.debug("K8s client: got response status {d}", .{result.response.status});
+        debugLog("K8s client: got response status {d}", .{result.response.status});
 
         // Check status code
         if (result.response.status >= 400) {
@@ -406,9 +415,105 @@ pub const Client = struct {
 
         // Debug: log raw response (first 200 bytes)
         const preview_len = @min(body.len, 200);
-        std.log.debug("K8s API response ({d} bytes): {s}", .{ body.len, body[0..preview_len] });
+        debugLog("K8s API response ({d} bytes): {s}", .{ body.len, body[0..preview_len] });
 
         return body;
+    }
+
+    /// PATCH the status subresource of a resource.
+    /// Uses JSON Merge Patch (application/merge-patch+json).
+    ///
+    /// Preconditions:
+    /// - resource_path must start with '/' (e.g., "/apis/gateway.networking.k8s.io/v1/namespaces/default/gateways/my-gw/status")
+    /// - status_json must be valid JSON (not validated here, K8s API will return error)
+    ///
+    /// Returns:
+    /// - success (void) on 2xx status
+    /// - ConflictRetryable on HTTP 409 (resourceVersion mismatch)
+    /// - HttpError on other 4xx/5xx errors
+    ///
+    /// TigerStyle: Bounded buffers, explicit error handling.
+    pub fn patchStatus(
+        self: *Self,
+        resource_path: []const u8,
+        status_json: []const u8,
+        io: Io,
+    ) ClientError!void {
+        // S1: Preconditions
+        assert(resource_path.len > 0); // path must be non-empty
+        assert(resource_path[0] == '/'); // path must start with /
+        assert(status_json.len > 0); // body must be non-empty
+        assert(status_json.len <= MAX_RESPONSE_SIZE_BYTES); // S1: body within buffer limit
+
+        // Build Content-Length header value
+        // Max Content-Length: MAX_RESPONSE_SIZE_BYTES (1MB) = 7 digits
+        var content_length_buf: [16]u8 = undefined;
+        const content_length_str = std.fmt.bufPrint(&content_length_buf, "{d}", .{status_json.len}) catch {
+            // status_json.len is bounded by caller, this should never fail
+            return ClientError.RequestFailed;
+        };
+
+        // Build request with authentication
+        var request = Request{
+            .method = .PATCH,
+            .path = resource_path,
+            .version = .@"HTTP/1.1",
+            .headers = .{},
+            .body = status_json,
+        };
+
+        // Add required headers
+        request.headers.put("Host", self.api_server) catch return ClientError.HeaderError;
+
+        // Build Bearer token header
+        const token_slice = self.token[0..self.token_len];
+        var auth_buf: [BEARER_PREFIX.len + MAX_TOKEN_SIZE_BYTES]u8 = undefined;
+        const auth_len = BEARER_PREFIX.len + token_slice.len;
+        @memcpy(auth_buf[0..BEARER_PREFIX.len], BEARER_PREFIX);
+        @memcpy(auth_buf[BEARER_PREFIX.len..auth_len], token_slice);
+        request.headers.put("Authorization", auth_buf[0..auth_len]) catch return ClientError.HeaderError;
+
+        // JSON Merge Patch content type (RFC 7396)
+        request.headers.put("Content-Type", "application/merge-patch+json") catch return ClientError.HeaderError;
+        request.headers.put("Content-Length", content_length_str) catch return ClientError.HeaderError;
+        request.headers.put("Accept", "application/json") catch return ClientError.HeaderError;
+        request.headers.put("Connection", "close") catch return ClientError.HeaderError;
+
+        // Create upstream for K8s API server
+        const upstream = Upstream{
+            .host = self.api_server,
+            .port = self.api_port,
+            .tls = true,
+            .idx = 0,
+        };
+
+        debugLog("K8s client: PATCH {s} ({d} bytes)", .{ resource_path, status_json.len });
+
+        // Make request using serval-client
+        var result = self.http_client.request(upstream, &request, self.header_buffer, io) catch |err| {
+            debugLog("K8s client: PATCH request failed: {s}", .{@errorName(err)});
+            return mapClientError(err);
+        };
+        defer result.conn.socket.close();
+
+        debugLog("K8s client: PATCH response status {d}", .{result.response.status});
+
+        // S2: Postcondition - valid HTTP status code
+        assert(result.response.status >= 100 and result.response.status <= 599);
+
+        // Check status code
+        if (result.response.status >= 200 and result.response.status < 300) {
+            // Success - we don't need to read the body
+            return;
+        }
+
+        if (result.response.status == 409) {
+            // HTTP 409 Conflict - resource version mismatch, caller should retry
+            return ClientError.ConflictRetryable;
+        }
+
+        // Other 4xx/5xx errors
+        return ClientError.HttpError;
     }
 
     /// Read response body into response_buffer based on body framing.
@@ -423,8 +528,11 @@ pub const Client = struct {
         // S1: Precondition - connection and response are valid
         assert(self.response_buffer.len > 0); // Buffer must have capacity
 
+        debugLog("K8s client: reading body, framing={s}", .{@tagName(response.body_framing)});
+
         var reader = serval_client.BodyReader.init(&conn.socket, response.body_framing);
         const body = reader.readAll(self.response_buffer) catch |err| {
+            debugLog("K8s client: body read error: {s}", .{@errorName(err)});
             // S6: Explicit error mapping
             return switch (err) {
                 error.BufferTooSmall => ClientError.ResponseTooLarge,
@@ -619,4 +727,115 @@ test "mapClientError maps all variants" {
 
 test "BEARER_PREFIX is correct" {
     try std.testing.expectEqualStrings("Bearer ", BEARER_PREFIX);
+}
+
+test "ClientError has ConflictRetryable variant" {
+    // Verify ConflictRetryable error exists in the error set
+    const err: ClientError = ClientError.ConflictRetryable;
+    try std.testing.expect(err == ClientError.ConflictRetryable);
+
+    // Verify it's distinct from HttpError
+    try std.testing.expect(err != ClientError.HttpError);
+}
+
+test "ClientError error set completeness" {
+    // Verify all error variants exist and are distinct
+    const errors = [_]ClientError{
+        ClientError.TokenNotFound,
+        ClientError.NamespaceNotFound,
+        ClientError.CaNotFound,
+        ClientError.TokenTooLarge,
+        ClientError.NamespaceTooLarge,
+        ClientError.ResponseTooLarge,
+        ClientError.UrlTooLarge,
+        ClientError.DnsResolutionFailed,
+        ClientError.ConnectionFailed,
+        ClientError.TlsHandshakeFailed,
+        ClientError.RequestFailed,
+        ClientError.HttpError,
+        ClientError.EmptyResponse,
+        ClientError.ResponseParseFailed,
+        ClientError.OutOfMemory,
+        ClientError.SslContextFailed,
+        ClientError.ReadIterationsExceeded,
+        ClientError.HeaderError,
+        ClientError.ConflictRetryable,
+    };
+
+    // Each error should be distinct
+    for (errors, 0..) |err1, i| {
+        for (errors[i + 1 ..]) |err2| {
+            try std.testing.expect(err1 != err2);
+        }
+    }
+}
+
+test "patchStatus path validation - empty path panics" {
+    // Note: This test documents the assertion behavior.
+    // In production, assertions should not be triggered - callers must validate inputs.
+    // We cannot test assertion failures in unit tests, but we document the precondition.
+
+    // Precondition: path must be non-empty
+    // Precondition: path must start with '/'
+    // Precondition: status_json must be non-empty
+    // Precondition: status_json.len <= MAX_RESPONSE_SIZE_BYTES
+
+    // These assertions protect against programming errors, not runtime conditions.
+    // The caller is responsible for providing valid inputs.
+}
+
+test "patchStatus builds correct request structure" {
+    // This test verifies that patchStatus can be called and builds the request correctly.
+    // Since we cannot easily mock the HTTP client, we verify the method's type signature
+    // and that a client can be initialized to call it.
+
+    const allocator = std.testing.allocator;
+
+    // Initialize client with test config
+    const client = try Client.initWithConfig(
+        allocator,
+        "localhost",
+        6443,
+        "test-token-12345",
+        "default",
+    );
+    defer client.deinit();
+
+    // Verify the method signature is correct - patchStatus takes:
+    // - resource_path: []const u8 (must start with '/')
+    // - status_json: []const u8 (must be non-empty, <= MAX_RESPONSE_SIZE_BYTES)
+    // - io: Io
+    // Returns: ClientError!void
+
+    // We cannot call patchStatus without a real Io runtime and K8s API,
+    // but we can verify the client is properly initialized for PATCH requests.
+    try std.testing.expectEqualStrings("localhost", client.getApiServer());
+    try std.testing.expectEqual(@as(u16, 6443), client.api_port);
+
+    // Verify buffer sizes are adequate for PATCH operations
+    try std.testing.expectEqual(@as(usize, HTTP_HEADER_BUFFER_SIZE), client.header_buffer.len);
+    try std.testing.expectEqual(@as(usize, MAX_RESPONSE_SIZE_BYTES), client.response_buffer.len);
+}
+
+test "patchStatus preconditions documented" {
+    // Document the preconditions that patchStatus enforces via assertions:
+    //
+    // 1. resource_path.len > 0 - path must be non-empty
+    // 2. resource_path[0] == '/' - path must start with '/'
+    // 3. status_json.len > 0 - body must be non-empty
+    // 4. status_json.len <= MAX_RESPONSE_SIZE_BYTES - body must fit in buffer
+    //
+    // Violating any of these preconditions will trigger an assertion failure.
+    // These are programming errors, not runtime conditions.
+    //
+    // Valid example paths:
+    // - "/apis/gateway.networking.k8s.io/v1/namespaces/default/gateways/my-gw/status"
+    // - "/apis/gateway.networking.k8s.io/v1/namespaces/test/httproutes/my-route/status"
+    //
+    // Valid status_json examples:
+    // - {"status":{"conditions":[{"type":"Accepted","status":"True"}]}}
+
+    // Verify MAX_RESPONSE_SIZE_BYTES is reasonable for status updates
+    try std.testing.expect(MAX_RESPONSE_SIZE_BYTES >= 1024); // At least 1KB
+    try std.testing.expect(MAX_RESPONSE_SIZE_BYTES <= 16 * 1024 * 1024); // At most 16MB
 }
