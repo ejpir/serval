@@ -47,6 +47,10 @@ const sendErrorResponse = response.sendErrorResponse;
 const sendDirectResponse = response.sendDirectResponse;
 const send100Continue = response.send100Continue;
 const send501NotImplemented = response.send501NotImplemented;
+const sendStreamHeaders = response.sendStreamHeaders;
+const sendChunk = response.sendChunk;
+const sendFinalChunk = response.sendFinalChunk;
+const StreamResponse = types.StreamResponse;
 const readRequest = reader.readRequest;
 const readMoreData = reader.readMoreData;
 const getBodyLength = reader.getBodyLength;
@@ -296,6 +300,24 @@ pub fn Server(
                 try writer.interface.flush();
             }
         }
+
+        /// TLS-aware write wrapper for streaming response helpers.
+        /// Implements writeAll interface that sendStreamHeaders/sendChunk/sendFinalChunk expect.
+        /// TigerStyle: Stack-allocated context, no runtime allocation.
+        const TlsWriter = struct {
+            maybe_tls: ?*const TLSStream,
+            io: *Io,
+            stream: Io.net.Stream,
+
+            /// Write all data to connection (TLS or plain).
+            /// TigerStyle: Maps to connectionWrite with error handling.
+            pub fn writeAll(self: *TlsWriter, data: []const u8) !void {
+                // S1: Precondition - data must be non-empty for write
+                // Note: Allow empty writes for flexibility (e.g., empty extra_headers)
+                if (data.len == 0) return;
+                try connectionWrite(self.maybe_tls, self.io, self.stream, data);
+            }
+        };
 
         // =========================================================================
         // Helper Functions for handleConnectionImpl
@@ -732,15 +754,83 @@ pub fn Server(
                             buffer_offset += parser.headers_end + body_length_for_offset;
                             continue;
                         },
-                        .stream => {
-                            // Streaming response: returns 501 until nextChunk() loop is implemented.
-                            // See docs/plans/2026-01-10-streaming-response-design.md for planned behavior.
-                            sendErrorResponseTls(maybe_tls_ptr, &io_mut, stream, 501, "Streaming not implemented");
-                            const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
-                            metrics.requestEnd(501, duration_ns);
-                            tracer.endSpan(span_handle, "streaming_not_implemented");
-                            buffer_offset += parser.headers_end + body_length_for_offset;
-                            continue;
+                        .stream => |stream_resp| {
+                            // Streaming response: call handler.nextChunk() in bounded loop.
+                            // TigerStyle: Comptime check for nextChunk method.
+                            if (comptime !@hasDecl(Handler, "nextChunk")) {
+                                // Handler returns .stream but has no nextChunk method.
+                                // Send 501 Not Implemented at runtime.
+                                sendErrorResponseTls(maybe_tls_ptr, &io_mut, stream, 501, "Handler missing nextChunk method");
+                                const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
+                                metrics.requestEnd(501, duration_ns);
+                                tracer.endSpan(span_handle, "missing_nextChunk");
+                                buffer_offset += parser.headers_end + body_length_for_offset;
+                                continue;
+                            } else {
+                                // Create TLS-aware writer for streaming helpers
+                                var tls_writer = TlsWriter{
+                                    .maybe_tls = maybe_tls_ptr,
+                                    .io = &io_mut,
+                                    .stream = stream,
+                                };
+
+                                // 1. Send headers (chunked encoding)
+                                sendStreamHeaders(&tls_writer, stream_resp) catch |err| {
+                                    std.log.err("streaming response: failed to send headers: {s}", .{@errorName(err)});
+                                    const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
+                                    metrics.requestEnd(500, duration_ns);
+                                    tracer.endSpan(span_handle, "stream_headers_failed");
+                                    buffer_offset += parser.headers_end + body_length_for_offset;
+                                    continue;
+                                };
+
+                                // 2. Bounded streaming loop
+                                var chunk_count: u32 = 0;
+                                const max_chunk_count: u32 = config.MAX_STREAM_CHUNK_COUNT;
+                                var stream_error: bool = false;
+
+                                while (chunk_count < max_chunk_count) : (chunk_count += 1) {
+                                    const maybe_len = handler.nextChunk(&ctx, &response_buf) catch |err| {
+                                        // S6: Log error before terminating stream
+                                        std.log.err("streaming response failed at chunk {d}: {s}", .{ chunk_count, @errorName(err) });
+                                        sendFinalChunk(&tls_writer) catch {};
+                                        stream_error = true;
+                                        break;
+                                    };
+
+                                    if (maybe_len) |len| {
+                                        assert(len <= response_buf.len); // S1: postcondition
+                                        if (len > 0) {
+                                            sendChunk(&tls_writer, response_buf[0..len]) catch |err| {
+                                                std.log.err("streaming response: failed to send chunk {d}: {s}", .{ chunk_count, @errorName(err) });
+                                                stream_error = true;
+                                                break;
+                                            };
+                                        }
+                                    } else {
+                                        // null = done
+                                        sendFinalChunk(&tls_writer) catch {};
+                                        break;
+                                    }
+                                }
+
+                                // TigerStyle: if we hit max_chunk_count, log and terminate cleanly
+                                if (chunk_count >= max_chunk_count) {
+                                    std.log.warn("streaming response hit max chunk count: {d}", .{max_chunk_count});
+                                    sendFinalChunk(&tls_writer) catch {};
+                                }
+
+                                const final_status: u16 = if (stream_error) 500 else stream_resp.status;
+                                const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
+                                metrics.requestEnd(final_status, duration_ns);
+                                if (stream_error) {
+                                    tracer.endSpan(span_handle, "stream_error");
+                                } else {
+                                    tracer.endSpan(span_handle, null);
+                                }
+                                buffer_offset += parser.headers_end + body_length_for_offset;
+                                continue;
+                            }
                         },
                     }
                 }

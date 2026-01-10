@@ -63,6 +63,13 @@ const DirectResponse = types.DirectResponse;
 const RejectResponse = types.RejectResponse;
 const ResponseMode = types.ResponseMode;
 const UpstreamConnectInfo = types.UpstreamConnectInfo;
+const StreamResponse = types.StreamResponse;
+
+// Import streaming helpers from h1/response.zig
+const h1_response = @import("h1/response.zig");
+const sendStreamHeaders = h1_response.sendStreamHeaders;
+const sendChunk = h1_response.sendChunk;
+const sendFinalChunk = h1_response.sendFinalChunk;
 
 // =============================================================================
 // Connection Handling (RFC 9112)
@@ -190,6 +197,26 @@ pub fn Server(
                 };
             }
         }
+
+        /// Plain socket write wrapper for streaming response helpers.
+        /// Implements writeAll interface that sendStreamHeaders/sendChunk/sendFinalChunk expect.
+        /// TigerStyle: Stack-allocated context, no runtime allocation.
+        const PlainWriter = struct {
+            io: Io,
+            stream: Io.net.Stream,
+
+            /// Write all data to plain socket connection.
+            /// TigerStyle: Maps to stream.writer with error handling.
+            pub fn writeAll(self: *PlainWriter, data: []const u8) !void {
+                // Allow empty writes for flexibility (e.g., empty extra_headers)
+                if (data.len == 0) return;
+
+                var write_buf: [WRITE_BUFFER_SIZE_BYTES]u8 = std.mem.zeroes([WRITE_BUFFER_SIZE_BYTES]u8);
+                var writer = self.stream.writer(self.io, &write_buf);
+                try writer.interface.writeAll(data);
+                try writer.interface.flush();
+            }
+        };
 
         /// Handle HTTP/1.1 connection with keep-alive and pipelining support.
         /// Processes multiple requests until: client sends Connection: close,
@@ -386,17 +413,87 @@ pub fn Server(
                             buffer_offset += parser.headers_end + body_length;
                             continue;
                         },
-                        .stream => {
-                            // Streaming response: returns 501 until nextChunk() loop is implemented.
-                            // See docs/plans/2026-01-10-streaming-response-design.md for planned behavior.
-                            sendRejectResponseImpl(io, stream, .{ .status = 501, .reason = "Streaming not implemented" });
-                            ctx.response_status = 501;
-                            const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
-                            metrics.requestEnd(501, duration_ns);
-                            tracer.endSpan(span_handle, "streaming_not_implemented");
-                            const body_length = getBodyLength(&parser.request);
-                            buffer_offset += parser.headers_end + body_length;
-                            continue;
+                        .stream => |stream_resp| {
+                            // Streaming response: call handler.nextChunk() in bounded loop.
+                            // TigerStyle: Comptime check for nextChunk method.
+                            if (comptime !@hasDecl(Handler, "nextChunk")) {
+                                // Handler returns .stream but has no nextChunk method.
+                                // Send 501 Not Implemented at runtime.
+                                sendRejectResponseImpl(io, stream, .{ .status = 501, .reason = "Handler missing nextChunk method" });
+                                ctx.response_status = 501;
+                                const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
+                                metrics.requestEnd(501, duration_ns);
+                                tracer.endSpan(span_handle, "missing_nextChunk");
+                                const body_length = getBodyLength(&parser.request);
+                                buffer_offset += parser.headers_end + body_length;
+                                continue;
+                            } else {
+                                // Create plain socket writer for streaming helpers
+                                var plain_writer = PlainWriter{
+                                    .io = io,
+                                    .stream = stream,
+                                };
+
+                                // 1. Send headers (chunked encoding)
+                                sendStreamHeaders(&plain_writer, stream_resp) catch |err| {
+                                    std.log.err("streaming response: failed to send headers: {s}", .{@errorName(err)});
+                                    const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
+                                    metrics.requestEnd(500, duration_ns);
+                                    tracer.endSpan(span_handle, "stream_headers_failed");
+                                    const body_length = getBodyLength(&parser.request);
+                                    buffer_offset += parser.headers_end + body_length;
+                                    continue;
+                                };
+
+                                // 2. Bounded streaming loop
+                                var chunk_count: u32 = 0;
+                                const max_chunk_count: u32 = config.MAX_STREAM_CHUNK_COUNT;
+                                var stream_error: bool = false;
+
+                                while (chunk_count < max_chunk_count) : (chunk_count += 1) {
+                                    const maybe_len = handler.nextChunk(&ctx, &response_buf) catch |err| {
+                                        // S6: Log error before terminating stream
+                                        std.log.err("streaming response failed at chunk {d}: {s}", .{ chunk_count, @errorName(err) });
+                                        sendFinalChunk(&plain_writer) catch {};
+                                        stream_error = true;
+                                        break;
+                                    };
+
+                                    if (maybe_len) |len| {
+                                        assert(len <= response_buf.len); // S1: postcondition
+                                        if (len > 0) {
+                                            sendChunk(&plain_writer, response_buf[0..len]) catch |err| {
+                                                std.log.err("streaming response: failed to send chunk {d}: {s}", .{ chunk_count, @errorName(err) });
+                                                stream_error = true;
+                                                break;
+                                            };
+                                        }
+                                    } else {
+                                        // null = done
+                                        sendFinalChunk(&plain_writer) catch {};
+                                        break;
+                                    }
+                                }
+
+                                // TigerStyle: if we hit max_chunk_count, log and terminate cleanly
+                                if (chunk_count >= max_chunk_count) {
+                                    std.log.warn("streaming response hit max chunk count: {d}", .{max_chunk_count});
+                                    sendFinalChunk(&plain_writer) catch {};
+                                }
+
+                                const final_status: u16 = if (stream_error) 500 else stream_resp.status;
+                                const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
+                                ctx.response_status = final_status;
+                                metrics.requestEnd(final_status, duration_ns);
+                                if (stream_error) {
+                                    tracer.endSpan(span_handle, "stream_error");
+                                } else {
+                                    tracer.endSpan(span_handle, null);
+                                }
+                                const body_length = getBodyLength(&parser.request);
+                                buffer_offset += parser.headers_end + body_length;
+                                continue;
+                            }
                         },
                     }
                 }
