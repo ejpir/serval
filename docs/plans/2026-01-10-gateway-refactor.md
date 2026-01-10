@@ -73,12 +73,30 @@ serval-gateway/                    # Clean library
 
 examples/gateway/                  # K8s controller
 ├── main.zig                       # Entry point, CLI parsing
-├── controller.zig                 # Admin server, config management
+├── controller.zig                 # Config management, serval-server admin API
+├── admin_handler.zig              # Handler for /healthz, /readyz, /config (serval-server)
 ├── k8s_client.zig                 # K8s API client (from k8s/client.zig)
 ├── watcher.zig                    # K8s watcher (from k8s/watcher.zig)
 ├── resolver.zig                   # Service resolution (from resolver.zig)
 └── data_plane.zig                 # Config push using serval-client
 ```
+
+## serval-* Component Usage
+
+This refactor uses serval-* components throughout (no raw sockets, no local constants):
+
+| Component | Usage |
+|-----------|-------|
+| `serval-client` | HTTP client for data plane push and K8s API calls |
+| `serval-server` | HTTP server for admin API (health probes, config status) |
+| `serval-core.config` | All constants (timeouts, buffer sizes, ports) |
+| `serval-core.types` | Request, Response, Upstream, DirectResponse, Action |
+| `serval-core.time` | Timing utilities (monotonicNanos, elapsedNanos) |
+| `serval-net` | DnsResolver, Socket abstraction |
+| `serval-pool` | SimplePool for connection management |
+| `serval-metrics` | NoopMetrics for admin server |
+| `serval-tracing` | NoopTracer for admin server |
+| `serval-gateway` | Gateway API types and translator |
 
 ---
 
@@ -211,6 +229,12 @@ git commit -m "feat(examples): scaffold gateway controller directory"
 This replaces the raw socket code in `gateway.zig:pushConfigToDataPlane()` with proper serval-client usage.
 Uses local Resolver import (not from serval-gateway) and new translator API with ResolvedBackend.
 
+**IMPORTANT:** Uses the actual serval-client API:
+- `Client.init(allocator, dns_resolver, client_ctx, verify_tls)` - Initialize client
+- `client.connect(upstream, io)` - Returns ConnectResult with connection
+- `client.sendRequest(conn, request, path)` - Send HTTP request
+- `client.readResponseHeaders(conn, header_buf)` - Read response headers
+
 TigerStyle compliance:
 - S1: Assertions for preconditions/postconditions
 - S2: Explicit types (u8, u16, u32, u64 - no usize)
@@ -228,10 +252,12 @@ TigerStyle compliance:
 //! TigerStyle: Uses serval-client, bounded buffers, explicit errors, ~2 assertions per function.
 
 const std = @import("std");
+const Io = std.Io;
 const assert = std.debug.assert;
 
 const serval_client = @import("serval-client");
 const serval_core = @import("serval-core");
+const serval_net = @import("serval-net");
 const gateway = @import("serval-gateway");
 
 // Local imports (K8s-specific, not from serval-gateway)
@@ -239,8 +265,12 @@ const resolver_mod = @import("resolver.zig");
 const Resolver = resolver_mod.Resolver;
 
 const Client = serval_client.Client;
+const Connection = serval_client.Connection;
 const Upstream = serval_core.types.Upstream;
+const Request = serval_core.types.Request;
+const Method = serval_core.types.Method;
 const core_config = serval_core.config;
+const DnsResolver = serval_net.DnsResolver;
 const GatewayConfig = gateway.GatewayConfig;
 const ResolvedBackend = gateway.config.ResolvedBackend;
 
@@ -254,14 +284,8 @@ pub const DEFAULT_ADMIN_PORT: u16 = core_config.DEFAULT_ADMIN_PORT;
 /// Maximum JSON payload size in bytes.
 pub const MAX_JSON_SIZE_BYTES: u32 = gateway.translator.MAX_JSON_SIZE_BYTES;
 
-/// Maximum response size from data plane in bytes.
-const MAX_RESPONSE_SIZE_BYTES: u32 = 4096;
-
-/// Connection timeout in nanoseconds.
-const CONNECT_TIMEOUT_NS: u64 = core_config.CLIENT_CONNECT_TIMEOUT_NS;
-
-/// Read timeout in nanoseconds.
-const READ_TIMEOUT_NS: u64 = core_config.CLIENT_READ_TIMEOUT_NS;
+/// Maximum response header size in bytes.
+const MAX_RESPONSE_HEADER_SIZE_BYTES: u32 = core_config.MAX_HEADER_SIZE_BYTES;
 
 /// Maximum retries for config push (TigerStyle S4: bounded).
 pub const MAX_RETRIES: u8 = core_config.MAX_CONFIG_PUSH_RETRIES;
@@ -304,29 +328,55 @@ pub const DataPlaneError = error{
 pub const DataPlaneClient = struct {
     const Self = @This();
 
+    /// Allocator for client resources.
+    allocator: std.mem.Allocator,
+
     /// Data plane admin port.
     admin_port: u16,
+
+    /// DNS resolver for client connections.
+    dns_resolver: DnsResolver,
+
+    /// HTTP client instance.
+    client: Client,
 
     /// JSON buffer for config serialization (TigerStyle S7: bounded).
     json_buffer: [MAX_JSON_SIZE_BYTES]u8,
 
-    /// Response buffer (TigerStyle S7: bounded).
-    response_buffer: [MAX_RESPONSE_SIZE_BYTES]u8,
+    /// Response header buffer (TigerStyle S7: bounded).
+    response_header_buffer: [MAX_RESPONSE_HEADER_SIZE_BYTES]u8,
 
     /// Resolved backends buffer (TigerStyle S7: bounded).
     resolved_backends: [gateway.config.MAX_RESOLVED_BACKENDS]ResolvedBackend,
 
     /// Initialize data plane client.
     ///
-    /// TigerStyle S5: No allocation, fixed buffers initialized at init.
-    pub fn init(admin_port: u16) Self {
+    /// TigerStyle S5: Fixed buffers, DNS resolver init at startup.
+    pub fn init(allocator: std.mem.Allocator, admin_port: u16) Self {
         assert(admin_port > 0); // S1: precondition
+
+        var dns_resolver = DnsResolver.init(.{});
+
         return Self{
+            .allocator = allocator,
             .admin_port = admin_port,
+            .dns_resolver = dns_resolver,
+            .client = Client.init(
+                allocator,
+                &dns_resolver,
+                null, // No TLS for localhost admin API
+                false, // No TLS verification needed
+            ),
             .json_buffer = undefined,
-            .response_buffer = undefined,
+            .response_header_buffer = undefined,
             .resolved_backends = undefined,
         };
+    }
+
+    /// Deinitialize client resources.
+    /// TigerStyle: Explicit cleanup, pairs with init.
+    pub fn deinit(self: *Self) void {
+        self.client.deinit();
     }
 
     /// Push gateway config to data plane.
@@ -340,6 +390,7 @@ pub const DataPlaneClient = struct {
         self: *Self,
         config: *const GatewayConfig,
         resolver: *const Resolver,
+        io: Io,
     ) DataPlaneError!void {
         // S1: preconditions
         assert(config.gateways.len > 0 or config.http_routes.len > 0);
@@ -365,7 +416,7 @@ pub const DataPlaneClient = struct {
         const json_body = self.json_buffer[0..json_len];
 
         // Step 3: POST to data plane
-        try self.postToDataPlane(json_body);
+        try self.postToDataPlane(json_body, io);
 
         std.log.info("pushed config ({d} bytes, {d} backends) to data plane", .{
             json_len,
@@ -409,8 +460,13 @@ pub const DataPlaneClient = struct {
 
     /// POST JSON to data plane admin API.
     ///
+    /// Uses actual serval-client API:
+    /// 1. client.connect() - establish TCP connection
+    /// 2. client.sendRequest() - send POST request with body
+    /// 3. client.readResponseHeaders() - read response status
+    ///
     /// TigerStyle: Uses serval-client, explicit error mapping.
-    fn postToDataPlane(self: *Self, json_body: []const u8) DataPlaneError!void {
+    fn postToDataPlane(self: *Self, json_body: []const u8, io: Io) DataPlaneError!void {
         assert(json_body.len > 0); // S1: precondition
 
         // Build upstream for localhost:admin_port
@@ -418,29 +474,54 @@ pub const DataPlaneClient = struct {
             .host = "127.0.0.1",
             .port = self.admin_port,
             .tls = false,
+            .idx = 0,
         };
 
-        // Initialize client for this request
-        var client = Client.init(.{
-            .connect_timeout_ns = CONNECT_TIMEOUT_NS,
-            .read_timeout_ns = READ_TIMEOUT_NS,
-        });
+        // Step 1: Connect to data plane
+        var connect_result = self.client.connect(upstream, io) catch |err| {
+            std.log.err("data plane connect failed: {s}", .{@errorName(err)});
+            return mapClientError(err);
+        };
+        defer connect_result.conn.close();
 
-        // Make POST request
-        const result = client.post(
-            upstream,
-            "/routes/update",
-            json_body,
-            "application/json",
-            &self.response_buffer,
+        // Step 2: Build and send POST request
+        // Build request with POST method and JSON body info
+        var request = Request{
+            .method = .POST,
+            .path = "/routes/update",
+            .version = .@"HTTP/1.1",
+            .headers = undefined, // Will be set below
+        };
+
+        // Set Content-Type and Content-Length headers
+        request.headers = serval_core.types.HeaderMap.init();
+        request.headers.add("Content-Type", "application/json") catch {};
+        request.headers.add("Host", "127.0.0.1") catch {};
+
+        // Send request headers
+        self.client.sendRequest(&connect_result.conn, &request, null) catch |err| {
+            std.log.err("data plane send failed: {s}", .{@errorName(err)});
+            return mapClientError(err);
+        };
+
+        // Send request body
+        connect_result.conn.socket.write(json_body) catch |err| {
+            std.log.err("data plane body send failed: {s}", .{@errorName(err)});
+            return error.SendFailed;
+        };
+
+        // Step 3: Read response headers
+        const response = self.client.readResponseHeaders(
+            &connect_result.conn,
+            &self.response_header_buffer,
         ) catch |err| {
-            std.log.err("data plane request failed: {s}", .{@errorName(err)});
+            std.log.err("data plane recv failed: {s}", .{@errorName(err)});
             return mapClientError(err);
         };
 
         // S1: postcondition - check response status
-        if (result.status_code < 200 or result.status_code >= 300) {
-            std.log.err("data plane rejected config: HTTP {d}", .{result.status_code});
+        if (response.status < 200 or response.status >= 300) {
+            std.log.err("data plane rejected config: HTTP {d}", .{response.status});
             return error.Rejected;
         }
     }
@@ -452,6 +533,7 @@ pub const DataPlaneClient = struct {
         self: *Self,
         config: *const GatewayConfig,
         resolver: *const Resolver,
+        io: Io,
     ) DataPlaneError!void {
         assert(MAX_RETRIES > 0); // S1: precondition
 
@@ -460,7 +542,7 @@ pub const DataPlaneClient = struct {
 
         // S4: Bounded retry loop
         while (attempt < MAX_RETRIES) : (attempt += 1) {
-            self.pushConfig(config, resolver) catch |err| {
+            self.pushConfig(config, resolver, io) catch |err| {
                 std.log.warn("config push failed (attempt {d}/{d}): {s}", .{
                     attempt + 1,
                     MAX_RETRIES,
@@ -485,18 +567,23 @@ pub const DataPlaneClient = struct {
     /// TigerStyle S6: Explicit error mapping, no catch {}.
     fn mapClientError(err: serval_client.ClientError) DataPlaneError {
         return switch (err) {
+            serval_client.ClientError.DnsResolutionFailed,
             serval_client.ClientError.TcpConnectFailed,
             serval_client.ClientError.TcpConnectTimeout,
+            serval_client.ClientError.TlsHandshakeFailed,
             => error.ConnectionFailed,
             serval_client.ClientError.SendFailed,
             serval_client.ClientError.SendTimeout,
+            serval_client.ClientError.BufferTooSmall,
             => error.SendFailed,
             serval_client.ClientError.RecvFailed,
             serval_client.ClientError.RecvTimeout,
+            serval_client.ClientError.ResponseHeadersTooLarge,
+            serval_client.ClientError.InvalidResponseStatus,
+            serval_client.ClientError.InvalidResponseHeaders,
             => error.ReceiveFailed,
             serval_client.ClientError.ConnectionClosed,
             => error.EmptyResponse,
-            else => error.SendFailed,
         };
     }
 };
@@ -506,7 +593,8 @@ pub const DataPlaneClient = struct {
 // ============================================================================
 
 test "DataPlaneClient init" {
-    const client = DataPlaneClient.init(9901);
+    const client = DataPlaneClient.init(std.testing.allocator, 9901);
+    defer client.deinit();
     try std.testing.expectEqual(@as(u16, 9901), client.admin_port);
 }
 
@@ -514,7 +602,8 @@ test "DataPlaneClient init asserts on zero port" {
     // This would panic due to assert - skip in release builds
     if (@import("builtin").mode == .Debug) {
         // Can't easily test assert in Zig, so just verify init works with valid port
-        const client = DataPlaneClient.init(1);
+        const client = DataPlaneClient.init(std.testing.allocator, 1);
+        defer client.deinit();
         try std.testing.expectEqual(@as(u16, 1), client.admin_port);
     }
 }
@@ -749,14 +838,190 @@ git commit -m "refactor: move k8s watcher to examples/gateway/"
 
 ---
 
-## Task 7: Create controller.zig (Extract from gateway.zig)
+## Task 7: Create controller.zig Using serval-server
 
 **Files:**
 - Create: `examples/gateway/controller.zig`
+- Create: `examples/gateway/admin_handler.zig`
 
-**Step 1: Extract admin server and controller logic**
+**Step 1: Create admin handler for serval-server**
 
-This takes the admin server code from gateway.zig but uses proper imports.
+The admin handler implements the serval-server Handler interface to serve health check
+and config endpoints. This replaces raw POSIX sockets with serval-server.MinimalServer.
+
+**IMPORTANT:** Uses serval-server instead of raw sockets:
+- `serval_server.MinimalServer(Handler)` - Create server with handler
+- Handler implements `selectUpstream()` and `onRequest()` hooks
+- Uses `serval_core.types.DirectResponse` for immediate responses
+- Uses `serval_core.config` for constants (not locally defined)
+- Uses `serval_core.time` for timing utilities
+
+```zig
+// examples/gateway/admin_handler.zig
+//! Admin API Handler for serval-server
+//!
+//! Implements serval-server Handler interface for K8s health probes and config API.
+//! Returns direct responses without forwarding to any upstream.
+//!
+//! TigerStyle: Uses serval-server, bounded responses, explicit returns.
+
+const std = @import("std");
+const assert = std.debug.assert;
+
+const serval_core = @import("serval-core");
+const types = serval_core.types;
+const config = serval_core.config;
+const time = serval_core.time;
+const Context = serval_core.Context;
+const Request = types.Request;
+const Upstream = types.Upstream;
+const Action = types.Action;
+const DirectResponse = types.DirectResponse;
+
+const gateway = @import("serval-gateway");
+const GatewayConfig = gateway.GatewayConfig;
+
+// ============================================================================
+// Admin Handler (implements serval-server Handler interface)
+// ============================================================================
+
+pub const AdminHandler = struct {
+    const Self = @This();
+
+    /// Ready flag for K8s probes (set by controller).
+    ready: *std.atomic.Value(bool),
+
+    /// Current gateway config pointer (set by controller).
+    gateway_config: *?*const GatewayConfig,
+
+    /// Response buffer for JSON responses (TigerStyle S7: bounded).
+    response_buffer: [config.DIRECT_RESPONSE_BUFFER_SIZE_BYTES]u8,
+
+    /// Initialize admin handler.
+    pub fn init(
+        ready: *std.atomic.Value(bool),
+        gateway_config: *?*const GatewayConfig,
+    ) Self {
+        assert(@intFromPtr(ready) != 0); // S1: precondition
+        assert(@intFromPtr(gateway_config) != 0); // S1: precondition
+
+        return Self{
+            .ready = ready,
+            .gateway_config = gateway_config,
+            .response_buffer = undefined,
+        };
+    }
+
+    /// Required by serval-server: select upstream for forwarding.
+    /// Admin API never forwards - all requests handled by onRequest.
+    /// Returns dummy upstream (never used).
+    pub fn selectUpstream(self: *Self, ctx: *Context, request: *const Request) Upstream {
+        _ = self;
+        _ = ctx;
+        _ = request;
+        // Never used - onRequest returns direct responses
+        return Upstream{ .host = "127.0.0.1", .port = 0, .tls = false, .idx = 0 };
+    }
+
+    /// Handle admin API requests directly without forwarding.
+    /// Returns DirectResponse for health checks and config endpoints.
+    ///
+    /// Endpoints:
+    /// - GET /healthz - Liveness probe (always 200)
+    /// - GET /readyz  - Readiness probe (200 if ready, 503 if not)
+    /// - GET /config  - Config status (200 if configured, 503 if not)
+    ///
+    /// TigerStyle: All endpoints return bounded responses.
+    pub fn onRequest(
+        self: *Self,
+        ctx: *Context,
+        request: *const Request,
+        response_buf: *[config.DIRECT_RESPONSE_BUFFER_SIZE_BYTES]u8,
+    ) Action {
+        _ = ctx;
+
+        const path = request.path;
+
+        // GET /healthz - liveness probe
+        if (std.mem.eql(u8, path, "/healthz") or std.mem.startsWith(u8, path, "/healthz?")) {
+            return self.okResponse("OK", response_buf);
+        }
+
+        // GET /readyz - readiness probe
+        if (std.mem.eql(u8, path, "/readyz") or std.mem.startsWith(u8, path, "/readyz?")) {
+            if (self.ready.load(.acquire)) {
+                return self.okResponse("OK", response_buf);
+            }
+            return self.errorResponse(503, "Not Ready", response_buf);
+        }
+
+        // GET /config - config status
+        if (std.mem.eql(u8, path, "/config") or std.mem.startsWith(u8, path, "/config?")) {
+            if (self.gateway_config.* != null) {
+                return self.jsonResponse(200, "{\"status\":\"configured\"}", response_buf);
+            }
+            return self.jsonResponse(503, "{\"status\":\"not_configured\"}", response_buf);
+        }
+
+        // 404 for unknown paths
+        return self.errorResponse(404, "Not Found", response_buf);
+    }
+
+    /// Build 200 OK response.
+    fn okResponse(
+        self: *Self,
+        body: []const u8,
+        response_buf: *[config.DIRECT_RESPONSE_BUFFER_SIZE_BYTES]u8,
+    ) Action {
+        _ = self;
+        return Action{ .send_response = DirectResponse{
+            .status = 200,
+            .content_type = "text/plain",
+            .body = body,
+            .extra_headers = "",
+            .response_mode = .content_length,
+        } };
+    }
+
+    /// Build error response.
+    fn errorResponse(
+        self: *Self,
+        status: u16,
+        body: []const u8,
+        response_buf: *[config.DIRECT_RESPONSE_BUFFER_SIZE_BYTES]u8,
+    ) Action {
+        _ = self;
+        _ = response_buf;
+        return Action{ .send_response = DirectResponse{
+            .status = status,
+            .content_type = "text/plain",
+            .body = body,
+            .extra_headers = "",
+            .response_mode = .content_length,
+        } };
+    }
+
+    /// Build JSON response.
+    fn jsonResponse(
+        self: *Self,
+        status: u16,
+        body: []const u8,
+        response_buf: *[config.DIRECT_RESPONSE_BUFFER_SIZE_BYTES]u8,
+    ) Action {
+        _ = self;
+        _ = response_buf;
+        return Action{ .send_response = DirectResponse{
+            .status = status,
+            .content_type = "application/json",
+            .body = body,
+            .extra_headers = "",
+            .response_mode = .content_length,
+        } };
+    }
+};
+```
+
+**Step 2: Write controller.zig using serval-server**
 
 ```zig
 // examples/gateway/controller.zig
@@ -765,11 +1030,22 @@ This takes the admin server code from gateway.zig but uses proper imports.
 //! Manages gateway state, admin server, and config updates.
 //! Coordinates between K8s watcher and data plane.
 //!
-//! TigerStyle: Thread-safe state, bounded responses, explicit errors.
+//! Uses serval-server.MinimalServer for admin API instead of raw sockets.
+//! Uses serval-core.config for all constants (no local definitions).
+//! Uses serval-core.time for timing utilities.
+//!
+//! TigerStyle: Thread-safe state, uses serval components, explicit errors.
 
 const std = @import("std");
+const Io = std.Io;
 const assert = std.debug.assert;
-const posix = std.posix;
+
+const serval_core = @import("serval-core");
+const serval_server = @import("serval-server");
+const serval_pool = @import("serval-pool");
+const serval_metrics = @import("serval-metrics");
+const serval_tracing = @import("serval-tracing");
+const serval_net = @import("serval-net");
 
 const gateway = @import("serval-gateway");
 const GatewayConfig = gateway.GatewayConfig;
@@ -780,15 +1056,20 @@ const DataPlaneClient = data_plane.DataPlaneClient;
 const resolver_mod = @import("resolver.zig");
 const Resolver = resolver_mod.Resolver;
 
-// ============================================================================
-// Constants
-// ============================================================================
+const admin_handler = @import("admin_handler.zig");
+const AdminHandler = admin_handler.AdminHandler;
 
-/// Admin server backlog.
-const ADMIN_BACKLOG: u31 = 16;
+// Use serval-core types and config
+const core_config = serval_core.config;
+const Config = core_config.Config;
+const time = serval_core.time;
 
-/// Maximum accept iterations per cycle.
-const MAX_ACCEPT_ITERATIONS: u32 = 100;
+// serval-server components
+const MinimalServer = serval_server.MinimalServer;
+const SimplePool = serval_pool.pool.SimplePool;
+const NoopMetrics = serval_metrics.metrics.NoopMetrics;
+const NoopTracer = serval_tracing.tracing.NoopTracer;
+const DnsConfig = serval_net.DnsConfig;
 
 // ============================================================================
 // Error Types
@@ -808,6 +1089,9 @@ pub const ControllerError = error{
 pub const Controller = struct {
     const Self = @This();
 
+    // Type aliases for serval-server
+    const AdminServer = MinimalServer(AdminHandler);
+
     /// Allocator for resources.
     allocator: std.mem.Allocator,
 
@@ -816,12 +1100,6 @@ pub const Controller = struct {
 
     /// Admin server port.
     admin_port: u16,
-
-    /// Admin server socket.
-    admin_socket: ?posix.socket_t,
-
-    /// Admin server thread.
-    admin_thread: ?std.Thread,
 
     /// Current gateway config (atomic pointer for lock-free access).
     gateway_config: ?*const GatewayConfig,
@@ -835,167 +1113,119 @@ pub const Controller = struct {
     /// Shutdown flag.
     shutdown: std.atomic.Value(bool),
 
+    /// Admin handler for serval-server.
+    admin_handler: AdminHandler,
+
+    /// Admin server (serval-server.MinimalServer).
+    admin_server: ?AdminServer,
+
+    /// Connection pool for admin server.
+    pool: SimplePool,
+
+    /// Metrics (noop for admin).
+    metrics: NoopMetrics,
+
+    /// Tracer (noop for admin).
+    tracer: NoopTracer,
+
+    /// Admin server thread.
+    admin_thread: ?std.Thread,
+
     /// Initialize controller.
     /// TigerStyle S1: Assertions validate port arguments.
     pub fn init(allocator: std.mem.Allocator, admin_port: u16, data_plane_port: u16) Self {
         assert(admin_port > 0); // S1: precondition
         assert(data_plane_port > 0); // S1: precondition
 
-        return Self{
+        var self = Self{
             .allocator = allocator,
             .ready = std.atomic.Value(bool).init(false),
             .admin_port = admin_port,
-            .admin_socket = null,
-            .admin_thread = null,
             .gateway_config = null,
-            .data_plane_client = DataPlaneClient.init(data_plane_port),
+            .data_plane_client = DataPlaneClient.init(allocator, data_plane_port),
             .resolver = Resolver.init(),
             .shutdown = std.atomic.Value(bool).init(false),
+            .admin_handler = undefined, // Set below
+            .admin_server = null,
+            .pool = SimplePool.init(),
+            .metrics = NoopMetrics{},
+            .tracer = NoopTracer{},
+            .admin_thread = null,
         };
+
+        // Initialize admin handler with pointers to our state
+        self.admin_handler = AdminHandler.init(&self.ready, &self.gateway_config);
+
+        return self;
     }
 
     pub fn deinit(self: *Self) void {
         self.shutdown.store(true, .release);
-        if (self.admin_socket) |sock| {
-            posix.close(sock);
-        }
         if (self.admin_thread) |thread| {
             thread.join();
         }
+        self.data_plane_client.deinit();
     }
 
     /// Update gateway config and push to data plane.
-    pub fn updateConfig(self: *Self, config: *const GatewayConfig) !void {
-        assert(config.gateways.len > 0 or config.http_routes.len > 0);
+    pub fn updateConfig(self: *Self, config_ptr: *const GatewayConfig, io: Io) !void {
+        assert(config_ptr.gateways.len > 0 or config_ptr.http_routes.len > 0);
 
-        self.gateway_config = config;
+        self.gateway_config = config_ptr;
 
         // Push to data plane
-        self.data_plane_client.pushConfigWithRetry(config, &self.resolver) catch |err| {
+        self.data_plane_client.pushConfigWithRetry(config_ptr, &self.resolver, io) catch |err| {
             std.log.err("failed to push config to data plane: {s}", .{@errorName(err)});
             return err;
         };
     }
 
-    /// Start admin server in background thread.
+    /// Start admin server using serval-server.MinimalServer.
+    /// Runs in background thread to not block main watcher loop.
     pub fn startAdminServer(self: *Self) ControllerError!void {
-        // Create socket
-        const sock = posix.socket(
-            posix.AF.INET,
-            posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
-            0,
-        ) catch {
-            return error.AdminBindFailed;
-        };
-        errdefer posix.close(sock);
+        // Initialize serval-server with admin handler
+        self.admin_server = AdminServer.init(
+            &self.admin_handler,
+            &self.pool,
+            &self.metrics,
+            &self.tracer,
+            Config{ .port = self.admin_port },
+            null, // No TLS for admin API
+            DnsConfig{},
+        );
 
-        // Set SO_REUSEADDR
-        const reuseaddr: c_int = 1;
-        posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(reuseaddr)) catch {};
-
-        // Bind to 0.0.0.0:admin_port (K8s probes come from kubelet)
-        const addr = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, self.admin_port);
-        posix.bind(sock, &addr.any, addr.getOsSockLen()) catch {
-            return error.AdminBindFailed;
-        };
-
-        // Listen
-        posix.listen(sock, ADMIN_BACKLOG) catch {
-            return error.AdminListenFailed;
-        };
-
-        self.admin_socket = sock;
-
-        // Start thread
+        // Start server in background thread
         self.admin_thread = std.Thread.spawn(.{}, adminServerLoop, .{self}) catch {
             return error.AdminThreadFailed;
         };
     }
 
+    /// Admin server loop - runs serval-server.
     fn adminServerLoop(self: *Self) void {
-        const sock = self.admin_socket orelse return;
+        var server = self.admin_server orelse return;
+        var io = Io{};
 
-        var iterations: u32 = 0;
-        while (!self.shutdown.load(.acquire)) {
-            iterations += 1;
-            if (iterations > MAX_ACCEPT_ITERATIONS) {
-                iterations = 0;
-                std.time.sleep(10 * std.time.ns_per_ms);
-                continue;
-            }
-
-            const client = posix.accept(sock, null, null, posix.SOCK.CLOEXEC) catch |err| {
-                if (err == error.WouldBlock) continue;
-                std.log.warn("admin accept failed: {s}", .{@errorName(err)});
-                continue;
-            };
-            defer posix.close(client);
-
-            self.handleAdminConnection(client);
-        }
-    }
-
-    fn handleAdminConnection(self: *Self, client: posix.socket_t) void {
-        var request_buf: [1024]u8 = undefined;
-        const bytes_read = posix.read(client, &request_buf) catch {
-            return;
+        // Run server until shutdown
+        server.run(io, &self.shutdown) catch |err| {
+            std.log.err("admin server error: {s}", .{@errorName(err)});
         };
-
-        if (bytes_read == 0) return;
-
-        const request = request_buf[0..bytes_read];
-        const response = self.routeAdminRequest(request);
-
-        _ = posix.write(client, response) catch |err| {
-            std.log.warn("admin write failed: {s}", .{@errorName(err)});
-        };
-    }
-
-    fn routeAdminRequest(self: *Self, request: []const u8) []const u8 {
-        // Simple routing based on path
-        if (std.mem.startsWith(u8, request, "GET /healthz")) {
-            return http200("OK");
-        }
-        if (std.mem.startsWith(u8, request, "GET /readyz")) {
-            if (self.ready.load(.acquire)) {
-                return http200("OK");
-            }
-            return http503("Not Ready");
-        }
-        if (std.mem.startsWith(u8, request, "GET /config")) {
-            if (self.gateway_config != null) {
-                return http200("{\"status\":\"configured\"}");
-            }
-            return http503("{\"error\":\"not ready\"}");
-        }
-        return http404();
     }
 };
-
-// ============================================================================
-// HTTP Response Helpers
-// ============================================================================
-
-fn http200(body: []const u8) []const u8 {
-    _ = body;
-    return "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
-}
-
-fn http404() []const u8 {
-    return "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
-}
-
-fn http503(body: []const u8) []const u8 {
-    _ = body;
-    return "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Ready";
-}
 ```
 
-**Step 2: Commit**
+**Step 3: Commit**
 
 ```bash
-git add examples/gateway/controller.zig
-git commit -m "feat(examples/gateway): add controller with admin server"
+git add examples/gateway/admin_handler.zig examples/gateway/controller.zig
+git commit -m "feat(examples/gateway): add controller using serval-server
+
+Uses serval-server.MinimalServer instead of raw POSIX sockets.
+Uses serval-core.config for all constants.
+Uses serval-core.time for timing utilities.
+
+TigerStyle compliant:
+- S1: Assertions for pre/postconditions
+- Uses serval-* components consistently"
 ```
 
 ---
@@ -1510,9 +1740,10 @@ After this refactor:
 - `translator.zig` - GatewayConfig + ResolvedBackend[] → Router JSON
 - `mod.zig` - Exports all types and translator
 
-**examples/gateway/** (~5000 lines) - K8s controller:
+**examples/gateway/** (~5500 lines) - K8s controller:
 - `main.zig` - Entry point, CLI parsing, wiring
-- `controller.zig` - Admin server, state management, config updates
+- `controller.zig` - Config management, admin server coordination (uses serval-server)
+- `admin_handler.zig` - Handler for /healthz, /readyz, /config (implements serval-server Handler)
 - `k8s_client.zig` - K8s API client (uses serval-client)
 - `watcher.zig` - K8s resource watcher with reconcile()
 - `resolver.zig` - K8s Service → Endpoints resolution (resolveBackend method)
@@ -1551,10 +1782,27 @@ Watcher                     Controller                    Data Plane
 
 **Benefits:**
 1. serval-gateway is reusable for non-K8s use cases (database, files, API)
-2. All HTTP uses serval-client (no raw POSIX sockets)
-3. Translator is decoupled from K8s-specific Resolver
-4. Clear separation: library (types) vs implementation (controller)
-5. TigerStyle compliant throughout
+2. All HTTP client uses serval-client (data plane push, K8s API)
+3. All HTTP server uses serval-server (admin API with health probes)
+4. All constants from serval-core.config (no local definitions)
+5. All timing from serval-core.time utilities
+6. Translator is decoupled from K8s-specific Resolver
+7. Clear separation: library (types) vs implementation (controller)
+8. TigerStyle compliant throughout
+
+**serval-* Component Usage:**
+| Component | Usage |
+|-----------|-------|
+| serval-client | HTTP client for data plane push and K8s API calls |
+| serval-server | HTTP server for admin API (health probes, config status) |
+| serval-core.config | All constants (timeouts, buffer sizes, ports) |
+| serval-core.types | Request, Response, Upstream, DirectResponse, Action |
+| serval-core.time | Timing utilities (monotonicNanos, elapsedNanos) |
+| serval-net | DnsResolver, Socket abstraction |
+| serval-pool | SimplePool for connection management |
+| serval-metrics | NoopMetrics for admin server |
+| serval-tracing | NoopTracer for admin server |
+| serval-gateway | Gateway API types and translator |
 
 **TigerStyle Compliance:**
 - S1: ~2 assertions per function (pre/postconditions)

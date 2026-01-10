@@ -279,6 +279,7 @@
   <module name="serval-client" path="serval-client/">HTTP/1.1 client (DNS, TCP, TLS, request/response)</module>
   <module name="serval-lb" path="serval-lb/">Load balancer handler (round-robin)</module>
   <module name="serval-router" path="serval-router/">Content-based routing with per-pool load balancing</module>
+  <module name="serval-gateway" path="serval-gateway/">Gateway API types and translator (library for gateway controllers)</module>
   <module name="serval-server" path="serval-server/">HTTP server with connection handling and hooks</module>
   <module name="serval-cli" path="serval-cli/">CLI argument parsing utilities</module>
 
@@ -341,11 +342,13 @@
     <layer level="4" name="strategy">
       <module>serval-lb</module>
       <module>serval-router</module>
+      <module>serval-gateway</module>
       <module status="future">serval-forward</module>
-      <responsibility>WHERE/WHICH to forward - routing decisions, upstream selection</responsibility>
+      <responsibility>WHERE/WHICH to forward - routing decisions, upstream selection, gateway config</responsibility>
       <notes>
         serval-lb: Health-aware round-robin with background probing (implemented)
         serval-router: Content-based routing with host/path matching, path rewriting, per-pool LB (implemented)
+        serval-gateway: Gateway API types (Gateway, HTTPRoute) and translator to serval-router config (implemented)
         serval-forward: Simple forwarding handler (future)
       </notes>
     </layer>
@@ -465,6 +468,100 @@
     </rule>
   </abstraction-rules>
 </architecture>
+
+<component-usage>
+  <CRITICAL>Use serval-* components consistently - avoid raw implementations</CRITICAL>
+
+  <rule name="http-clients">
+    Always use serval-client for HTTP client operations:
+    - Use Client.init(allocator, dns_resolver, client_ctx, verify_tls)
+    - Use client.connect(upstream, io) → ConnectResult
+    - Use client.sendRequest(conn, request, path)
+    - Use client.readResponseHeaders(conn, header_buf)
+    - NEVER use raw posix.socket() for HTTP client connections
+  </rule>
+
+  <rule name="http-servers">
+    Always use serval-server for HTTP server operations:
+    - Use Server(Handler, Pool, Metrics, Tracer) or MinimalServer(Handler)
+    - Implement Handler interface (selectUpstream, onRequest hooks)
+    - Use DirectResponse for immediate responses without forwarding
+    - NEVER use raw posix.socket(), posix.bind(), posix.listen(), posix.accept()
+  </rule>
+
+  <rule name="constants">
+    Always use serval-core.config for constants:
+    - Timeouts: CLIENT_CONNECT_TIMEOUT_NS, CLIENT_READ_TIMEOUT_NS, etc.
+    - Buffer sizes: MAX_HEADER_SIZE_BYTES, DIRECT_RESPONSE_BUFFER_SIZE_BYTES, etc.
+    - Limits: MAX_RETRIES, MAX_UPSTREAMS, etc.
+    - Ports: DEFAULT_ADMIN_PORT
+    - NEVER define local constants for values that exist in serval-core.config
+  </rule>
+
+  <rule name="timing">
+    Always use serval-core.time for timing utilities:
+    - Use time.monotonicNanos() for elapsed time measurements
+    - Use time.realtimeNanos() for wall clock timestamps
+    - Use time.elapsedNanos(start, end) for duration calculations
+    - NEVER use std.time directly when serval-core.time provides the utility
+  </rule>
+
+  <rule name="types">
+    Always use serval-core.types for common types:
+    - Request, Response, Method, Version
+    - Upstream, Action, DirectResponse, RejectResponse
+    - HeaderMap, ConnectionInfo
+    - NEVER redefine types that exist in serval-core
+  </rule>
+
+  <rule name="dns">
+    Always use serval-net.DnsResolver for DNS:
+    - Provides caching and async resolution
+    - Thread-safe for concurrent access
+    - NEVER use std.net.getAddressList directly
+  </rule>
+
+  <rule name="sockets">
+    Always use serval-net.Socket for socket operations:
+    - Unified abstraction for plain TCP and TLS
+    - Consistent read/write interface
+    - NEVER mix raw posix sockets with serval-net.Socket
+  </rule>
+
+  <rule name="tls">
+    Always use serval-tls for TLS operations:
+    - Use ssl.createServerCtx() for server TLS termination (accepts client connections)
+    - Use ssl.createClientCtx() for client TLS origination (connects to HTTPS upstreams)
+    - Use TLSStream for userspace TLS encryption/decryption
+    - Use ktls for kernel TLS offload (automatic fallback to userspace if unsupported)
+    - Set SSL_CTX_set_verify() for certificate verification control
+    - Caller owns SSL_CTX lifetime (create once, free on shutdown)
+    - NEVER use raw OpenSSL/BoringSSL calls directly - use serval-tls wrappers
+  </rule>
+
+  <examples>
+    <bad-example>
+      // BAD: Raw socket for HTTP client
+      const sock = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+      posix.connect(sock, &addr);
+      posix.write(sock, "GET / HTTP/1.1\r\n...");
+    </bad-example>
+    <good-example>
+      // GOOD: serval-client for HTTP client
+      var client = Client.init(allocator, &dns_resolver, null, false);
+      var result = try client.connect(upstream, io);
+      try client.sendRequest(&result.conn, &request, null);
+    </good-example>
+    <bad-example>
+      // BAD: Local timeout constant
+      const MY_TIMEOUT_NS: u64 = 5_000_000_000;
+    </bad-example>
+    <good-example>
+      // GOOD: Use serval-core.config
+      const timeout_ns = serval_core.config.CLIENT_CONNECT_TIMEOUT_NS;
+    </good-example>
+  </examples>
+</component-usage>
 
 <code-placement>
   <IMPORTANT>Before writing code, decide WHERE it belongs using this framework</IMPORTANT>

@@ -4,10 +4,187 @@
 //! Demonstrates serval with LbHandler for health-aware load balancing.
 //! Backends automatically recover via background probing.
 //!
-//! Usage:
+//! ## Component Flow Diagram
+//!
+//! ```
+//!                                    REQUEST FLOW
+//!  ┌─────────┐
+//!  │ Client  │
+//!  └────┬────┘
+//!       │ TCP/TLS connection
+//!       ▼
+//!  ┌─────────────────────────────────────────────────────────────────────────┐
+//!  │                         serval-server                                   │
+//!  │  (accept loop, HTTP/1.1 parsing, connection management, hooks)          │
+//!  │                                                                         │
+//!  │  Server struct contains:                                                │
+//!  │  - handler: *Handler (LbHandler in this example)                        │
+//!  │  - forwarder: Forwarder(Pool, Tracer)  ← BUILT-IN, not a hook!          │
+//!  │  - pool: *Pool                                                          │
+//!  │  - metrics: *Metrics                                                    │
+//!  │  - tracer: *Tracer                                                      │
+//!  │                                                                         │
+//!  │  Request processing (server.zig:715-745):                               │
+//!  │  ┌─────────────────────────────────────────────────────────────────┐    │
+//!  │  │ 1. handler.onRequest(ctx, request) → Action     [OPTIONAL HOOK] │    │
+//!  │  │    - .continue_request → proceed to step 2                      │    │
+//!  │  │    - .send_response    → send direct response, skip forwarding  │    │
+//!  │  │    - .reject           → send error, skip forwarding            │    │
+//!  │  │                                                                 │    │
+//!  │  │ 2. handler.selectUpstream(ctx, request) → Upstream [REQUIRED]   │    │
+//!  │  │    - Handler decides which backend to use                       │    │
+//!  │  │    - Returns Upstream{host, port, tls, idx}                     │    │
+//!  │  │                                                                 │    │
+//!  │  │ 3. forwarder.forward(io, stream, tls, request, upstream, ...)   │    │
+//!  │  │    - Server calls its built-in forwarder automatically          │    │
+//!  │  │    - Handler is NOT involved in forwarding!                     │    │
+//!  │  └─────────────────────────────────────────────────────────────────┘    │
+//!  │                                                                         │
+//!  │  Components used:                                                       │
+//!  │  - serval-net.Socket: TCP/TLS socket abstraction                        │
+//!  │  - serval-http: HTTP/1.1 request parser                                 │
+//!  │  - serval-tls: TLS termination (if --cert/--key provided)               │
+//!  │  - serval-pool: Connection pooling (SimplePool)                         │
+//!  │  - serval-metrics: Request metrics (RealTimeMetrics)                    │
+//!  │  - serval-tracing: Distributed tracing (OtelTracer or NoopTracer)       │
+//!  │  - serval-proxy: Forwarder (BUILT INTO Server struct)                   │
+//!  └────┬────────────────────────────────────────────────────────────────────┘
+//!       │
+//!       │ Step 2: handler.selectUpstream(ctx, request)
+//!       ▼
+//!  ┌─────────────────────────────────────────────────────────────────────────┐
+//!  │                         serval-lb (LbHandler)                           │
+//!  │  (health-aware round-robin, passive health tracking, background probes) │
+//!  │                                                                         │
+//!  │  selectUpstream() implementation:                                       │
+//!  │  1. Get next index (atomic round-robin counter)                         │
+//!  │  2. health.findNthHealthy(n) → skip unhealthy backends                  │
+//!  │  3. Return upstreams[healthy_idx]                                       │
+//!  │                                                                         │
+//!  │  Components used:                                                       │
+//!  │  - serval-health: HealthState (atomic bitmap + threshold counters)      │
+//!  │  - serval-prober: Background HTTP/HTTPS probes to unhealthy backends    │
+//!  │  - serval-net.DnsResolver: DNS resolution for probe hostnames           │
+//!  │  - serval-tls: TLS for HTTPS probes (if upstream.tls=true)              │
+//!  └────┬────────────────────────────────────────────────────────────────────┘
+//!       │ returns Upstream{host, port, tls, idx}
+//!       │
+//!       │ Step 3: Server automatically calls forwarder.forward()
+//!       ▼
+//!  ┌─────────────────────────────────────────────────────────────────────────┐
+//!  │                    serval-proxy (Forwarder.forward)                     │
+//!  │                                                                         │
+//!  │  Step 1: Pool Acquire                                                   │
+//!  │  ┌─────────────────────────────────────────────────────────────────┐    │
+//!  │  │ pool.acquire(upstream.idx) → Connection?                        │    │
+//!  │  │ - If HIT: reuse existing TCP/TLS connection (skip DNS+connect)  │    │
+//!  │  │ - If MISS or STALE: create fresh connection (see Step 2)        │    │
+//!  │  │ - Bounded retry on stale (MAX_STALE_RETRIES=2)                  │    │
+//!  │  └─────────────────────────────────────────────────────────────────┘    │
+//!  │                              │                                          │
+//!  │                              ▼                                          │
+//!  │  Step 2: Connect (if pool miss)                                         │
+//!  │  ┌─────────────────────────────────────────────────────────────────┐    │
+//!  │  │ connectUpstream(upstream, io, config, dns_resolver)             │    │
+//!  │  │ 1. dns_resolver.resolve(host) → IP address (cached 60s)         │    │
+//!  │  │ 2. posix.socket() + posix.connect() → TCP connection            │    │
+//!  │  │ 3. If upstream.tls: TLS handshake via serval-tls                │    │
+//!  │  │ Returns: ConnectResult{socket, dns_ns, tcp_ns, local_port}      │    │
+//!  │  └─────────────────────────────────────────────────────────────────┘    │
+//!  │                              │                                          │
+//!  │                              ▼                                          │
+//!  │  Step 3: Send Request                                                   │
+//!  │  ┌─────────────────────────────────────────────────────────────────┐    │
+//!  │  │ sendRequest(conn, io, request, effective_path)                  │    │
+//!  │  │ 1. buildRequestBuffer() - serialize headers (filter hop-by-hop) │    │
+//!  │  │ 2. conn.socket.write() - send headers to upstream               │    │
+//!  │  │ 3. streamRequestBody() - forward body from client→upstream      │    │
+//!  │  │    (uses Socket abstraction for TLS/plaintext transparency)     │    │
+//!  │  └─────────────────────────────────────────────────────────────────┘    │
+//!  │                              │                                          │
+//!  │                              ▼                                          │
+//!  │  Step 4: Receive Response                                               │
+//!  │  ┌─────────────────────────────────────────────────────────────────┐    │
+//!  │  │ forwardResponse(io, conn, client_stream, upstream_sock, ...)    │    │
+//!  │  │ 1. Read response headers from upstream                          │    │
+//!  │  │ 2. Parse status code and headers                                │    │
+//!  │  │ 3. Forward response body upstream→client (streaming/chunked)    │    │
+//!  │  │ Returns: ForwardResult{status, response_bytes, timings...}      │    │
+//!  │  └─────────────────────────────────────────────────────────────────┘    │
+//!  │                              │                                          │
+//!  │                              ▼                                          │
+//!  │  Step 5: Pool Release                                                   │
+//!  │  ┌─────────────────────────────────────────────────────────────────┐    │
+//!  │  │ pool.release(upstream.idx, conn, healthy=true)                  │    │
+//!  │  │ - Returns connection to pool for reuse (keep-alive)             │    │
+//!  │  │ - Or closes if unhealthy/error                                  │    │
+//!  │  └─────────────────────────────────────────────────────────────────┘    │
+//!  │                                                                         │
+//!  │  Components used:                                                       │
+//!  │  - serval-pool: Connection pooling (acquire/release by upstream.idx)   │
+//!  │  - serval-net.DnsResolver: DNS resolution with TTL caching             │
+//!  │  - serval-net.Socket: Unified TCP/TLS read/write                       │
+//!  │  - serval-tls: TLS origination for HTTPS upstreams                     │
+//!  │  - serval-client.request: buildRequestBuffer, sendBufferToSocket       │
+//!  │  - serval-core.config: CONNECT_TIMEOUT_NS, MAX_BODY_SIZE_BYTES, etc.   │
+//!  └────┬────────────────────────────────────────────────────────────────────┘
+//!       │ TCP/TLS connection (pooled or fresh)
+//!       ▼
+//!  ┌─────────┐
+//!  │ Backend │  (e.g., 127.0.0.1:8001, 127.0.0.1:8002)
+//!  └─────────┘
+//!
+//!
+//!                              BACKGROUND HEALTH PROBING
+//!
+//!  ┌─────────────────────────────────────────────────────────────────────────┐
+//!  │                         serval-prober                                   │
+//!  │  (separate thread, probes unhealthy backends at probe_interval_ms)      │
+//!  │                                                                         │
+//!  │  Uses serval-client to:                                                 │
+//!  │  1. DNS resolve backend hostname                                        │
+//!  │  2. TCP connect (+ TLS handshake if upstream.tls=true)                  │
+//!  │  3. Send GET /health_path HTTP/1.1                                      │
+//!  │  4. Check for 2xx response                                              │
+//!  │                                                                         │
+//!  │  Updates serval-health.HealthState:                                     │
+//!  │  - Success: recordSuccess(idx) → may transition to healthy              │
+//!  │  - Failure: recordFailure(idx) → stays unhealthy                        │
+//!  └─────────────────────────────────────────────────────────────────────────┘
+//!
+//!
+//!                              COMPONENT SUMMARY
+//!
+//!  Layer 0 (Foundation):    serval-core    - types, config, errors, context, time
+//!  Layer 1 (Protocol):      serval-http    - HTTP/1.1 request/response parsing
+//!                           serval-net     - Socket (TCP/TLS), DnsResolver
+//!                           serval-tls     - TLS handshake, kTLS offload
+//!  Layer 2 (Infrastructure): serval-pool   - Connection pooling (per-upstream)
+//!                           serval-metrics - Request metrics (RealTimeMetrics)
+//!                           serval-tracing - Distributed tracing (OtelTracer)
+//!                           serval-health  - Health state (atomic bitmap)
+//!                           serval-prober  - Background HTTP/HTTPS probes
+//!                           serval-client  - HTTP client (used by prober)
+//!  Layer 3 (Mechanics):     serval-proxy   - Forwarder (pool+connect+send+recv)
+//!  Layer 4 (Strategy):      serval-lb      - LbHandler (round-robin + health)
+//!  Layer 5 (Orchestration): serval-server  - Server (accept loop, hooks)
+//!                           serval-cli     - CLI argument parsing
+//!
+//!                              KEY DATA STRUCTURES
+//!
+//!  Upstream         = {host, port, tls, idx}     - backend server address
+//!  Connection       = {socket, created_ns}       - pooled TCP/TLS connection
+//!  Socket           = Plain{fd} | TLS{fd,stream} - unified read/write interface
+//!  HealthState      = {bitmap, counters[16]}     - per-upstream health tracking
+//!  ForwardResult    = {status, bytes, timings}   - result of upstream forward
+//! ```
+//!
+//! ## Usage
+//!
 //!   lb_example [OPTIONS]
 //!
-//! Options:
+//! ## Options
+//!
 //!   --port <PORT>                Listening port (default: 8080)
 //!   --backends <HOSTS>           Comma-separated backend addresses (default: 127.0.0.1:8001,127.0.0.1:8002)
 //!   --cert <PATH>                Server certificate file (PEM format, enables TLS)
