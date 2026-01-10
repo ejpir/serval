@@ -45,6 +45,17 @@ pub const MAX_HOSTNAMES: u8 = 16;
 /// Maximum number of certificate references per TLS config.
 pub const MAX_CERTIFICATE_REFS: u8 = 4;
 
+/// Maximum name length for K8s resources (names are max 63 chars).
+pub const MAX_NAME_LEN: u8 = 63;
+
+/// Maximum endpoints per resolved backend.
+/// TigerStyle: Explicit bound matching resolver limits.
+pub const MAX_RESOLVED_ENDPOINTS: u8 = 64;
+
+/// Maximum resolved backends in a translation batch.
+/// TigerStyle: Matches MAX_HTTP_ROUTES * MAX_RULES for worst case.
+pub const MAX_RESOLVED_BACKENDS: u16 = 256;
+
 // ============================================================================
 // Top-Level Configuration
 // ============================================================================
@@ -344,6 +355,59 @@ pub const ResolvedCertificate = struct {
     key_pem: []const u8,
 };
 
+/// A single resolved endpoint with fixed-size IP buffer (for translator API).
+/// TigerStyle: Fixed-size buffer, no allocation needed.
+pub const FixedResolvedEndpoint = struct {
+    /// IP address as string (IPv4 or IPv6).
+    ip: [45]u8, // Max IPv6 length with scope
+    ip_len: u8,
+
+    /// Port number.
+    port: u16,
+
+    /// Get IP as slice.
+    pub fn getIp(self: *const FixedResolvedEndpoint) []const u8 {
+        assert(self.ip_len <= 45); // S1: precondition - length within buffer bounds
+        return self.ip[0..self.ip_len];
+    }
+};
+
+/// A backend reference with resolved endpoint addresses.
+/// Used by translator to avoid coupling to K8s-specific Resolver.
+///
+/// TigerStyle: Fixed-size arrays, explicit bounds, no allocation.
+pub const ResolvedBackend = struct {
+    /// Service name (matches HTTPBackendRef.name for lookup).
+    name: [MAX_NAME_LEN]u8,
+    name_len: u8,
+
+    /// Namespace (matches HTTPBackendRef.namespace).
+    namespace: [MAX_NAME_LEN]u8,
+    namespace_len: u8,
+
+    /// Resolved endpoint IP addresses.
+    endpoints: [MAX_RESOLVED_ENDPOINTS]FixedResolvedEndpoint,
+    endpoint_count: u8,
+
+    /// Get name as slice.
+    pub fn getName(self: *const ResolvedBackend) []const u8 {
+        assert(self.name_len <= MAX_NAME_LEN); // S1: precondition - length within buffer bounds
+        return self.name[0..self.name_len];
+    }
+
+    /// Get namespace as slice.
+    pub fn getNamespace(self: *const ResolvedBackend) []const u8 {
+        assert(self.namespace_len <= MAX_NAME_LEN); // S1: precondition - length within buffer bounds
+        return self.namespace[0..self.namespace_len];
+    }
+
+    /// Get endpoints as slice.
+    pub fn getEndpoints(self: *const ResolvedBackend) []const FixedResolvedEndpoint {
+        assert(self.endpoint_count <= MAX_RESOLVED_ENDPOINTS); // S1: precondition - count within bounds
+        return self.endpoints[0..self.endpoint_count];
+    }
+};
+
 // ============================================================================
 // Unit Tests
 // ============================================================================
@@ -556,9 +620,10 @@ test "ResolvedCertificate construction" {
     try std.testing.expect(std.mem.startsWith(u8, cert.key_pem, "-----BEGIN PRIVATE KEY-----"));
 }
 
-test "MAX constants are within u8 bounds" {
-    // Verify all MAX constants fit in u8 (compile-time check via type)
+test "MAX constants are within bounds" {
+    // Verify all MAX constants fit in their respective types (compile-time check via type)
     comptime {
+        // u8 bounds
         assert(MAX_GATEWAYS <= 255);
         assert(MAX_LISTENERS <= 255);
         assert(MAX_HTTP_ROUTES <= 255);
@@ -568,5 +633,97 @@ test "MAX constants are within u8 bounds" {
         assert(MAX_BACKEND_REFS <= 255);
         assert(MAX_HOSTNAMES <= 255);
         assert(MAX_CERTIFICATE_REFS <= 255);
+        assert(MAX_NAME_LEN <= 255);
+        assert(MAX_RESOLVED_ENDPOINTS <= 255);
+        // u16 bounds
+        assert(MAX_RESOLVED_BACKENDS <= 65535);
     }
+}
+
+test "FixedResolvedEndpoint construction and getIp" {
+    var endpoint: FixedResolvedEndpoint = undefined;
+    const ip = "192.168.1.100";
+    @memcpy(endpoint.ip[0..ip.len], ip);
+    endpoint.ip_len = ip.len;
+    endpoint.port = 8080;
+
+    try std.testing.expectEqualStrings("192.168.1.100", endpoint.getIp());
+    try std.testing.expectEqual(@as(u16, 8080), endpoint.port);
+}
+
+test "FixedResolvedEndpoint IPv6 address" {
+    var endpoint: FixedResolvedEndpoint = undefined;
+    const ip = "2001:0db8:85a3:0000:0000:8a2e:0370:7334";
+    @memcpy(endpoint.ip[0..ip.len], ip);
+    endpoint.ip_len = ip.len;
+    endpoint.port = 443;
+
+    try std.testing.expectEqualStrings("2001:0db8:85a3:0000:0000:8a2e:0370:7334", endpoint.getIp());
+    try std.testing.expectEqual(@as(u16, 443), endpoint.port);
+}
+
+test "ResolvedBackend construction and accessors" {
+    var backend: ResolvedBackend = undefined;
+
+    // Set name
+    const name = "my-service";
+    @memcpy(backend.name[0..name.len], name);
+    backend.name_len = name.len;
+
+    // Set namespace
+    const namespace = "production";
+    @memcpy(backend.namespace[0..namespace.len], namespace);
+    backend.namespace_len = namespace.len;
+
+    // Set one endpoint
+    const ip = "10.0.0.5";
+    @memcpy(backend.endpoints[0].ip[0..ip.len], ip);
+    backend.endpoints[0].ip_len = ip.len;
+    backend.endpoints[0].port = 8080;
+    backend.endpoint_count = 1;
+
+    try std.testing.expectEqualStrings("my-service", backend.getName());
+    try std.testing.expectEqualStrings("production", backend.getNamespace());
+    try std.testing.expectEqual(@as(u8, 1), backend.endpoint_count);
+    try std.testing.expectEqualStrings("10.0.0.5", backend.endpoints[0].getIp());
+    try std.testing.expectEqual(@as(u16, 8080), backend.endpoints[0].port);
+}
+
+test "ResolvedBackend with multiple endpoints" {
+    var backend: ResolvedBackend = undefined;
+
+    // Set name and namespace
+    const name = "api-svc";
+    @memcpy(backend.name[0..name.len], name);
+    backend.name_len = name.len;
+    const namespace = "default";
+    @memcpy(backend.namespace[0..namespace.len], namespace);
+    backend.namespace_len = namespace.len;
+
+    // Set multiple endpoints (simulating multiple pods)
+    const ips = [_][]const u8{ "10.0.0.1", "10.0.0.2", "10.0.0.3" };
+    const ports = [_]u16{ 8080, 8080, 8080 };
+
+    for (ips, ports, 0..) |ip, port, i| {
+        @memcpy(backend.endpoints[i].ip[0..ip.len], ip);
+        backend.endpoints[i].ip_len = @intCast(ip.len);
+        backend.endpoints[i].port = port;
+    }
+    backend.endpoint_count = 3;
+
+    try std.testing.expectEqual(@as(u8, 3), backend.endpoint_count);
+    try std.testing.expectEqualStrings("10.0.0.1", backend.endpoints[0].getIp());
+    try std.testing.expectEqualStrings("10.0.0.2", backend.endpoints[1].getIp());
+    try std.testing.expectEqualStrings("10.0.0.3", backend.endpoints[2].getIp());
+}
+
+test "ResolvedBackend max name length" {
+    var backend: ResolvedBackend = undefined;
+
+    // K8s resource names are max 63 characters
+    const max_name = "a" ** MAX_NAME_LEN;
+    @memcpy(backend.name[0..max_name.len], max_name);
+    backend.name_len = MAX_NAME_LEN;
+
+    try std.testing.expectEqual(@as(usize, 63), backend.getName().len);
 }
