@@ -43,6 +43,12 @@ Standalone modules:
 ├── serval-router   # Content-based router (host/path matching, per-pool LB)
 ├── serval-k8s-gateway  # Gateway API types + translation (library, not controller)
 └── serval-cli      # CLI argument parsing utilities
+
+Future modules (API gateway):
+├── serval-ratelimit  # Rate limiting (token bucket, sliding window)
+├── serval-waf        # Web Application Firewall (SQLi, XSS detection)
+├── serval-cache      # Response caching (keys, TTL, eviction)
+└── serval-auth       # Authentication/authorization (JWT, API keys)
 ```
 
 ### The Facade Pattern (Re-exports)

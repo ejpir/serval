@@ -283,6 +283,12 @@
   <module name="serval-server" path="serval-server/">HTTP server with connection handling and hooks</module>
   <module name="serval-cli" path="serval-cli/">CLI argument parsing utilities</module>
 
+  <!-- Future modules for API gateway -->
+  <module name="serval-ratelimit" status="future">Rate limiting (token bucket, sliding window, keyed by IP/path/header)</module>
+  <module name="serval-waf" status="future">Web Application Firewall (SQLi, XSS, path traversal detection)</module>
+  <module name="serval-cache" status="future">Response caching (keys, TTL, eviction policies)</module>
+  <module name="serval-auth" status="future">Authentication/authorization (JWT validation, API keys)</module>
+
   <design-points>
     <point>Concurrent connection handling via Io.Group.concurrent (io_uring batch submission)</point>
     <point>Handler hooks: onRequest, onResponse, onError, onLog, onConnectionOpen, onConnectionClose</point>
@@ -318,6 +324,7 @@
       <module status="future">serval-cache</module>
       <module status="future">serval-waf</module>
       <module status="future">serval-ratelimit</module>
+      <module status="future">serval-auth</module>
       <responsibility>Reusable infrastructure - generic, handler-agnostic</responsibility>
       <notes>
         serval-pool: Fixed-size connection pooling with idle/age eviction (implemented)
@@ -328,8 +335,9 @@
         serval-prober: Background HTTP/HTTPS health probing using serval-client (implemented)
         serval-client: HTTP/1.1 client for upstream connections (implemented)
         serval-cache: Cache storage and lookup (keys, TTL, eviction) - policy via handler hooks (future)
-        serval-waf: Rule engine for threat detection (SQLi, XSS, etc.) - blocking via handler hooks (future)
-        serval-ratelimit: Token bucket / sliding window rate limiting - keyed by IP, path, header (future)
+        serval-waf: Rule engine for threat detection (SQLi, XSS, path traversal) - blocking via handler hooks (future)
+        serval-ratelimit: Token bucket / sliding window rate limiting - keyed by IP, path, header, API key (future)
+        serval-auth: JWT validation, API key verification, OIDC integration - reject unauthorized via hooks (future)
       </notes>
     </layer>
     <layer level="3" name="mechanics">
