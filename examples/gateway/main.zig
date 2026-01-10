@@ -4,6 +4,7 @@
 //! - Watches K8s Gateway API resources (Gateway, HTTPRoute)
 //! - Translates to serval-router configuration
 //! - Pushes config to data plane via admin API
+//! - Runs admin HTTP server for K8s health probes (/healthz, /readyz)
 //!
 //! Usage:
 //!   gateway [OPTIONS]
@@ -19,10 +20,17 @@
 //! TigerStyle Y1: Functions under 70 lines, extracted helpers.
 
 const std = @import("std");
+const Io = std.Io;
 const gateway = @import("serval-gateway");
 const gw_config = gateway.config;
+const serval_server = @import("serval-server");
+const serval_net = @import("serval-net");
+const serval_pool = @import("serval-pool");
+const serval_metrics = @import("serval-metrics");
+const serval_tracing = @import("serval-tracing");
 
 const Controller = @import("controller.zig").Controller;
+const AdminHandler = @import("admin_handler.zig").AdminHandler;
 const k8s_client_mod = @import("k8s_client.zig");
 const K8sClient = k8s_client_mod.Client;
 const Watcher = @import("watcher.zig").Watcher;
@@ -138,11 +146,27 @@ fn run(allocator: std.mem.Allocator, config: CliConfig) !void {
     const ctrl = try Controller.create(allocator, config.admin_port, config.data_plane_port);
     defer ctrl.destroy();
 
-    // Initialize K8s client
+    // Start admin server thread for K8s health probes
+    var admin_shutdown = std.atomic.Value(bool).init(false);
+    const admin_thread = startAdminServer(ctrl.getAdminHandler(), config.admin_port, &admin_shutdown) catch |err| {
+        std.log.err("failed to start admin server: {s}", .{@errorName(err)});
+        return err;
+    };
+
+    std.log.info("admin server started on port {d}", .{config.admin_port});
+
+    // Initialize K8s client (optional - admin server stays up for liveness probes)
     const k8s_client = initK8sClient(allocator, config) catch |err| {
         std.log.err("failed to initialize K8s client: {s}", .{@errorName(err)});
         std.log.info("hint: run inside a K8s pod or provide --api-server and --token", .{});
-        return err;
+        std.log.info("admin server remains running for liveness probes (readiness will fail)", .{});
+
+        // Keep running with just admin server - liveness works, readiness fails
+        waitForShutdown(ctrl);
+        std.log.info("shutdown requested, stopping admin server...", .{});
+        admin_shutdown.store(true, .release);
+        admin_thread.join();
+        return;
     };
     defer k8s_client.deinit();
 
@@ -152,14 +176,20 @@ fn run(allocator: std.mem.Allocator, config: CliConfig) !void {
     // Initialize watcher with callback
     const watcher = Watcher.init(allocator, k8s_client, onConfigChange, ctrl) catch |err| {
         std.log.err("failed to initialize watcher: {s}", .{@errorName(err)});
-        return error.WatcherInitFailed;
+        waitForShutdown(ctrl);
+        admin_shutdown.store(true, .release);
+        admin_thread.join();
+        return;
     };
     defer watcher.deinit();
 
     // Start watcher thread
     const watcher_thread = watcher.start() catch |err| {
         std.log.err("failed to start watcher thread: {s}", .{@errorName(err)});
-        return err;
+        waitForShutdown(ctrl);
+        admin_shutdown.store(true, .release);
+        admin_thread.join();
+        return;
     };
 
     // Mark ready after watcher started
@@ -169,10 +199,12 @@ fn run(allocator: std.mem.Allocator, config: CliConfig) !void {
     // Wait for shutdown signal
     waitForShutdown(ctrl);
 
-    // Graceful shutdown
-    std.log.info("shutdown requested, stopping watcher...", .{});
+    // Graceful shutdown: stop both threads
+    std.log.info("shutdown requested, stopping services...", .{});
     watcher.stop();
+    admin_shutdown.store(true, .release);
     watcher_thread.join();
+    admin_thread.join();
 
     std.log.info("gateway controller stopped", .{});
 }
@@ -221,9 +253,63 @@ fn waitForShutdown(ctrl: *Controller) void {
     }
 }
 
+/// Start the admin HTTP server in a separate thread.
+/// Serves K8s health probes at /healthz and /readyz.
+///
+/// TigerStyle S1: ~2 assertions, explicit error handling.
+fn startAdminServer(
+    handler: *AdminHandler,
+    port: u16,
+    shutdown: *std.atomic.Value(bool),
+) !std.Thread {
+    std.debug.assert(port > 0); // S1: precondition - valid port
+
+    return std.Thread.spawn(.{}, adminServerLoop, .{ handler, port, shutdown });
+}
+
+/// Admin server loop running in dedicated thread.
+/// Uses MinimalServer from serval-server for health probe responses.
+///
+/// TigerStyle: Initializes Io runtime in thread context.
+fn adminServerLoop(
+    handler: *AdminHandler,
+    port: u16,
+    shutdown: *std.atomic.Value(bool),
+) void {
+    std.debug.assert(port > 0); // S1: precondition - valid port
+
+    // Initialize async I/O runtime for this thread
+    var threaded: Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Initialize minimal server components
+    var pool = serval_pool.SimplePool.init();
+    var metrics = serval_metrics.NoopMetrics{};
+    var tracer = serval_tracing.NoopTracer{};
+
+    // Create minimal server - no TLS, no upstream forwarding needed
+    // TigerStyle: Use MinimalServer for handlers that only return direct responses
+    var server = serval_server.MinimalServer(AdminHandler).init(
+        handler,
+        &pool,
+        &metrics,
+        &tracer,
+        .{ .port = port },
+        null, // No TLS client context
+        serval_net.DnsConfig{}, // Default DNS config
+    );
+
+    // Run server until shutdown
+    server.run(io, shutdown) catch |err| {
+        std.log.err("admin server error: {s}", .{@errorName(err)});
+    };
+}
+
 test "main module compiles" {
     // Basic compile test
     _ = Controller;
     _ = K8sClient;
     _ = Watcher;
+    _ = AdminHandler;
 }

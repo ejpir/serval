@@ -76,9 +76,11 @@ pub const AdminHandler = struct {
     pub fn onRequest(
         self: *Self,
         ctx: *Context,
-        request: *const Request,
+        request: *Request,
+        response_buf: []u8,
     ) Action {
         _ = ctx;
+        _ = response_buf;
         assert(request.path.len > 0); // S1: precondition - non-empty path
 
         const path = request.path;
@@ -167,11 +169,12 @@ test "AdminHandler onRequest /healthz returns 200" {
     var config_ptr: ?*const GatewayConfig = null;
     var handler = AdminHandler.init(&ready, &config_ptr);
 
-    const request = Request{
+    var request = Request{
         .path = "/healthz",
     };
+    var response_buf: [1024]u8 = undefined;
 
-    const action = handler.onRequest(undefined, &request);
+    const action = handler.onRequest(undefined, &request, &response_buf);
 
     switch (action) {
         .send_response => |resp| {
@@ -187,11 +190,12 @@ test "AdminHandler onRequest /healthz with query params returns 200" {
     var config_ptr: ?*const GatewayConfig = null;
     var handler = AdminHandler.init(&ready, &config_ptr);
 
-    const request = Request{
+    var request = Request{
         .path = "/healthz?verbose=true",
     };
+    var response_buf: [1024]u8 = undefined;
 
-    const action = handler.onRequest(undefined, &request);
+    const action = handler.onRequest(undefined, &request, &response_buf);
 
     switch (action) {
         .send_response => |resp| {
@@ -206,11 +210,12 @@ test "AdminHandler onRequest /readyz returns 503 when not ready" {
     var config_ptr: ?*const GatewayConfig = null;
     var handler = AdminHandler.init(&ready, &config_ptr);
 
-    const request = Request{
+    var request = Request{
         .path = "/readyz",
     };
+    var response_buf: [1024]u8 = undefined;
 
-    const action = handler.onRequest(undefined, &request);
+    const action = handler.onRequest(undefined, &request, &response_buf);
 
     switch (action) {
         .send_response => |resp| {
@@ -226,11 +231,12 @@ test "AdminHandler onRequest /readyz returns 200 when ready" {
     var config_ptr: ?*const GatewayConfig = null;
     var handler = AdminHandler.init(&ready, &config_ptr);
 
-    const request = Request{
+    var request = Request{
         .path = "/readyz",
     };
+    var response_buf: [1024]u8 = undefined;
 
-    const action = handler.onRequest(undefined, &request);
+    const action = handler.onRequest(undefined, &request, &response_buf);
 
     switch (action) {
         .send_response => |resp| {
@@ -246,11 +252,12 @@ test "AdminHandler onRequest /config returns 503 when not configured" {
     var config_ptr: ?*const GatewayConfig = null;
     var handler = AdminHandler.init(&ready, &config_ptr);
 
-    const request = Request{
+    var request = Request{
         .path = "/config",
     };
+    var response_buf: [1024]u8 = undefined;
 
-    const action = handler.onRequest(undefined, &request);
+    const action = handler.onRequest(undefined, &request, &response_buf);
 
     switch (action) {
         .send_response => |resp| {
@@ -267,11 +274,12 @@ test "AdminHandler onRequest unknown path returns 404" {
     var config_ptr: ?*const GatewayConfig = null;
     var handler = AdminHandler.init(&ready, &config_ptr);
 
-    const request = Request{
+    var request = Request{
         .path = "/unknown",
     };
+    var response_buf: [1024]u8 = undefined;
 
-    const action = handler.onRequest(undefined, &request);
+    const action = handler.onRequest(undefined, &request, &response_buf);
 
     switch (action) {
         .send_response => |resp| {
