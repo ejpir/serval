@@ -2,9 +2,9 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Refactor serval-gateway into a clean library (types + translator) and move K8s-specific implementation to examples/gateway/.
+**Goal:** Refactor serval-k8s-gateway into a clean library (types + translator) and move K8s-specific implementation to examples/gateway/.
 
-**Architecture:** serval-gateway becomes a reusable library with Gateway API types and translation logic. The K8s controller implementation moves to examples/gateway/ with proper separation of concerns. All HTTP communication uses serval-client instead of raw sockets.
+**Architecture:** serval-k8s-gateway becomes a reusable library with Gateway API types and translation logic. The K8s controller implementation moves to examples/gateway/ with proper separation of concerns. All HTTP communication uses serval-client instead of raw sockets.
 
 **Tech Stack:** Zig, serval-client, serval-core, serval-net
 
@@ -12,7 +12,7 @@
 
 ## Current State Analysis
 
-**serval-gateway/** (5609 lines total):
+**serval-k8s-gateway/** (5609 lines total):
 - `config.zig` - Gateway API types (KEEP - generic)
 - `translator.zig` - GatewayConfig → Router JSON (KEEP - generic)
 - `gateway.zig` (1273 lines) - Controller + admin server + pushConfigToDataPlane (MOVE)
@@ -23,7 +23,7 @@
 **Problems:**
 1. `pushConfigToDataPlane()` uses raw POSIX sockets instead of serval-client
 2. K8s-specific code mixed with generic gateway library
-3. Can't use serval-gateway for non-K8s use cases (config files, REST API, etc.)
+3. Can't use serval-k8s-gateway for non-K8s use cases (config files, REST API, etc.)
 4. **translator.zig depends on resolver.zig** - after moving resolver to examples/, translator can't import it
 
 ---
@@ -66,7 +66,7 @@ pub fn translateToJson(
 ## Target Structure
 
 ```
-serval-gateway/                    # Clean library
+serval-k8s-gateway/                    # Clean library
 ├── config.zig                     # Gateway API types (unchanged)
 ├── translator.zig                 # GatewayConfig → Router JSON (unchanged)
 └── mod.zig                        # Exports only config + translator
@@ -96,14 +96,14 @@ This refactor uses serval-* components throughout (no raw sockets, no local cons
 | `serval-pool` | SimplePool for connection management |
 | `serval-metrics` | NoopMetrics for admin server |
 | `serval-tracing` | NoopTracer for admin server |
-| `serval-gateway` | Gateway API types and translator |
+| `serval-k8s-gateway` | Gateway API types and translator |
 
 ---
 
 ## Task 1: Add ResolvedBackend Type to config.zig
 
 **Files:**
-- Modify: `serval-gateway/config.zig`
+- Modify: `serval-k8s-gateway/config.zig`
 
 **Step 1: Add ResolvedBackend type**
 
@@ -111,7 +111,7 @@ This type represents a backend with resolved endpoints (IP addresses instead of 
 TigerStyle: Explicit bounds, units in names, bounded arrays.
 
 ```zig
-// Add to serval-gateway/config.zig
+// Add to serval-k8s-gateway/config.zig
 
 /// Maximum endpoints per resolved backend.
 /// TigerStyle: Explicit bound matching resolver limits.
@@ -173,8 +173,8 @@ Expected: Compiles, existing tests pass
 **Step 3: Commit**
 
 ```bash
-git add serval-gateway/config.zig
-git commit -m "feat(serval-gateway): add ResolvedBackend type for decoupled translation"
+git add serval-k8s-gateway/config.zig
+git commit -m "feat(serval-k8s-gateway): add ResolvedBackend type for decoupled translation"
 ```
 
 ---
@@ -192,7 +192,7 @@ git commit -m "feat(serval-gateway): add ResolvedBackend type for decoupled tran
 //! Kubernetes Gateway API Controller
 //!
 //! Watches K8s Gateway API resources and configures serval-router.
-//! This is a complete controller implementation using serval-gateway library.
+//! This is a complete controller implementation using serval-k8s-gateway library.
 
 const std = @import("std");
 
@@ -227,7 +227,7 @@ git commit -m "feat(examples): scaffold gateway controller directory"
 **Step 1: Write the data plane client**
 
 This replaces the raw socket code in `gateway.zig:pushConfigToDataPlane()` with proper serval-client usage.
-Uses local Resolver import (not from serval-gateway) and new translator API with ResolvedBackend.
+Uses local Resolver import (not from serval-k8s-gateway) and new translator API with ResolvedBackend.
 
 **IMPORTANT:** Uses the actual serval-client API:
 - `Client.init(allocator, dns_resolver, client_ctx, verify_tls)` - Initialize client
@@ -258,9 +258,9 @@ const assert = std.debug.assert;
 const serval_client = @import("serval-client");
 const serval_core = @import("serval-core");
 const serval_net = @import("serval-net");
-const gateway = @import("serval-gateway");
+const gateway = @import("serval-k8s-gateway");
 
-// Local imports (K8s-specific, not from serval-gateway)
+// Local imports (K8s-specific, not from serval-k8s-gateway)
 const resolver_mod = @import("resolver.zig");
 const Resolver = resolver_mod.Resolver;
 
@@ -634,13 +634,13 @@ TigerStyle compliant:
 ## Task 4: Move resolver.zig to examples/gateway/
 
 **Files:**
-- Move: `serval-gateway/resolver.zig` → `examples/gateway/resolver.zig`
-- Modify: `serval-gateway/mod.zig` (remove resolver export)
+- Move: `serval-k8s-gateway/resolver.zig` → `examples/gateway/resolver.zig`
+- Modify: `serval-k8s-gateway/mod.zig` (remove resolver export)
 
 **Step 1: Copy resolver.zig**
 
 ```bash
-cp serval-gateway/resolver.zig examples/gateway/resolver.zig
+cp serval-k8s-gateway/resolver.zig examples/gateway/resolver.zig
 ```
 
 **Step 2: Update imports in examples/gateway/resolver.zig**
@@ -651,7 +651,7 @@ const config = @import("config.zig");
 ```
 To:
 ```zig
-const gateway = @import("serval-gateway");
+const gateway = @import("serval-k8s-gateway");
 const gw_config = gateway.config;
 ```
 
@@ -716,12 +716,12 @@ pub const ResolverError = error{
 };
 ```
 
-**Step 5: Update serval-gateway/mod.zig**
+**Step 5: Update serval-k8s-gateway/mod.zig**
 
 Remove resolver exports - keep only config and translator:
 
 ```zig
-//! serval-gateway
+//! serval-k8s-gateway
 //!
 //! Gateway API library for serval.
 //! Provides Gateway API types and translation to serval-router config.
@@ -769,7 +769,7 @@ Expected: Tests pass (some may fail due to missing imports - fix in next tasks)
 **Step 7: Commit**
 
 ```bash
-git add examples/gateway/resolver.zig serval-gateway/mod.zig
+git add examples/gateway/resolver.zig serval-k8s-gateway/mod.zig
 git commit -m "refactor: move resolver.zig to examples/gateway/
 
 - Add resolveBackend() method returning ResolvedBackend
@@ -782,13 +782,13 @@ git commit -m "refactor: move resolver.zig to examples/gateway/
 ## Task 5: Move k8s/client.zig to examples/gateway/
 
 **Files:**
-- Move: `serval-gateway/k8s/client.zig` → `examples/gateway/k8s_client.zig`
-- Delete: `serval-gateway/k8s/` directory
+- Move: `serval-k8s-gateway/k8s/client.zig` → `examples/gateway/k8s_client.zig`
+- Delete: `serval-k8s-gateway/k8s/` directory
 
 **Step 1: Copy k8s/client.zig**
 
 ```bash
-cp serval-gateway/k8s/client.zig examples/gateway/k8s_client.zig
+cp serval-k8s-gateway/k8s/client.zig examples/gateway/k8s_client.zig
 ```
 
 **Step 2: Update imports**
@@ -807,12 +807,12 @@ git commit -m "refactor: move k8s client to examples/gateway/"
 ## Task 6: Move k8s/watcher.zig to examples/gateway/
 
 **Files:**
-- Move: `serval-gateway/k8s/watcher.zig` → `examples/gateway/watcher.zig`
+- Move: `serval-k8s-gateway/k8s/watcher.zig` → `examples/gateway/watcher.zig`
 
 **Step 1: Copy watcher.zig**
 
 ```bash
-cp serval-gateway/k8s/watcher.zig examples/gateway/watcher.zig
+cp serval-k8s-gateway/k8s/watcher.zig examples/gateway/watcher.zig
 ```
 
 **Step 2: Update imports**
@@ -825,7 +825,7 @@ const gw_config = @import("../config.zig");
 To:
 ```zig
 const k8s_client = @import("k8s_client.zig");
-const gateway = @import("serval-gateway");
+const gateway = @import("serval-k8s-gateway");
 const gw_config = gateway.config;
 ```
 
@@ -878,7 +878,7 @@ const Upstream = types.Upstream;
 const Action = types.Action;
 const DirectResponse = types.DirectResponse;
 
-const gateway = @import("serval-gateway");
+const gateway = @import("serval-k8s-gateway");
 const GatewayConfig = gateway.GatewayConfig;
 
 // ============================================================================
@@ -1047,7 +1047,7 @@ const serval_metrics = @import("serval-metrics");
 const serval_tracing = @import("serval-tracing");
 const serval_net = @import("serval-net");
 
-const gateway = @import("serval-gateway");
+const gateway = @import("serval-k8s-gateway");
 const GatewayConfig = gateway.GatewayConfig;
 
 const data_plane = @import("data_plane.zig");
@@ -1262,7 +1262,7 @@ TigerStyle compliant:
 
 const std = @import("std");
 const cli = @import("serval-cli");
-const gateway = @import("serval-gateway");
+const gateway = @import("serval-k8s-gateway");
 
 const controller_mod = @import("controller.zig");
 const Controller = controller_mod.Controller;
@@ -1388,7 +1388,7 @@ fn initK8sClient(allocator: std.mem.Allocator, opts: *const GatewayOptions) !*K8
 /// Print startup banner.
 /// TigerStyle Y1: Extracted helper for banner printing.
 fn printBanner(opts: *const GatewayOptions, client: *const K8sClient) void {
-    std.debug.print("\n=== serval-gateway ===\n", .{});
+    std.debug.print("\n=== serval-k8s-gateway ===\n", .{});
     std.debug.print("Admin API: http://localhost:{d}\n", .{opts.@"admin-port"});
     std.debug.print("Data plane: localhost:{d}\n", .{opts.@"data-plane-port"});
     std.debug.print("K8s namespace: {s}\n", .{client.getNamespace()});
@@ -1406,18 +1406,18 @@ git commit -m "feat(examples/gateway): complete main.zig wiring"
 
 ---
 
-## Task 9: Clean Up serval-gateway/
+## Task 9: Clean Up serval-k8s-gateway/
 
 **Files:**
-- Delete: `serval-gateway/gateway.zig`
-- Delete: `serval-gateway/resolver.zig`
-- Delete: `serval-gateway/k8s/` directory
-- Modify: `serval-gateway/mod.zig`
+- Delete: `serval-k8s-gateway/gateway.zig`
+- Delete: `serval-k8s-gateway/resolver.zig`
+- Delete: `serval-k8s-gateway/k8s/` directory
+- Modify: `serval-k8s-gateway/mod.zig`
 
 **Step 1: Update mod.zig to minimal exports**
 
 ```zig
-//! serval-gateway
+//! serval-k8s-gateway
 //!
 //! Gateway API library for serval.
 //! Provides Gateway API types and translation to serval-router config.
@@ -1457,9 +1457,9 @@ test {
 **Step 2: Delete moved files**
 
 ```bash
-rm serval-gateway/gateway.zig
-rm serval-gateway/resolver.zig
-rm -rf serval-gateway/k8s/
+rm serval-k8s-gateway/gateway.zig
+rm serval-k8s-gateway/resolver.zig
+rm -rf serval-k8s-gateway/k8s/
 ```
 
 **Step 3: Run tests**
@@ -1471,7 +1471,7 @@ Expected: Tests pass
 
 ```bash
 git add -A
-git commit -m "refactor: clean serval-gateway to library-only (types + translator)"
+git commit -m "refactor: clean serval-k8s-gateway to library-only (types + translator)"
 ```
 
 ---
@@ -1506,7 +1506,7 @@ git commit -m "build: update gateway example to examples/gateway/"
 ## Task 11: Update translator.zig API to Use ResolvedBackend
 
 **Files:**
-- Modify: `serval-gateway/translator.zig`
+- Modify: `serval-k8s-gateway/translator.zig`
 
 This is the key refactor that decouples translator from K8s-specific Resolver.
 
@@ -1643,7 +1643,7 @@ Verify:
 **Step 8: Commit**
 
 ```bash
-git add serval-gateway/translator.zig
+git add serval-k8s-gateway/translator.zig
 git commit -m "refactor(translator): take ResolvedBackend[] instead of Resolver
 
 BREAKING CHANGE: translateToJson signature changed.
@@ -1680,12 +1680,12 @@ git commit -m "chore: remove old gateway_example.zig"
 ## Task 13: Update Documentation
 
 **Files:**
-- Modify: `serval-gateway/README.md`
-- Modify: `serval-gateway/TODO.md`
+- Modify: `serval-k8s-gateway/README.md`
+- Modify: `serval-k8s-gateway/TODO.md`
 
 **Step 1: Update README.md**
 
-Document that serval-gateway is now a library with types and translator only. Point to examples/gateway/ for the K8s controller.
+Document that serval-k8s-gateway is now a library with types and translator only. Point to examples/gateway/ for the K8s controller.
 
 **Step 2: Update TODO.md**
 
@@ -1694,8 +1694,8 @@ Remove completed items, update structure.
 **Step 3: Commit**
 
 ```bash
-git add serval-gateway/README.md serval-gateway/TODO.md
-git commit -m "docs: update serval-gateway docs for library-only structure"
+git add serval-k8s-gateway/README.md serval-k8s-gateway/TODO.md
+git commit -m "docs: update serval-k8s-gateway docs for library-only structure"
 ```
 
 ---
@@ -1715,7 +1715,7 @@ Expected: All tests pass
 **Step 3: Verify structure**
 
 ```bash
-ls -la serval-gateway/
+ls -la serval-k8s-gateway/
 # Should only have: config.zig, translator.zig, mod.zig, README.md, TODO.md
 
 ls -la examples/gateway/
@@ -1735,7 +1735,7 @@ git commit -m "refactor: complete gateway refactor - library + example separatio
 
 After this refactor:
 
-**serval-gateway/** (~1500 lines) - Clean library:
+**serval-k8s-gateway/** (~1500 lines) - Clean library:
 - `config.zig` - Gateway API types + ResolvedBackend/ResolvedEndpoint
 - `translator.zig` - GatewayConfig + ResolvedBackend[] → Router JSON
 - `mod.zig` - Exports all types and translator
@@ -1781,7 +1781,7 @@ Watcher                     Controller                    Data Plane
 ```
 
 **Benefits:**
-1. serval-gateway is reusable for non-K8s use cases (database, files, API)
+1. serval-k8s-gateway is reusable for non-K8s use cases (database, files, API)
 2. All HTTP client uses serval-client (data plane push, K8s API)
 3. All HTTP server uses serval-server (admin API with health probes)
 4. All constants from serval-core.config (no local definitions)
@@ -1802,7 +1802,7 @@ Watcher                     Controller                    Data Plane
 | serval-pool | SimplePool for connection management |
 | serval-metrics | NoopMetrics for admin server |
 | serval-tracing | NoopTracer for admin server |
-| serval-gateway | Gateway API types and translator |
+| serval-k8s-gateway | Gateway API types and translator |
 
 **TigerStyle Compliance:**
 - S1: ~2 assertions per function (pre/postconditions)

@@ -1,4 +1,4 @@
-# serval-gateway TODO
+# serval-k8s-gateway TODO
 
 Status: **Data Plane Integrated** - K8s API integration works, translator and resolver connected to router_example.
 
@@ -17,7 +17,7 @@ Status: **Data Plane Integrated** - K8s API integration works, translator and re
 
 ## ~~Next Step: Implement `reconcile()`~~ COMPLETED
 
-**File:** `serval-gateway/k8s/watcher.zig:899-1052`
+**File:** `serval-k8s-gateway/k8s/watcher.zig:899-1052`
 
 **Status:** Implemented. The `reconcile()` function now:
 1. Parses Gateway raw JSON into `StoredGateway` structs
@@ -51,14 +51,14 @@ pushConfigToDataPlane()  ────▶  router_example
 ## Shortcuts Taken
 
 ### 1. Insecure TLS (No Certificate Verification)
-**File:** `serval-gateway/k8s/client.zig:478`
+**File:** `serval-k8s-gateway/k8s/client.zig:478`
 ```zig
 tls.ssl.SSL_CTX_set_verify(ctx, tls.ssl.SSL_VERIFY_NONE, null);
 ```
 **Fix:** Load CA cert from `/var/run/secrets/kubernetes.io/serviceaccount/ca.crt` and verify K8s API server certificate.
 
 ### 2. kTLS Disabled
-**File:** `serval-gateway/k8s/client.zig:407`
+**File:** `serval-k8s-gateway/k8s/client.zig:407`
 ```zig
 net.Socket.TLS.TLSSocket.initClientWithOptions(fd, self.ssl_ctx, self.api_server, false)
 ```
@@ -66,7 +66,7 @@ net.Socket.TLS.TLSSocket.initClientWithOptions(fd, self.ssl_ctx, self.api_server
 **Fix:** Investigate kTLS compatibility with K8s API server's TLS implementation, or keep userspace TLS for control plane (acceptable - not performance critical).
 
 ### 3. TLSError Treated as Normal EOF
-**File:** `serval-gateway/k8s/client.zig:322`
+**File:** `serval-k8s-gateway/k8s/client.zig:322`
 ```zig
 if (err == net.SocketError.ConnectionClosed or err == net.SocketError.TLSError) {
     break; // Use data we have
@@ -76,7 +76,7 @@ if (err == net.SocketError.ConnectionClosed or err == net.SocketError.TLSError) 
 **Fix:** Properly handle TLS shutdown vs errors. Parse Content-Length header to know when response is complete.
 
 ### 4. Gateway Marked Ready Immediately
-**File:** `examples/gateway_example.zig:140`
+**File:** `examples/gateway/main.zig:140`
 ```zig
 gw.ready.store(true, .release);
 ```
@@ -92,7 +92,7 @@ gw.ready.store(true, .release);
 **Status:** Resolver integration implemented - maps Service names to pod IPs via Endpoints.
 
 ### 7. Admin Server Binds to 0.0.0.0
-**File:** `serval-gateway/gateway.zig:342`
+**File:** `serval-k8s-gateway/gateway.zig:342`
 **Reason:** K8s probes come from kubelet, not localhost.
 **Decision:** Acceptable for K8s deployment. Could add flag for localhost-only in non-K8s mode.
 
@@ -108,9 +108,9 @@ gw.ready.store(true, .release);
 ~~5. Support header matching/modification~~
 
 **Status:** Implemented via:
-- `serval-gateway/translator.zig` - HTTPRoute to Router config translation
-- `serval-gateway/gateway.zig:pushConfigToDataPlane()` - Config push to router_example
-- `router_example.zig` - Admin API with atomic config swap
+- `serval-k8s-gateway/translator.zig` - HTTPRoute to Router config translation
+- `serval-k8s-gateway/gateway.zig:pushConfigToDataPlane()` - Config push to router_example
+- `examples/gateway/data_plane.zig` - Admin API with atomic config swap
 - Resolver integration for Service -> pod IP resolution
 
 ```
@@ -185,11 +185,11 @@ Current implementation polls K8s API repeatedly. Should use proper watch with:
 ## Files Changed
 
 ### New/Modified for K8s Integration
-- `serval-gateway/k8s/client.zig` - K8s API HTTP client using serval-tls
-- `serval-gateway/gateway.zig` - Admin server bind address
+- `serval-k8s-gateway/k8s/client.zig` - K8s API HTTP client using serval-tls
+- `serval-k8s-gateway/gateway.zig` - Admin server bind address
 - `serval-tls/stream.zig` - Added `enable_ktls` parameter
 - `serval-net/tls_socket.zig` - Added `initClientWithOptions`
-- `examples/gateway_example.zig` - Main entry point
+- `examples/gateway/` - Complete K8s gateway controller example
 - `build.zig` - Added gateway example, serval-net dependency
 
 ### Deployment

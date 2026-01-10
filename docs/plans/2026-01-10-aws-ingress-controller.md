@@ -31,7 +31,7 @@ serval-router serval-router
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                           serval-gateway                                     │
+│                           serval-k8s-gateway                                     │
 │                          (Control Plane)                                     │
 │                                                                              │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
@@ -68,7 +68,7 @@ serval-router serval-router
 ## File Structure
 
 ```
-serval-gateway/
+serval-k8s-gateway/
 ├── mod.zig                      # Public exports
 ├── gateway.zig                  # ✅ EXISTS - Main struct, admin API
 ├── reconciler.zig               # ❌ NEW - Main reconciliation loop

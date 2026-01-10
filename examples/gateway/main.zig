@@ -22,7 +22,7 @@
 
 const std = @import("std");
 const Io = std.Io;
-const gateway = @import("serval-gateway");
+const gateway = @import("serval-k8s-gateway");
 const gw_config = gateway.config;
 const serval_server = @import("serval-server");
 const serval_net = @import("serval-net");
@@ -229,7 +229,7 @@ fn run(allocator: std.mem.Allocator, config: CliConfig) !void {
 fn logStartupBanner(config: CliConfig) void {
     std.debug.assert(config.admin_port > 0); // S1: precondition
     std.debug.assert(config.namespace.len > 0); // S1: precondition
-    std.log.info("=== serval-gateway v{s} ===", .{VERSION});
+    std.log.info("=== serval-k8s-gateway v{s} ===", .{VERSION});
     std.log.info("Admin API: http://localhost:{d}", .{config.admin_port});
     std.log.info("Data plane: {s}:{d}", .{ config.data_plane_host, config.data_plane_port });
 }

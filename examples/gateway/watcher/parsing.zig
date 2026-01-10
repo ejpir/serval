@@ -8,7 +8,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
-const gateway = @import("serval-gateway");
+const gateway = @import("serval-k8s-gateway");
 const gw_config = gateway.config;
 
 const k8s_json = @import("../k8s_client/json_types.zig");

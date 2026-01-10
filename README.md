@@ -83,7 +83,7 @@ exe.root_module.addImport("serval-lb", serval.module("serval-lb"));
 | `serval-server` | HTTP/1.1 server |
 | `serval-lb` | Load balancer handler (round-robin) |
 | `serval-router` | Content-based routing (host/path matching, path rewriting) |
-| `serval-gateway` | Kubernetes Gateway API controller |
+| `serval-k8s-gateway` | Kubernetes Gateway API types and translation |
 | `serval-health` | Backend health tracking (atomic bitmap) |
 | `serval-metrics` | Metrics interfaces |
 | `serval-tracing` | Distributed tracing interfaces |
@@ -219,21 +219,38 @@ The router strips path prefixes before forwarding:
 - `/api/users` → api-pool receives `/users`
 - `/static/image.png` → static-pool receives `/image.png`
 
-### Kubernetes Gateway API (serval-gateway)
+### Choosing Between serval-router and serval-k8s-gateway
 
-serval-gateway is an ingress controller that implements the [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io/). It watches Gateway API resources and configures serval-router for traffic routing.
+| Use Case | Module | Description |
+|----------|--------|-------------|
+| **Direct configuration** | `serval-router` | Configure routes in code or via JSON API. Best for standalone gateways, API platforms, non-K8s deployments. |
+| **Kubernetes Gateway API** | `serval-k8s-gateway` | K8s Gateway API types + translation. Use with `examples/gateway/` controller for K8s ingress. |
+
+**Use serval-router directly when:**
+- Not running in Kubernetes
+- Building an API platform with database-driven routes
+- Using static configuration files
+- Need simple programmatic routing
+
+**Use serval-k8s-gateway when:**
+- Building a Kubernetes ingress controller
+- Implementing the Gateway API specification
+- Need K8s-native resource watching
+
+### Kubernetes Gateway API (serval-k8s-gateway)
+
+`serval-k8s-gateway` is a **library** providing Kubernetes Gateway API types and translation to serval-router JSON. For a complete controller, see `examples/gateway/`.
 
 ```
-┌─────────────┐       ┌─────────────────┐       ┌───────────────┐
-│  K8s API    │──────▶│ serval-gateway  │──────▶│ Backend Pods  │
-│  (watch)    │       │ (data plane)    │       │               │
-└─────────────┘       └─────────────────┘       └───────────────┘
-      │
-      ▼
- Gateway API Resources:
- - GatewayClass (defines controller)
- - Gateway (defines listeners/ports)
- - HTTPRoute (defines routing rules)
+┌─────────────┐       ┌───────────────────┐       ┌─────────────────┐
+│  K8s API    │──────▶│ examples/gateway/ │──────▶│  serval-router  │
+│  (watch)    │       │ (controller)      │       │  (data plane)   │
+└─────────────┘       └───────────────────┘       └─────────────────┘
+      │                        │
+      ▼                        ▼
+ Gateway API Resources    serval-k8s-gateway
+ - Gateway                (types + translator)
+ - HTTPRoute
 ```
 
 **Deploy to k3s:**
@@ -242,7 +259,7 @@ serval-gateway is an ingress controller that implements the [Kubernetes Gateway 
 # Install Gateway API CRDs
 kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.0.0/standard-install.yaml
 
-# Deploy serval-gateway (builds binaries, images, deploys to k3s)
+# Deploy gateway controller (builds binaries, images, deploys to k3s)
 ./deploy/deploy-k3s.sh
 ```
 
@@ -281,7 +298,7 @@ spec:
           port: 8080
 ```
 
-See [serval-gateway/README.md](serval-gateway/README.md) for full documentation.
+See [serval-k8s-gateway/README.md](serval-k8s-gateway/README.md) for library documentation.
 
 ### Direct Response Handler
 

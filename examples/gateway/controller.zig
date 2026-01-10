@@ -12,7 +12,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 const serval_core = @import("serval-core");
-const gateway = @import("serval-gateway");
+const gateway = @import("serval-k8s-gateway");
 const GatewayConfig = gateway.GatewayConfig;
 
 const core_config = serval_core.config;

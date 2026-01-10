@@ -12,7 +12,7 @@ const assert = std.debug.assert;
 const serval_client = @import("serval-client");
 const serval_core = @import("serval-core");
 const serval_net = @import("serval-net");
-const gateway = @import("serval-gateway");
+const gateway = @import("serval-k8s-gateway");
 const resolver_mod = @import("resolver/mod.zig");
 
 const Client = serval_client.Client;

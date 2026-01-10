@@ -13,7 +13,7 @@ Kubernetes deployment manifests for serval components.
 | Component | Description | Status |
 |-----------|-------------|--------|
 | serval-router | Content-based router (hardcoded config) | Ready |
-| serval-gateway | K8s Gateway API controller | WIP |
+| serval-k8s-gateway | K8s Gateway API controller | WIP |
 | echo-backend | Test backend for routing validation | Ready |
 
 ## Scripts
@@ -55,12 +55,12 @@ zig build
 
 # Build docker images
 sudo docker build -f deploy/Dockerfile.router -t serval-router:latest .
-sudo docker build -f deploy/Dockerfile.gateway -t serval-gateway:latest .
+sudo docker build -f deploy/Dockerfile.gateway -t serval-k8s-gateway:latest .
 sudo docker build -f deploy/Dockerfile.echo-backend -t echo-backend:latest .
 
 # Load into k3s
 sudo docker save serval-router:latest | sudo k3s ctr images import -
-sudo docker save serval-gateway:latest | sudo k3s ctr images import -
+sudo docker save serval-k8s-gateway:latest | sudo k3s ctr images import -
 sudo docker save echo-backend:latest | sudo k3s ctr images import -
 ```
 
@@ -74,7 +74,7 @@ sudo kubectl apply -f deploy/examples/echo-backend.yaml
 sudo kubectl apply -f deploy/serval-router.yaml
 
 # Deploy gateway (WIP)
-sudo kubectl apply -f deploy/serval-gateway.yaml
+sudo kubectl apply -f deploy/serval-k8s-gateway.yaml
 ```
 
 ## Status Commands
@@ -82,11 +82,11 @@ sudo kubectl apply -f deploy/serval-gateway.yaml
 ```bash
 # Check all serval pods
 sudo kubectl get pods -l app=serval-router
-sudo kubectl get pods -l app=serval-gateway
+sudo kubectl get pods -l app=serval-k8s-gateway
 sudo kubectl get pods -l app=echo-backend
 
 # Check services
-sudo kubectl get svc serval-router serval-gateway echo-backend
+sudo kubectl get svc serval-router serval-k8s-gateway echo-backend
 
 # Check all at once
 sudo kubectl get pods,svc | grep -E 'serval|echo'
@@ -100,15 +100,15 @@ sudo kubectl logs -l app=serval-router -f
 sudo kubectl logs -l app=serval-router --tail=100
 
 # Gateway logs
-sudo kubectl logs -l app=serval-gateway -f
-sudo kubectl logs -l app=serval-gateway --tail=100
+sudo kubectl logs -l app=serval-k8s-gateway -f
+sudo kubectl logs -l app=serval-k8s-gateway --tail=100
 
 # Echo backend logs
 sudo kubectl logs -l app=echo-backend -f
 
 # All pods for a deployment
 sudo kubectl logs deployment/serval-router -f
-sudo kubectl logs deployment/serval-gateway -f
+sudo kubectl logs deployment/serval-k8s-gateway -f
 ```
 
 ## Debug Commands
@@ -116,11 +116,11 @@ sudo kubectl logs deployment/serval-gateway -f
 ```bash
 # Describe pod (events, conditions)
 sudo kubectl describe pod -l app=serval-router
-sudo kubectl describe pod -l app=serval-gateway
+sudo kubectl describe pod -l app=serval-k8s-gateway
 
 # Exec into pod
 sudo kubectl exec -it deployment/serval-router -- /bin/sh
-sudo kubectl exec -it deployment/serval-gateway -- /bin/sh
+sudo kubectl exec -it deployment/serval-k8s-gateway -- /bin/sh
 
 # Check endpoints (backend IPs)
 sudo kubectl get endpoints echo-backend
@@ -128,7 +128,7 @@ sudo kubectl get endpoints serval-router
 
 # Port forward for local testing
 sudo kubectl port-forward svc/serval-router 8080:80
-sudo kubectl port-forward svc/serval-gateway 8080:80
+sudo kubectl port-forward svc/serval-k8s-gateway 8080:80
 
 # Check events
 sudo kubectl get events --sort-by='.lastTimestamp' | tail -20
@@ -139,7 +139,7 @@ sudo kubectl get events --sort-by='.lastTimestamp' | tail -20
 ```bash
 # Restart deployment (rolling)
 sudo kubectl rollout restart deployment/serval-router
-sudo kubectl rollout restart deployment/serval-gateway
+sudo kubectl rollout restart deployment/serval-k8s-gateway
 
 # Delete and recreate
 sudo kubectl delete -f deploy/serval-router.yaml && sudo kubectl apply -f deploy/serval-router.yaml
@@ -156,13 +156,13 @@ sudo kubectl scale deployment/serval-router --replicas=1
 sudo kubectl delete -f deploy/serval-router.yaml
 
 # Delete gateway
-sudo kubectl delete -f deploy/serval-gateway.yaml
+sudo kubectl delete -f deploy/serval-k8s-gateway.yaml
 
 # Delete echo-backend
 sudo kubectl delete -f deploy/examples/echo-backend.yaml
 
 # Delete all
-sudo kubectl delete -f deploy/serval-router.yaml -f deploy/serval-gateway.yaml -f deploy/examples/echo-backend.yaml
+sudo kubectl delete -f deploy/serval-router.yaml -f deploy/serval-k8s-gateway.yaml -f deploy/examples/echo-backend.yaml
 ```
 
 ## Testing

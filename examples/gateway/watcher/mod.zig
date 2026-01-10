@@ -11,7 +11,7 @@ const assert = std.debug.assert;
 const posix = std.posix;
 const Io = std.Io;
 
-const gateway = @import("serval-gateway");
+const gateway = @import("serval-k8s-gateway");
 const gw_config = gateway.config;
 const k8s_client_mod = @import("../k8s_client/mod.zig");
 const Client = k8s_client_mod.Client;

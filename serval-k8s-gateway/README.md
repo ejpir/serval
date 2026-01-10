@@ -1,15 +1,15 @@
-# serval-gateway
+# serval-k8s-gateway
 
 > **Status: Library Implemented**
 >
-> Gateway API types and translator to serval-router JSON config.
+> Kubernetes Gateway API types and translator to serval-router JSON config.
 > For a complete K8s controller implementation, see `examples/gateway/`.
 
-Gateway API library for serval — provides types and translation for building ingress controllers.
+Kubernetes Gateway API library for serval — provides types and translation for building Kubernetes ingress controllers.
 
 ## What is this?
 
-**serval-gateway is a library**, not a controller. It provides:
+**serval-k8s-gateway is a library**, not a controller. It provides:
 
 1. **Gateway API types** (config.zig) — Zig structs mirroring Kubernetes Gateway API resources
 2. **Translator** (translator.zig) — Converts GatewayConfig to JSON for serval-router admin API
@@ -25,7 +25,7 @@ For a complete Kubernetes controller implementation, see `examples/gateway/`.
 ## File Structure
 
 ```
-serval-gateway/
+serval-k8s-gateway/
 ├── config.zig      # Gateway API types (GatewayConfig, HTTPRoute, etc.)
 ├── translator.zig  # GatewayConfig → Router JSON translation
 └── mod.zig         # Module exports
@@ -34,7 +34,7 @@ serval-gateway/
 ## Exports
 
 ```zig
-const gateway = @import("serval-gateway");
+const gateway = @import("serval-k8s-gateway");
 
 // Configuration types (Gateway API)
 gateway.GatewayConfig     // Complete Gateway API config snapshot
@@ -61,7 +61,7 @@ gateway.TranslatorError             // Translation errors
 
 ```zig
 const std = @import("std");
-const gateway = @import("serval-gateway");
+const gateway = @import("serval-k8s-gateway");
 
 pub fn translateAndPush(
     config: *const gateway.GatewayConfig,
@@ -188,6 +188,7 @@ Gateway API is the newer, more expressive replacement for the Ingress API:
 ## Dependencies
 
 - `serval-core`: Types, config constants
+- `serval-router`: Target for translated config (admin API)
 
 ## TigerStyle Compliance
 

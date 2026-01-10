@@ -166,8 +166,8 @@ pub fn build(b: *std.Build) void {
     });
 
     // Gateway module - depends on router, core, server, net, tls, client, pool (Layer 5 - Orchestration)
-    const serval_gateway_module = b.addModule("serval-gateway", .{
-        .root_source_file = b.path("serval-gateway/mod.zig"),
+    const serval_gateway_module = b.addModule("serval-k8s-gateway", .{
+        .root_source_file = b.path("serval-k8s-gateway/mod.zig"),
         .imports = &.{
             .{ .name = "serval-core", .module = serval_core_module },
             .{ .name = "serval-router", .module = serval_router_module },
@@ -286,10 +286,10 @@ pub fn build(b: *std.Build) void {
     router_test_step.dependOn(&run_router_tests.step);
 
     // Gateway module tests
-    // Note: Links SSL libraries since serval-gateway depends on serval-server/router which depend on serval-tls
+    // Note: Links SSL libraries since serval-k8s-gateway depends on serval-server/router which depend on serval-tls
     // serval-router -> serval-prober -> serval-client dependencies
     const gateway_tests_mod = b.createModule(.{
-        .root_source_file = b.path("serval-gateway/mod.zig"),
+        .root_source_file = b.path("serval-k8s-gateway/mod.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -313,7 +313,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_gateway_tests = b.addRunArtifact(gateway_tests);
 
-    const gateway_test_step = b.step("test-gateway", "Run serval-gateway library tests");
+    const gateway_test_step = b.step("test-k8s-gateway", "Run serval-k8s-gateway library tests");
     gateway_test_step.dependOn(&run_gateway_tests.step);
 
     // Health module tests
@@ -494,7 +494,7 @@ pub fn build(b: *std.Build) void {
     run_router_example_step.dependOn(&run_router_example.step);
 
     // Gateway example (Kubernetes Gateway API controller)
-    // Note: Links SSL libraries since serval-gateway depends on serval-server which depends on serval-tls
+    // Note: Links SSL libraries since serval-k8s-gateway depends on serval-server which depends on serval-tls
     const gateway_example_mod = b.createModule(.{
         .root_source_file = b.path("examples/gateway/main.zig"),
         .target = target,
@@ -503,7 +503,7 @@ pub fn build(b: *std.Build) void {
     });
     gateway_example_mod.linkSystemLibrary("ssl", .{});
     gateway_example_mod.linkSystemLibrary("crypto", .{});
-    gateway_example_mod.addImport("serval-gateway", serval_gateway_module);
+    gateway_example_mod.addImport("serval-k8s-gateway", serval_gateway_module);
     gateway_example_mod.addImport("serval-cli", serval_cli_module);
     gateway_example_mod.addImport("serval-core", serval_core_module);
     gateway_example_mod.addImport("serval-net", serval_net_module);

@@ -8,7 +8,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
-const gateway = @import("serval-gateway");
+const gateway = @import("serval-k8s-gateway");
 const gw_config = gateway.config;
 
 // Import and re-export types from types.zig

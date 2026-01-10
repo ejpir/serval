@@ -2,12 +2,12 @@
 
 **Date:** 2026-01-09
 **Status:** Implemented
-**Related:** serval-gateway, serval-router, router_example
+**Related:** serval-k8s-gateway, serval-router, router_example
 
 ## Implementation Notes
 
 **Completed 2026-01-09:**
-- Translator module (`serval-gateway/translator.zig`) - HTTPRoute to Router config
+- Translator module (`serval-k8s-gateway/translator.zig`) - HTTPRoute to Router config
 - Resolver integration - Service name to pod IP mapping
 - `pushConfigToDataPlane()` in gateway.zig - JSON POST to router_example admin API
 - Atomic config swap in router_example with double-buffering
@@ -21,12 +21,12 @@
 
 ## Overview
 
-Complete the serval-gateway ingress controller by integrating the data plane (HTTP traffic handling) with the control plane (K8s resource watching). The control plane already watches Gateway API resources; this design adds dynamic routing configuration updates.
+Complete the serval-k8s-gateway ingress controller by integrating the data plane (HTTP traffic handling) with the control plane (K8s resource watching). The control plane already watches Gateway API resources; this design adds dynamic routing configuration updates.
 
 ## Problem Statement
 
 **Current State:**
-- ✅ serval-gateway watches K8s Gateway API resources (control plane works)
+- ✅ serval-k8s-gateway watches K8s Gateway API resources (control plane works)
 - ✅ serval-router handles content-based routing (data plane works)
 - ✅ router_example demonstrates Router + Server integration
 - ❌ No translation from HTTPRoute → Router config
@@ -40,11 +40,11 @@ Complete the serval-gateway ingress controller by integrating the data plane (HT
 
 ### Separation of Concerns
 
-Instead of building everything into serval-gateway, split into two components:
+Instead of building everything into serval-k8s-gateway, split into two components:
 
 ```
 ┌──────────────────────┐                    ┌──────────────────────┐
-│   serval-gateway     │                    │   router_example     │
+│   serval-k8s-gateway     │                    │   router_example     │
 │   (Control Plane)    │                    │   (Data Plane)       │
 ├──────────────────────┤                    ├──────────────────────┤
 │                      │                    │                      │
@@ -118,7 +118,7 @@ fn swapRouter(new_config: RouteConfig) !void {
 }
 ```
 
-### Control Plane: serval-gateway
+### Control Plane: serval-k8s-gateway
 
 **Responsibilities:**
 1. Watch K8s Gateway API resources
@@ -129,7 +129,7 @@ fn swapRouter(new_config: RouteConfig) !void {
 **Key Components:**
 
 ```zig
-// serval-gateway/translator.zig
+// serval-k8s-gateway/translator.zig
 pub fn translateConfig(
     gw_config: *const GatewayConfig,
     resolver: *const Resolver,
@@ -139,7 +139,7 @@ pub fn translateConfig(
     // URLRewrite filter → strip_prefix flag
 }
 
-// serval-gateway/gateway.zig
+// serval-k8s-gateway/gateway.zig
 pub fn pushConfigToDataPlane(
     self: *Gateway,
     config: *const TranslatedConfig,
@@ -330,7 +330,7 @@ pub fn swapRouter(new_config: RouteConfig) !void {
 **Output:** JSON payload for router admin API
 
 ```zig
-// serval-gateway/translator.zig
+// serval-k8s-gateway/translator.zig
 
 pub fn translateHTTPRouteToRoutes(
     http_route: *const HTTPRoute,
@@ -363,7 +363,7 @@ pub fn resolveBackendRefsToPool(
 Use **serval-client** (not std.http.Client) for production-ready HTTP:
 
 ```zig
-// serval-gateway/gateway.zig
+// serval-k8s-gateway/gateway.zig
 
 pub fn pushConfigToDataPlane(
     self: *Gateway,
@@ -461,7 +461,7 @@ pub const CONFIG_PUSH_BACKOFF_BASE_MS: u64 = 100;
 pub const MAX_CONFIG_PUSH_BACKOFF_MS: u64 = 5000;
 ```
 
-### serval-gateway/config.zig (K8s-specific)
+### serval-k8s-gateway/config.zig (K8s-specific)
 
 Already defined, no changes needed:
 - `MAX_GATEWAYS`, `MAX_LISTENERS`, `MAX_HTTP_ROUTES`, etc.
@@ -502,8 +502,8 @@ Already defined, no changes needed:
 - Edge case: concurrent requests during swap
 - Error case: invalid pool_idx rejected
 
-### Phase 5: Implement Translator in serval-gateway
-- Create `serval-gateway/translator.zig`
+### Phase 5: Implement Translator in serval-k8s-gateway
+- Create `serval-k8s-gateway/translator.zig`
 - Implement `translateHTTPRouteToRoutes()`
 - Implement `resolveBackendRefsToPool()`
 - Handle URLRewrite filters → strip_prefix
@@ -514,7 +514,7 @@ Already defined, no changes needed:
 - Unit tests: various HTTPRoute configurations
 
 ### Phase 6: Implement Resolver Integration
-- Extend `serval-gateway/resolver.zig`
+- Extend `serval-k8s-gateway/resolver.zig`
 - Add Service + Endpoints watching to K8s watcher
 - Map Service name → pod IPs
 - Bounded: MAX_SERVICES, MAX_ENDPOINTS_PER_SERVICE
@@ -543,8 +543,8 @@ Already defined, no changes needed:
 
 ### Phase 9: Documentation Updates
 - `serval-router/README.md`: Document admin API
-- `serval-gateway/README.md`: Update status (remove "WIP")
-- `serval-gateway/TODO.md`: Mark data plane items complete
+- `serval-k8s-gateway/README.md`: Update status (remove "WIP")
+- `serval-k8s-gateway/TODO.md`: Mark data plane items complete
 - `serval/ARCHITECTURE.md`: Document atomic swap pattern
 - Update this design doc status to "Implemented"
 
@@ -569,7 +569,7 @@ zig build run-gateway-example  # Smoke test
 - `test "admin API parse valid JSON"`: Valid route config parses correctly
 - `test "admin API reject invalid"`: Invalid pool_idx rejected with 400
 
-**serval-gateway/translator.zig:**
+**serval-k8s-gateway/translator.zig:**
 - `test "translate simple HTTPRoute"`: Path prefix match → Route
 - `test "translate with host match"`: Host header match → Route.host
 - `test "translate URLRewrite strip"`: URLRewrite filter → strip_prefix = true
@@ -582,7 +582,7 @@ zig build run-gateway-example  # Smoke test
 - POST invalid config (bad pool_idx), verify 400 error
 - POST update while serving traffic, verify no dropped requests
 
-**serval-gateway → router_example:**
+**serval-k8s-gateway → router_example:**
 - Mock K8s watcher event → translator → push to router → verify config
 - Service Endpoints change → resolver → new IPs in config
 
@@ -606,9 +606,9 @@ zig build run-gateway-example  # Smoke test
 - [x] router_example accepts config via POST /routes/update
 - [x] Atomic swap completes in < 1ms (grace period separate)
 - [x] No dropped requests during config swap
-- [x] serval-gateway translates HTTPRoute → Router config
-- [x] serval-gateway resolves Service → pod IPs
-- [x] serval-gateway pushes config to router_example
+- [x] serval-k8s-gateway translates HTTPRoute → Router config
+- [x] serval-k8s-gateway resolves Service → pod IPs
+- [x] serval-k8s-gateway pushes config to router_example
 - [ ] End-to-end: HTTPRoute change reflects in traffic routing within 5s
 - [x] All TigerStyle rules pass (/tigerstyle validation)
 - [x] All tests pass (unit, integration, E2E)
@@ -646,11 +646,11 @@ zig build run-gateway-example  # Smoke test
 ## Dependencies
 
 **New:**
-- serval-gateway needs `serval-client` for HTTP POST
+- serval-k8s-gateway needs `serval-client` for HTTP POST
 
 **Existing:**
 - router_example already uses serval-router, serval-server
-- serval-gateway already uses serval-core
+- serval-k8s-gateway already uses serval-core
 
 **Build System:**
 - No new modules, changes to existing code only
@@ -678,7 +678,7 @@ zig build run-gateway-example  # Smoke test
 ## References
 
 - `serval/ARCHITECTURE.md` - Module structure and layers
-- `serval-gateway/TODO.md` - Outstanding work items
+- `serval-k8s-gateway/TODO.md` - Outstanding work items
 - `serval-router/README.md` - Router API documentation
 - `CLAUDE.md` - TigerStyle requirements and quality standards
 - Envoy xDS Protocol - Industry standard for dynamic config

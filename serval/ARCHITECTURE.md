@@ -41,7 +41,7 @@ serval (umbrella - re-exports all modules)
 Standalone modules:
 ├── serval-lb       # Load balancer handler (round-robin)
 ├── serval-router   # Content-based router (host/path matching, per-pool LB)
-├── serval-gateway  # Gateway API types + translation (library, not controller)
+├── serval-k8s-gateway  # Gateway API types + translation (library, not controller)
 └── serval-cli      # CLI argument parsing utilities
 ```
 
@@ -116,7 +116,7 @@ Layer 5 (Orchestration):                                    │      │
 Standalone:
   serval-core ←── serval-lb (load balancer handler, depends on serval-health, serval-prober)
   serval-core ←── serval-router (content-based router, depends on serval-lb, serval-health, serval-prober)
-  serval-core ←── serval-gateway (Gateway API types + translator, minimal deps)
+  serval-core ←── serval-k8s-gateway (Gateway API types + translator, minimal deps)
   serval-core ←── serval-cli (CLI utilities)
 ```
 
@@ -138,7 +138,7 @@ Standalone:
 | serval-server | HTTP/1.1 server | `Server`, `MinimalServer` |
 | serval-lb | Load balancing | `LbHandler` (health-aware round-robin with background probing) |
 | serval-router | Content-based routing | `Router`, `Route`, `RouteMatcher`, `PathMatch`, `PoolConfig` |
-| serval-gateway | Gateway API types + translation | `GatewayConfig`, `HTTPRoute`, `translateToJson` |
+| serval-k8s-gateway | Gateway API types + translation | `GatewayConfig`, `HTTPRoute`, `translateToJson` |
 | serval-cli | CLI argument parsing | `Args`, `ParseResult`, comptime generics |
 
 ### Module Purpose Clarifications
@@ -148,18 +148,18 @@ Some modules have similar names but serve very different purposes:
 | Module | Layer | What It Does | Handles Traffic? |
 |--------|-------|--------------|------------------|
 | **serval-server** | 5 (Orchestration) | HTTP server: accept loop, connection handling, dispatch to handlers | **Yes** - actual HTTP requests |
-| **serval-gateway** | 4 (Strategy) | Gateway API types and JSON translation | **No** - just data types |
+| **serval-k8s-gateway** | 4 (Strategy) | Gateway API types and JSON translation | **No** - just data types |
 | **serval-router** | 4 (Strategy) | Routing decisions: match request → select backend | **Yes** - as a handler |
 | **serval-lb** | 4 (Strategy) | Load balancing: round-robin across upstreams | **Yes** - as a handler |
 
-**serval-server vs serval-gateway:**
+**serval-server vs serval-k8s-gateway:**
 - `serval-server` = "the engine that runs" - accepts connections, parses HTTP, invokes handlers
-- `serval-gateway` = "the blueprint format" - Gateway API schema (GatewayConfig, HTTPRoute, etc.)
+- `serval-k8s-gateway` = "the blueprint format" - Gateway API schema (GatewayConfig, HTTPRoute, etc.)
 
 **In practice:**
 ```
 examples/gateway/              # K8s controller (control plane - no traffic)
-    └── uses serval-gateway types (GatewayConfig, HTTPRoute)
+    └── uses serval-k8s-gateway types (GatewayConfig, HTTPRoute)
     └── watches K8s API for changes
     └── translates config and pushes to data plane
 
@@ -171,8 +171,8 @@ examples/router_example.zig    # Data plane (handles traffic)
 
 **When to use which:**
 - Building an HTTP server/proxy → `serval-server` + `serval-router` or `serval-lb`
-- Building a K8s ingress controller → `serval-gateway` types + your own controller logic
-- Building a config-file-based gateway → `serval-gateway` types + file watcher
+- Building a K8s ingress controller → `serval-k8s-gateway` types + your own controller logic
+- Building a config-file-based gateway → `serval-k8s-gateway` types + file watcher
 
 ### Control Plane vs Data Plane
 
@@ -187,7 +187,7 @@ Serval separates configuration management (control plane) from traffic handling 
 │         │ uses                                                           │
 │         ▼                                                                │
 │   ┌─────────────────┐                                                    │
-│   │ serval-gateway  │  ← Library: GatewayConfig types + translateToJson()│
+│   │ serval-k8s-gateway  │  ← Library: GatewayConfig types + translateToJson()│
 │   └────────┬────────┘                                                    │
 │            │ produces JSON                                               │
 │            ▼                                                             │
@@ -214,7 +214,7 @@ Serval separates configuration management (control plane) from traffic handling 
 
 | Module | Role | Analogy |
 |--------|------|---------|
-| **serval-gateway** | Route definitions (types + JSON translation) | "The menu" |
+| **serval-k8s-gateway** | Route definitions (types + JSON translation) | "The menu" |
 | **serval-router** | Route matching + backend selection | "The waiter" |
 | **serval-server** | Accept connections, parse HTTP, invoke handlers | "The restaurant" |
 
@@ -238,13 +238,13 @@ Serval separates configuration management (control plane) from traffic handling 
    }                                }
 
    ─────────────────▶              ─────────────────▶
-   serval-gateway                  POST /routes/update
+   serval-k8s-gateway                  POST /routes/update
    translateToJson()               to serval-router
 ```
 
 ### Building an API Platform
 
-Since serval-gateway is just a library with types, you can build any control plane:
+Since serval-k8s-gateway is just a library with types, you can build any control plane:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -258,7 +258,7 @@ Since serval-gateway is just a library with types, you can build any control pla
 │                         Database                             │
 │  - Routes, backends, API keys, rate limits, usage metrics   │
 ├─────────────────────────────────────────────────────────────┤
-│           Config Pusher (uses serval-gateway)               │
+│           Config Pusher (uses serval-k8s-gateway)               │
 │  - Watches DB for changes                                    │
 │  - Builds GatewayConfig from DB rows                        │
 │  - Translates to JSON, pushes to data plane                 │
@@ -276,7 +276,7 @@ Since serval-gateway is just a library with types, you can build any control pla
 
 **Use cases for different control planes:**
 
-| Use Case | Control Plane | serval-gateway Usage |
+| Use Case | Control Plane | serval-k8s-gateway Usage |
 |----------|---------------|---------------------|
 | K8s Ingress | Watch K8s API | `examples/gateway/` |
 | API Platform | Database + REST API | Build `GatewayConfig` from DB |
@@ -284,9 +284,9 @@ Since serval-gateway is just a library with types, you can build any control pla
 | GitOps | Watch git repo | Parse manifests → `GatewayConfig` |
 | Multi-tenant SaaS | Per-tenant DB tables | Filter routes by tenant |
 
-**What serval-gateway provides vs what you build:**
+**What serval-k8s-gateway provides vs what you build:**
 
-| Component | serval-gateway | You Build |
+| Component | serval-k8s-gateway | You Build |
 |-----------|----------------|-----------|
 | Route types | `HTTPRoute`, `HTTPRouteRule`, `HTTPRouteMatch` | - |
 | Backend types | `HTTPBackendRef` | - |
@@ -297,7 +297,7 @@ Since serval-gateway is just a library with types, you can build any control pla
 | Auth/API keys | - | Validation logic |
 | Developer portal | - | Web UI |
 
-**Key insight:** serval-gateway defines **what a route looks like** (Gateway API spec). You choose **where the routes come from** (K8s, database, files, API). The translator converts to JSON, and you push to serval-router.
+**Key insight:** serval-k8s-gateway defines **what a route looks like** (Gateway API spec). You choose **where the routes come from** (K8s, database, files, API). The translator converts to JSON, and you push to serval-router.
 
 ---
 
@@ -763,7 +763,7 @@ pub const WeightedHandler = struct {
 
 | Feature | Module | Status |
 |---------|--------|--------|
-| Gateway refactor | serval-gateway | Refactoring to library-only (types + translator) |
+| Gateway refactor | serval-k8s-gateway | Refactoring to library-only (types + translator) |
 | K8s controller | examples/gateway/ | Moving K8s-specific code to example |
 
 ### Not Implemented

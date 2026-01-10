@@ -279,7 +279,7 @@
   <module name="serval-client" path="serval-client/">HTTP/1.1 client (DNS, TCP, TLS, request/response)</module>
   <module name="serval-lb" path="serval-lb/">Load balancer handler (round-robin)</module>
   <module name="serval-router" path="serval-router/">Content-based routing with per-pool load balancing</module>
-  <module name="serval-gateway" path="serval-gateway/">Gateway API types and translator (library for gateway controllers)</module>
+  <module name="serval-k8s-gateway" path="serval-k8s-gateway/">Gateway API types and translator (library for gateway controllers)</module>
   <module name="serval-server" path="serval-server/">HTTP server with connection handling and hooks</module>
   <module name="serval-cli" path="serval-cli/">CLI argument parsing utilities</module>
 
@@ -342,13 +342,13 @@
     <layer level="4" name="strategy">
       <module>serval-lb</module>
       <module>serval-router</module>
-      <module>serval-gateway</module>
+      <module>serval-k8s-gateway</module>
       <module status="future">serval-forward</module>
       <responsibility>WHERE/WHICH to forward - routing decisions, upstream selection, gateway config</responsibility>
       <notes>
         serval-lb: Health-aware round-robin with background probing (implemented)
         serval-router: Content-based routing with host/path matching, path rewriting, per-pool LB (implemented)
-        serval-gateway: Gateway API types (Gateway, HTTPRoute) and translator to serval-router config (implemented)
+        serval-k8s-gateway: Gateway API types (Gateway, HTTPRoute) and translator to serval-router config (implemented)
         serval-forward: Simple forwarding handler (future)
       </notes>
     </layer>

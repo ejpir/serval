@@ -1,10 +1,10 @@
-# serval-gateway Design
+# serval-k8s-gateway Design
 
 Kubernetes Gateway API data plane for serval. Watches K8s resources directly and configures serval-router at runtime.
 
 ## Overview
 
-**serval-gateway** is an in-process Gateway API controller that:
+**serval-k8s-gateway** is an in-process Gateway API controller that:
 - Watches GatewayClass, Gateway, HTTPRoute resources from K8s API
 - Resolves Service references to pod IPs (via Endpoints)
 - Resolves Secret references to TLS certificates
@@ -15,7 +15,7 @@ Kubernetes Gateway API data plane for serval. Watches K8s resources directly and
 
 ```
 ┌─────────────────┐         ┌─────────────────────────────┐
-│  K8s API Server │◄────────│      serval-gateway         │
+│  K8s API Server │◄────────│      serval-k8s-gateway         │
 │                 │  watch  │                             │
 │  - GatewayClass │         │  ┌───────────────────────┐  │
 │  - Gateway      │         │  │ Watcher Thread        │  │
@@ -54,7 +54,7 @@ Kubernetes Gateway API data plane for serval. Watches K8s resources directly and
 ## Module Structure
 
 ```
-serval-gateway/
+serval-k8s-gateway/
 ├── mod.zig           # Re-exports
 ├── gateway.zig       # Main: admin API, config management, router setup
 ├── config.zig        # Gateway API types (Gateway, HTTPRoute, etc.)
@@ -210,7 +210,7 @@ pub const BackendRef = struct {
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                    serval-gateway                        │
+│                    serval-k8s-gateway                        │
 ├─────────────────────────────────────────────────────────┤
 │                                                          │
 │  Watcher Thread (single)                                 │
@@ -270,8 +270,8 @@ kind create cluster
 # 2. Install Gateway API CRDs
 kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.0.0/standard-install.yaml
 
-# 3. Deploy serval-gateway
-kubectl apply -f deploy/serval-gateway.yaml
+# 3. Deploy serval-k8s-gateway
+kubectl apply -f deploy/serval-k8s-gateway.yaml
 
 # 4. Create test resources
 kubectl apply -f examples/basic-gateway.yaml

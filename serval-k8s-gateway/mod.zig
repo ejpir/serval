@@ -1,9 +1,9 @@
-//! serval-gateway
+//! serval-k8s-gateway
 //!
-//! Gateway API library for serval.
+//! Kubernetes Gateway API library for serval.
 //! Provides Gateway API types and translation to serval-router config.
 //!
-//! Use this library to build your own gateway controller:
+//! Use this library to build your own Kubernetes gateway controller:
 //! - Define GatewayConfig with routes
 //! - Use translator to convert to JSON
 //! - POST to serval-router admin API

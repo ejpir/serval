@@ -225,7 +225,7 @@ pub const BodyError = error{
 |--------|-------|
 | serval-proxy | connect + send + read headers, then splice body |
 | serval-prober | connect + send + read headers, check status |
-| serval-gateway | connect + send + read headers + buffer body |
+| serval-k8s-gateway | connect + send + read headers + buffer body |
 
 ## Configuration
 

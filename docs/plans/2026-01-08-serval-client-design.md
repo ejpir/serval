@@ -10,7 +10,7 @@ serval-client is an HTTP/1.1 client library for making requests to upstream serv
 ### Purpose
 
 - Unified HTTP client for all serval components
-- Replaces duplicated HTTP client code in serval-gateway and serval-prober
+- Replaces duplicated HTTP client code in serval-k8s-gateway and serval-prober
 - Provides building blocks that serval-proxy composes for forwarding
 
 ### Design Principles
@@ -58,7 +58,7 @@ serval-client is an HTTP/1.1 client library for making requests to upstream serv
 |--------|----------------|
 | serval-proxy | `connect()`, `sendRequest()`, `readResponseHeaders()` - then splice for body |
 | serval-prober | `connect()`, `sendRequest()`, `readResponseHeaders()` - check status code |
-| serval-gateway | `connect()`, `sendRequest()`, `readResponseHeaders()` + read body into buffer |
+| serval-k8s-gateway | `connect()`, `sendRequest()`, `readResponseHeaders()` + read body into buffer |
 
 ## File Structure
 
@@ -259,10 +259,10 @@ try self.spliceResponseBody(conn, client_fd, response.body_framing);
 
 ## Consumer Integration
 
-### serval-gateway (K8s client)
+### serval-k8s-gateway (K8s client)
 
 ```zig
-// serval-gateway/k8s/client.zig
+// serval-k8s-gateway/k8s/client.zig
 const serval_client = @import("serval-client");
 
 pub const Client = struct {
@@ -385,5 +385,5 @@ if (iteration >= MAX_WRITE_ITERATIONS) return ClientError.SendFailed;
 ### Consumer Tests
 
 - serval-prober using serval-client for probes
-- serval-gateway using serval-client for K8s API
+- serval-k8s-gateway using serval-client for K8s API
 - serval-proxy using serval-client for upstream requests

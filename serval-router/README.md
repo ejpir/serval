@@ -320,7 +320,7 @@ curl http://localhost:8080/api/users      # -> api:8001, path: /users
 curl http://localhost:8080/static/img.png # -> static:8002, path: /img.png
 curl http://localhost:8080/other          # -> api:8001, path: /other
 
-Ready for serval-gateway
+Ready for serval-k8s-gateway
 
 The router provides the foundation needed for Kubernetes Gateway API integration:
 - Path prefix/exact matching ✅
