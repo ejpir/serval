@@ -607,3 +607,181 @@ pub const StoredGateway = struct {
         return gw;
     }
 };
+
+// =============================================================================
+// GatewayClass Storage
+// =============================================================================
+
+/// Maximum length for controller name strings.
+/// Controller names are DNS-like strings (e.g., "serval.dev/gateway-controller").
+/// TigerStyle: Explicit bound, u8 length sufficient for DNS names.
+pub const MAX_CONTROLLER_NAME_LEN: u8 = 128;
+
+/// Maximum number of GatewayClass resources to track.
+/// Re-export from serval-k8s-gateway for consistency.
+pub const MAX_GATEWAY_CLASSES: u8 = gw_config.MAX_GATEWAY_CLASSES;
+
+/// Fixed-size storage for a controller name string.
+/// TigerStyle: Bounded storage, no allocation after init.
+pub const ControllerNameStorage = struct {
+    data: [MAX_CONTROLLER_NAME_LEN]u8,
+    len: u8,
+
+    /// Initialize empty controller name storage.
+    pub fn init() ControllerNameStorage {
+        const result = ControllerNameStorage{
+            .data = std.mem.zeroes([MAX_CONTROLLER_NAME_LEN]u8),
+            .len = 0,
+        };
+        assert(result.len == 0); // S1: postcondition - empty storage
+        return result;
+    }
+
+    /// Copy a controller name into storage.
+    /// TigerStyle: Caller must ensure value length does not exceed MAX_CONTROLLER_NAME_LEN.
+    pub fn set(self: *ControllerNameStorage, value: []const u8) void {
+        assert(value.len <= MAX_CONTROLLER_NAME_LEN); // S1: precondition
+        const copy_len: u8 = @intCast(@min(value.len, MAX_CONTROLLER_NAME_LEN));
+        @memcpy(self.data[0..copy_len], value[0..copy_len]);
+        self.len = copy_len;
+        assert(self.len <= MAX_CONTROLLER_NAME_LEN); // S1: postcondition
+    }
+
+    /// Get controller name as slice.
+    pub fn slice(self: *const ControllerNameStorage) []const u8 {
+        assert(self.len <= MAX_CONTROLLER_NAME_LEN); // S1: precondition - valid length
+        return self.data[0..self.len];
+    }
+};
+
+/// Stored GatewayClass with inline storage.
+/// GatewayClass is cluster-scoped (no namespace field).
+/// TigerStyle: Fixed-size storage, no allocation after init.
+pub const StoredGatewayClass = struct {
+    /// GatewayClass name (metadata.name).
+    name: NameStorage,
+    /// Controller that manages this class (spec.controllerName).
+    controller_name: ControllerNameStorage,
+    /// Indicates if this slot is in use.
+    active: bool,
+
+    /// Initialize empty GatewayClass storage.
+    pub fn init() StoredGatewayClass {
+        const result = StoredGatewayClass{
+            .name = NameStorage.init(),
+            .controller_name = ControllerNameStorage.init(),
+            .active = false,
+        };
+        assert(result.name.len == 0); // S1: postcondition - empty name
+        assert(result.controller_name.len == 0); // S1: postcondition - empty controller name
+        assert(!result.active); // S1: postcondition - not active until used
+        return result;
+    }
+};
+
+// =============================================================================
+// Unit Tests
+// =============================================================================
+
+test "ControllerNameStorage init returns empty storage" {
+    const storage = ControllerNameStorage.init();
+    try std.testing.expectEqual(@as(u8, 0), storage.len);
+    try std.testing.expectEqualStrings("", storage.slice());
+}
+
+test "ControllerNameStorage set and slice" {
+    var storage = ControllerNameStorage.init();
+    const controller = "serval.dev/gateway-controller";
+    storage.set(controller);
+
+    try std.testing.expectEqual(@as(u8, controller.len), storage.len);
+    try std.testing.expectEqualStrings(controller, storage.slice());
+}
+
+test "ControllerNameStorage set with long controller name" {
+    var storage = ControllerNameStorage.init();
+    // Long but valid controller name (under MAX_CONTROLLER_NAME_LEN)
+    const controller = "very-long-domain.example.com/path/to/gateway-controller-name";
+    storage.set(controller);
+
+    try std.testing.expectEqual(@as(u8, controller.len), storage.len);
+    try std.testing.expectEqualStrings(controller, storage.slice());
+}
+
+test "ControllerNameStorage set max length" {
+    var storage = ControllerNameStorage.init();
+    // Create a string of exactly MAX_CONTROLLER_NAME_LEN characters
+    const max_controller = "a" ** MAX_CONTROLLER_NAME_LEN;
+    storage.set(max_controller);
+
+    try std.testing.expectEqual(MAX_CONTROLLER_NAME_LEN, storage.len);
+    try std.testing.expectEqual(@as(usize, MAX_CONTROLLER_NAME_LEN), storage.slice().len);
+}
+
+test "ControllerNameStorage overwrite existing value" {
+    var storage = ControllerNameStorage.init();
+
+    // Set initial value
+    storage.set("controller-v1");
+    try std.testing.expectEqualStrings("controller-v1", storage.slice());
+
+    // Overwrite with new value
+    storage.set("controller-v2");
+    try std.testing.expectEqualStrings("controller-v2", storage.slice());
+}
+
+test "StoredGatewayClass init returns inactive empty storage" {
+    const gc = StoredGatewayClass.init();
+
+    try std.testing.expect(!gc.active);
+    try std.testing.expectEqual(@as(u8, 0), gc.name.len);
+    try std.testing.expectEqual(@as(u8, 0), gc.controller_name.len);
+    try std.testing.expectEqualStrings("", gc.name.slice());
+    try std.testing.expectEqualStrings("", gc.controller_name.slice());
+}
+
+test "StoredGatewayClass set name and controller_name" {
+    var gc = StoredGatewayClass.init();
+
+    gc.name.set("serval-gateway");
+    gc.controller_name.set("serval.dev/gateway-controller");
+    gc.active = true;
+
+    try std.testing.expect(gc.active);
+    try std.testing.expectEqualStrings("serval-gateway", gc.name.slice());
+    try std.testing.expectEqualStrings("serval.dev/gateway-controller", gc.controller_name.slice());
+}
+
+test "StoredGatewayClass multiple instances are independent" {
+    var gc1 = StoredGatewayClass.init();
+    var gc2 = StoredGatewayClass.init();
+
+    gc1.name.set("class-a");
+    gc1.controller_name.set("example.com/controller-a");
+    gc1.active = true;
+
+    gc2.name.set("class-b");
+    gc2.controller_name.set("example.com/controller-b");
+    gc2.active = true;
+
+    // Verify they are independent
+    try std.testing.expectEqualStrings("class-a", gc1.name.slice());
+    try std.testing.expectEqualStrings("class-b", gc2.name.slice());
+    try std.testing.expectEqualStrings("example.com/controller-a", gc1.controller_name.slice());
+    try std.testing.expectEqualStrings("example.com/controller-b", gc2.controller_name.slice());
+}
+
+test "MAX_GATEWAY_CLASSES matches serval-k8s-gateway config" {
+    // Verify the re-exported constant matches the original
+    try std.testing.expectEqual(gw_config.MAX_GATEWAY_CLASSES, MAX_GATEWAY_CLASSES);
+}
+
+test "MAX_CONTROLLER_NAME_LEN is sufficient for typical controller names" {
+    // Typical controller name format: <domain>/<path>/<controller-name>
+    // Example: "gateway.networking.k8s.io/gateway-controller"
+    // MAX_CONTROLLER_NAME_LEN (128) should be sufficient
+    comptime {
+        assert(MAX_CONTROLLER_NAME_LEN >= 64); // Minimum reasonable size
+        assert(MAX_CONTROLLER_NAME_LEN <= 255); // Fits in u8 length field
+    }
+}
