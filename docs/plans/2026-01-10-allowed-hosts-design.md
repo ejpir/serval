@@ -6,29 +6,60 @@
 
 ## Overview
 
-Add host validation to the router to reject requests for hosts the gateway is not configured to serve. This prevents the gateway from routing traffic for arbitrary hosts.
+Add host validation to the router to reject requests for hosts the gateway is not configured to serve. Also remove `default_route` - unmatched requests return 404 instead of routing to a fallback.
 
 ## Requirements
 
 - Validate Host header against configured allowed hosts BEFORE route matching
-- Return 421 Misdirected Request when Host doesn't match
+- Return 421 Misdirected Request when Host doesn't match allowed_hosts
+- Return 404 Not Found when no route matches (no default_route fallback)
 - Empty allowed_hosts = allow any host (backwards compatible)
-- Exact match only (no wildcards for now - future enhancement)
+- Router does exact match only (no wildcards)
+- Controller does wildcard matching for Gateway listener → HTTPRoute compatibility
 - Case-insensitive comparison per RFC 9110
+
+## Request Flow
+
+```
+Request arrives
+    ↓
+Host in allowed_hosts? ──NO──→ 421 Misdirected Request
+    ↓ YES
+Route matches? ──NO──→ 404 Not Found
+    ↓ YES
+Forward to backend pool
+```
 
 ## Data Flow
 
 ```
-Gateway listeners (K8s)
-    ↓ hostnames extracted by watcher
-GatewayConfig.gateways[].listeners[].hostname
-    ↓ translator collects unique hostnames
-JSON: {"allowed_hosts": ["api.example.com"], "routes": [...]}
+Gateway listener: hostname = "*.example.com" (may have wildcards)
+    ↓
+Controller checks: HTTPRoute hostnames compatible with listener?
+    ↓ wildcard matching in controller
+HTTPRoute: hostnames = ["api.example.com", "www.example.com"]
+    ↓ translator extracts HTTPRoute hostnames (specific, no wildcards)
+JSON: {"allowed_hosts": ["api.example.com", "www.example.com"], ...}
     ↓ router_example parses JSON
-Router.allowed_hosts: []const []const u8
+Router.allowed_hosts (exact match only)
     ↓ selectUpstream() validates Host header
-Reject 421 or continue to route matching
+Reject 421, 404, or forward to backend
 ```
+
+## Wildcard Handling
+
+| Component | Wildcard support | Hostname source |
+|-----------|-----------------|-----------------|
+| Controller | YES (compatibility check) | Gateway listeners |
+| Translator | NO (passes through) | HTTPRoute hostnames |
+| Router | NO (exact match only) | allowed_hosts from translator |
+
+Example:
+- Gateway listener: `*.example.com`
+- HTTPRoute: `["api.example.com", "www.example.com"]`
+- Controller: checks `api.example.com` matches `*.example.com` → YES, attach route
+- Router receives: `allowed_hosts: ["api.example.com", "www.example.com"]`
+- Router does exact matching only
 
 ## Implementation
 
@@ -39,27 +70,27 @@ Reject 421 or continue to route matching
 pub const MAX_ALLOWED_HOSTS: u8 = 64;
 
 /// Maximum hostname length in bytes (RFC 1035).
-pub const MAX_HOSTNAME_LEN: u8 = 253;
+pub const MAX_HOSTNAME_LEN: u16 = 253;
 ```
 
 ### 2. Router Changes (serval-router/router.zig)
 
-Add `allowed_hosts` field and validation in `selectUpstream()`:
+Remove `default_route`, add `allowed_hosts`, return 404 on no match:
 
 ```zig
 pub const Router = struct {
     routes: []const Route,
-    default_route: Route,
+    // REMOVED: default_route: Route,
     pools: []Pool,
     pool_storage: [MAX_POOLS]Pool = undefined,
-    allowed_hosts: []const []const u8 = &.{},  // NEW
+    allowed_hosts: []const []const u8 = &.{},
 
     pub fn init(
         self: *Self,
         routes: []const Route,
-        default_route: Route,
+        // REMOVED: default_route: Route,
         pool_configs: []const PoolConfig,
-        allowed_hosts: []const []const u8,  // NEW
+        allowed_hosts: []const []const u8,
         client_ctx: ?*ssl.SSL_CTX,
         dns_resolver: ?*DnsResolver,
     ) !void {
@@ -88,7 +119,35 @@ pub const Router = struct {
             }
         }
 
-        // Continue with existing route matching...
+        // Find matching route - no default fallback
+        const route = self.findRoute(request) orelse {
+            return .{ .reject = .{
+                .status = 404,
+                .body = "Not Found",
+            }};
+        };
+
+        // Store rewritten path if strip_prefix enabled
+        ctx.rewritten_path = self.rewritePath(route, request.path);
+
+        // Delegate to pool's LbHandler for health-aware selection
+        assert(route.pool_idx < self.pools.len);
+        return .{ .forward = self.pools[route.pool_idx].lb_handler.selectUpstream(ctx, request) };
+    }
+
+    /// Find matching route. Returns null if no route matches.
+    fn findRoute(self: *const Self, request: *const Request) ?*const Route {
+        assert(self.routes.len <= MAX_ROUTES);
+
+        const host = request.headers.getHost();
+        const path = request.path;
+
+        for (self.routes) |*route| {
+            if (route.matcher.matches(host, path)) {
+                return route;
+            }
+        }
+        return null;  // No default fallback
     }
 
     /// Check if Host header matches any allowed hostname.
@@ -117,7 +176,7 @@ pub const Router = struct {
 
 ### 3. Translator Changes (serval-k8s-gateway/translator.zig)
 
-Extract hostnames from Gateway listeners:
+Extract hostnames from **HTTPRoutes** (not Gateway listeners):
 
 ```zig
 pub fn translateToJson(
@@ -128,18 +187,23 @@ pub fn translateToJson(
     var writer = JsonWriter.init(out_buf);
     writer.writeRaw("{") catch return error.BufferTooSmall;
 
-    // Write allowed_hosts array from Gateway listeners
+    // Write allowed_hosts array from HTTPRoute hostnames
+    // (NOT from Gateway listeners - those may have wildcards)
     writer.writeRaw("\"allowed_hosts\":[") catch return error.BufferTooSmall;
     var host_count: u8 = 0;
 
-    for (config_ptr.gateways, 0..) |gateway, gw_i| {
-        if (gw_i >= gw_config.MAX_GATEWAYS) break;
+    for (config_ptr.http_routes, 0..) |http_route, route_i| {
+        if (route_i >= gw_config.MAX_HTTP_ROUTES) break;
 
-        for (gateway.listeners, 0..) |listener, l_i| {
-            if (l_i >= gw_config.MAX_LISTENERS) break;
+        for (http_route.hostnames, 0..) |hostname, h_i| {
+            if (h_i >= gw_config.MAX_HOSTNAMES) break;
+            if (host_count >= MAX_ALLOWED_HOSTS) break;
 
-            if (listener.hostname) |hostname| {
-                if (host_count >= MAX_ALLOWED_HOSTS) break;
+            // Skip duplicates (simple O(n) check, bounded by MAX_ALLOWED_HOSTS)
+            var is_duplicate = false;
+            // ... duplicate check omitted for brevity ...
+
+            if (!is_duplicate) {
                 if (host_count > 0) {
                     writer.writeRaw(",") catch return error.BufferTooSmall;
                 }
@@ -153,24 +217,28 @@ pub fn translateToJson(
 
     writer.writeRaw("],") catch return error.BufferTooSmall;
 
-    // ... existing routes/pools code ...
+    // Write routes array (existing code)
+    // REMOVED: default_route from output
+    // Write pools array (existing code)
 }
 ```
 
 ### 4. router_example.zig Changes
 
-Add parsing and storage for allowed_hosts:
+Remove default_route, add allowed_hosts parsing:
 
 ```zig
 const ConfigJson = struct {
     allowed_hosts: []const []const u8 = &.{},
     routes: []const RouteJson = &.{},
-    default_route: RouteJson,
+    // REMOVED: default_route: RouteJson,
     pools: []const PoolJson,
 };
 
 const ConfigStorage = struct {
     // ... existing fields ...
+    // REMOVED: default route storage
+
     allowed_hosts_storage: [config.MAX_ALLOWED_HOSTS][config.MAX_HOSTNAME_LEN]u8 = undefined,
     allowed_hosts_ptrs: [config.MAX_ALLOWED_HOSTS][]const u8 = undefined,
     allowed_hosts_count: u8 = 0,
@@ -187,6 +255,24 @@ const ConfigStorage = struct {
         return self.allowed_hosts_ptrs[0..hosts.len];
     }
 };
+
+fn swapRouter(
+    routes: []const Route,
+    // REMOVED: default_route: Route,
+    pool_configs: []const PoolConfig,
+    allowed_hosts: []const []const u8,
+    dns_resolver: ?*DnsResolver,
+) !void {
+    // ... copy to persistent storage ...
+    try router_storage[inactive_slot].init(
+        persistent_routes,
+        // REMOVED: persistent_default,
+        persistent_pools,
+        persistent_allowed_hosts,
+        null,
+        dns_resolver,
+    );
+}
 ```
 
 ## JSON Format
@@ -197,24 +283,31 @@ const ConfigStorage = struct {
   "routes": [
     {"name": "api", "host": "api.example.com", "path_prefix": "/api/", "pool_idx": 0}
   ],
-  "default_route": {"name": "default", "path_prefix": "/", "pool_idx": 0},
   "pools": [
     {"name": "api-pool", "upstreams": [{"host": "10.0.1.5", "port": 8001, "idx": 0}]}
   ]
 }
 ```
 
+Note: `default_route` is removed from JSON format.
+
 ## Files to Modify
 
 1. `serval-core/config.zig` - Add MAX_ALLOWED_HOSTS, MAX_HOSTNAME_LEN constants
-2. `serval-router/router.zig` - Add allowed_hosts field, validation in selectUpstream()
-3. `serval-k8s-gateway/translator.zig` - Extract hostnames from Gateway listeners
-4. `examples/router_example.zig` - Parse allowed_hosts, pass to Router.init
+2. `serval-router/router.zig` - Remove default_route, add allowed_hosts, return 404 on no match
+3. `serval-k8s-gateway/translator.zig` - Extract hostnames from HTTPRoutes, remove default_route output
+4. `examples/router_example.zig` - Remove default_route, parse allowed_hosts, update swapRouter
+
+## Breaking Changes
+
+- `default_route` removed from Router.init() signature
+- `default_route` removed from JSON config format
+- Requests that previously fell through to default_route now get 404
 
 ## Future Enhancements
 
-- Wildcard hostname matching (*.example.com)
-- Per-listener hostname validation (vs global allowed list)
+- Wildcard hostname matching in controller (*.example.com)
+- HTTPRoute status updates (Accepted/Rejected based on listener compatibility)
 
 ## TigerStyle Compliance
 
