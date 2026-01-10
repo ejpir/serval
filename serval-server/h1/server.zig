@@ -732,6 +732,16 @@ pub fn Server(
                             buffer_offset += parser.headers_end + body_length_for_offset;
                             continue;
                         },
+                        .stream => {
+                            // Streaming response: returns 501 until nextChunk() loop is implemented.
+                            // See docs/plans/2026-01-10-streaming-response-design.md for planned behavior.
+                            sendErrorResponseTls(maybe_tls_ptr, &io_mut, stream, 501, "Streaming not implemented");
+                            const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
+                            metrics.requestEnd(501, duration_ns);
+                            tracer.endSpan(span_handle, "streaming_not_implemented");
+                            buffer_offset += parser.headers_end + body_length_for_offset;
+                            continue;
+                        },
                     }
                 }
 

@@ -386,6 +386,18 @@ pub fn Server(
                             buffer_offset += parser.headers_end + body_length;
                             continue;
                         },
+                        .stream => {
+                            // Streaming response: returns 501 until nextChunk() loop is implemented.
+                            // See docs/plans/2026-01-10-streaming-response-design.md for planned behavior.
+                            sendRejectResponseImpl(io, stream, .{ .status = 501, .reason = "Streaming not implemented" });
+                            ctx.response_status = 501;
+                            const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
+                            metrics.requestEnd(501, duration_ns);
+                            tracer.endSpan(span_handle, "streaming_not_implemented");
+                            const body_length = getBodyLength(&parser.request);
+                            buffer_offset += parser.headers_end + body_length;
+                            continue;
+                        },
                     }
                 }
 
@@ -582,6 +594,10 @@ pub fn Server(
                     .reject => {
                         // Note: Response already sent, cannot reject
                         debugLog("onResponse: reject ignored, response already streamed", .{});
+                    },
+                    .stream => {
+                        // Note: Response already sent via streaming, cannot replace with stream
+                        debugLog("onResponse: stream ignored, response already streamed", .{});
                     },
                 }
             }

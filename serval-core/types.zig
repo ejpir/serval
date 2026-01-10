@@ -137,6 +137,10 @@ pub const Action = union(enum) {
     /// Reject the request with an error status (e.g., 400, 403, 429).
     /// Use for WAF blocking, rate limiting, auth failures.
     reject: RejectResponse,
+    /// Stream a response incrementally using chunked Transfer-Encoding.
+    /// Handler must implement nextChunk() method to generate content.
+    /// Use for SSE, LLM responses, database cursors, large dynamic content.
+    stream: StreamResponse,
 };
 
 /// Rejection response for handlers that block requests.
@@ -205,6 +209,25 @@ pub const DirectResponse = struct {
     /// know the exact size upfront. Explicit mode selection prevents
     /// mismatches between handler intent and wire format.
     response_mode: ResponseMode = .content_length,
+};
+
+/// Streaming response for incrementally-generated content.
+/// Used for SSE (Server-Sent Events), LLM responses, database cursors, etc.
+/// Handler must implement nextChunk() to generate content incrementally.
+/// Server will use Transfer-Encoding: chunked (RFC 9112 Section 7.1).
+/// TigerStyle: Caller-owned buffer, bounded iterations, explicit termination.
+pub const StreamResponse = struct {
+    /// HTTP status code for the response.
+    status: u16 = 200,
+    /// Content-Type header value.
+    /// Default: application/octet-stream (binary data).
+    /// Use "text/event-stream" for SSE, "application/json" for JSON streaming.
+    content_type: []const u8 = "application/octet-stream",
+    /// Additional headers as pre-formatted string (e.g., "Cache-Control: no-cache\r\n").
+    /// Handler is responsible for correct HTTP header formatting.
+    /// NOTE: Do NOT include Transfer-Encoding or Content-Length headers -
+    /// server manages these automatically for chunked streaming.
+    extra_headers: []const u8 = "",
 };
 
 // =============================================================================
@@ -351,6 +374,7 @@ test "Action send_response variant" {
             try std.testing.expectEqualStrings("Not Found", r.body);
         },
         .reject => try std.testing.expect(false),
+        .stream => try std.testing.expect(false),
     }
 }
 
@@ -423,7 +447,84 @@ test "DirectResponse response_mode in Action" {
             try std.testing.expect(r.response_mode == .chunked);
         },
         .reject => try std.testing.expect(false),
+        .stream => try std.testing.expect(false),
     }
+}
+
+// =============================================================================
+// StreamResponse Tests
+// =============================================================================
+
+test "StreamResponse has sensible defaults" {
+    const resp = StreamResponse{};
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqualStrings("application/octet-stream", resp.content_type);
+    try std.testing.expectEqualStrings("", resp.extra_headers);
+}
+
+test "StreamResponse with SSE content type" {
+    // Server-Sent Events use text/event-stream content type
+    const resp = StreamResponse{
+        .status = 200,
+        .content_type = "text/event-stream",
+        .extra_headers = "Cache-Control: no-cache\r\n",
+    };
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqualStrings("text/event-stream", resp.content_type);
+    try std.testing.expectEqualStrings("Cache-Control: no-cache\r\n", resp.extra_headers);
+}
+
+test "StreamResponse with JSON streaming content type" {
+    // JSON streaming (e.g., LLM responses) uses application/json
+    const resp = StreamResponse{
+        .status = 200,
+        .content_type = "application/json",
+    };
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqualStrings("application/json", resp.content_type);
+}
+
+test "StreamResponse with custom status" {
+    // Streaming responses can have non-200 status codes
+    const resp = StreamResponse{
+        .status = 206, // Partial Content
+        .content_type = "video/mp4",
+    };
+    try std.testing.expectEqual(@as(u16, 206), resp.status);
+    try std.testing.expectEqualStrings("video/mp4", resp.content_type);
+}
+
+test "Action stream variant" {
+    const stream_resp = StreamResponse{
+        .status = 200,
+        .content_type = "text/event-stream",
+        .extra_headers = "X-Accel-Buffering: no\r\n",
+    };
+    const action: Action = .{ .stream = stream_resp };
+
+    switch (action) {
+        .continue_request => try std.testing.expect(false),
+        .send_response => try std.testing.expect(false),
+        .reject => try std.testing.expect(false),
+        .stream => |s| {
+            try std.testing.expectEqual(@as(u16, 200), s.status);
+            try std.testing.expectEqualStrings("text/event-stream", s.content_type);
+            try std.testing.expectEqualStrings("X-Accel-Buffering: no\r\n", s.extra_headers);
+        },
+    }
+}
+
+test "StreamResponse extra_headers with multiple headers" {
+    // Multiple extra headers for SSE streaming
+    const resp = StreamResponse{
+        .status = 200,
+        .content_type = "text/event-stream",
+        .extra_headers = "Cache-Control: no-cache\r\nConnection: keep-alive\r\nX-Accel-Buffering: no\r\n",
+    };
+    try std.testing.expectEqualStrings(
+        "Cache-Control: no-cache\r\nConnection: keep-alive\r\nX-Accel-Buffering: no\r\n",
+        resp.extra_headers,
+    );
 }
 
 // =============================================================================
@@ -477,6 +578,7 @@ test "Action reject variant" {
             try std.testing.expectEqual(@as(u16, 403), r.status);
             try std.testing.expectEqualStrings("WAF blocked", r.reason);
         },
+        .stream => try std.testing.expect(false),
     }
 }
 
@@ -486,6 +588,7 @@ test "Action switch coverage" {
         .continue_request,
         .{ .send_response = DirectResponse{ .status = 200 } },
         .{ .reject = RejectResponse{ .status = 403 } },
+        .{ .stream = StreamResponse{ .status = 200 } },
     };
 
     for (actions) |action| {
@@ -493,6 +596,7 @@ test "Action switch coverage" {
             .continue_request => "continue",
             .send_response => "response",
             .reject => "reject",
+            .stream => "stream",
         };
         try std.testing.expect(desc.len > 0);
     }
