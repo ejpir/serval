@@ -13,7 +13,7 @@ const serval_client = @import("serval-client");
 const serval_core = @import("serval-core");
 const serval_net = @import("serval-net");
 const gateway = @import("serval-gateway");
-const resolver_mod = @import("resolver.zig");
+const resolver_mod = @import("resolver/mod.zig");
 
 const Client = serval_client.Client;
 const Upstream = serval_core.types.Upstream;
@@ -98,15 +98,18 @@ pub const DataPlaneClient = struct {
     /// Resolved backends buffer (TigerStyle S7: bounded).
     resolved_backends: [gateway.config.MAX_RESOLVED_BACKENDS]ResolvedBackend,
 
-    /// Initialize data plane client.
+    /// Create data plane client on heap.
     ///
+    /// TigerStyle C3: Large struct (~1MB) must be heap-allocated.
     /// TigerStyle S1: Assertions for preconditions.
-    /// TigerStyle S5: Fixed buffers, no runtime allocation.
-    pub fn init(allocator: std.mem.Allocator, admin_host: []const u8, admin_port: u16) Self {
+    pub fn create(allocator: std.mem.Allocator, admin_host: []const u8, admin_port: u16) !*Self {
         assert(admin_port > 0); // S1: precondition - valid port
         assert(admin_host.len > 0); // S1: precondition - non-empty host
 
-        return Self{
+        const self = try allocator.create(Self);
+        errdefer allocator.destroy(self);
+
+        self.* = Self{
             .allocator = allocator,
             .admin_port = admin_port,
             .admin_host = admin_host,
@@ -114,20 +117,23 @@ pub const DataPlaneClient = struct {
             .response_header_buffer = undefined,
             .resolved_backends = undefined,
         };
+
+        return self;
     }
 
-    /// Initialize data plane client with default localhost host.
+    /// Create data plane client with default localhost host.
     ///
+    /// TigerStyle C3: Large struct (~1MB) must be heap-allocated.
     /// TigerStyle S1: Assertions for preconditions.
-    pub fn initLocalhost(allocator: std.mem.Allocator, admin_port: u16) Self {
-        return init(allocator, "127.0.0.1", admin_port);
+    pub fn createLocalhost(allocator: std.mem.Allocator, admin_port: u16) !*Self {
+        return create(allocator, "127.0.0.1", admin_port);
     }
 
-    /// Deinitialize client resources.
-    /// TigerStyle: Explicit cleanup, pairs with init.
-    pub fn deinit(self: *Self) void {
-        _ = self;
-        // No resources to free - fixed buffers only
+    /// Destroy client and free heap memory.
+    ///
+    /// TigerStyle: Explicit cleanup, pairs with create.
+    pub fn destroy(self: *Self) void {
+        self.allocator.destroy(self);
     }
 
     /// Push configuration to data plane.
@@ -267,6 +273,7 @@ pub const DataPlaneClient = struct {
     /// Send config JSON to data plane admin API.
     ///
     /// TigerStyle: Uses serval-client for HTTP, explicit error handling.
+    /// TigerStyle Y1: Refactored to stay under 70 lines by extracting buildConfigRequest.
     fn sendConfigRequest(
         self: *Self,
         json_body: []const u8,
@@ -301,38 +308,19 @@ pub const DataPlaneClient = struct {
         };
         defer connect_result.conn.close();
 
-        // Format Content-Length value into stable buffer
+        // Build and send request
         var content_len_buf: [16]u8 = undefined;
-        const content_len_str = std.fmt.bufPrint(&content_len_buf, "{d}", .{json_body.len}) catch {
-            return DataPlaneError.SendFailed;
-        };
+        const request = buildConfigRequest(
+            self.admin_host,
+            json_body,
+            &content_len_buf,
+        ) orelse return DataPlaneError.SendFailed;
 
-        // Build request with Content-Type and Content-Length headers
-        var header_map = serval_core.types.HeaderMap.init();
-        header_map.put("Host", self.admin_host) catch {
-            return DataPlaneError.SendFailed;
-        };
-        header_map.put("Content-Type", "application/json") catch {
-            return DataPlaneError.SendFailed;
-        };
-        header_map.put("Content-Length", content_len_str) catch {
-            return DataPlaneError.SendFailed;
-        };
-
-        const request = serval_core.types.Request{
-            .method = .POST,
-            .path = ADMIN_ROUTES_PATH,
-            .version = .@"HTTP/1.1",
-            .headers = header_map,
-            .body = json_body,
-        };
-
-        // Send request
         client.sendRequest(&connect_result.conn, &request, null) catch {
             return DataPlaneError.SendFailed;
         };
 
-        // Read response headers
+        // Read and validate response
         const response = client.readResponseHeaders(
             &connect_result.conn,
             &self.response_header_buffer,
@@ -340,7 +328,6 @@ pub const DataPlaneClient = struct {
             return DataPlaneError.ReceiveFailed;
         };
 
-        // Check response status (expect 2xx)
         if (response.status < 200 or response.status >= 300) {
             return DataPlaneError.Rejected;
         }
@@ -350,27 +337,63 @@ pub const DataPlaneClient = struct {
     }
 };
 
+/// Build HTTP request for config push.
+///
+/// TigerStyle Y1: Extracted from sendConfigRequest to meet 70-line limit.
+/// TigerStyle S1: Assertions for preconditions.
+fn buildConfigRequest(
+    host: []const u8,
+    json_body: []const u8,
+    content_len_buf: *[16]u8,
+) ?serval_core.types.Request {
+    // S1: preconditions
+    assert(host.len > 0);
+    assert(json_body.len > 0);
+
+    // Format Content-Length value
+    const content_len_str = std.fmt.bufPrint(content_len_buf, "{d}", .{json_body.len}) catch {
+        return null;
+    };
+
+    // Build headers
+    var header_map = serval_core.types.HeaderMap.init();
+    header_map.put("Host", host) catch return null;
+    header_map.put("Content-Type", "application/json") catch return null;
+    header_map.put("Content-Length", content_len_str) catch return null;
+
+    // S2: postcondition - headers populated
+    assert(header_map.entries_len > 0);
+
+    return serval_core.types.Request{
+        .method = .POST,
+        .path = ADMIN_ROUTES_PATH,
+        .version = .@"HTTP/1.1",
+        .headers = header_map,
+        .body = json_body,
+    };
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
 
-test "DataPlaneClient init with custom host and port" {
-    var client = DataPlaneClient.init(std.testing.allocator, "10.0.0.1", 9901);
-    defer client.deinit();
+test "DataPlaneClient create with custom host and port" {
+    const client = try DataPlaneClient.create(std.testing.allocator, "10.0.0.1", 9901);
+    defer client.destroy();
     try std.testing.expectEqual(@as(u16, 9901), client.admin_port);
     try std.testing.expectEqualStrings("10.0.0.1", client.admin_host);
 }
 
-test "DataPlaneClient initLocalhost uses 127.0.0.1" {
-    var client = DataPlaneClient.initLocalhost(std.testing.allocator, DEFAULT_ADMIN_PORT);
-    defer client.deinit();
+test "DataPlaneClient createLocalhost uses 127.0.0.1" {
+    const client = try DataPlaneClient.createLocalhost(std.testing.allocator, DEFAULT_ADMIN_PORT);
+    defer client.destroy();
     try std.testing.expectEqual(@as(u16, 9901), client.admin_port);
     try std.testing.expectEqualStrings("127.0.0.1", client.admin_host);
 }
 
-test "DataPlaneClient init with default port" {
-    var client = DataPlaneClient.init(std.testing.allocator, "localhost", DEFAULT_ADMIN_PORT);
-    defer client.deinit();
+test "DataPlaneClient create with default port" {
+    const client = try DataPlaneClient.create(std.testing.allocator, "localhost", DEFAULT_ADMIN_PORT);
+    defer client.destroy();
     try std.testing.expectEqual(@as(u16, 9901), client.admin_port);
 }
 

@@ -82,6 +82,7 @@ pub const AdminHandler = struct {
         _ = ctx;
         _ = response_buf;
         assert(request.path.len > 0); // S1: precondition - non-empty path
+        assert(@intFromPtr(self.ready) != 0); // S1: precondition - ready flag initialized
 
         const path = request.path;
 

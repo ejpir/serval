@@ -18,7 +18,7 @@ const GatewayConfig = gateway.GatewayConfig;
 const core_config = serval_core.config;
 
 const DataPlaneClient = @import("data_plane.zig").DataPlaneClient;
-const Resolver = @import("resolver.zig").Resolver;
+const Resolver = @import("resolver/mod.zig").Resolver;
 const AdminHandler = @import("admin_handler.zig").AdminHandler;
 
 // ============================================================================
@@ -60,11 +60,11 @@ pub const Controller = struct {
     /// Current gateway config (atomic pointer for lock-free access).
     gateway_config: ?*const GatewayConfig,
 
-    /// Data plane client.
-    data_plane_client: DataPlaneClient,
+    /// Data plane client (heap-allocated, TigerStyle C3).
+    data_plane_client: *DataPlaneClient,
 
-    /// Service resolver.
-    resolver: Resolver,
+    /// Service resolver (heap-allocated due to large size ~2.5MB).
+    resolver: *Resolver,
 
     /// Shutdown flag.
     shutdown: std.atomic.Value(bool),
@@ -76,9 +76,23 @@ pub const Controller = struct {
     ///
     /// TigerStyle C3: Large struct (~2.5MB) must be heap-allocated.
     /// TigerStyle S1: Assertions validate port arguments.
-    pub fn create(allocator: std.mem.Allocator, admin_port: u16, data_plane_port: u16) !*Self {
+    pub fn create(
+        allocator: std.mem.Allocator,
+        admin_port: u16,
+        data_plane_host: []const u8,
+        data_plane_port: u16,
+    ) !*Self {
         assert(admin_port > 0); // S1: precondition - valid port
+        assert(data_plane_host.len > 0); // S1: precondition - non-empty host
         assert(data_plane_port > 0); // S1: precondition - valid port
+
+        // Create resolver first (can fail)
+        const resolver = try Resolver.create(allocator);
+        errdefer resolver.destroy();
+
+        // Create data plane client (can fail)
+        const data_plane_client = try DataPlaneClient.create(allocator, data_plane_host, data_plane_port);
+        errdefer data_plane_client.destroy();
 
         const self = try allocator.create(Self);
         errdefer allocator.destroy(self);
@@ -89,8 +103,8 @@ pub const Controller = struct {
             .admin_port = admin_port,
             .data_plane_port = data_plane_port,
             .gateway_config = null,
-            .data_plane_client = DataPlaneClient.initLocalhost(allocator, data_plane_port),
-            .resolver = Resolver.init(),
+            .data_plane_client = data_plane_client,
+            .resolver = resolver,
             .shutdown = std.atomic.Value(bool).init(false),
             .admin_handler = undefined, // Set below after self is initialized
         };
@@ -98,6 +112,9 @@ pub const Controller = struct {
         // Initialize admin handler with pointers to our state
         self.admin_handler = AdminHandler.init(&self.ready, &self.gateway_config);
 
+        assert(self.admin_port > 0); // S1: postcondition - valid admin port
+        assert(self.data_plane_port > 0); // S1: postcondition - valid data plane port
+        assert(!self.ready.load(.acquire)); // S1: postcondition - not ready initially
         return self;
     }
 
@@ -105,8 +122,12 @@ pub const Controller = struct {
     ///
     /// TigerStyle: Explicit cleanup, pairs with create.
     pub fn destroy(self: *Self) void {
+        assert(@intFromPtr(self) != 0); // S1: precondition - valid self pointer
+        assert(@intFromPtr(self.data_plane_client) != 0); // S1: precondition - valid client pointer
+
         self.shutdown.store(true, .release);
-        self.data_plane_client.deinit();
+        self.data_plane_client.destroy();
+        self.resolver.destroy();
         self.allocator.destroy(self);
     }
 
@@ -114,7 +135,7 @@ pub const Controller = struct {
     ///
     /// TigerStyle: Trivial accessor, assertion-exempt.
     pub fn getResolver(self: *Self) *Resolver {
-        return &self.resolver;
+        return self.resolver;
     }
 
     /// Mark the controller as ready.
@@ -200,7 +221,7 @@ pub const Controller = struct {
 // ============================================================================
 
 test "Controller create" {
-    const ctrl = try Controller.create(std.testing.allocator, 9901, 8080);
+    const ctrl = try Controller.create(std.testing.allocator, 9901, "localhost", 8080);
     defer ctrl.destroy();
 
     try std.testing.expectEqual(@as(u16, 9901), ctrl.admin_port);
@@ -211,7 +232,7 @@ test "Controller create" {
 }
 
 test "Controller setReady" {
-    const ctrl = try Controller.create(std.testing.allocator, 9901, 8080);
+    const ctrl = try Controller.create(std.testing.allocator, 9901, "localhost", 8080);
     defer ctrl.destroy();
 
     try std.testing.expectEqual(false, ctrl.isReady());
@@ -224,7 +245,7 @@ test "Controller setReady" {
 }
 
 test "Controller requestShutdown" {
-    const ctrl = try Controller.create(std.testing.allocator, 9901, 8080);
+    const ctrl = try Controller.create(std.testing.allocator, 9901, "localhost", 8080);
     defer ctrl.destroy();
 
     try std.testing.expectEqual(false, ctrl.isShutdown());
@@ -234,7 +255,7 @@ test "Controller requestShutdown" {
 }
 
 test "Controller getResolver" {
-    const ctrl = try Controller.create(std.testing.allocator, 9901, 8080);
+    const ctrl = try Controller.create(std.testing.allocator, 9901, "localhost", 8080);
     defer ctrl.destroy();
 
     const resolver = ctrl.getResolver();
@@ -242,7 +263,7 @@ test "Controller getResolver" {
 }
 
 test "Controller getAdminHandler" {
-    const ctrl = try Controller.create(std.testing.allocator, 9901, 8080);
+    const ctrl = try Controller.create(std.testing.allocator, 9901, "localhost", 8080);
     defer ctrl.destroy();
 
     const handler = ctrl.getAdminHandler();
@@ -250,7 +271,7 @@ test "Controller getAdminHandler" {
 }
 
 test "Controller getAdminPort and getDataPlanePort" {
-    const ctrl = try Controller.create(std.testing.allocator, 9901, 8080);
+    const ctrl = try Controller.create(std.testing.allocator, 9901, "localhost", 8080);
     defer ctrl.destroy();
 
     try std.testing.expectEqual(@as(u16, 9901), ctrl.getAdminPort());
@@ -258,7 +279,7 @@ test "Controller getAdminPort and getDataPlanePort" {
 }
 
 test "Controller getConfig returns null initially" {
-    const ctrl = try Controller.create(std.testing.allocator, 9901, 8080);
+    const ctrl = try Controller.create(std.testing.allocator, 9901, "localhost", 8080);
     defer ctrl.destroy();
 
     try std.testing.expect(ctrl.getConfig() == null);
@@ -269,7 +290,7 @@ test "Controller uses default admin port from config" {
     const default_port = core_config.DEFAULT_ADMIN_PORT;
     try std.testing.expectEqual(@as(u16, 9901), default_port);
 
-    const ctrl = try Controller.create(std.testing.allocator, default_port, 8080);
+    const ctrl = try Controller.create(std.testing.allocator, default_port, "localhost", 8080);
     defer ctrl.destroy();
 
     try std.testing.expectEqual(default_port, ctrl.admin_port);

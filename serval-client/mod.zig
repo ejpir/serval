@@ -27,8 +27,14 @@ pub const readResponseHeaders = response.readResponseHeaders;
 pub const HeaderBytesResult = response.HeaderBytesResult;
 pub const readHeaderBytes = response.readHeaderBytes;
 
+// Body reading
+pub const body = @import("body.zig");
+pub const BodyReader = body.BodyReader;
+pub const BodyError = body.BodyError;
+
 test {
     _ = @import("client.zig");
     _ = @import("request.zig");
     _ = @import("response.zig");
+    _ = @import("body.zig");
 }

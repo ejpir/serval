@@ -110,6 +110,50 @@ pub const ClientError = error{
 // Client
 // =============================================================================
 
+/// Pre-allocated buffers for K8s client operations.
+/// TigerStyle: Explicit resource ownership, allocated once at init.
+const Buffers = struct {
+    token: []u8,
+    namespace: []u8,
+    header: []u8,
+    response: []u8,
+};
+
+/// Allocate all buffers needed for K8s client.
+/// TigerStyle: All allocations in one place, explicit error handling.
+fn allocateBuffers(allocator: std.mem.Allocator) ClientError!Buffers {
+    // Allocate token buffer
+    const token_buf = allocator.alloc(u8, MAX_TOKEN_SIZE_BYTES) catch return ClientError.OutOfMemory;
+    errdefer allocator.free(token_buf);
+
+    // Allocate namespace buffer
+    const namespace_buf = allocator.alloc(u8, MAX_NAMESPACE_LEN) catch return ClientError.OutOfMemory;
+    errdefer allocator.free(namespace_buf);
+
+    // Allocate header buffer
+    const header_buf = allocator.alloc(u8, HTTP_HEADER_BUFFER_SIZE) catch return ClientError.OutOfMemory;
+    errdefer allocator.free(header_buf);
+
+    // Allocate response buffer
+    const response_buf = allocator.alloc(u8, MAX_RESPONSE_SIZE_BYTES) catch return ClientError.OutOfMemory;
+
+    return .{
+        .token = token_buf,
+        .namespace = namespace_buf,
+        .header = header_buf,
+        .response = response_buf,
+    };
+}
+
+/// Free all buffers in the Buffers struct.
+/// TigerStyle: Symmetric with allocateBuffers for clean error handling.
+fn freeBuffers(allocator: std.mem.Allocator, bufs: Buffers) void {
+    allocator.free(bufs.response);
+    allocator.free(bufs.header);
+    allocator.free(bufs.namespace);
+    allocator.free(bufs.token);
+}
+
 /// Kubernetes API HTTP client.
 /// Manages authentication via ServiceAccount token and provides methods
 /// for GET requests and watch streams.
@@ -149,31 +193,19 @@ pub const Client = struct {
         const self = allocator.create(Self) catch return ClientError.OutOfMemory;
         errdefer allocator.destroy(self);
 
-        // Allocate token buffer
-        const token_buf = allocator.alloc(u8, MAX_TOKEN_SIZE_BYTES) catch return ClientError.OutOfMemory;
-        errdefer allocator.free(token_buf);
-
-        // Allocate namespace buffer
-        const namespace_buf = allocator.alloc(u8, MAX_NAMESPACE_LEN) catch return ClientError.OutOfMemory;
-        errdefer allocator.free(namespace_buf);
-
-        // Allocate header buffer
-        const header_buf = allocator.alloc(u8, HTTP_HEADER_BUFFER_SIZE) catch return ClientError.OutOfMemory;
-        errdefer allocator.free(header_buf);
-
-        // Allocate response buffer
-        const response_buf = allocator.alloc(u8, MAX_RESPONSE_SIZE_BYTES) catch return ClientError.OutOfMemory;
-        errdefer allocator.free(response_buf);
+        // Allocate all buffers
+        const bufs = try allocateBuffers(allocator);
+        errdefer freeBuffers(allocator, bufs);
 
         // Read token from filesystem
-        const token_len = readFileIntoBuffer(SA_TOKEN_PATH, token_buf) catch {
+        const token_len = readFileIntoBuffer(SA_TOKEN_PATH, bufs.token) catch {
             return ClientError.TokenNotFound;
         };
         if (token_len == 0) return ClientError.TokenNotFound;
         if (token_len > MAX_TOKEN_SIZE_BYTES) return ClientError.TokenTooLarge;
 
         // Read namespace from filesystem
-        const namespace_len = readFileIntoBuffer(SA_NAMESPACE_PATH, namespace_buf) catch {
+        const namespace_len = readFileIntoBuffer(SA_NAMESPACE_PATH, bufs.namespace) catch {
             return ClientError.NamespaceNotFound;
         };
         if (namespace_len == 0) return ClientError.NamespaceNotFound;
@@ -191,12 +223,12 @@ pub const Client = struct {
             .allocator = allocator,
             .api_server = DEFAULT_API_SERVER,
             .api_port = DEFAULT_API_PORT,
-            .token = token_buf,
+            .token = bufs.token,
             .token_len = @intCast(token_len),
-            .namespace = namespace_buf,
+            .namespace = bufs.namespace,
             .namespace_len = @intCast(namespace_len),
-            .header_buffer = header_buf,
-            .response_buffer = response_buf,
+            .header_buffer = bufs.header,
+            .response_buffer = bufs.response,
             .ssl_ctx = ssl_ctx,
             .dns_resolver = dns_resolver,
             .http_client = undefined, // Set below
@@ -240,25 +272,13 @@ pub const Client = struct {
         const self = allocator.create(Self) catch return ClientError.OutOfMemory;
         errdefer allocator.destroy(self);
 
-        // Allocate and copy token
-        const token_buf = allocator.alloc(u8, MAX_TOKEN_SIZE_BYTES) catch return ClientError.OutOfMemory;
-        errdefer allocator.free(token_buf);
-        @memcpy(token_buf[0..token.len], token);
+        // Allocate all buffers and copy input data
+        const bufs = try allocateBuffers(allocator);
+        errdefer freeBuffers(allocator, bufs);
+        @memcpy(bufs.token[0..token.len], token);
+        @memcpy(bufs.namespace[0..namespace.len], namespace);
 
-        // Allocate and copy namespace
-        const namespace_buf = allocator.alloc(u8, MAX_NAMESPACE_LEN) catch return ClientError.OutOfMemory;
-        errdefer allocator.free(namespace_buf);
-        @memcpy(namespace_buf[0..namespace.len], namespace);
-
-        // Allocate header buffer
-        const header_buf = allocator.alloc(u8, HTTP_HEADER_BUFFER_SIZE) catch return ClientError.OutOfMemory;
-        errdefer allocator.free(header_buf);
-
-        // Allocate response buffer
-        const response_buf = allocator.alloc(u8, MAX_RESPONSE_SIZE_BYTES) catch return ClientError.OutOfMemory;
-        errdefer allocator.free(response_buf);
-
-        // Copy api_server (we may need to own it for lifetime)
+        // Copy api_server (we need to own it for lifetime)
         const api_server_copy = allocator.dupe(u8, api_server) catch return ClientError.OutOfMemory;
         errdefer allocator.free(api_server_copy);
 
@@ -274,12 +294,12 @@ pub const Client = struct {
             .allocator = allocator,
             .api_server = api_server_copy,
             .api_port = api_port,
-            .token = token_buf,
+            .token = bufs.token,
             .token_len = @intCast(token.len),
-            .namespace = namespace_buf,
+            .namespace = bufs.namespace,
             .namespace_len = @intCast(namespace.len),
-            .header_buffer = header_buf,
-            .response_buffer = response_buf,
+            .header_buffer = bufs.header,
+            .response_buffer = bufs.response,
             .ssl_ctx = ssl_ctx,
             .dns_resolver = dns_resolver,
             .http_client = undefined, // Set below
@@ -393,69 +413,37 @@ pub const Client = struct {
 
     /// Read response body into response_buffer based on body framing.
     /// Returns the slice of data read.
-    /// TigerStyle: Bounded loop, explicit framing handling.
+    /// Uses serval-client BodyReader for proper chunked/content-length handling.
+    /// TigerStyle: Explicit error mapping.
     fn readBody(
         self: *Self,
         conn: *serval_client.client.Connection,
         response: serval_client.ResponseHeaders,
     ) ClientError![]const u8 {
-        var total_read: usize = 0;
-        var iteration: u32 = 0;
+        // S1: Precondition - connection and response are valid
+        assert(self.response_buffer.len > 0); // Buffer must have capacity
 
-        switch (response.body_framing) {
-            .content_length => |content_len| {
-                // Known body size - read exactly content_len bytes
-                const len: usize = @intCast(@min(content_len, MAX_RESPONSE_SIZE_BYTES));
-                if (len > self.response_buffer.len) {
-                    return ClientError.ResponseTooLarge;
-                }
+        var reader = serval_client.BodyReader.init(&conn.socket, response.body_framing);
+        const body = reader.readAll(self.response_buffer) catch |err| {
+            // S6: Explicit error mapping
+            return switch (err) {
+                error.BufferTooSmall => ClientError.ResponseTooLarge,
+                error.UnexpectedEof => ClientError.EmptyResponse,
+                error.IterationLimitExceeded => ClientError.ReadIterationsExceeded,
+                error.InvalidChunkedEncoding => ClientError.ResponseParseFailed,
+                error.ChunkTooLarge => ClientError.ResponseTooLarge,
+                error.ReadFailed => ClientError.RequestFailed,
+                else => ClientError.RequestFailed,
+            };
+        };
 
-                while (total_read < len and iteration < MAX_READ_ITERATIONS) : (iteration += 1) {
-                    const n = conn.socket.read(self.response_buffer[total_read..len]) catch |err| {
-                        if (err == net.SocketError.ConnectionClosed) break;
-                        std.log.debug("K8s client: read failed: {}", .{err});
-                        return ClientError.RequestFailed;
-                    };
-                    if (n == 0) break; // EOF
-                    total_read += n;
-                }
-            },
-            .chunked => {
-                // Chunked encoding - read until connection close
-                // (simplified: read until EOF or buffer full)
-                while (total_read < self.response_buffer.len and iteration < MAX_READ_ITERATIONS) : (iteration += 1) {
-                    const n = conn.socket.read(self.response_buffer[total_read..]) catch |err| {
-                        if (err == net.SocketError.ConnectionClosed or err == net.SocketError.TLSError) break;
-                        std.log.debug("K8s client: read failed: {}", .{err});
-                        return ClientError.RequestFailed;
-                    };
-                    if (n == 0) break; // EOF
-                    total_read += n;
-                }
-                // TODO: Proper chunked decoding if needed
-            },
-            .none => {
-                // No body expected, or read until close (Connection: close)
-                // K8s API typically uses Content-Length, but handle this case
-                while (total_read < self.response_buffer.len and iteration < MAX_READ_ITERATIONS) : (iteration += 1) {
-                    const n = conn.socket.read(self.response_buffer[total_read..]) catch |err| {
-                        if (err == net.SocketError.ConnectionClosed or err == net.SocketError.TLSError) break;
-                        std.log.debug("K8s client: read failed: {}", .{err});
-                        return ClientError.RequestFailed;
-                    };
-                    if (n == 0) break; // EOF
-                    total_read += n;
-                }
-            },
-        }
+        // S2: Postcondition - body slice is within response_buffer bounds
+        assert(@intFromPtr(body.ptr) >= @intFromPtr(self.response_buffer.ptr));
+        assert(body.len <= self.response_buffer.len);
 
-        if (iteration >= MAX_READ_ITERATIONS) {
-            return ClientError.ReadIterationsExceeded;
-        }
+        if (body.len == 0) return ClientError.EmptyResponse;
 
-        if (total_read == 0) return ClientError.EmptyResponse;
-
-        return self.response_buffer[0..total_read];
+        return body;
     }
 
     /// Start a watch request to the K8s API (simplified - single response).

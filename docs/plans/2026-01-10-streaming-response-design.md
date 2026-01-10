@@ -164,6 +164,12 @@ Note: RFC 7230 is obsoleted by RFC 9112, but chunked encoding format is unchange
 | S7 no-unbounded-queues | PASS | Fixed-size buffer, bounded chunk count |
 | Y3 units-in-names | PASS | MAX_STREAM_CHUNK_COUNT (count suffix) |
 
+## Related Designs
+
+- **BodyReader** (`docs/plans/2026-01-10-body-reader-design.md`) - Client-side chunked decoding. BodyReader reads/decodes chunked responses from upstreams; StreamResponse writes/encodes chunked responses to clients. Both use RFC 9112 chunked format but in opposite directions.
+
+- **Shared chunked encoding** - `serval-http/chunked.zig` provides chunk size parsing. The `sendChunk`/`sendFinalChunk` helpers here could potentially move to serval-http for consistency, but are simple enough to keep inline for now.
+
 ## Testing
 
 1. Unit: StreamResponse defaults, chunk formatting

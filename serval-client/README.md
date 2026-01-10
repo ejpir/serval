@@ -83,6 +83,34 @@ const response = try client.readResponseHeaders(&connect_result.conn, &header_bu
 connect_result.conn.close();
 ```
 
+### Body Reading
+
+After reading response headers, use `BodyReader` to consume the response body:
+
+**Buffer entire body (JSON APIs)**
+```zig
+var body_reader = serval_client.BodyReader.init(&result.conn.socket, result.response.body_framing);
+var body_buf: [64 * 1024]u8 = undefined;
+const json = try body_reader.readAll(&body_buf);
+const parsed = try std.json.parseFromSlice(MyType, allocator, json, .{});
+```
+
+**Stream large file to disk**
+```zig
+var body_reader = serval_client.BodyReader.init(&conn.socket, response.body_framing);
+var chunk_buf: [8192]u8 = undefined;
+while (try body_reader.readChunk(&chunk_buf)) |chunk| {
+    try file.writeAll(chunk);
+}
+```
+
+**Forward response body (gateway/proxy)**
+```zig
+var body_reader = serval_client.BodyReader.init(&upstream_socket, response.body_framing);
+var scratch: [16384]u8 = undefined;
+const bytes_forwarded = try body_reader.forwardTo(&client_socket, &scratch);
+```
+
 ### Path Rewriting
 
 ```zig
@@ -151,6 +179,33 @@ pub const ClientError = error{
     InvalidResponseStatus,
     InvalidResponseHeaders,
     ConnectionClosed,
+};
+```
+
+### BodyReader
+
+```zig
+pub const BodyReader = struct {
+    pub fn init(socket: *Socket, framing: BodyFraming) BodyReader;
+    pub fn readAll(self: *BodyReader, buf: []u8) BodyError![]u8;
+    pub fn readChunk(self: *BodyReader, buf: []u8) BodyError!?[]u8;
+    pub fn forwardTo(self: *BodyReader, dst: *Socket, scratch: []u8) BodyError!u64;
+};
+```
+
+### BodyError
+
+```zig
+pub const BodyError = error{
+    ReadFailed,
+    WriteFailed,
+    UnexpectedEof,
+    BufferTooSmall,
+    IterationLimitExceeded,
+    InvalidChunkedEncoding,
+    ChunkTooLarge,
+    SpliceFailed,
+    PipeCreationFailed,
 };
 ```
 

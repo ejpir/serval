@@ -11,174 +11,31 @@ const assert = std.debug.assert;
 const gateway = @import("serval-gateway");
 const gw_config = gateway.config;
 
-// ============================================================================
-// Bounded Array Limits (TigerStyle: explicit bounds, no unbounded growth)
-// ============================================================================
+// Import and re-export types from types.zig
+const resolver_types = @import("types.zig");
 
-/// Maximum endpoints per service (pod instances).
-pub const MAX_ENDPOINTS_PER_SERVICE: u8 = 64;
+pub const MAX_ENDPOINTS_PER_SERVICE = resolver_types.MAX_ENDPOINTS_PER_SERVICE;
+pub const MAX_SERVICES = resolver_types.MAX_SERVICES;
+pub const MAX_SECRETS = resolver_types.MAX_SECRETS;
+pub const MAX_NAME_LEN = resolver_types.MAX_NAME_LEN;
+pub const MAX_IP_LEN = resolver_types.MAX_IP_LEN;
+pub const MAX_CERT_SIZE = resolver_types.MAX_CERT_SIZE;
+pub const MAX_BASE64_INPUT_SIZE = resolver_types.MAX_BASE64_INPUT_SIZE;
 
-/// Maximum services that can be resolved concurrently.
-pub const MAX_SERVICES: u8 = 128;
+pub const ResolverError = resolver_types.ResolverError;
 
-/// Maximum secrets that can be resolved concurrently.
-pub const MAX_SECRETS: u8 = 32;
+// Internal type aliases
+const IpStorage = resolver_types.IpStorage;
+const NameStorage = resolver_types.NameStorage;
+const CertStorage = resolver_types.CertStorage;
+const StoredEndpoint = resolver_types.StoredEndpoint;
+const StoredService = resolver_types.StoredService;
+const StoredSecret = resolver_types.StoredSecret;
 
-/// Maximum length of name/namespace strings.
-pub const MAX_NAME_LEN: u16 = 253; // K8s DNS-1123 subdomain max
-
-/// Maximum length of IP address string (IPv6: 39 chars, IPv4: 15 chars).
-pub const MAX_IP_LEN: u8 = 45; // IPv6 mapped IPv4: "::ffff:xxx.xxx.xxx.xxx"
-
-/// Maximum size of base64-decoded cert/key data.
-pub const MAX_CERT_SIZE: u32 = 16384; // 16KB should cover most certificates
-
-/// Maximum size of base64-encoded input (cert data before decoding).
-pub const MAX_BASE64_INPUT_SIZE: u32 = 22000; // ~16KB * 4/3 for base64 overhead
-
-/// Maximum number of subsets in Endpoints JSON.
-const MAX_SUBSETS: u8 = 8;
-
-/// Maximum number of addresses per subset.
-const MAX_ADDRESSES_PER_SUBSET: u8 = 32;
-
-/// Maximum number of ports per subset.
-const MAX_PORTS_PER_SUBSET: u8 = 8;
-
-// ============================================================================
-// Error Types
-// ============================================================================
-
-pub const ResolverError = error{
-    /// Too many services registered (exceeds MAX_SERVICES).
-    ServiceLimitExceeded,
-    /// Too many secrets registered (exceeds MAX_SECRETS).
-    SecretLimitExceeded,
-    /// Too many endpoints for service (exceeds MAX_ENDPOINTS_PER_SERVICE).
-    EndpointLimitExceeded,
-    /// Name or namespace string too long.
-    NameTooLong,
-    /// Invalid JSON format in Endpoints data.
-    InvalidEndpointsJson,
-    /// Invalid JSON format in Secret data.
-    InvalidSecretJson,
-    /// Secret is not of type kubernetes.io/tls.
-    InvalidSecretType,
-    /// Missing tls.crt in Secret data.
-    MissingTlsCert,
-    /// Missing tls.key in Secret data.
-    MissingTlsKey,
-    /// Base64 decoding failed for cert/key.
-    Base64DecodeFailed,
-    /// Certificate data too large.
-    CertTooLarge,
-    /// IP address string too long.
-    IpTooLong,
-    /// Output buffer too small.
-    BufferTooSmall,
-    /// Service not found in resolver registry.
-    ServiceNotFound,
-};
-
-// ============================================================================
-// Storage Types
-// ============================================================================
-
-/// Fixed-size storage for endpoint IP addresses.
-const IpStorage = [MAX_IP_LEN]u8;
-
-/// Fixed-size storage for name strings.
-const NameStorage = [MAX_NAME_LEN]u8;
-
-/// Fixed-size storage for certificate/key PEM data.
-const CertStorage = [MAX_CERT_SIZE]u8;
-
-/// Stored endpoint with inline IP string.
-const StoredEndpoint = struct {
-    ip_storage: IpStorage,
-    ip_len: u8,
-    port: u16,
-
-    /// Get IP as slice.
-    pub fn ip(self: *const StoredEndpoint) []const u8 {
-        assert(self.ip_len <= MAX_IP_LEN);
-        return self.ip_storage[0..self.ip_len];
-    }
-};
-
-/// Stored service with inline storage.
-const StoredService = struct {
-    name_storage: NameStorage,
-    name_len: u8,
-    namespace_storage: NameStorage,
-    namespace_len: u8,
-    endpoints: [MAX_ENDPOINTS_PER_SERVICE]StoredEndpoint,
-    endpoints_count: u8,
-    active: bool,
-
-    /// Get name as slice.
-    pub fn name(self: *const StoredService) []const u8 {
-        assert(self.name_len <= MAX_NAME_LEN);
-        return self.name_storage[0..self.name_len];
-    }
-
-    /// Get namespace as slice.
-    pub fn namespace(self: *const StoredService) []const u8 {
-        assert(self.namespace_len <= MAX_NAME_LEN);
-        return self.namespace_storage[0..self.namespace_len];
-    }
-
-    /// Check if this service matches name/namespace.
-    pub fn matches(self: *const StoredService, svc_name: []const u8, svc_namespace: []const u8) bool {
-        if (!self.active) return false;
-        return std.mem.eql(u8, self.name(), svc_name) and
-            std.mem.eql(u8, self.namespace(), svc_namespace);
-    }
-};
-
-/// Stored secret with inline storage.
-const StoredSecret = struct {
-    name_storage: NameStorage,
-    name_len: u8,
-    namespace_storage: NameStorage,
-    namespace_len: u8,
-    cert_storage: CertStorage,
-    cert_len: u16,
-    key_storage: CertStorage,
-    key_len: u16,
-    active: bool,
-
-    /// Get name as slice.
-    pub fn name(self: *const StoredSecret) []const u8 {
-        assert(self.name_len <= MAX_NAME_LEN);
-        return self.name_storage[0..self.name_len];
-    }
-
-    /// Get namespace as slice.
-    pub fn namespace(self: *const StoredSecret) []const u8 {
-        assert(self.namespace_len <= MAX_NAME_LEN);
-        return self.namespace_storage[0..self.namespace_len];
-    }
-
-    /// Get certificate PEM as slice.
-    pub fn certPem(self: *const StoredSecret) []const u8 {
-        assert(self.cert_len <= MAX_CERT_SIZE);
-        return self.cert_storage[0..self.cert_len];
-    }
-
-    /// Get key PEM as slice.
-    pub fn keyPem(self: *const StoredSecret) []const u8 {
-        assert(self.key_len <= MAX_CERT_SIZE);
-        return self.key_storage[0..self.key_len];
-    }
-
-    /// Check if this secret matches name/namespace.
-    pub fn matches(self: *const StoredSecret, secret_name: []const u8, secret_namespace: []const u8) bool {
-        if (!self.active) return false;
-        return std.mem.eql(u8, self.name(), secret_name) and
-            std.mem.eql(u8, self.namespace(), secret_namespace);
-    }
-};
+// Import JSON parsing functions from parsing.zig
+const resolver_parsing = @import("parsing.zig");
+const parseEndpointsJson = resolver_parsing.parseEndpointsJson;
+const parseSecretJson = resolver_parsing.parseSecretJson;
 
 // ============================================================================
 // Resolved Types (returned to callers)
@@ -219,7 +76,13 @@ pub const ResolvedSecret = struct {
 
 /// Resource resolver for K8s Services and Secrets.
 /// All storage is pre-allocated; no allocation after init.
+///
+/// TigerStyle C3: Large struct (~2.5MB) must use create/destroy pattern.
+/// Contains [128]StoredService and [32]StoredSecret arrays.
 pub const Resolver = struct {
+    /// Allocator for heap allocation.
+    allocator: std.mem.Allocator,
+
     /// Storage for resolved services.
     services: [MAX_SERVICES]StoredService,
 
@@ -228,12 +91,33 @@ pub const Resolver = struct {
 
     const Self = @This();
 
-    /// Initialize resolver with zeroed storage.
-    pub fn init() Self {
-        return Self{
+    /// Create resolver on heap with zeroed storage.
+    ///
+    /// TigerStyle C3: Large struct (~2.5MB) returned via pointer, not value.
+    /// TigerStyle S1: Allocator must be valid (non-null implied by type).
+    pub fn create(allocator: std.mem.Allocator) !*Self {
+        const self = try allocator.create(Self);
+        errdefer allocator.destroy(self);
+
+        self.* = Self{
+            .allocator = allocator,
             .services = std.mem.zeroes([MAX_SERVICES]StoredService),
             .secrets = std.mem.zeroes([MAX_SECRETS]StoredSecret),
         };
+
+        // S2: postcondition - all storage zeroed means no active entries
+        assert(self.serviceCount() == 0);
+        assert(self.secretCount() == 0);
+
+        return self;
+    }
+
+    /// Destroy resolver and free heap memory.
+    ///
+    /// TigerStyle: Explicit cleanup, pairs with create.
+    pub fn destroy(self: *Self) void {
+        const allocator = self.allocator;
+        allocator.destroy(self);
     }
 
     /// Update service endpoints from K8s Endpoints JSON.
@@ -584,197 +468,20 @@ pub const Resolver = struct {
 };
 
 // ============================================================================
-// JSON Parsing Helpers
-// ============================================================================
-
-/// JSON types for K8s Endpoints parsing.
-const EndpointsJson = struct {
-    subsets: ?[]const SubsetJson = null,
-};
-
-const SubsetJson = struct {
-    addresses: ?[]const AddressJson = null,
-    ports: ?[]const PortJson = null,
-};
-
-const AddressJson = struct {
-    ip: []const u8,
-};
-
-const PortJson = struct {
-    port: u16,
-};
-
-/// JSON types for K8s Secret parsing.
-const SecretJson = struct {
-    type: ?[]const u8 = null,
-    data: ?DataJson = null,
-};
-
-const DataJson = struct {
-    @"tls.crt": ?[]const u8 = null,
-    @"tls.key": ?[]const u8 = null,
-};
-
-/// Parse K8s Endpoints JSON into StoredEndpoint array.
-fn parseEndpointsJson(
-    json_data: []const u8,
-    out_endpoints: *[MAX_ENDPOINTS_PER_SERVICE]StoredEndpoint,
-    out_count: *u8,
-) ResolverError!void {
-    assert(json_data.len > 0);
-
-    const parsed = std.json.parseFromSlice(
-        EndpointsJson,
-        std.heap.page_allocator, // Temporary allocator for parsing only
-        json_data,
-        .{ .ignore_unknown_fields = true },
-    ) catch {
-        return error.InvalidEndpointsJson;
-    };
-    defer parsed.deinit();
-
-    const endpoints = parsed.value;
-    var count: u8 = 0;
-
-    const subsets = endpoints.subsets orelse {
-        out_count.* = 0;
-        return;
-    };
-
-    // Bound loop iterations (TigerStyle: no unbounded loops)
-    const max_subsets = @min(subsets.len, MAX_SUBSETS);
-
-    for (subsets[0..max_subsets]) |subset| {
-        const addresses = subset.addresses orelse continue;
-        const ports = subset.ports orelse continue;
-
-        if (ports.len == 0) continue;
-
-        // Use first port (simplification - full impl would handle named ports)
-        const port = ports[0].port;
-
-        const max_addresses = @min(addresses.len, MAX_ADDRESSES_PER_SUBSET);
-
-        for (addresses[0..max_addresses]) |addr| {
-            if (count >= MAX_ENDPOINTS_PER_SERVICE) {
-                return error.EndpointLimitExceeded;
-            }
-
-            if (addr.ip.len > MAX_IP_LEN) {
-                return error.IpTooLong;
-            }
-
-            var stored = &out_endpoints[count];
-            @memcpy(stored.ip_storage[0..addr.ip.len], addr.ip);
-            stored.ip_len = @intCast(addr.ip.len);
-            stored.port = port;
-            count += 1;
-        }
-    }
-
-    out_count.* = count;
-
-    // Postcondition
-    assert(out_count.* <= MAX_ENDPOINTS_PER_SERVICE);
-}
-
-/// Parse K8s Secret JSON and decode base64 cert/key.
-fn parseSecretJson(
-    json_data: []const u8,
-    out_cert: *CertStorage,
-    out_cert_len: *u16,
-    out_key: *CertStorage,
-    out_key_len: *u16,
-) ResolverError!void {
-    assert(json_data.len > 0);
-
-    const parsed = std.json.parseFromSlice(
-        SecretJson,
-        std.heap.page_allocator, // Temporary allocator for parsing only
-        json_data,
-        .{ .ignore_unknown_fields = true },
-    ) catch {
-        return error.InvalidSecretJson;
-    };
-    defer parsed.deinit();
-
-    const secret = parsed.value;
-
-    // Verify secret type
-    if (secret.type) |secret_type| {
-        if (!std.mem.eql(u8, secret_type, "kubernetes.io/tls")) {
-            return error.InvalidSecretType;
-        }
-    }
-
-    const data = secret.data orelse return error.InvalidSecretJson;
-
-    // Decode certificate
-    const cert_b64 = data.@"tls.crt" orelse return error.MissingTlsCert;
-    if (cert_b64.len > MAX_BASE64_INPUT_SIZE) {
-        return error.CertTooLarge;
-    }
-    const cert_len = decodeBase64(cert_b64, out_cert) catch {
-        return error.Base64DecodeFailed;
-    };
-    if (cert_len > MAX_CERT_SIZE) {
-        return error.CertTooLarge;
-    }
-    out_cert_len.* = @intCast(cert_len);
-
-    // Decode key
-    const key_b64 = data.@"tls.key" orelse return error.MissingTlsKey;
-    if (key_b64.len > MAX_BASE64_INPUT_SIZE) {
-        return error.CertTooLarge;
-    }
-    const key_len = decodeBase64(key_b64, out_key) catch {
-        return error.Base64DecodeFailed;
-    };
-    if (key_len > MAX_CERT_SIZE) {
-        return error.CertTooLarge;
-    }
-    out_key_len.* = @intCast(key_len);
-
-    // Postconditions
-    assert(out_cert_len.* <= MAX_CERT_SIZE);
-    assert(out_key_len.* <= MAX_CERT_SIZE);
-}
-
-/// Decode base64 data into output buffer.
-/// Returns decoded length.
-fn decodeBase64(input: []const u8, output: *CertStorage) !usize {
-    if (input.len == 0) return 0;
-
-    // Calculate expected decoded size
-    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(input) catch {
-        return error.InvalidCharacter;
-    };
-
-    if (decoded_len > MAX_CERT_SIZE) {
-        return error.NoSpaceLeft;
-    }
-
-    // Decode
-    std.base64.standard.Decoder.decode(output[0..decoded_len], input) catch {
-        return error.InvalidCharacter;
-    };
-
-    return decoded_len;
-}
-
-// ============================================================================
 // Unit Tests
 // ============================================================================
 
-test "Resolver init" {
-    const resolver = Resolver.init();
+test "Resolver create and destroy" {
+    const resolver = try Resolver.create(std.testing.allocator);
+    defer resolver.destroy();
+
     try std.testing.expectEqual(@as(u8, 0), resolver.serviceCount());
     try std.testing.expectEqual(@as(u8, 0), resolver.secretCount());
 }
 
 test "Resolver updateService and getService" {
-    var resolver = Resolver.init();
+    const resolver = try Resolver.create(std.testing.allocator);
+    defer resolver.destroy();
 
     const endpoints_json =
         \\{
@@ -818,7 +525,8 @@ test "Resolver updateService and getService" {
 }
 
 test "Resolver getServiceEndpoints" {
-    var resolver = Resolver.init();
+    const resolver = try Resolver.create(std.testing.allocator);
+    defer resolver.destroy();
 
     const endpoints_json =
         \\{
@@ -849,7 +557,8 @@ test "Resolver getServiceEndpoints" {
 }
 
 test "Resolver updateService overwrites existing" {
-    var resolver = Resolver.init();
+    const resolver = try Resolver.create(std.testing.allocator);
+    defer resolver.destroy();
 
     const json1 =
         \\{
@@ -895,7 +604,8 @@ test "Resolver updateService overwrites existing" {
 }
 
 test "Resolver removeService" {
-    var resolver = Resolver.init();
+    const resolver = try Resolver.create(std.testing.allocator);
+    defer resolver.destroy();
 
     const endpoints_json =
         \\{
@@ -918,12 +628,15 @@ test "Resolver removeService" {
 }
 
 test "Resolver getService not found" {
-    const resolver = Resolver.init();
+    const resolver = try Resolver.create(std.testing.allocator);
+    defer resolver.destroy();
+
     try std.testing.expect(resolver.getService("nonexistent", "ns") == null);
 }
 
 test "Resolver updateSecret and getSecret" {
-    var resolver = Resolver.init();
+    const resolver = try Resolver.create(std.testing.allocator);
+    defer resolver.destroy();
 
     // Base64 encode test cert/key
     const cert_plain = "-----BEGIN CERTIFICATE-----\ntest-cert\n-----END CERTIFICATE-----";
@@ -959,7 +672,8 @@ test "Resolver updateSecret and getSecret" {
 }
 
 test "Resolver removeSecret" {
-    var resolver = Resolver.init();
+    const resolver = try Resolver.create(std.testing.allocator);
+    defer resolver.destroy();
 
     const cert_plain = "cert-data";
     const key_plain = "key-data";
@@ -990,12 +704,15 @@ test "Resolver removeSecret" {
 }
 
 test "Resolver getSecret not found" {
-    const resolver = Resolver.init();
+    const resolver = try Resolver.create(std.testing.allocator);
+    defer resolver.destroy();
+
     try std.testing.expect(resolver.getSecret("nonexistent", "ns") == null);
 }
 
 test "Resolver resolveBackendRef" {
-    var resolver = Resolver.init();
+    const resolver = try Resolver.create(std.testing.allocator);
+    defer resolver.destroy();
 
     const endpoints_json =
         \\{
@@ -1031,7 +748,8 @@ test "Resolver resolveBackendRef" {
 }
 
 test "Resolver resolveBackendRef not found" {
-    const resolver = Resolver.init();
+    const resolver = try Resolver.create(std.testing.allocator);
+    defer resolver.destroy();
 
     const backend_ref = gw_config.BackendRef{
         .name = "nonexistent",
@@ -1043,137 +761,6 @@ test "Resolver resolveBackendRef not found" {
     const count = resolver.resolveBackendRef(&backend_ref, &upstreams);
 
     try std.testing.expectEqual(@as(u8, 0), count);
-}
-
-test "parseEndpointsJson empty subsets" {
-    var endpoints: [MAX_ENDPOINTS_PER_SERVICE]StoredEndpoint = undefined;
-    var count: u8 = 0;
-
-    const json = "{}";
-    try parseEndpointsJson(json, &endpoints, &count);
-    try std.testing.expectEqual(@as(u8, 0), count);
-}
-
-test "parseEndpointsJson multiple subsets" {
-    var endpoints: [MAX_ENDPOINTS_PER_SERVICE]StoredEndpoint = undefined;
-    var count: u8 = 0;
-
-    const json =
-        \\{
-        \\  "subsets": [
-        \\    {
-        \\      "addresses": [{ "ip": "10.0.1.1" }],
-        \\      "ports": [{ "port": 8080 }]
-        \\    },
-        \\    {
-        \\      "addresses": [{ "ip": "10.0.2.1" }],
-        \\      "ports": [{ "port": 9090 }]
-        \\    }
-        \\  ]
-        \\}
-    ;
-
-    try parseEndpointsJson(json, &endpoints, &count);
-    try std.testing.expectEqual(@as(u8, 2), count);
-    try std.testing.expectEqualStrings("10.0.1.1", endpoints[0].ip());
-    try std.testing.expectEqual(@as(u16, 8080), endpoints[0].port);
-    try std.testing.expectEqualStrings("10.0.2.1", endpoints[1].ip());
-    try std.testing.expectEqual(@as(u16, 9090), endpoints[1].port);
-}
-
-test "parseEndpointsJson invalid JSON" {
-    var endpoints: [MAX_ENDPOINTS_PER_SERVICE]StoredEndpoint = undefined;
-    var count: u8 = 0;
-
-    const json = "not valid json";
-    try std.testing.expectError(error.InvalidEndpointsJson, parseEndpointsJson(json, &endpoints, &count));
-}
-
-test "parseSecretJson missing tls.crt" {
-    var cert: CertStorage = undefined;
-    var cert_len: u16 = 0;
-    var key: CertStorage = undefined;
-    var key_len: u16 = 0;
-
-    const json =
-        \\{
-        \\  "type": "kubernetes.io/tls",
-        \\  "data": {
-        \\    "tls.key": "a2V5"
-        \\  }
-        \\}
-    ;
-
-    try std.testing.expectError(error.MissingTlsCert, parseSecretJson(json, &cert, &cert_len, &key, &key_len));
-}
-
-test "parseSecretJson missing tls.key" {
-    var cert: CertStorage = undefined;
-    var cert_len: u16 = 0;
-    var key: CertStorage = undefined;
-    var key_len: u16 = 0;
-
-    const json =
-        \\{
-        \\  "type": "kubernetes.io/tls",
-        \\  "data": {
-        \\    "tls.crt": "Y2VydA=="
-        \\  }
-        \\}
-    ;
-
-    try std.testing.expectError(error.MissingTlsKey, parseSecretJson(json, &cert, &cert_len, &key, &key_len));
-}
-
-test "parseSecretJson invalid type" {
-    var cert: CertStorage = undefined;
-    var cert_len: u16 = 0;
-    var key: CertStorage = undefined;
-    var key_len: u16 = 0;
-
-    const json =
-        \\{
-        \\  "type": "Opaque",
-        \\  "data": {
-        \\    "tls.crt": "Y2VydA==",
-        \\    "tls.key": "a2V5"
-        \\  }
-        \\}
-    ;
-
-    try std.testing.expectError(error.InvalidSecretType, parseSecretJson(json, &cert, &cert_len, &key, &key_len));
-}
-
-test "parseSecretJson invalid base64" {
-    var cert: CertStorage = undefined;
-    var cert_len: u16 = 0;
-    var key: CertStorage = undefined;
-    var key_len: u16 = 0;
-
-    const json =
-        \\{
-        \\  "type": "kubernetes.io/tls",
-        \\  "data": {
-        \\    "tls.crt": "not-valid-base64!!!",
-        \\    "tls.key": "a2V5"
-        \\  }
-        \\}
-    ;
-
-    try std.testing.expectError(error.Base64DecodeFailed, parseSecretJson(json, &cert, &cert_len, &key, &key_len));
-}
-
-test "decodeBase64 empty input" {
-    var output: CertStorage = undefined;
-    const len = try decodeBase64("", &output);
-    try std.testing.expectEqual(@as(usize, 0), len);
-}
-
-test "decodeBase64 valid input" {
-    var output: CertStorage = undefined;
-    const len = try decodeBase64("SGVsbG8gV29ybGQ=", &output);
-    try std.testing.expectEqual(@as(usize, 11), len);
-    try std.testing.expectEqualStrings("Hello World", output[0..len]);
 }
 
 test "MAX constants are within bounds" {
@@ -1188,7 +775,8 @@ test "MAX constants are within bounds" {
 }
 
 test "Resolver multiple services" {
-    var resolver = Resolver.init();
+    const resolver = try Resolver.create(std.testing.allocator);
+    defer resolver.destroy();
 
     const json1 =
         \\{
@@ -1221,7 +809,8 @@ test "Resolver multiple services" {
 }
 
 test "Resolver slot reuse after remove" {
-    var resolver = Resolver.init();
+    const resolver = try Resolver.create(std.testing.allocator);
+    defer resolver.destroy();
 
     const json =
         \\{
@@ -1245,7 +834,8 @@ test "Resolver slot reuse after remove" {
 }
 
 test "Resolver resolveBackend" {
-    var resolver = Resolver.init();
+    const resolver = try Resolver.create(std.testing.allocator);
+    defer resolver.destroy();
 
     const endpoints_json =
         \\{
@@ -1278,7 +868,8 @@ test "Resolver resolveBackend" {
 }
 
 test "Resolver resolveBackend not found" {
-    const resolver = Resolver.init();
+    const resolver = try Resolver.create(std.testing.allocator);
+    defer resolver.destroy();
 
     var resolved: gw_config.ResolvedBackend = undefined;
     try std.testing.expectError(error.ServiceNotFound, resolver.resolveBackend("nonexistent", "ns", &resolved));
