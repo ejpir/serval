@@ -66,6 +66,11 @@ pub const CHUNK_BUFFER_SIZE_BYTES: u32 = 8192;
 /// TigerStyle S3: Bounded loop limit.
 pub const MAX_CHUNK_ITERATIONS: u32 = 1024 * 1024;
 
+/// Maximum chunks for streaming response callbacks.
+/// TigerStyle S3: Bounded loop limit for handler-generated streams.
+/// 64K chunks * 8KB buffer = 512MB max streamed response.
+pub const MAX_STREAM_CHUNK_COUNT: u32 = 65536;
+
 /// Buffer size for direct response handlers (echo backends, health checks, etc.)
 /// Only allocated when handler implements onRequest hook.
 /// TigerStyle: Sized for typical API/debug responses, bounded.
