@@ -357,6 +357,110 @@ curl -H "Host: test.example.com" http://localhost:8080/api/test
 | Memory allocations | Runtime | Zero after init |
 | Observability | CloudWatch | Built-in metrics |
 
+### Migrating from ALB + Envoy
+
+Common architecture to replace:
+
+```
+Current:
+┌─────┐     ┌─────┐     ┌───────────────────┐     ┌──────────┐
+│ CDN │────▶│ ALB │────▶│ Envoy (K8s)       │────▶│ Backends │
+└─────┘     └─────┘     │ Fargate/Karpenter │     └──────────┘
+                        └───────────────────┘
+```
+
+**Option A: Replace ALB + Envoy with serval**
+
+```
+┌─────┐     ┌─────┐     ┌───────────────────┐     ┌──────────┐
+│ CDN │────▶│ NLB │────▶│ serval-router     │────▶│ Backends │
+└─────┘     └─────┘     │ (K8s)             │     └──────────┘
+                        └───────────────────┘
+```
+
+NLB does TCP passthrough, serval handles L7 routing.
+
+**Option B: Eliminate load balancer entirely**
+
+If your CDN supports multiple origin IPs (CloudFront, Cloudflare, Fastly):
+
+```
+┌─────┐     ┌───────────────────────────────┐     ┌──────────┐
+│ CDN │────▶│ serval-router (hostNetwork)   │────▶│ Backends │
+└─────┘     │ CDN points to node IPs        │     └──────────┘
+            └───────────────────────────────┘
+```
+
+```yaml
+# DaemonSet with hostNetwork - no NLB needed
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: serval-router
+spec:
+  template:
+    spec:
+      hostNetwork: true  # Binds to node IP directly
+      containers:
+      - name: router
+        ports:
+        - containerPort: 80
+          hostPort: 80
+```
+
+Configure CDN origin to your node IPs (Route53 health checks for failover).
+
+**Option C: Keep NLB, replace only Envoy**
+
+```
+┌─────┐     ┌─────┐     ┌───────────────────┐     ┌──────────┐
+│ CDN │────▶│ NLB │────▶│ serval-router     │────▶│ Backends │
+└─────┘     │(existing)│ │ (replaces Envoy)  │     └──────────┘
+            └─────┘     └───────────────────┘
+```
+
+Just swap Envoy pods for serval pods, keep existing NLB.
+
+### Migration Path
+
+```
+Phase 1: Current
+  CDN → ALB → Envoy → Backends
+
+Phase 2: Deploy serval alongside (shadow/canary)
+  CDN → ALB → Envoy → Backends
+                ↓
+          serval-router (shadow traffic, compare responses)
+
+Phase 3: Switch traffic
+  CDN → NLB → serval-router → Backends
+
+Phase 4: Cleanup
+  - Remove ALB
+  - Remove Envoy pods
+  - Optional: Remove NLB if CDN supports direct origin
+```
+
+### CDN Compatibility
+
+| CDN | Skip NLB? | How |
+|-----|-----------|-----|
+| CloudFront | Yes | Origin group with multiple IPs + health checks |
+| Cloudflare | Yes | Load balancing across origins |
+| Fastly | Yes | Multiple backends with health checks |
+| Akamai | Yes | Origin failover groups |
+
+### Cost Comparison
+
+| Component | Hourly Cost (us-east-1) |
+|-----------|------------------------|
+| ALB | ~$0.0225/hr + LCU |
+| NLB | ~$0.0225/hr + LCU |
+| serval on Fargate | ~$0.01/hr (256MB) |
+| serval hostNetwork | $0 (runs on existing nodes) |
+
+Eliminating ALB/NLB saves ~$16-20/month per load balancer plus LCU charges.
+
 ## Features
 
 - **Gateway API v1 Support**: Watches GatewayClass, Gateway, and HTTPRoute resources
