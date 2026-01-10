@@ -153,6 +153,7 @@ pub fn send501NotImplemented(io: Io, stream: Io.net.Stream, message: []const u8)
 const types = @import("serval-core").types;
 const DirectResponse = types.DirectResponse;
 const ResponseMode = types.ResponseMode;
+const StreamResponse = types.StreamResponse;
 const DIRECT_RESPONSE_HEADER_SIZE_BYTES = config.DIRECT_RESPONSE_HEADER_SIZE_BYTES;
 
 /// Send a direct response from handler without forwarding to upstream.
@@ -233,6 +234,100 @@ fn sendDirectResponseChunked(io: Io, stream: Io.net.Stream, resp: DirectResponse
     writer.interface.writeAll(resp.body) catch return;
     writer.interface.writeAll(chunk_terminator) catch return;
     writer.interface.flush() catch return;
+}
+
+// =============================================================================
+// Streaming Response Helpers (for chunked Transfer-Encoding)
+// =============================================================================
+
+/// Maximum hex digits for chunk size: u64 max = 16 hex chars + \r\n = 18 bytes.
+/// TigerStyle: Named constant with units, explicitly sized for max chunk header.
+const CHUNK_HEADER_SIZE_BYTES: u32 = 20;
+
+/// Send chunked transfer encoding headers for streaming response.
+/// RFC 9112 Section 7.1: MUST include Transfer-Encoding: chunked.
+/// RFC 9112 Section 6.2: MUST NOT include Content-Length with chunked.
+/// TigerStyle: Pure function, explicit I/O parameter, no hidden state.
+///
+/// Parameters:
+/// - writer: Write interface (supports TLS or plain socket via duck typing)
+/// - resp: StreamResponse with status, content_type, extra_headers
+///
+/// Returns: void on success, error on write failure.
+pub fn sendStreamHeaders(writer: anytype, resp: StreamResponse) !void {
+    // S1: Preconditions - valid HTTP status code range (100-599)
+    assert(resp.status >= 100 and resp.status < 600);
+    // S1: Precondition - content_type must be non-empty
+    assert(resp.content_type.len > 0);
+    // S1: Precondition - extra_headers must end with \r\n if non-empty
+    assert(resp.extra_headers.len == 0 or std.mem.endsWith(u8, resp.extra_headers, "\r\n"));
+
+    // Format HTTP response headers with Transfer-Encoding: chunked
+    // NOTE: Content-Length is intentionally omitted per RFC 9112
+    var header_buf: [DIRECT_RESPONSE_HEADER_SIZE_BYTES]u8 = std.mem.zeroes([DIRECT_RESPONSE_HEADER_SIZE_BYTES]u8);
+    const headers = std.fmt.bufPrint(
+        &header_buf,
+        "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nTransfer-Encoding: chunked\r\n{s}\r\n",
+        .{ resp.status, statusText(resp.status), resp.content_type, resp.extra_headers },
+    ) catch return error.HeadersTooLarge;
+
+    // S2: Postcondition - headers end with double CRLF (valid HTTP header block)
+    assert(std.mem.endsWith(u8, headers, "\r\n\r\n"));
+
+    try writer.writeAll(headers);
+}
+
+/// Send a single chunk in chunked transfer encoding format.
+/// RFC 9112 Section 7.1: chunk = chunk-size CRLF chunk-data CRLF
+/// Format: "{hex length}\r\n{data}\r\n"
+/// TigerStyle: Pure function, explicit parameters, bounded buffer.
+///
+/// Parameters:
+/// - writer: Write interface (supports TLS or plain socket via duck typing)
+/// - data: Chunk data to send (must be non-empty for mid-stream chunks)
+///
+/// Returns: void on success, error on write failure.
+pub fn sendChunk(writer: anytype, data: []const u8) !void {
+    // S1: Precondition - don't send empty chunks mid-stream
+    // Empty chunks are only valid as final chunk (sendFinalChunk handles that)
+    assert(data.len > 0);
+
+    // Format chunk header: hex length + CRLF
+    // u64 max fits in 16 hex chars, plus 2 for CRLF = 18, buffer is 20 for safety
+    var chunk_header_buf: [CHUNK_HEADER_SIZE_BYTES]u8 = std.mem.zeroes([CHUNK_HEADER_SIZE_BYTES]u8);
+    const chunk_header = std.fmt.bufPrint(
+        &chunk_header_buf,
+        "{x}\r\n",
+        .{data.len},
+    ) catch return error.ChunkHeaderFormatFailed;
+
+    // Write: chunk-header, data, trailing CRLF
+    try writer.writeAll(chunk_header);
+    try writer.writeAll(data);
+    try writer.writeAll("\r\n");
+}
+
+/// Send final chunk to terminate chunked transfer encoding.
+/// RFC 9112 Section 7.1: last-chunk = 1*"0" CRLF
+/// Followed by optional trailer and final CRLF.
+/// Format: "0\r\n\r\n" (zero-length chunk without trailers)
+/// TigerStyle: Pure function, explicit parameter, constant output.
+///
+/// Parameters:
+/// - writer: Write interface (supports TLS or plain socket via duck typing)
+///
+/// Returns: void on success, error on write failure.
+pub fn sendFinalChunk(writer: anytype) !void {
+    // RFC 9112: Final chunk is "0\r\n" followed by optional trailer-section and final CRLF.
+    // Without trailers: "0\r\n\r\n" (5 bytes total)
+    const final_chunk = "0\r\n\r\n";
+
+    // S2: Postcondition - final chunk has correct format
+    assert(final_chunk.len == 5);
+    assert(std.mem.startsWith(u8, final_chunk, "0\r\n"));
+    assert(std.mem.endsWith(u8, final_chunk, "\r\n\r\n"));
+
+    try writer.writeAll(final_chunk);
 }
 
 // =============================================================================
@@ -350,4 +445,168 @@ test "DirectResponse content_length mode is default" {
     };
 
     try std.testing.expect(resp.response_mode == .content_length);
+}
+
+// =============================================================================
+// Streaming Response Helper Tests
+// =============================================================================
+
+/// Mock writer for testing streaming helpers.
+/// Captures all writes to an internal buffer for verification.
+/// TigerStyle: Bounded buffer, explicit size.
+const MockWriter = struct {
+    const BUFFER_SIZE: usize = 4096;
+    buffer: [BUFFER_SIZE]u8 = std.mem.zeroes([BUFFER_SIZE]u8),
+    pos: usize = 0,
+    write_count: u32 = 0,
+
+    pub fn writeAll(self: *MockWriter, data: []const u8) !void {
+        if (self.pos + data.len > BUFFER_SIZE) {
+            return error.BufferOverflow;
+        }
+        @memcpy(self.buffer[self.pos..][0..data.len], data);
+        self.pos += data.len;
+        self.write_count += 1;
+    }
+
+    pub fn written(self: *const MockWriter) []const u8 {
+        return self.buffer[0..self.pos];
+    }
+
+    pub fn reset(self: *MockWriter) void {
+        self.pos = 0;
+        self.write_count = 0;
+        @memset(&self.buffer, 0);
+    }
+};
+
+test "sendStreamHeaders formats headers correctly" {
+    var writer = MockWriter{};
+    const resp = StreamResponse{
+        .status = 200,
+        .content_type = "text/event-stream",
+        .extra_headers = "",
+    };
+
+    try sendStreamHeaders(&writer, resp);
+
+    const expected = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+    try std.testing.expectEqualStrings(expected, writer.written());
+}
+
+test "sendStreamHeaders includes extra headers" {
+    var writer = MockWriter{};
+    const resp = StreamResponse{
+        .status = 200,
+        .content_type = "application/json",
+        .extra_headers = "Cache-Control: no-cache\r\n",
+    };
+
+    try sendStreamHeaders(&writer, resp);
+
+    const expected = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nCache-Control: no-cache\r\n\r\n";
+    try std.testing.expectEqualStrings(expected, writer.written());
+}
+
+test "sendStreamHeaders with non-200 status" {
+    var writer = MockWriter{};
+    const resp = StreamResponse{
+        .status = 206,
+        .content_type = "video/mp4",
+        .extra_headers = "",
+    };
+
+    try sendStreamHeaders(&writer, resp);
+
+    const expected = "HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\nTransfer-Encoding: chunked\r\n\r\n";
+    try std.testing.expectEqualStrings(expected, writer.written());
+}
+
+test "sendChunk formats small chunk correctly" {
+    var writer = MockWriter{};
+    const data = "Hello, World!";
+
+    try sendChunk(&writer, data);
+
+    // "Hello, World!" is 13 bytes = 0xd in hex
+    const expected = "d\r\nHello, World!\r\n";
+    try std.testing.expectEqualStrings(expected, writer.written());
+}
+
+test "sendChunk formats large chunk correctly" {
+    var writer = MockWriter{};
+    // Create 256-byte chunk (0x100 in hex)
+    var data: [256]u8 = undefined;
+    @memset(&data, 'X');
+
+    try sendChunk(&writer, &data);
+
+    // Verify header is "100\r\n"
+    const output = writer.written();
+    try std.testing.expect(std.mem.startsWith(u8, output, "100\r\n"));
+    // Verify trailing CRLF
+    try std.testing.expect(std.mem.endsWith(u8, output, "\r\n"));
+    // Verify total length: 5 (header) + 256 (data) + 2 (trailing CRLF) = 263
+    try std.testing.expectEqual(@as(usize, 263), output.len);
+}
+
+test "sendChunk with single byte" {
+    var writer = MockWriter{};
+    const data = "X";
+
+    try sendChunk(&writer, data);
+
+    const expected = "1\r\nX\r\n";
+    try std.testing.expectEqualStrings(expected, writer.written());
+}
+
+test "sendFinalChunk sends correct terminator" {
+    var writer = MockWriter{};
+
+    try sendFinalChunk(&writer);
+
+    const expected = "0\r\n\r\n";
+    try std.testing.expectEqualStrings(expected, writer.written());
+    try std.testing.expectEqual(@as(usize, 5), writer.written().len);
+}
+
+test "streaming sequence: headers, chunks, final" {
+    var writer = MockWriter{};
+
+    // Send stream headers
+    try sendStreamHeaders(&writer, .{
+        .status = 200,
+        .content_type = "text/plain",
+        .extra_headers = "",
+    });
+
+    // Send two chunks
+    try sendChunk(&writer, "chunk1");
+    try sendChunk(&writer, "chunk2");
+
+    // Send final chunk
+    try sendFinalChunk(&writer);
+
+    const output = writer.written();
+
+    // Verify structure
+    try std.testing.expect(std.mem.indexOf(u8, output, "Transfer-Encoding: chunked") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "6\r\nchunk1\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "6\r\nchunk2\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, output, "0\r\n\r\n"));
+}
+
+test "sendStreamHeaders multiple extra headers" {
+    var writer = MockWriter{};
+    const resp = StreamResponse{
+        .status = 200,
+        .content_type = "text/event-stream",
+        .extra_headers = "Cache-Control: no-cache\r\nX-Accel-Buffering: no\r\n",
+    };
+
+    try sendStreamHeaders(&writer, resp);
+
+    const output = writer.written();
+    try std.testing.expect(std.mem.indexOf(u8, output, "Cache-Control: no-cache\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "X-Accel-Buffering: no\r\n") != null);
 }
