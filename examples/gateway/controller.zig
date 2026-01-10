@@ -72,14 +72,18 @@ pub const Controller = struct {
     /// Admin handler for serval-server.
     admin_handler: AdminHandler,
 
-    /// Initialize controller.
+    /// Create controller on heap.
     ///
+    /// TigerStyle C3: Large struct (~2.5MB) must be heap-allocated.
     /// TigerStyle S1: Assertions validate port arguments.
-    pub fn init(allocator: std.mem.Allocator, admin_port: u16, data_plane_port: u16) Self {
+    pub fn create(allocator: std.mem.Allocator, admin_port: u16, data_plane_port: u16) !*Self {
         assert(admin_port > 0); // S1: precondition - valid port
         assert(data_plane_port > 0); // S1: precondition - valid port
 
-        var self = Self{
+        const self = try allocator.create(Self);
+        errdefer allocator.destroy(self);
+
+        self.* = Self{
             .allocator = allocator,
             .ready = std.atomic.Value(bool).init(false),
             .admin_port = admin_port,
@@ -97,12 +101,13 @@ pub const Controller = struct {
         return self;
     }
 
-    /// Deinitialize controller resources.
+    /// Destroy controller and free heap memory.
     ///
-    /// TigerStyle: Explicit cleanup, pairs with init.
-    pub fn deinit(self: *Self) void {
+    /// TigerStyle: Explicit cleanup, pairs with create.
+    pub fn destroy(self: *Self) void {
         self.shutdown.store(true, .release);
         self.data_plane_client.deinit();
+        self.allocator.destroy(self);
     }
 
     /// Get the resolver for updating with K8s data.
@@ -194,9 +199,9 @@ pub const Controller = struct {
 // Tests
 // ============================================================================
 
-test "Controller init" {
-    var ctrl = Controller.init(std.testing.allocator, 9901, 8080);
-    defer ctrl.deinit();
+test "Controller create" {
+    const ctrl = try Controller.create(std.testing.allocator, 9901, 8080);
+    defer ctrl.destroy();
 
     try std.testing.expectEqual(@as(u16, 9901), ctrl.admin_port);
     try std.testing.expectEqual(@as(u16, 8080), ctrl.data_plane_port);
@@ -206,8 +211,8 @@ test "Controller init" {
 }
 
 test "Controller setReady" {
-    var ctrl = Controller.init(std.testing.allocator, 9901, 8080);
-    defer ctrl.deinit();
+    const ctrl = try Controller.create(std.testing.allocator, 9901, 8080);
+    defer ctrl.destroy();
 
     try std.testing.expectEqual(false, ctrl.isReady());
 
@@ -219,8 +224,8 @@ test "Controller setReady" {
 }
 
 test "Controller requestShutdown" {
-    var ctrl = Controller.init(std.testing.allocator, 9901, 8080);
-    defer ctrl.deinit();
+    const ctrl = try Controller.create(std.testing.allocator, 9901, 8080);
+    defer ctrl.destroy();
 
     try std.testing.expectEqual(false, ctrl.isShutdown());
 
@@ -229,32 +234,32 @@ test "Controller requestShutdown" {
 }
 
 test "Controller getResolver" {
-    var ctrl = Controller.init(std.testing.allocator, 9901, 8080);
-    defer ctrl.deinit();
+    const ctrl = try Controller.create(std.testing.allocator, 9901, 8080);
+    defer ctrl.destroy();
 
     const resolver = ctrl.getResolver();
     try std.testing.expect(@intFromPtr(resolver) != 0);
 }
 
 test "Controller getAdminHandler" {
-    var ctrl = Controller.init(std.testing.allocator, 9901, 8080);
-    defer ctrl.deinit();
+    const ctrl = try Controller.create(std.testing.allocator, 9901, 8080);
+    defer ctrl.destroy();
 
     const handler = ctrl.getAdminHandler();
     try std.testing.expect(@intFromPtr(handler) != 0);
 }
 
 test "Controller getAdminPort and getDataPlanePort" {
-    var ctrl = Controller.init(std.testing.allocator, 9901, 8080);
-    defer ctrl.deinit();
+    const ctrl = try Controller.create(std.testing.allocator, 9901, 8080);
+    defer ctrl.destroy();
 
     try std.testing.expectEqual(@as(u16, 9901), ctrl.getAdminPort());
     try std.testing.expectEqual(@as(u16, 8080), ctrl.getDataPlanePort());
 }
 
 test "Controller getConfig returns null initially" {
-    var ctrl = Controller.init(std.testing.allocator, 9901, 8080);
-    defer ctrl.deinit();
+    const ctrl = try Controller.create(std.testing.allocator, 9901, 8080);
+    defer ctrl.destroy();
 
     try std.testing.expect(ctrl.getConfig() == null);
 }
@@ -264,8 +269,8 @@ test "Controller uses default admin port from config" {
     const default_port = core_config.DEFAULT_ADMIN_PORT;
     try std.testing.expectEqual(@as(u16, 9901), default_port);
 
-    var ctrl = Controller.init(std.testing.allocator, default_port, 8080);
-    defer ctrl.deinit();
+    const ctrl = try Controller.create(std.testing.allocator, default_port, 8080);
+    defer ctrl.destroy();
 
     try std.testing.expectEqual(default_port, ctrl.admin_port);
 }

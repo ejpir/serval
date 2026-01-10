@@ -54,9 +54,9 @@ fn run(allocator: std.mem.Allocator, admin_port: u16, data_plane_port: u16) !voi
     std.debug.print("Admin API: http://localhost:{d}\n", .{admin_port});
     std.debug.print("Data plane: localhost:{d}\n", .{data_plane_port});
 
-    // Initialize controller
-    var ctrl = Controller.init(allocator, admin_port, data_plane_port);
-    defer ctrl.deinit();
+    // Initialize controller (heap-allocated due to ~2.5MB size)
+    const ctrl = try Controller.create(allocator, admin_port, data_plane_port);
+    defer ctrl.destroy();
 
     // Mark ready (simplified - in production would wait for K8s connection)
     ctrl.setReady(true);
