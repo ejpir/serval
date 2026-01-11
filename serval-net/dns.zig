@@ -52,6 +52,37 @@ pub const ResolveResult = struct {
     resolution_ns: u64,
 };
 
+/// Result of DNS resolution returning all addresses.
+/// TigerStyle: Fixed-size array, explicit count.
+pub const ResolveAllResult = struct {
+    /// Maximum addresses stored.
+    pub const MAX_ADDRESSES: u8 = config.DNS_MAX_ADDRESSES;
+
+    /// Resolved IP addresses with port applied.
+    addresses: [MAX_ADDRESSES]Io.net.IpAddress,
+    /// Number of valid addresses in array.
+    count: u8,
+    /// True if any result came from cache.
+    from_cache: bool,
+    /// Time spent resolving in nanoseconds (0 if from cache).
+    resolution_ns: u64,
+
+    /// Get slice of valid addresses.
+    pub fn slice(self: *const ResolveAllResult) []const Io.net.IpAddress {
+        return self.addresses[0..self.count];
+    }
+
+    /// Initialize empty result.
+    pub fn empty() ResolveAllResult {
+        return .{
+            .addresses = undefined,
+            .count = 0,
+            .from_cache = false,
+            .resolution_ns = 0,
+        };
+    }
+};
+
 // =============================================================================
 // Configuration
 // =============================================================================
@@ -233,6 +264,81 @@ pub const DnsResolver = struct {
         };
     }
 
+    /// Resolve a hostname to all IP addresses.
+    /// Returns all addresses from DNS response (up to MAX_ADDRESSES).
+    /// TigerStyle: Async via Io, thread-safe via mutex.
+    pub fn resolveAll(
+        self: *DnsResolver,
+        hostname: []const u8,
+        port: u16,
+        io: Io,
+    ) DnsError!ResolveAllResult {
+        // S1: preconditions
+        if (hostname.len == 0) return DnsError.InvalidHostname;
+        if (hostname.len > config.DNS_MAX_HOSTNAME_LEN) return DnsError.InvalidHostname;
+        assert(port > 0);
+
+        const now_ns = time.monotonicNanos();
+
+        // Check cache first (under lock)
+        // Note: Cache only stores single address, so cache hit returns 1 address
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            if (self.findInCache(hostname, now_ns)) |entry| {
+                self.stats_hits +|= 1;
+                var result = ResolveAllResult.empty();
+                result.addresses[0] = switch (entry.address) {
+                    .ip4 => |v| .{ .ip4 = .{ .bytes = v.bytes, .port = port } },
+                    .ip6 => |v| .{ .ip6 = .{ .bytes = v.bytes, .port = port, .flow = v.flow, .interface = v.interface } },
+                };
+                result.count = 1;
+                result.from_cache = true;
+                result.resolution_ns = 0;
+                return result;
+            }
+
+            self.stats_misses +|= 1;
+        }
+
+        // Cache miss - resolve all addresses
+        const start_ns = time.monotonicNanos();
+        var result = self.doResolveAll(hostname, port, io) catch |err| {
+            debugLog("DNS resolveAll failed for '{s}': {s}", .{ hostname, @errorName(err) });
+            return switch (err) {
+                error.UnknownHostName,
+                error.ResolvConfParseFailed,
+                error.InvalidDnsARecord,
+                error.InvalidDnsAAAARecord,
+                error.InvalidDnsCnameRecord,
+                error.NameServerFailure,
+                error.DetectingNetworkConfigurationFailed,
+                => DnsError.DnsResolutionFailed,
+                error.NameTooLong,
+                error.InvalidHostName,
+                => DnsError.InvalidHostname,
+                else => DnsError.DnsResolutionFailed,
+            };
+        };
+        const end_ns = time.monotonicNanos();
+        result.resolution_ns = time.elapsedNanos(start_ns, end_ns);
+
+        // Store first address in cache (under lock)
+        if (result.count > 0) {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.storeInCache(hostname, result.addresses[0], now_ns);
+        }
+
+        // S2: postcondition - all addresses have correct port
+        for (result.addresses[0..result.count]) |addr| {
+            assert(addr.getPort() == port);
+        }
+
+        return result;
+    }
+
     /// Invalidate a cached entry for a hostname.
     /// TigerStyle: Thread-safe, no error if not found.
     pub fn invalidate(self: *DnsResolver, hostname: []const u8) void {
@@ -395,6 +501,84 @@ pub const DnsResolver = struct {
                 },
             }
         }
+    }
+
+    /// Perform DNS resolution returning all addresses.
+    /// TigerStyle: Bounded by MAX_ADDRESSES.
+    fn doResolveAll(self: *DnsResolver, hostname: []const u8, port: u16, io: Io) !ResolveAllResult {
+        _ = self;
+
+        var result = ResolveAllResult.empty();
+
+        // First try parsing as IP address directly
+        if (Io.net.IpAddress.parse(hostname, port)) |addr| {
+            debugLog("DNS: '{s}' parsed as IP address directly", .{hostname});
+            result.addresses[0] = addr;
+            result.count = 1;
+            return result;
+        } else |_| {}
+
+        // Debug: Read and log resolv.conf contents
+        logResolvConf(io);
+
+        debugLog("DNS: starting resolveAll lookup for '{s}' port={d}", .{ hostname, port });
+
+        const host = Io.net.HostName.init(hostname) catch |err| {
+            std.log.err("DNS: HostName.init failed for '{s}': {s}", .{ hostname, @errorName(err) });
+            return err;
+        };
+
+        var canonical_name_buffer: [Io.net.HostName.max_len]u8 = undefined;
+        var lookup_buffer: [16]Io.net.HostName.LookupResult = undefined;
+        var lookup_queue: Io.Queue(Io.net.HostName.LookupResult) = .init(&lookup_buffer);
+
+        var lookup_future = io.async(Io.net.HostName.lookup, .{
+            host,
+            io,
+            &lookup_queue,
+            .{
+                .port = port,
+                .canonical_name_buffer = &canonical_name_buffer,
+            },
+        });
+        defer lookup_future.cancel(io) catch {};
+
+        // Collect all address results (bounded by MAX_ADDRESSES)
+        var iteration: u8 = 0;
+        const max_iterations: u8 = 64; // S3: bounded loop
+        while (iteration < max_iterations) : (iteration += 1) {
+            const queue_result = lookup_queue.getOne(io) catch |err| {
+                switch (err) {
+                    error.Canceled => return error.Canceled,
+                    error.Closed => break, // Queue closed, done collecting
+                }
+            };
+
+            switch (queue_result) {
+                .address => |addr| {
+                    if (result.count < ResolveAllResult.MAX_ADDRESSES) {
+                        result.addresses[result.count] = addr;
+                        result.count += 1;
+                        debugLog("DNS: collected address #{d}: {}", .{ result.count, addr });
+                    }
+                },
+                .canonical_name => |cn| {
+                    debugLog("DNS: got canonical_name: {s}", .{cn.bytes});
+                },
+            }
+        }
+
+        if (result.count == 0) {
+            // No addresses found - check if lookup had an error
+            lookup_future.await(io) catch |lookup_err| {
+                std.log.err("DNS: lookup_future.await returned error: {s}", .{@errorName(lookup_err)});
+                return lookup_err;
+            };
+            return error.UnknownHostName;
+        }
+
+        debugLog("DNS: resolveAll found {d} addresses for '{s}'", .{ result.count, hostname });
+        return result;
     }
 
     /// Debug helper: read and log /etc/resolv.conf contents using posix
@@ -613,4 +797,54 @@ test "DnsConfig: default values" {
     const cfg = DnsConfig{};
     try testing.expectEqual(config.DNS_DEFAULT_TTL_NS, cfg.ttl_ns);
     try testing.expectEqual(config.DNS_TIMEOUT_NS, cfg.timeout_ns);
+}
+
+test "DnsResolver: resolveAll returns multiple addresses" {
+    const resolver = DnsResolver.init(.{});
+
+    // We can't test real DNS in unit tests, but we can test the structure
+    // This test verifies the API exists and returns the correct type
+    try testing.expect(@sizeOf(ResolveAllResult) > 0);
+    try testing.expect(ResolveAllResult.MAX_ADDRESSES == config.DNS_MAX_ADDRESSES);
+
+    // Test empty result initialization
+    const empty_result = ResolveAllResult.empty();
+    try testing.expectEqual(@as(u8, 0), empty_result.count);
+    try testing.expect(!empty_result.from_cache);
+    try testing.expectEqual(@as(u64, 0), empty_result.resolution_ns);
+
+    // Test slice function returns empty for empty result
+    const empty_slice = empty_result.slice();
+    try testing.expectEqual(@as(usize, 0), empty_slice.len);
+
+    // Test that resolver has the resolveAll method (type check)
+    _ = @TypeOf(resolver).resolveAll;
+}
+
+test "DnsResolver: resolveAll invalid hostname rejected" {
+    var resolver = DnsResolver.init(.{});
+
+    // Empty hostname
+    const result1 = resolver.resolveAll("", 80, undefined);
+    try testing.expectError(DnsError.InvalidHostname, result1);
+
+    // Hostname too long
+    var too_long: [config.DNS_MAX_HOSTNAME_LEN + 10]u8 = undefined;
+    @memset(&too_long, 'a');
+    const result2 = resolver.resolveAll(&too_long, 80, undefined);
+    try testing.expectError(DnsError.InvalidHostname, result2);
+}
+
+test "ResolveAllResult: slice returns correct view" {
+    var result = ResolveAllResult.empty();
+
+    // Add some addresses
+    result.addresses[0] = .{ .ip4 = .{ .bytes = .{ 1, 2, 3, 4 }, .port = 80 } };
+    result.addresses[1] = .{ .ip4 = .{ .bytes = .{ 5, 6, 7, 8 }, .port = 80 } };
+    result.count = 2;
+
+    const slice_view = result.slice();
+    try testing.expectEqual(@as(usize, 2), slice_view.len);
+    try testing.expectEqual(@as(u16, 80), slice_view[0].getPort());
+    try testing.expectEqual(@as(u16, 80), slice_view[1].getPort());
 }

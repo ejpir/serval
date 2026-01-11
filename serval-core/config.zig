@@ -261,6 +261,9 @@ pub const DNS_DEFAULT_TTL_NS: u64 = 60 * std.time.ns_per_s;
 /// DNS resolution timeout in nanoseconds (5 seconds).
 pub const DNS_TIMEOUT_NS: u64 = 5 * std.time.ns_per_s;
 
+/// Maximum addresses returned from a single DNS lookup.
+pub const DNS_MAX_ADDRESSES: u8 = 16;
+
 // =============================================================================
 // Admin API Configuration (for reconfigurable data planes)
 // =============================================================================
