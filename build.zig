@@ -465,7 +465,7 @@ pub fn build(b: *std.Build) void {
     // Router example
     // Note: Links SSL libraries since serval depends on serval-server which depends on serval-tls
     const router_example_mod = b.createModule(.{
-        .root_source_file = b.path("examples/router_example.zig"),
+        .root_source_file = b.path("examples/router/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
