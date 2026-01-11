@@ -163,12 +163,33 @@ pub const MAX_RAW_JSON_LEN: u32 = 1024 * 1024;
 /// Raw JSON buffer is heap-allocated to avoid stack overflow.
 /// TigerStyle: Heap allocation at init, no allocation after init.
 pub const TrackedResource = struct {
-    meta: ResourceMeta,
+    /// Resource name - stored in fixed buffer (not a slice into temp memory).
+    name: NameStorage,
+    /// Resource namespace - stored in fixed buffer.
+    namespace: NameStorage,
+    /// Resource version - stored in fixed buffer.
+    resource_version: NameStorage,
     /// Heap-allocated buffer for raw JSON.
     raw_json_buf: ?[]u8,
     raw_json_len: u32,
     /// Indicates if this slot is in use.
     active: bool,
+
+    /// Get metadata as ResourceMeta (slices into our storage).
+    pub fn meta(self: *const TrackedResource) ResourceMeta {
+        return .{
+            .name = self.name.slice(),
+            .namespace = self.namespace.slice(),
+            .resource_version = self.resource_version.slice(),
+        };
+    }
+
+    /// Set metadata by copying into our storage.
+    pub fn setMeta(self: *TrackedResource, m: ResourceMeta) void {
+        self.name.set(m.name);
+        self.namespace.set(m.namespace);
+        self.resource_version.set(m.resource_version);
+    }
 
     /// Get the raw JSON as a slice.
     pub fn rawJson(self: *const TrackedResource) []const u8 {
@@ -230,6 +251,9 @@ pub fn ResourceStore(comptime capacity: u32, comptime buffer_size: u32) type {
             }
 
             while (allocated < capacity) : (allocated += 1) {
+                self.items[allocated].name = NameStorage.init();
+                self.items[allocated].namespace = NameStorage.init();
+                self.items[allocated].resource_version = NameStorage.init();
                 self.items[allocated].raw_json_buf = allocator.alloc(u8, buffer_size) catch {
                     return WatcherError.OutOfMemory;
                 };
@@ -264,14 +288,20 @@ pub fn ResourceStore(comptime capacity: u32, comptime buffer_size: u32) type {
             assert(meta.name.len > 0); // S1: precondition
             assert(meta.namespace.len > 0); // S1: precondition
 
+            std.log.debug("ResourceStore.upsert: name={s} namespace={s} current_count={d}", .{
+                meta.name,
+                meta.namespace,
+                self.count,
+            });
+
             // Try to find existing entry with same name/namespace.
             var found_idx: ?u32 = null;
             var iteration: u32 = 0;
             while (iteration < capacity) : (iteration += 1) {
                 if (self.items[iteration].active) {
-                    const existing = self.items[iteration].meta;
-                    if (std.mem.eql(u8, existing.name, meta.name) and
-                        std.mem.eql(u8, existing.namespace, meta.namespace))
+                    // Compare using stored buffers (not temp slices)
+                    if (std.mem.eql(u8, self.items[iteration].name.slice(), meta.name) and
+                        std.mem.eql(u8, self.items[iteration].namespace.slice(), meta.namespace))
                     {
                         found_idx = iteration;
                         break;
@@ -281,7 +311,8 @@ pub fn ResourceStore(comptime capacity: u32, comptime buffer_size: u32) type {
 
             if (found_idx) |idx| {
                 // Update existing entry.
-                self.items[idx].meta = meta;
+                std.log.debug("ResourceStore.upsert: updating existing at idx={d}", .{idx});
+                self.items[idx].setMeta(meta);
                 self.items[idx].setRawJson(raw_json);
             } else {
                 // Find first inactive slot.
@@ -295,10 +326,12 @@ pub fn ResourceStore(comptime capacity: u32, comptime buffer_size: u32) type {
                 }
 
                 if (slot_idx) |idx| {
-                    self.items[idx].meta = meta;
+                    std.log.debug("ResourceStore.upsert: adding new at idx={d}", .{idx});
+                    self.items[idx].setMeta(meta);
                     self.items[idx].setRawJson(raw_json);
                     self.items[idx].active = true;
                     self.count += 1;
+                    std.log.debug("ResourceStore.upsert: new count={d}", .{self.count});
                     assert(self.count <= capacity); // S1: postcondition - count within bounds
                 } else {
                     return WatcherError.BufferOverflow;
@@ -319,9 +352,9 @@ pub fn ResourceStore(comptime capacity: u32, comptime buffer_size: u32) type {
             var iteration: u32 = 0;
             while (iteration < capacity) : (iteration += 1) {
                 if (self.items[iteration].active) {
-                    const existing = self.items[iteration].meta;
-                    if (std.mem.eql(u8, existing.name, name) and
-                        std.mem.eql(u8, existing.namespace, namespace))
+                    // Compare using stored buffers
+                    if (std.mem.eql(u8, self.items[iteration].name.slice(), name) and
+                        std.mem.eql(u8, self.items[iteration].namespace.slice(), namespace))
                     {
                         self.items[iteration].active = false;
                         self.count -= 1;

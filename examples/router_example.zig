@@ -457,6 +457,10 @@ const RouterHandler = struct {
             std.log.err("RouterHandler: no router available", .{});
             return .{ .reject = .{ .status = 503, .body = "Service Unavailable" } };
         };
+        std.log.debug("RouterHandler: loaded router with {d} routes, {d} allowed_hosts", .{
+            router.routes.len,
+            router.allowed_hosts.len,
+        });
         return router.selectUpstream(ctx, request);
     }
 
@@ -982,7 +986,16 @@ fn handleRouteUpdate(body: ?[]const u8, response_buf: []u8) RouteUpdateResult {
         };
     };
 
-    std.log.info("handleRouteUpdate: config swap successful", .{});
+    // Verify the swap worked by loading the new router
+    const new_router = current_router.load(.acquire);
+    if (new_router) |r| {
+        std.log.info("handleRouteUpdate: config swap successful - new router has {d} routes, {d} allowed_hosts", .{
+            r.routes.len,
+            r.allowed_hosts.len,
+        });
+    } else {
+        std.log.err("handleRouteUpdate: swap succeeded but current_router is null!", .{});
+    }
 
     const generation = getRouterGeneration();
     const success_body = std.fmt.bufPrint(response_buf, "{{\"status\":\"ok\",\"generation\":{d}}}", .{generation}) catch {

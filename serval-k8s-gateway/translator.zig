@@ -376,7 +376,8 @@ fn writePool(
     writer.writeRaw("\"upstreams\":[") catch return error.BufferTooSmall;
 
     var upstream_count: u8 = 0;
-    const global_upstream_idx: u8 = pool_idx * MAX_UPSTREAMS_PER_POOL;
+    // Use local indices (0, 1, 2...) per pool, not global indices.
+    // Each pool has its own LbHandler with independent health bitmap.
 
     for (backend_refs, 0..) |backend_ref, ref_i| {
         // S3: Bounded loop check
@@ -405,7 +406,7 @@ fn writePool(
                 writer.writeRaw(",") catch return error.BufferTooSmall;
             }
 
-            try writeUpstream(writer, ep.getIp(), backend_ref.port, global_upstream_idx + upstream_count);
+            try writeUpstream(writer, ep.getIp(), backend_ref.port, upstream_count);
             upstream_count += 1;
         }
     }

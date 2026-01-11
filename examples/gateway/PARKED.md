@@ -97,6 +97,21 @@ See: `docs/plans/2026-01-10-allowed-hosts-design.md`
 
 ---
 
+## Rename /routes/update API Endpoint
+
+**Current State**: Endpoint is `POST /routes/update` but it replaces the entire config (routes, pools, upstreams, allowed_hosts).
+
+**Expected Behavior**: Name should reflect that it's a full config replacement, not just routes.
+
+**Options**:
+- `POST /config` - simple, clear
+- `PUT /config` - RESTful (PUT = full replacement)
+- `POST /config/replace` - explicit about replacement
+
+**Priority**: Low - cosmetic, current API works fine
+
+---
+
 ## Config Change Detection
 
 **Status**: ✅ IMPLEMENTED
