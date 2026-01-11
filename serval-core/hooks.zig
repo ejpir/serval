@@ -126,7 +126,13 @@ pub fn verifyHandler(comptime Handler: type) void {
     verifyOptionalHook(Handler, "onConnectionClose", &[_]type{ *Handler, u64, u32, u64 }, void);
 }
 
-/// Verify selectUpstream has correct signature: (self: *Handler, ctx: *Context, request: *const Request) Upstream
+/// Verify selectUpstream has correct signature.
+///
+/// Handlers can return either:
+/// - `Upstream` directly (legacy handlers like LbHandler)
+/// - A union with `.forward: Upstream` and `.reject: {status, body}` variants (Router)
+///
+/// The server will use hasUpstreamAction() to detect which style and handle accordingly.
 fn verifySelectUpstream(comptime Handler: type) void {
     const SelectFn = @TypeOf(@field(Handler, "selectUpstream"));
     const info = @typeInfo(SelectFn);
@@ -137,9 +143,26 @@ fn verifySelectUpstream(comptime Handler: type) void {
 
     const fn_info = info.@"fn";
 
-    // Verify return type is Upstream
-    if (fn_info.return_type != Upstream) {
-        @compileError("selectUpstream must return Upstream, got: " ++ @typeName(fn_info.return_type.?));
+    // Verify return type is either Upstream or a union with .forward variant
+    const return_type = fn_info.return_type.?;
+    const is_valid_return = blk: {
+        if (return_type == Upstream) {
+            break :blk true;
+        }
+        // Check for union with .forward field that returns Upstream
+        const type_info = @typeInfo(return_type);
+        if (type_info == .@"union") {
+            inline for (type_info.@"union".fields) |field| {
+                if (std.mem.eql(u8, field.name, "forward") and field.type == Upstream) {
+                    break :blk true;
+                }
+            }
+        }
+        break :blk false;
+    };
+
+    if (!is_valid_return) {
+        @compileError("selectUpstream must return Upstream or a union with .forward: Upstream, got: " ++ @typeName(return_type));
     }
 
     // Verify takes 3 args: *Handler, *Context, *const Request
@@ -161,6 +184,14 @@ fn verifySelectUpstream(comptime Handler: type) void {
     if (fn_info.params[2].type != *const Request) {
         @compileError("selectUpstream third parameter must be *const Request");
     }
+}
+
+/// Check if Handler.selectUpstream returns an Action-style union (vs plain Upstream).
+/// TigerStyle: Comptime helper for polymorphic handler dispatch in Server.
+pub fn hasUpstreamAction(comptime Handler: type) bool {
+    const SelectFn = @TypeOf(@field(Handler, "selectUpstream"));
+    const fn_info = @typeInfo(SelectFn).@"fn";
+    return fn_info.return_type.? != Upstream;
 }
 
 /// Verify an optional hook has correct signature if it exists.

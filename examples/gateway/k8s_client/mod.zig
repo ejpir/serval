@@ -384,6 +384,8 @@ pub const Client = struct {
         request.headers.put("Authorization", auth_buf[0..auth_len]) catch return ClientError.HeaderError;
 
         request.headers.put("Accept", "application/json") catch return ClientError.HeaderError;
+        // Connection: close for one-shot requests. We close the connection after
+        // receiving the response, so tell the server not to expect more requests.
         request.headers.put("Connection", "close") catch return ClientError.HeaderError;
 
         // Create upstream for K8s API server
@@ -477,6 +479,8 @@ pub const Client = struct {
         request.headers.put("Content-Type", "application/merge-patch+json") catch return ClientError.HeaderError;
         request.headers.put("Content-Length", content_length_str) catch return ClientError.HeaderError;
         request.headers.put("Accept", "application/json") catch return ClientError.HeaderError;
+        // Connection: close for one-shot requests. We close the connection after
+        // receiving the response, so tell the server not to expect more requests.
         request.headers.put("Connection", "close") catch return ClientError.HeaderError;
 
         // Create upstream for K8s API server
@@ -592,7 +596,9 @@ pub const Client = struct {
         request.headers.put("Authorization", auth_buf[0..auth_len]) catch return ClientError.HeaderError;
 
         request.headers.put("Accept", "application/json") catch return ClientError.HeaderError;
-        // Note: Do NOT set "Connection: close" - we want to keep the connection open.
+        // Do NOT set "Connection: close" for watch requests. Watches are long-lived
+        // streaming connections that receive events as they occur. HTTP/1.1 defaults
+        // to keep-alive which is what we want here.
 
         // Create upstream for K8s API server.
         const upstream = Upstream{
@@ -622,14 +628,15 @@ pub const Client = struct {
             return ClientError.HttpError;
         }
 
-        // Create body reader for incremental reading.
-        const body_reader = serval_client.BodyReader.init(&result.conn.socket, result.response.body_framing);
-
         debugLog("watcher: stream opened, framing={s}", .{@tagName(result.response.body_framing)});
 
+        // Note: BodyReader is initialized in WatchStream.initBodyReader() after
+        // the struct is in its final location, to avoid dangling pointer issues.
         return WatchStream{
             .conn = result.conn,
-            .body_reader = body_reader,
+            .body_framing = result.response.body_framing,
+            .body_reader_initialized = false,
+            .body_reader = undefined, // Initialized on first readEvent
             .line_buffer = line_buffer,
             .line_pos = 0,
             .done = false,
@@ -709,8 +716,9 @@ pub const LazyWatchStream = struct {
 // Watch Stream
 // =============================================================================
 
-/// Maximum size of a single watch event line (K8s events are typically <64KB).
-const MAX_WATCH_EVENT_SIZE: u32 = 128 * 1024;
+/// Maximum size of a single watch event line.
+/// Secrets with TLS certificates can be 500KB+, so we allow 1MB.
+const MAX_WATCH_EVENT_SIZE: u32 = 1024 * 1024;
 
 /// Maximum iterations for reading chunks in a single readEvent call.
 const MAX_CHUNK_READ_ITERATIONS: u32 = 1000;
@@ -721,7 +729,12 @@ const MAX_CHUNK_READ_ITERATIONS: u32 = 1000;
 pub const WatchStream = struct {
     /// Connection to K8s API (owned, must be closed by caller).
     conn: serval_client.client.Connection,
+    /// Body framing type (stored for lazy BodyReader initialization).
+    body_framing: BodyFraming,
+    /// Whether body_reader has been initialized.
+    body_reader_initialized: bool,
     /// Body reader for incremental chunked reading.
+    /// Initialized lazily on first readEvent to avoid dangling pointer.
     body_reader: serval_client.BodyReader,
     /// Buffer for accumulating partial lines.
     line_buffer: []u8,
@@ -743,6 +756,14 @@ pub const WatchStream = struct {
 
         if (self.done) return null;
 
+        // Lazily initialize body_reader on first call.
+        // This must happen after the WatchStream is in its final location.
+        if (!self.body_reader_initialized) {
+            self.body_reader = serval_client.BodyReader.init(&self.conn.socket, self.body_framing);
+            self.body_reader_initialized = true;
+            debugLog("watcher: body_reader initialized", .{});
+        }
+
         // Check if we already have a complete line in the buffer.
         if (self.findNewline()) |newline_pos| {
             return self.extractLine(buffer, newline_pos);
@@ -759,6 +780,11 @@ pub const WatchStream = struct {
                 return ClientError.ResponseTooLarge;
             }
 
+            debugLog("watcher: calling body_reader.readChunk, line_pos={d}, space={d}", .{
+                self.line_pos,
+                self.line_buffer.len - self.line_pos,
+            });
+
             const chunk = self.body_reader.readChunk(self.line_buffer[self.line_pos..]) catch |err| {
                 debugLog("watcher: chunk read error: {s}", .{@errorName(err)});
                 self.done = true;
@@ -772,6 +798,8 @@ pub const WatchStream = struct {
                     error.WriteFailed, error.SpliceFailed, error.PipeCreationFailed => ClientError.RequestFailed,
                 };
             };
+
+            debugLog("watcher: readChunk returned", .{});
 
             if (chunk) |data| {
                 self.line_pos += @intCast(data.len);

@@ -4,7 +4,9 @@
 //! Parses newline-delimited JSON watch event stream from K8s watch API
 //! and triggers reconciliation when resources change.
 //!
-//! TigerStyle: Single thread, bounded buffers, reconnection with backoff.
+//! TigerStyle: Parallel watch threads, bounded buffers, reconnection with backoff.
+//! Each resource type (GatewayClass, Gateway, HTTPRoute, Service, Endpoints, Secret)
+//! is watched in a separate thread to avoid blocking on long-running watch streams.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -16,6 +18,7 @@ const gw_config = gateway.config;
 const k8s_client_mod = @import("../k8s_client/mod.zig");
 const Client = k8s_client_mod.Client;
 const k8s_json = @import("../k8s_client/json_types.zig");
+const Resolver = @import("../resolver/mod.zig").Resolver;
 
 // Re-export all types from types.zig
 pub const watcher_types = @import("types.zig");
@@ -76,6 +79,55 @@ const INITIAL_BACKOFF_MS = types.INITIAL_BACKOFF_MS;
 const MAX_BACKOFF_MS = types.MAX_BACKOFF_MS;
 const BACKOFF_MULTIPLIER = types.BACKOFF_MULTIPLIER;
 
+/// Number of resource types to watch in parallel.
+/// TigerStyle: Explicit constant for bounded thread count.
+const RESOURCE_TYPE_COUNT: u8 = 6;
+
+/// Buffer sizes for different resource types (heap-allocated).
+/// Secrets need large buffers for TLS certificates.
+/// TigerStyle: Explicit bounds, sized for expected data.
+const SMALL_BUFFER_SIZE: u32 = 16 * 1024; // 16KB for most resources
+const LARGE_BUFFER_SIZE: u32 = 1024 * 1024; // 1MB for Secrets
+
+// =============================================================================
+// Resource Type
+// =============================================================================
+
+/// Resource type enum for dispatch.
+/// Defined at module level for use in WatchThreadContext.
+pub const ResourceType = enum(u8) {
+    gateway_class = 0,
+    gateway = 1,
+    http_route = 2,
+    service = 3,
+    endpoints = 4,
+    secret = 5,
+
+    /// Get the K8s API path for this resource type.
+    pub fn getPath(self: ResourceType) []const u8 {
+        return switch (self) {
+            .gateway_class => GATEWAY_CLASS_PATH,
+            .gateway => GATEWAY_PATH,
+            .http_route => HTTP_ROUTE_PATH,
+            .service => SERVICES_PATH,
+            .endpoints => ENDPOINTS_PATH,
+            .secret => SECRETS_PATH,
+        };
+    }
+
+    /// Get the resource type name for logging.
+    pub fn getName(self: ResourceType) []const u8 {
+        return switch (self) {
+            .gateway_class => "GatewayClass",
+            .gateway => "Gateway",
+            .http_route => "HTTPRoute",
+            .service => "Service",
+            .endpoints => "Endpoints",
+            .secret => "Secret",
+        };
+    }
+};
+
 // =============================================================================
 // Watcher
 // =============================================================================
@@ -97,14 +149,18 @@ pub const Watcher = struct {
     /// Controller name we manage (e.g., "serval.dev/gateway-controller").
     /// Only Gateways referencing GatewayClasses with this controllerName are included.
     controller_name: ControllerNameStorage,
+    /// Resolver for updating endpoint data when Endpoints resources change.
+    /// TigerStyle: Borrowed reference, watcher does not own resolver lifecycle.
+    resolver: *Resolver,
 
     /// Resource stores for each watched type.
-    gateway_classes: ResourceStore(MAX_GATEWAY_CLASSES),
-    gateways: ResourceStore(MAX_GATEWAYS),
-    http_routes: ResourceStore(MAX_HTTP_ROUTES),
-    services: ResourceStore(MAX_SERVICES),
-    endpoints: ResourceStore(MAX_ENDPOINTS),
-    secrets: ResourceStore(MAX_SECRETS),
+    /// Secrets use large buffers for TLS certificates; others use small buffers.
+    gateway_classes: ResourceStore(MAX_GATEWAY_CLASSES, SMALL_BUFFER_SIZE),
+    gateways: ResourceStore(MAX_GATEWAYS, SMALL_BUFFER_SIZE),
+    http_routes: ResourceStore(MAX_HTTP_ROUTES, SMALL_BUFFER_SIZE),
+    services: ResourceStore(MAX_SERVICES, SMALL_BUFFER_SIZE),
+    endpoints: ResourceStore(MAX_ENDPOINTS, SMALL_BUFFER_SIZE),
+    secrets: ResourceStore(MAX_SECRETS, LARGE_BUFFER_SIZE),
 
     /// Parsed GatewayClass storage (populated by reconcile).
     parsed_gateway_classes: [MAX_GATEWAY_CLASSES]StoredGatewayClass,
@@ -136,20 +192,32 @@ pub const Watcher = struct {
     /// Storage for temporary listeners slices per gateway.
     temp_listeners: [MAX_GATEWAYS][gw_config.MAX_LISTENERS]gw_config.Listener,
 
-    /// Line buffer for parsing watch events.
-    /// TigerStyle: Pre-allocated, bounded buffer.
-    line_buffer: []u8,
+    /// Line buffers for parsing watch events (one per watch thread).
+    /// TigerStyle: Pre-allocated, bounded buffers.
+    line_buffers: [RESOURCE_TYPE_COUNT][]u8,
 
-    /// Current backoff duration in milliseconds.
-    current_backoff_ms: u32,
+    /// Current backoff duration in milliseconds (per resource type).
+    current_backoff_ms: [RESOURCE_TYPE_COUNT]u32,
+
+    /// Mutex for protecting shared state during reconciliation.
+    /// TigerStyle: Explicit synchronization for thread safety.
+    mutex: std.Thread.Mutex,
+
+    /// Watch thread handles (one per resource type).
+    /// Stored for clean shutdown via join().
+    watch_threads: [RESOURCE_TYPE_COUNT]?std.Thread,
+
+    /// Number of active watch threads.
+    active_thread_count: std.atomic.Value(u8),
 
     const Self = @This();
 
-    /// Initialize watcher with client, callback, and controller name.
+    /// Initialize watcher with client, callback, resolver, and controller name.
     ///
     /// Preconditions:
     /// - client must be initialized and valid
     /// - on_config_change must be a valid function pointer
+    /// - resolver must be valid (for updating endpoint data)
     /// - controller_name must be non-empty and within bounds
     ///
     /// The callback receives:
@@ -161,22 +229,85 @@ pub const Watcher = struct {
         client: *Client,
         on_config_change: *const fn (?*anyopaque, *gw_config.GatewayConfig, Io) void,
         callback_context: ?*anyopaque,
+        resolver: *Resolver,
         controller_name: []const u8,
     ) WatcherError!*Self {
         assert(@intFromPtr(client) != 0); // S1: precondition - valid client pointer
         assert(@intFromPtr(on_config_change) != 0); // S1: precondition - valid callback
+        assert(@intFromPtr(resolver) != 0); // S1: precondition - valid resolver pointer
         assert(controller_name.len > 0); // S1: precondition - non-empty controller name
         assert(controller_name.len <= MAX_CONTROLLER_NAME_LEN); // S1: precondition - controller name fits
 
         const self = allocator.create(Self) catch return WatcherError.OutOfMemory;
         errdefer allocator.destroy(self);
 
-        const line_buffer = allocator.alloc(u8, MAX_LINE_SIZE_BYTES) catch return WatcherError.OutOfMemory;
-        errdefer allocator.free(line_buffer);
+        // Allocate line buffers for each watch thread.
+        // TigerStyle: Pre-allocate all buffers at init, no allocation after init.
+        var line_buffers: [RESOURCE_TYPE_COUNT][]u8 = undefined;
+        var allocated_count: u8 = 0;
+        errdefer {
+            // Clean up any buffers allocated before failure.
+            var cleanup_idx: u8 = 0;
+            while (cleanup_idx < allocated_count) : (cleanup_idx += 1) {
+                allocator.free(line_buffers[cleanup_idx]);
+            }
+        }
+
+        while (allocated_count < RESOURCE_TYPE_COUNT) : (allocated_count += 1) {
+            line_buffers[allocated_count] = allocator.alloc(u8, MAX_LINE_SIZE_BYTES) catch {
+                return WatcherError.OutOfMemory;
+            };
+        }
 
         // Initialize controller_name storage.
         var ctrl_name_storage = ControllerNameStorage.init();
         ctrl_name_storage.set(controller_name);
+
+        // Initialize backoff values for each resource type.
+        var initial_backoffs: [RESOURCE_TYPE_COUNT]u32 = undefined;
+        var backoff_idx: u8 = 0;
+        while (backoff_idx < RESOURCE_TYPE_COUNT) : (backoff_idx += 1) {
+            initial_backoffs[backoff_idx] = INITIAL_BACKOFF_MS;
+        }
+
+        // Initialize thread handles to null.
+        var initial_threads: [RESOURCE_TYPE_COUNT]?std.Thread = undefined;
+        var thread_idx: u8 = 0;
+        while (thread_idx < RESOURCE_TYPE_COUNT) : (thread_idx += 1) {
+            initial_threads[thread_idx] = null;
+        }
+
+        // Initialize resource stores with heap-allocated buffers.
+        // TigerStyle: All allocation at init, errdefer for cleanup.
+        var gateway_classes_store = ResourceStore(MAX_GATEWAY_CLASSES, SMALL_BUFFER_SIZE).init(allocator) catch {
+            return WatcherError.OutOfMemory;
+        };
+        errdefer gateway_classes_store.deinit();
+
+        var gateways_store = ResourceStore(MAX_GATEWAYS, SMALL_BUFFER_SIZE).init(allocator) catch {
+            return WatcherError.OutOfMemory;
+        };
+        errdefer gateways_store.deinit();
+
+        var http_routes_store = ResourceStore(MAX_HTTP_ROUTES, SMALL_BUFFER_SIZE).init(allocator) catch {
+            return WatcherError.OutOfMemory;
+        };
+        errdefer http_routes_store.deinit();
+
+        var services_store = ResourceStore(MAX_SERVICES, SMALL_BUFFER_SIZE).init(allocator) catch {
+            return WatcherError.OutOfMemory;
+        };
+        errdefer services_store.deinit();
+
+        var endpoints_store = ResourceStore(MAX_ENDPOINTS, SMALL_BUFFER_SIZE).init(allocator) catch {
+            return WatcherError.OutOfMemory;
+        };
+        errdefer endpoints_store.deinit();
+
+        var secrets_store = ResourceStore(MAX_SECRETS, LARGE_BUFFER_SIZE).init(allocator) catch {
+            return WatcherError.OutOfMemory;
+        };
+        errdefer secrets_store.deinit();
 
         self.* = .{
             .client = client,
@@ -185,12 +316,13 @@ pub const Watcher = struct {
             .on_config_change = on_config_change,
             .callback_context = callback_context,
             .controller_name = ctrl_name_storage,
-            .gateway_classes = ResourceStore(MAX_GATEWAY_CLASSES).init(),
-            .gateways = ResourceStore(MAX_GATEWAYS).init(),
-            .http_routes = ResourceStore(MAX_HTTP_ROUTES).init(),
-            .services = ResourceStore(MAX_SERVICES).init(),
-            .endpoints = ResourceStore(MAX_ENDPOINTS).init(),
-            .secrets = ResourceStore(MAX_SECRETS).init(),
+            .resolver = resolver,
+            .gateway_classes = gateway_classes_store,
+            .gateways = gateways_store,
+            .http_routes = http_routes_store,
+            .services = services_store,
+            .endpoints = endpoints_store,
+            .secrets = secrets_store,
             .parsed_gateway_classes = undefined,
             .parsed_gateway_classes_count = 0,
             .parsed_gateways = undefined,
@@ -205,8 +337,11 @@ pub const Watcher = struct {
             .temp_filters = undefined,
             .temp_backend_refs = undefined,
             .temp_listeners = undefined,
-            .line_buffer = line_buffer,
-            .current_backoff_ms = INITIAL_BACKOFF_MS,
+            .line_buffers = line_buffers,
+            .current_backoff_ms = initial_backoffs,
+            .mutex = .{},
+            .watch_threads = initial_threads,
+            .active_thread_count = std.atomic.Value(u8).init(0),
         };
 
         // Initialize parsed storage arrays.
@@ -214,150 +349,185 @@ pub const Watcher = struct {
         for (&self.parsed_gateways) |*gw| gw.* = StoredGateway.init();
         for (&self.parsed_http_routes) |*route| route.* = StoredHTTPRoute.init();
 
-        assert(self.line_buffer.len == MAX_LINE_SIZE_BYTES); // S1: postcondition - buffer allocated
-        assert(!self.running.load(.acquire)); // S1: postcondition - not running initially
-        assert(self.controller_name.len > 0); // S1: postcondition - controller name set
+        // S1: Postconditions
+        assert(self.line_buffers[0].len == MAX_LINE_SIZE_BYTES); // buffer allocated
+        assert(!self.running.load(.acquire)); // not running initially
+        assert(self.controller_name.len > 0); // controller name set
+        assert(self.active_thread_count.load(.acquire) == 0); // no threads running
         return self;
     }
 
     /// Clean up all allocated resources.
+    /// TigerStyle: Explicit cleanup of all allocated resources.
     pub fn deinit(self: *Self) void {
         assert(@intFromPtr(self) != 0); // S1: precondition - valid self pointer
-        assert(self.line_buffer.len > 0); // S1: precondition - buffer was allocated
+        assert(self.line_buffers[0].len > 0); // S1: precondition - buffers were allocated
 
-        self.allocator.free(self.line_buffer);
+        // Free resource store buffers.
+        self.gateway_classes.deinit();
+        self.gateways.deinit();
+        self.http_routes.deinit();
+        self.services.deinit();
+        self.endpoints.deinit();
+        self.secrets.deinit();
+
+        // Free all line buffers.
+        var buf_idx: u8 = 0;
+        while (buf_idx < RESOURCE_TYPE_COUNT) : (buf_idx += 1) {
+            self.allocator.free(self.line_buffers[buf_idx]);
+        }
         self.allocator.destroy(self);
     }
 
-    /// Start watching in a separate thread.
-    /// Returns the spawned thread handle.
-    pub fn start(self: *Self) !std.Thread {
+    /// Start watching resources in parallel threads.
+    /// Spawns one thread per resource type for concurrent watching.
+    /// TigerStyle: Bounded thread count (RESOURCE_TYPE_COUNT), explicit error handling.
+    pub fn start(self: *Self) !void {
         assert(@intFromPtr(self.client) != 0); // S1: precondition - client initialized
+        assert(!self.running.load(.acquire)); // S1: precondition - not already running
 
         self.running.store(true, .release);
-        assert(self.running.load(.acquire)); // S1: postcondition - running flag set
-        return std.Thread.spawn(.{}, watchLoopWrapper, .{self});
+
+        std.log.debug("watcher: starting {d} watch threads", .{RESOURCE_TYPE_COUNT});
+
+        // Spawn a thread for each resource type.
+        // TigerStyle: Bounded loop, explicit iteration.
+        const resource_types = [_]ResourceType{
+            .gateway_class,
+            .gateway,
+            .http_route,
+            .service,
+            .endpoints,
+            .secret,
+        };
+
+        var spawned_count: u8 = 0;
+        errdefer {
+            // On error, stop and wait for any threads that were spawned.
+            self.running.store(false, .release);
+            var cleanup_idx: u8 = 0;
+            while (cleanup_idx < spawned_count) : (cleanup_idx += 1) {
+                if (self.watch_threads[cleanup_idx]) |thread| {
+                    thread.join();
+                    self.watch_threads[cleanup_idx] = null;
+                }
+            }
+        }
+
+        while (spawned_count < RESOURCE_TYPE_COUNT) : (spawned_count += 1) {
+            const resource_type = resource_types[spawned_count];
+            const thread_idx = spawned_count;
+
+            std.log.debug("watcher: spawning thread for {s}", .{resource_type.getName()});
+
+            self.watch_threads[thread_idx] = std.Thread.spawn(
+                .{},
+                watchThreadLoop,
+                .{ self, resource_type, thread_idx },
+            ) catch |err| {
+                std.log.err("watcher: failed to spawn thread for {s}: {s}", .{
+                    resource_type.getName(),
+                    @errorName(err),
+                });
+                return err;
+            };
+
+            _ = self.active_thread_count.fetchAdd(1, .acq_rel);
+            std.log.info("watcher: thread {d} spawned for {s}", .{ thread_idx, resource_type.getName() });
+        }
+
+        // S1: Postconditions
+        assert(self.running.load(.acquire)); // running flag set
+        assert(self.active_thread_count.load(.acquire) == RESOURCE_TYPE_COUNT); // all threads spawned
+        std.log.debug("watcher: all {d} watch threads started", .{RESOURCE_TYPE_COUNT});
     }
 
-    /// Stop watching gracefully.
-    /// Sets the running flag to false; thread will exit on next iteration.
+    /// Stop watching gracefully and wait for all threads to finish.
+    /// TigerStyle: Explicit cleanup, bounded wait for threads.
     pub fn stop(self: *Self) void {
+        std.log.debug("watcher: stopping, signaling threads to exit", .{});
         self.running.store(false, .release);
+
+        // Wait for all watch threads to finish.
+        // TigerStyle: Bounded loop, explicit join for each thread.
+        var thread_idx: u8 = 0;
+        while (thread_idx < RESOURCE_TYPE_COUNT) : (thread_idx += 1) {
+            if (self.watch_threads[thread_idx]) |thread| {
+                std.log.debug("watcher: joining thread {d}", .{thread_idx});
+                thread.join();
+                self.watch_threads[thread_idx] = null;
+                _ = self.active_thread_count.fetchSub(1, .acq_rel);
+            }
+        }
+
+        // S1: Postconditions
+        assert(!self.running.load(.acquire)); // running flag cleared
+        assert(self.active_thread_count.load(.acquire) == 0); // all threads stopped
+        std.log.debug("watcher: all threads stopped", .{});
     }
 
-    /// Thread wrapper for watch loop.
-    fn watchLoopWrapper(self: *Self) void {
-        self.watchLoop();
-    }
+    /// Per-thread watch loop for a single resource type.
+    /// Each thread watches one resource type continuously with reconnection.
+    /// TigerStyle: Bounded reconnect attempts, explicit backoff per thread.
+    fn watchThreadLoop(self: *Self, resource_type: ResourceType, thread_idx: u8) void {
+        assert(thread_idx < RESOURCE_TYPE_COUNT); // S1: precondition - valid thread index
+        assert(self.running.load(.acquire)); // S1: precondition - watcher is running
 
-    /// Main watch loop.
-    /// Watches all resource types and handles reconnection.
-    /// TigerStyle: Bounded iterations, explicit backoff, Io.Threaded for async I/O.
-    fn watchLoop(self: *Self) void {
-        assert(self.running.load(.acquire)); // S1: precondition - running flag should be set
-        assert(@intFromPtr(self.client) != 0); // S1: precondition - client initialized
+        const resource_name = resource_type.getName();
+        std.log.info("watcher: thread {d} STARTING for {s}", .{ thread_idx, resource_name });
 
-        std.log.debug("watcher: watchLoop starting", .{});
-
-        // Initialize Io runtime for HTTP client.
+        // Initialize Io runtime for this thread's HTTP client operations.
         // TigerStyle: One-time initialization at thread start.
+        std.log.info("watcher: thread {d} initializing Io runtime...", .{thread_idx});
         var io_runtime = Io.Threaded.init(self.allocator, .{});
         defer io_runtime.deinit();
         const io = io_runtime.io();
-
-        std.log.debug("watcher: Io runtime initialized", .{});
+        std.log.info("watcher: thread {d} Io runtime ready", .{thread_idx});
 
         var reconnect_attempts: u32 = 0;
 
+        // Watch loop with reconnection.
+        // TigerStyle: Bounded reconnect attempts, explicit backoff.
         while (self.running.load(.acquire) and reconnect_attempts < MAX_RECONNECT_ATTEMPTS) {
-            std.log.debug("watcher: watchLoop iteration, attempt={d}", .{reconnect_attempts});
+            std.log.debug("watcher: thread {d} watch iteration, attempt={d}", .{ thread_idx, reconnect_attempts });
 
-            // Watch each resource type.
-            // TigerStyle: Explicit iteration over resource types.
-            const watch_success = self.watchAllResources(io);
-
-            std.log.debug("watcher: watchAllResources returned success={}", .{watch_success});
+            const watch_success = self.watchResourceType(resource_type, thread_idx, io);
 
             if (watch_success) {
                 // Reset backoff on success.
-                self.current_backoff_ms = INITIAL_BACKOFF_MS;
+                self.current_backoff_ms[thread_idx] = INITIAL_BACKOFF_MS;
                 reconnect_attempts = 0;
-            } else {
-                // Apply exponential backoff on failure.
+            } else if (self.running.load(.acquire)) {
+                // Apply exponential backoff on failure (only if still running).
                 reconnect_attempts += 1;
-                self.applyBackoff();
+                self.applyBackoff(thread_idx);
             }
         }
 
         if (reconnect_attempts >= MAX_RECONNECT_ATTEMPTS) {
-            std.log.err("watcher: max reconnection attempts ({d}) exceeded", .{MAX_RECONNECT_ATTEMPTS});
+            std.log.err("watcher: thread {d} ({s}) max reconnection attempts ({d}) exceeded", .{
+                thread_idx,
+                resource_name,
+                MAX_RECONNECT_ATTEMPTS,
+            });
         }
-        std.log.debug("watcher: watchLoop exiting", .{});
+
+        std.log.debug("watcher: thread {d} ({s}) exiting", .{ thread_idx, resource_name });
     }
 
-    /// Watch all resource types.
-    /// Returns true if all watches completed successfully.
-    fn watchAllResources(self: *Self, io: Io) bool {
-        assert(@intFromPtr(self) != 0); // S1: precondition - valid self
-
-        std.log.debug("watcher: watchAllResources starting", .{});
-
-        // Watch GatewayClass resources first (needed for filtering Gateways).
-        // GatewayClass is cluster-scoped (no namespace in path).
-        std.log.debug("watcher: watching GatewayClass at {s}", .{GATEWAY_CLASS_PATH});
-        const gc_success = self.watchResourceType(GATEWAY_CLASS_PATH, .gateway_class, io);
-        std.log.debug("watcher: GatewayClass watch result={}", .{gc_success});
-        if (!gc_success) return false;
-
-        // Watch Gateway resources.
-        std.log.debug("watcher: watching Gateway at {s}", .{GATEWAY_PATH});
-        const gateway_success = self.watchResourceType(GATEWAY_PATH, .gateway, io);
-        std.log.debug("watcher: Gateway watch result={}", .{gateway_success});
-        if (!gateway_success) return false;
-
-        // Watch HTTPRoute resources.
-        std.log.debug("watcher: watching HTTPRoute at {s}", .{HTTP_ROUTE_PATH});
-        const route_success = self.watchResourceType(HTTP_ROUTE_PATH, .http_route, io);
-        std.log.debug("watcher: HTTPRoute watch result={}", .{route_success});
-        if (!route_success) return false;
-
-        // Watch Service resources.
-        std.log.debug("watcher: watching Service at {s}", .{SERVICES_PATH});
-        const service_success = self.watchResourceType(SERVICES_PATH, .service, io);
-        std.log.debug("watcher: Service watch result={}", .{service_success});
-        if (!service_success) return false;
-
-        // Watch Endpoints resources.
-        std.log.debug("watcher: watching Endpoints at {s}", .{ENDPOINTS_PATH});
-        const endpoint_success = self.watchResourceType(ENDPOINTS_PATH, .endpoints, io);
-        std.log.debug("watcher: Endpoints watch result={}", .{endpoint_success});
-        if (!endpoint_success) return false;
-
-        // Watch Secret resources.
-        std.log.debug("watcher: watching Secret at {s}", .{SECRETS_PATH});
-        const secret_success = self.watchResourceType(SECRETS_PATH, .secret, io);
-        std.log.debug("watcher: Secret watch result={}", .{secret_success});
-        if (!secret_success) return false;
-
-        std.log.debug("watcher: watchAllResources completed successfully", .{});
-        return true;
-    }
-
-    /// Resource type enum for dispatch.
-    const ResourceType = enum {
-        gateway_class,
-        gateway,
-        http_route,
-        service,
-        endpoints,
-        secret,
-    };
-
-    /// Watch a single resource type.
+    /// Watch a single resource type using its dedicated thread buffer.
     /// Returns true if watch completed without error.
-    fn watchResourceType(self: *Self, path: []const u8, resource_type: ResourceType, io: Io) bool {
+    /// TigerStyle: Uses thread-specific line buffer, explicit error handling.
+    fn watchResourceType(self: *Self, resource_type: ResourceType, thread_idx: u8, io: Io) bool {
+        assert(thread_idx < RESOURCE_TYPE_COUNT); // S1: precondition - valid thread index
+
+        const path = resource_type.getPath();
+        const resource_name = resource_type.getName();
+        const line_buffer = self.line_buffers[thread_idx];
+
         assert(path.len > 0); // S1: precondition - non-empty path
         assert(path.len < 256); // S1: precondition - path fits in URL buffer
+        assert(line_buffer.len == MAX_LINE_SIZE_BYTES); // S1: precondition - buffer allocated
 
         // Build watch URL with resourceVersion for resumption.
         var url_buffer: [512]u8 = undefined;
@@ -370,7 +540,11 @@ pub const Watcher = struct {
             .secret => self.secrets.getLatestResourceVersion(),
         };
 
-        std.log.debug("watcher: watchResourceType path={s} rv={s}", .{ path, if (rv.len > 0) rv else "(none)" });
+        std.log.debug("watcher: thread {d} watchResourceType {s} rv={s}", .{
+            thread_idx,
+            resource_name,
+            if (rv.len > 0) rv else "(none)",
+        });
 
         const watch_url = if (rv.len > 0)
             std.fmt.bufPrint(&url_buffer, "{s}?watch=true&resourceVersion={s}", .{ path, rv }) catch {
@@ -383,43 +557,61 @@ pub const Watcher = struct {
                 return false;
             };
 
-        std.log.debug("watcher: starting watch stream URL={s}", .{watch_url});
+        std.log.debug("watcher: thread {d} starting watch stream URL={s}", .{ thread_idx, watch_url });
 
         // Start watch stream.
         var stream = self.client.watch(watch_url);
         defer stream.close(); // TigerStyle: Explicit cleanup paired with creation.
 
-        std.log.debug("watcher: watch stream created, reading events...", .{});
+        std.log.debug("watcher: thread {d} watch stream created, reading events...", .{thread_idx});
 
         // Process events until stream ends or error.
+        // TigerStyle: Bounded loop with explicit iteration limit.
         var events_processed: u32 = 0;
         while (events_processed < MAX_EVENTS_PER_ITERATION and self.running.load(.acquire)) {
-            // Read next event line.
-            const event_data = stream.readEvent(self.line_buffer, io) catch |err| {
-                std.log.debug("watcher: read error for {s}: {s}", .{ path, @errorName(err) });
+            std.log.debug("watcher: thread {d} iteration {d}, calling readEvent...", .{ thread_idx, events_processed });
+
+            // Read next event line using thread-specific buffer.
+            const event_data = stream.readEvent(line_buffer, io) catch |err| {
+                std.log.debug("watcher: thread {d} read error for {s}: {s}", .{
+                    thread_idx,
+                    resource_name,
+                    @errorName(err),
+                });
                 return false;
             };
 
             if (event_data) |data| {
-                std.log.debug("watcher: received event data len={d}", .{data.len});
-                // Parse and handle event.
+                std.log.debug("watcher: thread {d} received event data len={d}", .{ thread_idx, data.len });
+                // Parse and handle event (with mutex protection for shared state).
                 self.handleEvent(data, resource_type, io) catch |err| {
-                    std.log.debug("watcher: event handling error: {s}", .{@errorName(err)});
+                    std.log.debug("watcher: thread {d} event handling error: {s}", .{
+                        thread_idx,
+                        @errorName(err),
+                    });
                     // Continue processing despite parse errors.
                 };
                 events_processed += 1;
             } else {
-                // Stream ended normally.
-                std.log.debug("watcher: stream ended normally for {s}, events={d}", .{ path, events_processed });
+                // Stream ended normally (server closed connection).
+                std.log.debug("watcher: thread {d} stream ended normally for {s}, events={d}", .{
+                    thread_idx,
+                    resource_name,
+                    events_processed,
+                });
                 break;
             }
         }
 
-        std.log.debug("watcher: watchResourceType done, processed {d} events", .{events_processed});
+        std.log.debug("watcher: thread {d} watchResourceType done, processed {d} events", .{
+            thread_idx,
+            events_processed,
+        });
         return true;
     }
 
     /// Handle a single watch event.
+    /// TigerStyle: Mutex protection for thread-safe access to shared state.
     fn handleEvent(self: *Self, data: []const u8, resource_type: ResourceType, io: Io) WatcherError!void {
         assert(data.len > 0); // S1: precondition - non-empty event data
 
@@ -427,22 +619,46 @@ pub const Watcher = struct {
 
         std.log.debug("watcher: handleEvent type={s} resource={s}", .{ @tagName(event.event_type), @tagName(resource_type) });
 
+        // Acquire mutex for thread-safe access to shared ResourceStores.
+        // TigerStyle: Explicit synchronization, mutex held during store modification.
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         // Handle based on event type.
         switch (event.event_type) {
             .ADDED, .MODIFIED => {
-                const meta = try parsing.extractResourceMeta(event.raw_object);
+                std.log.debug("watcher: extracting meta from raw_object len={d}", .{event.raw_object.len});
+                const meta = parsing.extractResourceMeta(event.raw_object) catch |err| {
+                    std.log.err("watcher: extractResourceMeta failed: {s}", .{@errorName(err)});
+                    return err;
+                };
                 std.log.debug("watcher: {s} {s}/{s}", .{ @tagName(event.event_type), meta.namespace, meta.name });
                 switch (resource_type) {
                     .gateway_class => try self.gateway_classes.upsert(meta, event.raw_object),
                     .gateway => try self.gateways.upsert(meta, event.raw_object),
                     .http_route => try self.http_routes.upsert(meta, event.raw_object),
                     .service => try self.services.upsert(meta, event.raw_object),
-                    .endpoints => try self.endpoints.upsert(meta, event.raw_object),
+                    .endpoints => {
+                        std.log.debug("watcher: upserting endpoints for {s}/{s}", .{ meta.namespace, meta.name });
+                        try self.endpoints.upsert(meta, event.raw_object);
+                        // Update resolver with endpoint data for backend resolution.
+                        // TigerStyle: Resolver.updateService parses the JSON internally.
+                        std.log.debug("watcher: calling resolver.updateService for {s}/{s}", .{ meta.namespace, meta.name });
+                        self.resolver.updateService(meta.name, meta.namespace, event.raw_object) catch |err| {
+                            std.log.warn("watcher: failed to update resolver for {s}/{s}: {s}", .{
+                                meta.namespace,
+                                meta.name,
+                                @errorName(err),
+                            });
+                            // Continue - store update succeeded, resolver update is best-effort.
+                        };
+                        std.log.debug("watcher: resolver now has {d} services", .{self.resolver.serviceCount()});
+                    },
                     .secret => try self.secrets.upsert(meta, event.raw_object),
                 }
-                // Trigger reconciliation.
+                // Trigger reconciliation (still under mutex lock).
                 std.log.debug("watcher: triggering reconciliation", .{});
-                self.triggerReconciliation(io);
+                self.triggerReconciliationLocked(io);
             },
             .DELETED => {
                 const meta = try parsing.extractResourceMeta(event.raw_object);
@@ -451,11 +667,16 @@ pub const Watcher = struct {
                     .gateway => self.gateways.remove(meta.name, meta.namespace),
                     .http_route => self.http_routes.remove(meta.name, meta.namespace),
                     .service => self.services.remove(meta.name, meta.namespace),
-                    .endpoints => self.endpoints.remove(meta.name, meta.namespace),
+                    .endpoints => blk: {
+                        const r = self.endpoints.remove(meta.name, meta.namespace);
+                        // Also remove from resolver.
+                        self.resolver.removeService(meta.name, meta.namespace);
+                        break :blk r;
+                    },
                     .secret => self.secrets.remove(meta.name, meta.namespace),
                 };
                 if (removed) {
-                    self.triggerReconciliation(io);
+                    self.triggerReconciliationLocked(io);
                 }
             },
             .BOOKMARK => {
@@ -471,15 +692,27 @@ pub const Watcher = struct {
                 }
             },
             .ERROR => {
-                std.log.warn("watcher: received ERROR event", .{});
-                // Error events may indicate watch needs restart.
+                // ERROR events indicate watch needs restart.
+                // Most commonly caused by expired resourceVersion (410 Gone).
+                // Reset resourceVersion to empty so next watch starts fresh with a LIST.
+                std.log.warn("watcher: received ERROR event, resetting resourceVersion", .{});
+                switch (resource_type) {
+                    .gateway_class => self.gateway_classes.resetResourceVersion(),
+                    .gateway => self.gateways.resetResourceVersion(),
+                    .http_route => self.http_routes.resetResourceVersion(),
+                    .service => self.services.resetResourceVersion(),
+                    .endpoints => self.endpoints.resetResourceVersion(),
+                    .secret => self.secrets.resetResourceVersion(),
+                }
             },
         }
     }
 
     /// Trigger reconciliation by building config and calling callback.
+    /// Must be called with mutex already held.
     /// Passes Io to callback for async operations (e.g., K8s status updates).
-    fn triggerReconciliation(self: *Self, io: Io) void {
+    /// TigerStyle: Caller must hold mutex, explicit in function name.
+    fn triggerReconciliationLocked(self: *Self, io: Io) void {
         assert(@intFromPtr(self.on_config_change) != 0); // S1: precondition - callback set
 
         std.log.debug("watcher: triggerReconciliation starting", .{});
@@ -528,9 +761,17 @@ pub const Watcher = struct {
         std.log.debug("watcher: {d} GatewayClasses match our controller", .{matching_count});
 
         // Phase 3: Parse Gateways and filter by matching GatewayClasses.
-        try self.parseStoredGatewaysFiltered(matching_class_names[0..matching_count]);
+        std.log.debug("watcher: parsing Gateways...", .{});
+        self.parseStoredGatewaysFiltered(matching_class_names[0..matching_count]) catch |err| {
+            std.log.err("watcher: parseStoredGatewaysFiltered failed: {s}", .{@errorName(err)});
+            return err;
+        };
         std.log.debug("watcher: parsed {d} Gateways after filtering", .{self.parsed_gateways_count});
-        try self.parseStoredHTTPRoutes();
+        std.log.debug("watcher: parsing HTTPRoutes...", .{});
+        self.parseStoredHTTPRoutes() catch |err| {
+            std.log.err("watcher: parseStoredHTTPRoutes failed: {s}", .{@errorName(err)});
+            return err;
+        };
         std.log.debug("watcher: parsed {d} HTTPRoutes", .{self.parsed_http_routes_count});
 
         // Phase 4: Build config slices from parsed storage.
@@ -558,7 +799,7 @@ pub const Watcher = struct {
         while (iteration < MAX_GATEWAY_CLASSES) : (iteration += 1) {
             if (!items[iteration].active) continue;
 
-            const raw_json = items[iteration].raw_json;
+            const raw_json = items[iteration].rawJson();
             if (raw_json.len == 0) continue;
 
             if (self.parsed_gateway_classes_count >= MAX_GATEWAY_CLASSES) {
@@ -632,11 +873,15 @@ pub const Watcher = struct {
         var iteration: u32 = 0;
         const items = self.gateways.items;
 
+        std.log.debug("watcher: parseStoredGatewaysFiltered checking {d} slots", .{MAX_GATEWAYS});
+
         while (iteration < MAX_GATEWAYS) : (iteration += 1) {
             if (!items[iteration].active) continue;
 
-            const raw_json = items[iteration].raw_json;
+            const raw_json = items[iteration].rawJson();
             if (raw_json.len == 0) continue;
+
+            std.log.debug("watcher: parsing Gateway slot {d}, json_len={d}", .{ iteration, raw_json.len });
 
             if (self.parsed_gateways_count >= MAX_GATEWAYS) {
                 return WatcherError.BufferOverflow;
@@ -644,7 +889,11 @@ pub const Watcher = struct {
 
             // Parse into temporary storage first.
             var temp_gateway = StoredGateway.init();
-            try parseGatewayJson(raw_json, &temp_gateway);
+            parseGatewayJson(raw_json, &temp_gateway) catch |err| {
+                std.log.err("watcher: parseGatewayJson failed for slot {d}: {s}", .{ iteration, @errorName(err) });
+                std.log.err("watcher: raw_json preview: {s}", .{raw_json[0..@min(200, raw_json.len)]});
+                return err;
+            };
 
             // Check if this Gateway's gatewayClassName matches one of our classes.
             if (!gatewayClassMatches(temp_gateway.gateway_class_name.slice(), our_classes)) {
@@ -672,7 +921,7 @@ pub const Watcher = struct {
         while (iteration < MAX_HTTP_ROUTES) : (iteration += 1) {
             if (!items[iteration].active) continue;
 
-            const raw_json = items[iteration].raw_json;
+            const raw_json = items[iteration].rawJson();
             if (raw_json.len == 0) continue;
 
             if (self.parsed_http_routes_count >= MAX_HTTP_ROUTES) {
@@ -801,21 +1050,25 @@ pub const Watcher = struct {
         };
     }
 
-    /// Apply backoff delay with exponential increase.
-    fn applyBackoff(self: *Self) void {
-        assert(self.current_backoff_ms >= INITIAL_BACKOFF_MS); // S1: precondition - valid backoff
-        assert(self.current_backoff_ms <= MAX_BACKOFF_MS); // S1: precondition - within bounds
+    /// Apply backoff delay with exponential increase for a specific thread.
+    /// TigerStyle: Per-thread backoff prevents one failing resource from affecting others.
+    fn applyBackoff(self: *Self, thread_idx: u8) void {
+        assert(thread_idx < RESOURCE_TYPE_COUNT); // S1: precondition - valid thread index
+        assert(self.current_backoff_ms[thread_idx] >= INITIAL_BACKOFF_MS); // S1: precondition - valid backoff
+        assert(self.current_backoff_ms[thread_idx] <= MAX_BACKOFF_MS); // S1: precondition - within bounds
+
+        const current_ms = self.current_backoff_ms[thread_idx];
 
         // Sleep for current backoff duration.
-        const backoff_s: u64 = self.current_backoff_ms / 1000;
-        const backoff_ns: u64 = (@as(u64, self.current_backoff_ms) % 1000) * 1_000_000;
+        const backoff_s: u64 = current_ms / 1000;
+        const backoff_ns: u64 = (@as(u64, current_ms) % 1000) * 1_000_000;
         posix.nanosleep(backoff_s, backoff_ns);
 
         // Increase backoff for next attempt (capped at MAX_BACKOFF_MS).
-        const new_backoff = self.current_backoff_ms * BACKOFF_MULTIPLIER;
-        self.current_backoff_ms = @min(new_backoff, MAX_BACKOFF_MS);
+        const new_backoff = current_ms * BACKOFF_MULTIPLIER;
+        self.current_backoff_ms[thread_idx] = @min(new_backoff, MAX_BACKOFF_MS);
 
-        assert(self.current_backoff_ms <= MAX_BACKOFF_MS); // S1: postcondition - still within bounds
+        assert(self.current_backoff_ms[thread_idx] <= MAX_BACKOFF_MS); // S1: postcondition - still within bounds
     }
 };
 
@@ -969,6 +1222,37 @@ test "K8s API paths are correct" {
     try std.testing.expect(std.mem.startsWith(u8, SERVICES_PATH, "/api/v1/"));
     try std.testing.expect(std.mem.startsWith(u8, ENDPOINTS_PATH, "/api/v1/"));
     try std.testing.expect(std.mem.startsWith(u8, SECRETS_PATH, "/api/v1/"));
+}
+
+test "ResourceType.getPath returns correct paths" {
+    try std.testing.expectEqualStrings(GATEWAY_CLASS_PATH, ResourceType.gateway_class.getPath());
+    try std.testing.expectEqualStrings(GATEWAY_PATH, ResourceType.gateway.getPath());
+    try std.testing.expectEqualStrings(HTTP_ROUTE_PATH, ResourceType.http_route.getPath());
+    try std.testing.expectEqualStrings(SERVICES_PATH, ResourceType.service.getPath());
+    try std.testing.expectEqualStrings(ENDPOINTS_PATH, ResourceType.endpoints.getPath());
+    try std.testing.expectEqualStrings(SECRETS_PATH, ResourceType.secret.getPath());
+}
+
+test "ResourceType.getName returns correct names" {
+    try std.testing.expectEqualStrings("GatewayClass", ResourceType.gateway_class.getName());
+    try std.testing.expectEqualStrings("Gateway", ResourceType.gateway.getName());
+    try std.testing.expectEqualStrings("HTTPRoute", ResourceType.http_route.getName());
+    try std.testing.expectEqualStrings("Service", ResourceType.service.getName());
+    try std.testing.expectEqualStrings("Endpoints", ResourceType.endpoints.getName());
+    try std.testing.expectEqualStrings("Secret", ResourceType.secret.getName());
+}
+
+test "RESOURCE_TYPE_COUNT matches number of ResourceType variants" {
+    // TigerStyle: Explicit test that constant matches enum count.
+    const resource_types = [_]ResourceType{
+        .gateway_class,
+        .gateway,
+        .http_route,
+        .service,
+        .endpoints,
+        .secret,
+    };
+    try std.testing.expectEqual(RESOURCE_TYPE_COUNT, resource_types.len);
 }
 
 test "NameStorage - basic operations" {

@@ -6,10 +6,10 @@
 //! JSON Output Format:
 //! ```json
 //! {
+//!   "allowed_hosts": ["api.example.com", "www.example.com"],
 //!   "routes": [
 //!     {"name": "api", "host": "api.example.com", "path_prefix": "/api/", "pool_idx": 0, "strip_prefix": true}
 //!   ],
-//!   "default_route": {"name": "default", "path_prefix": "/", "pool_idx": 0, "strip_prefix": false},
 //!   "pools": [
 //!     {"name": "api-pool", "upstreams": [{"host": "10.0.1.5", "port": 8001, "idx": 0, "tls": false}]}
 //!   ]
@@ -42,8 +42,13 @@ pub const MAX_POOLS: u8 = core_config.MAX_POOLS;
 /// Maximum upstreams per pool in JSON output.
 pub const MAX_UPSTREAMS_PER_POOL: u8 = core_config.MAX_UPSTREAMS_PER_POOL;
 
+/// Maximum allowed hosts to include in JSON output.
+/// TigerStyle S7: Bounded by MAX_ALLOWED_HOSTS from serval-core.
+pub const MAX_ALLOWED_HOSTS: u8 = core_config.MAX_ALLOWED_HOSTS;
+
 /// Maximum iterations for route generation loop.
-const MAX_ROUTE_ITERATIONS: u32 = @as(u32, MAX_ROUTES) * @as(u32, gw_config.MAX_RULES) * @as(u32, gw_config.MAX_MATCHES);
+/// Accounts for: routes * rules * matches * hostnames (or 1 if no hostnames).
+const MAX_ROUTE_ITERATIONS: u32 = @as(u32, MAX_ROUTES) * @as(u32, gw_config.MAX_RULES) * @as(u32, gw_config.MAX_MATCHES) * @as(u32, gw_config.MAX_HOSTNAMES);
 
 // ============================================================================
 // Error Types
@@ -99,46 +104,101 @@ pub fn translateToJson(
     // Start root object
     writer.writeRaw("{") catch return error.BufferTooSmall;
 
+    // Write allowed_hosts array from HTTPRoute hostnames.
+    // TigerStyle Y5: We use HTTPRoute hostnames (not Gateway listener hostnames)
+    // because HTTPRoutes have specific hostnames while Gateway listeners may have wildcards.
+    writer.writeRaw("\"allowed_hosts\":[") catch return error.BufferTooSmall;
+    var host_count: u8 = 0;
+
+    // Storage for tracking seen hostnames to deduplicate.
+    // TigerStyle S7: Bounded by MAX_ALLOWED_HOSTS.
+    var seen_hosts: [MAX_ALLOWED_HOSTS][gw_config.MAX_NAME_LEN]u8 = undefined;
+    var seen_hosts_len: [MAX_ALLOWED_HOSTS]u8 = undefined;
+
+    for (config_ptr.http_routes, 0..) |http_route, route_i| {
+        // S3: Bounded loop check
+        if (route_i >= gw_config.MAX_HTTP_ROUTES) break;
+
+        for (http_route.hostnames, 0..) |hostname, h_i| {
+            // S3: Bounded loop check
+            if (h_i >= gw_config.MAX_HOSTNAMES) break;
+            // S7: Bounded by MAX_ALLOWED_HOSTS
+            if (host_count >= MAX_ALLOWED_HOSTS) break;
+
+            // Skip duplicates (simple O(n) check, bounded by MAX_ALLOWED_HOSTS)
+            var is_duplicate = false;
+            var dup_i: u8 = 0;
+            while (dup_i < host_count) : (dup_i += 1) {
+                const seen_len = seen_hosts_len[dup_i];
+                if (seen_len == hostname.len and
+                    std.mem.eql(u8, seen_hosts[dup_i][0..seen_len], hostname))
+                {
+                    is_duplicate = true;
+                    break;
+                }
+            }
+
+            if (!is_duplicate) {
+                if (host_count > 0) {
+                    writer.writeRaw(",") catch return error.BufferTooSmall;
+                }
+                writer.writeRaw("\"") catch return error.BufferTooSmall;
+                writer.writeRaw(hostname) catch return error.BufferTooSmall;
+                writer.writeRaw("\"") catch return error.BufferTooSmall;
+
+                // Track this hostname to prevent duplicates
+                const copy_len: u8 = @intCast(@min(hostname.len, gw_config.MAX_NAME_LEN));
+                @memcpy(seen_hosts[host_count][0..copy_len], hostname[0..copy_len]);
+                seen_hosts_len[host_count] = copy_len;
+                host_count += 1;
+            }
+        }
+    }
+
+    writer.writeRaw("],") catch return error.BufferTooSmall;
+
     // Write routes array
     writer.writeRaw("\"routes\":[") catch return error.BufferTooSmall;
     var route_count: u8 = 0;
-    var default_route_written = false;
+    var pool_count_for_routes: u8 = 0; // Tracks pools for route->pool mapping
 
     // Process each HTTPRoute
     for (config_ptr.http_routes, 0..) |http_route, route_i| {
         // S3: Bounded loop check
         if (route_i >= gw_config.MAX_HTTP_ROUTES) break;
 
-        // Get host from first hostname if available
-        const host: ?[]const u8 = if (http_route.hostnames.len > 0) http_route.hostnames[0] else null;
+        // Build hostname list: either actual hostnames or [null] for match-all
+        // TigerStyle: Use sentinel to indicate "no hostname filter"
+        const hostnames = http_route.hostnames;
+        const hostname_count: u8 = if (hostnames.len > 0) @intCast(@min(hostnames.len, gw_config.MAX_HOSTNAMES)) else 1;
 
         // Process each rule
         for (http_route.rules, 0..) |rule, rule_i| {
             // S3: Bounded loop check
             if (rule_i >= gw_config.MAX_RULES) break;
 
-            // Calculate pool index for this rule's backends
-            const pool_idx = route_count;
+            // Pool index for this rule's backends (one pool per rule)
+            const pool_idx = pool_count_for_routes;
             if (pool_idx >= MAX_POOLS) {
                 return error.TooManyPools;
             }
+            pool_count_for_routes += 1;
 
             // Check if rule has URLRewrite filter for strip_prefix
             const strip_prefix = hasUrlRewriteFilter(rule.filters);
 
-            // Process each match in the rule
-            if (rule.matches.len == 0) {
-                // No matches means catch-all route
-                if (route_count > 0) {
-                    writer.writeRaw(",") catch return error.BufferTooSmall;
-                }
-                try writeRoute(&writer, http_route.name, host, "/", pool_idx, false);
-                route_count += 1;
-            } else {
-                for (rule.matches, 0..) |match, match_i| {
-                    // S3: Bounded loop check
-                    if (match_i >= gw_config.MAX_MATCHES) break;
+            // For each hostname, generate routes for this rule
+            var hostname_i: u8 = 0;
+            while (hostname_i < hostname_count) : (hostname_i += 1) {
+                // S3: Bounded loop check
+                if (hostname_i >= gw_config.MAX_HOSTNAMES) break;
 
+                // Get current hostname (null if route has no hostnames)
+                const host: ?[]const u8 = if (hostnames.len > 0) hostnames[hostname_i] else null;
+
+                // Process each match in the rule
+                if (rule.matches.len == 0) {
+                    // No matches means catch-all route for this host
                     if (route_count >= MAX_ROUTES) {
                         return error.TooManyRoutes;
                     }
@@ -146,29 +206,31 @@ pub fn translateToJson(
                     if (route_count > 0) {
                         writer.writeRaw(",") catch return error.BufferTooSmall;
                     }
-
-                    const path_value = if (match.path) |p| p.value else "/";
-                    try writeRoute(&writer, http_route.name, host, path_value, pool_idx, strip_prefix);
+                    try writeRoute(&writer, http_route.name, host, "/", pool_idx, false);
                     route_count += 1;
+                } else {
+                    for (rule.matches, 0..) |match, match_i| {
+                        // S3: Bounded loop check
+                        if (match_i >= gw_config.MAX_MATCHES) break;
+
+                        if (route_count >= MAX_ROUTES) {
+                            return error.TooManyRoutes;
+                        }
+
+                        if (route_count > 0) {
+                            writer.writeRaw(",") catch return error.BufferTooSmall;
+                        }
+
+                        const path_value = if (match.path) |p| p.value else "/";
+                        try writeRoute(&writer, http_route.name, host, path_value, pool_idx, strip_prefix);
+                        route_count += 1;
+                    }
                 }
             }
         }
     }
 
     writer.writeRaw("],") catch return error.BufferTooSmall;
-
-    // Write default_route (first pool or empty catch-all)
-    writer.writeRaw("\"default_route\":") catch return error.BufferTooSmall;
-    if (route_count > 0) {
-        try writeRoute(&writer, "default", null, "/", 0, false);
-        default_route_written = true;
-    } else {
-        // Empty config - write minimal default route
-        try writeRoute(&writer, "default", null, "/", 0, false);
-        default_route_written = true;
-    }
-
-    writer.writeRaw(",") catch return error.BufferTooSmall;
 
     // Write pools array
     writer.writeRaw("\"pools\":[") catch return error.BufferTooSmall;
@@ -205,14 +267,20 @@ pub fn translateToJson(
 
     // S2: Postconditions
     assert(written <= MAX_JSON_SIZE_BYTES);
-    assert(default_route_written);
 
     return written;
 }
 
 /// Check if any filter has a URL rewrite path configured.
+/// TigerStyle S1: Precondition assertion. S4: Bounded loop with explicit bounds.
 fn hasUrlRewriteFilter(filters: []const gw_config.HTTPRouteFilter) bool {
-    for (filters) |filter| {
+    // S1: Precondition - filters bounded by MAX_FILTERS
+    assert(filters.len <= gw_config.MAX_FILTERS);
+
+    // S4: Bounded loop with explicit iteration bounds
+    for (filters, 0..) |filter, i| {
+        assert(i < gw_config.MAX_FILTERS);
+
         if (filter.type == .URLRewrite) {
             if (filter.url_rewrite) |rewrite| {
                 if (rewrite.path != null) {
@@ -344,9 +412,13 @@ fn writePool(
 
     writer.writeRaw("]") catch return error.BufferTooSmall;
 
-    // Add lb_config with full probing configuration
+    // Add lb_config with probing disabled for now.
+    // TODO: Enable probing once router_example has a global DnsResolver.
+    // Probing requires dns_resolver != null in LbHandler.init(), but
+    // router_example's handleRouteUpdate passes null to swapRouter().
+    // To enable: add global DnsResolver to router_example and pass to swapRouter.
     writer.writeRaw(",\"lb_config\":{") catch return error.BufferTooSmall;
-    writer.writeRaw("\"enable_probing\":true,") catch return error.BufferTooSmall;
+    writer.writeRaw("\"enable_probing\":false,") catch return error.BufferTooSmall;
     writer.writeRaw("\"probe_interval_ms\":5000,") catch return error.BufferTooSmall;
     writer.writeRaw("\"health_path\":\"/\"") catch return error.BufferTooSmall;
     writer.writeRaw("}") catch return error.BufferTooSmall;
@@ -477,9 +549,11 @@ test "translateToJson empty config" {
 
     // Should have valid JSON structure
     const json = out_buf[0..len];
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"allowed_hosts\":[]") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"routes\":[]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"default_route\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"pools\":[]") != null);
+    // default_route should NOT be present
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"default_route\":") == null);
 }
 
 test "translateToJson with simple HTTPRoute" {
@@ -716,9 +790,9 @@ test "translateToJson full lb_config structure" {
 
     const json = out_buf[0..len];
 
-    // Verify lb_config structure
+    // Verify lb_config structure (probing disabled for now - see TODO in writePool)
     try std.testing.expect(std.mem.indexOf(u8, json, "\"lb_config\":{") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"enable_probing\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"enable_probing\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"probe_interval_ms\":5000") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"health_path\":\"/\"") != null);
 }
@@ -742,4 +816,204 @@ test "findResolvedBackend basic lookup" {
     // Should not find with wrong namespace
     const wrong_ns = findResolvedBackend(&backends, "api-svc", "production");
     try std.testing.expect(wrong_ns == null);
+}
+
+test "translateToJson with multiple hostnames" {
+    // An HTTPRoute with two hostnames should generate two routes pointing to the same pool
+    var hostnames = [_][]const u8{ "api.example.com", "api.staging.example.com" };
+    var matches = [_]gw_config.HTTPRouteMatch{
+        .{ .path = .{ .type = .PathPrefix, .value = "/api/" } },
+    };
+    var backend_refs = [_]gw_config.BackendRef{
+        .{ .name = "api-svc", .namespace = "default", .port = 8080 },
+    };
+    var rules = [_]gw_config.HTTPRouteRule{
+        .{
+            .matches = &matches,
+            .filters = &.{},
+            .backend_refs = &backend_refs,
+        },
+    };
+    var http_routes = [_]gw_config.HTTPRoute{
+        .{
+            .name = "multi-host-route",
+            .namespace = "default",
+            .hostnames = &hostnames,
+            .rules = &rules,
+        },
+    };
+
+    const config_data = gw_config.GatewayConfig{
+        .gateways = &.{},
+        .http_routes = &http_routes,
+    };
+
+    // Set up resolved backends with service endpoints
+    const ips = [_][]const u8{ "10.0.1.1", "10.0.1.2" };
+    var resolved_backends = [_]gw_config.ResolvedBackend{
+        createTestBackend("api-svc", "default", &ips, 8080),
+    };
+
+    var out_buf: [MAX_JSON_SIZE_BYTES]u8 = undefined;
+    const len = try translateToJson(&config_data, &resolved_backends, &out_buf);
+
+    try std.testing.expect(len > 0);
+
+    const json = out_buf[0..len];
+
+    // Verify BOTH hostnames have routes generated
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"host\":\"api.example.com\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"host\":\"api.staging.example.com\"") != null);
+
+    // Both routes should point to pool_idx 0 (same backends)
+    // Count occurrences of the route path to verify two routes were created
+    var count: u8 = 0;
+    var search_start: usize = 0;
+    while (std.mem.indexOfPos(u8, json, search_start, "\"path_prefix\":\"/api/\"")) |pos| {
+        count += 1;
+        search_start = pos + 1;
+        if (count > 10) break; // S3: bounded loop
+    }
+    try std.testing.expectEqual(@as(u8, 2), count);
+
+    // Verify only one pool was created (both routes share same backends)
+    var pool_count: u8 = 0;
+    var pool_search: usize = 0;
+    while (std.mem.indexOfPos(u8, json, pool_search, "\"name\":\"multi-host-route-pool\"")) |pos| {
+        pool_count += 1;
+        pool_search = pos + 1;
+        if (pool_count > 10) break; // S3: bounded loop
+    }
+    try std.testing.expectEqual(@as(u8, 1), pool_count);
+}
+
+test "translateToJson includes allowed_hosts from HTTPRoute hostnames" {
+    var hostnames = [_][]const u8{ "api.example.com", "www.example.com" };
+    var matches = [_]gw_config.HTTPRouteMatch{
+        .{ .path = .{ .type = .PathPrefix, .value = "/" } },
+    };
+    var backend_refs = [_]gw_config.BackendRef{
+        .{ .name = "api-svc", .namespace = "default", .port = 8080 },
+    };
+    var rules = [_]gw_config.HTTPRouteRule{
+        .{
+            .matches = &matches,
+            .filters = &.{},
+            .backend_refs = &backend_refs,
+        },
+    };
+    var http_routes = [_]gw_config.HTTPRoute{
+        .{
+            .name = "host-route",
+            .namespace = "default",
+            .hostnames = &hostnames,
+            .rules = &rules,
+        },
+    };
+
+    const config_data = gw_config.GatewayConfig{
+        .gateways = &.{},
+        .http_routes = &http_routes,
+    };
+
+    // Set up resolved backends with service endpoints
+    const ips = [_][]const u8{"10.0.1.1"};
+    var resolved_backends = [_]gw_config.ResolvedBackend{
+        createTestBackend("api-svc", "default", &ips, 8080),
+    };
+
+    var out_buf: [MAX_JSON_SIZE_BYTES]u8 = undefined;
+    const len = try translateToJson(&config_data, &resolved_backends, &out_buf);
+
+    const json = out_buf[0..len];
+
+    // Verify allowed_hosts is present with both hostnames
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"allowed_hosts\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"api.example.com\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"www.example.com\"") != null);
+
+    // Verify default_route is NOT present
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"default_route\":") == null);
+}
+
+test "translateToJson deduplicates allowed_hosts" {
+    // Two HTTPRoutes with overlapping hostnames
+    var hostnames1 = [_][]const u8{ "api.example.com", "www.example.com" };
+    var hostnames2 = [_][]const u8{ "api.example.com", "admin.example.com" }; // api.example.com is duplicate
+
+    var matches = [_]gw_config.HTTPRouteMatch{
+        .{ .path = .{ .type = .PathPrefix, .value = "/" } },
+    };
+    var backend_refs1 = [_]gw_config.BackendRef{
+        .{ .name = "api-svc", .namespace = "default", .port = 8080 },
+    };
+    var backend_refs2 = [_]gw_config.BackendRef{
+        .{ .name = "admin-svc", .namespace = "default", .port = 8080 },
+    };
+    var rules1 = [_]gw_config.HTTPRouteRule{
+        .{
+            .matches = &matches,
+            .filters = &.{},
+            .backend_refs = &backend_refs1,
+        },
+    };
+    var rules2 = [_]gw_config.HTTPRouteRule{
+        .{
+            .matches = &matches,
+            .filters = &.{},
+            .backend_refs = &backend_refs2,
+        },
+    };
+    var http_routes = [_]gw_config.HTTPRoute{
+        .{
+            .name = "api-route",
+            .namespace = "default",
+            .hostnames = &hostnames1,
+            .rules = &rules1,
+        },
+        .{
+            .name = "admin-route",
+            .namespace = "default",
+            .hostnames = &hostnames2,
+            .rules = &rules2,
+        },
+    };
+
+    const config_data = gw_config.GatewayConfig{
+        .gateways = &.{},
+        .http_routes = &http_routes,
+    };
+
+    // Set up resolved backends
+    const ips = [_][]const u8{"10.0.1.1"};
+    var resolved_backends = [_]gw_config.ResolvedBackend{
+        createTestBackend("api-svc", "default", &ips, 8080),
+        createTestBackend("admin-svc", "default", &ips, 8080),
+    };
+
+    var out_buf: [MAX_JSON_SIZE_BYTES]u8 = undefined;
+    const len = try translateToJson(&config_data, &resolved_backends, &out_buf);
+
+    const json = out_buf[0..len];
+
+    // Verify allowed_hosts contains all 3 unique hostnames
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"api.example.com\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"www.example.com\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"admin.example.com\"") != null);
+
+    // Count occurrences of api.example.com - should only appear once in allowed_hosts
+    // (may appear in routes too, so just check first occurrence in allowed_hosts section)
+    const allowed_hosts_start = std.mem.indexOf(u8, json, "\"allowed_hosts\":[").?;
+    const allowed_hosts_end = std.mem.indexOfPos(u8, json, allowed_hosts_start, "],").?;
+    const allowed_hosts_section = json[allowed_hosts_start..allowed_hosts_end];
+
+    // Count api.example.com in allowed_hosts section
+    var api_count: u8 = 0;
+    var search_pos: usize = 0;
+    while (std.mem.indexOfPos(u8, allowed_hosts_section, search_pos, "\"api.example.com\"")) |pos| {
+        api_count += 1;
+        search_pos = pos + 1;
+        if (api_count > 10) break; // S3: bounded loop
+    }
+    try std.testing.expectEqual(@as(u8, 1), api_count);
 }

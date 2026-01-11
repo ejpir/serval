@@ -10,9 +10,9 @@
 //!   gateway [OPTIONS]
 //!
 //! Options:
-//!   --admin-port <PORT>       Admin API port (default: 9901)
+//!   --admin-port <PORT>       Admin API port for health probes (default: 8080)
 //!   --data-plane-host <HOST>  Data plane hostname (default: "serval-router")
-//!   --data-plane-port <PORT>  Data plane admin port (default: 9901)
+//!   --data-plane-port <PORT>  Data plane admin port for config updates (default: 9901)
 //!   --api-server <URL>        K8s API server (for out-of-cluster)
 //!   --api-port <PORT>         K8s API port (default: 443)
 //!   --token <TOKEN>           Bearer token for K8s API
@@ -44,9 +44,12 @@ const VERSION = "0.1.0";
 /// CLI configuration parsed from command line arguments.
 /// TigerStyle: Explicit struct with named fields.
 const CliConfig = struct {
-    admin_port: u16 = 9901,
+    /// Gateway controller's admin port for health probes (/healthz, /readyz).
+    /// Different from data_plane_port to avoid conflict.
+    admin_port: u16 = 8080,
     /// Trailing dot makes this an explicit FQDN, preventing search domain appending
     data_plane_host: []const u8 = "serval-router.default.svc.cluster.local.",
+    /// Data plane admin port where router_example listens for config updates.
     data_plane_port: u16 = 9901,
     api_server: ?[]const u8 = null,
     api_port: u16 = 443,
@@ -78,7 +81,7 @@ fn parseArgs() CliConfig {
 
         if (std.mem.eql(u8, arg, "--admin-port")) {
             if (args.next()) |val| {
-                config.admin_port = std.fmt.parseInt(u16, val, 10) catch 9901;
+                config.admin_port = std.fmt.parseInt(u16, val, 10) catch 8080;
             }
         } else if (std.mem.eql(u8, arg, "--data-plane-host")) {
             if (args.next()) |val| {
@@ -124,9 +127,9 @@ fn printUsage() void {
         \\Kubernetes Gateway API controller for serval.
         \\
         \\Options:
-        \\  --admin-port <PORT>       Admin API port (default: 9901)
+        \\  --admin-port <PORT>       Admin API port for health probes (default: 8080)
         \\  --data-plane-host <HOST>  Data plane hostname (default: "serval-router.default.svc.cluster.local.")
-        \\  --data-plane-port <PORT>  Data plane admin port (default: 9901)
+        \\  --data-plane-port <PORT>  Data plane admin port for config updates (default: 9901)
         \\  --api-server <URL>        K8s API server hostname (for out-of-cluster)
         \\  --api-port <PORT>         K8s API port (default: 443)
         \\  --token <TOKEN>           Bearer token for K8s API authentication
@@ -147,6 +150,7 @@ fn printUsage() void {
 /// Main entry point.
 /// TigerStyle Y1: Under 70 lines with extracted helpers.
 pub fn main() !void {
+    std.log.info("=== MAIN STARTING ===", .{});
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -175,10 +179,10 @@ const ShutdownContext = struct {
     }
 };
 
-/// Watcher result containing both watcher and thread for cleanup.
+/// Watcher pointer for cleanup.
+/// Note: Threads are managed internally by the Watcher; stop() joins all threads.
 const WatcherResult = struct {
     watcher: *Watcher,
-    thread: std.Thread,
 };
 
 /// Run the gateway controller.
@@ -235,9 +239,8 @@ fn run(allocator: std.mem.Allocator, config: CliConfig) !void {
 
     // Graceful shutdown: stop all threads
     std.log.info("shutdown requested, stopping services...", .{});
-    watcher_result.watcher.stop();
+    watcher_result.watcher.stop(); // stop() internally joins all watch threads
     admin_shutdown.store(true, .release);
-    watcher_result.thread.join();
     admin_thread.join();
     std.log.info("gateway controller stopped", .{});
 }
@@ -268,20 +271,26 @@ fn initAndStartWatcher(
     std.log.info("watching namespace: {s}", .{k8s_client.getNamespace()});
     std.log.info("controller name: {s}", .{controller_name});
 
-    const watcher = Watcher.init(allocator, k8s_client, onConfigChange, ctrl, controller_name) catch |err| {
+    // Get resolver from controller for endpoint data updates.
+    // Watcher updates resolver when it receives Endpoints events.
+    const resolver = ctrl.getResolver();
+
+    const watcher = Watcher.init(allocator, k8s_client, onConfigChange, ctrl, resolver, controller_name) catch |err| {
         std.log.err("failed to initialize watcher: {s}", .{@errorName(err)});
         shutdown_ctx.shutdownAdmin();
         return null;
     };
 
-    const watcher_thread = watcher.start() catch |err| {
-        std.log.err("failed to start watcher thread: {s}", .{@errorName(err)});
+    // Start spawns parallel watch threads for each resource type.
+    // Threads are managed internally; stop() will join all of them.
+    watcher.start() catch |err| {
+        std.log.err("failed to start watcher threads: {s}", .{@errorName(err)});
         watcher.deinit();
         shutdown_ctx.shutdownAdmin();
         return null;
     };
 
-    return WatcherResult{ .watcher = watcher, .thread = watcher_thread };
+    return WatcherResult{ .watcher = watcher };
 }
 
 /// Callback invoked when K8s watcher detects config changes.

@@ -232,6 +232,7 @@ pub fn Server(
             maybe_tls: ?*TLSStream,
             io: *Io,
             stream: Io.net.Stream,
+            conn_id: u64,
         };
 
         /// Read function for BodyReader - reads from TLS or plain socket.
@@ -242,7 +243,7 @@ pub fn Server(
             assert(@intFromPtr(ctx_ptr) != 0);
 
             const ctx: *BodyReadContext = @ptrCast(@alignCast(ctx_ptr));
-            return connectionRead(ctx.maybe_tls, ctx.io, ctx.stream, buf);
+            return connectionRead(ctx.maybe_tls, ctx.io, ctx.stream, buf, ctx.conn_id);
         }
 
         /// Read from connection (TLS or plain).
@@ -252,14 +253,18 @@ pub fn Server(
             io: *Io,
             stream: Io.net.Stream,
             buf: []u8,
+            conn_id: u64,
         ) ?usize {
             assert(buf.len > 0); // S1: precondition
 
             if (maybe_tls) |tls| {
                 // TLS read (blocking - std.Io handles socket-level async)
-                // SslRead error includes normal client disconnect, don't log as error.
                 var mutable_tls = tls.*;
-                const n = mutable_tls.read(buf) catch return null;
+                const n = mutable_tls.read(buf) catch |err| {
+                    // Log TLS errors (includes client disconnect, handshake issues, etc.)
+                    debugLog("server: conn={d} TLS read error: {s}", .{ conn_id, @errorName(err) });
+                    return null;
+                };
                 return n;
             } else {
                 // Plain socket read
@@ -268,7 +273,12 @@ pub fn Server(
                 var bufs: [1][]u8 = .{buf};
                 const n = stream_reader.interface.readVec(&bufs) catch |err| {
                     if (err != error.EndOfStream) {
-                        debugLog("Read error: {s}", .{@errorName(err)});
+                        // Log underlying error from stream_reader.err (ReadFailed wraps the real error)
+                        if (stream_reader.err) |underlying| {
+                            debugLog("server: conn={d} read error: {s} (underlying: {s})", .{ conn_id, @errorName(err), @errorName(underlying) });
+                        } else {
+                            debugLog("server: conn={d} read error: {s}", .{ conn_id, @errorName(err) });
+                        }
                     }
                     return null;
                 };
@@ -335,6 +345,7 @@ pub fn Server(
             buffer_offset: usize,
             buffer_len: *usize,
             cfg: Config,
+            conn_id: u64,
         ) bool {
             // TigerStyle: Bounded loop - max 16 iterations to receive complete headers
             const max_read_iterations: u32 = 16;
@@ -351,7 +362,7 @@ pub fn Server(
                     sendErrorResponseTls(maybe_tls, io, stream, 431, "Request Header Fields Too Large");
                     return false;
                 }
-                const n = connectionRead(maybe_tls, io, stream, recv_buf[buffer_len.*..]) orelse return false;
+                const n = connectionRead(maybe_tls, io, stream, recv_buf[buffer_len.*..], conn_id) orelse return false;
                 if (n == 0) return false;
                 buffer_len.* += n;
             }
@@ -650,13 +661,13 @@ pub fn Server(
                 debugLog("server: conn={d} waiting for request handler_start={d}", .{ connection_id, @as(u64, @intCast(handler_start_ns)) });
                 const read_start_ns = realtimeNanos();
                 if (buffer_offset >= buffer_len) {
-                    const n = connectionRead(maybe_tls_ptr, &io_mut, stream, &recv_buf) orelse return;
+                    const n = connectionRead(maybe_tls_ptr, &io_mut, stream, &recv_buf, connection_id) orelse return;
                     buffer_len = n;
                     buffer_offset = 0;
                 }
 
                 // Accumulate reads until complete headers received
-                if (!accumulateHeaders(maybe_tls_ptr, &io_mut, stream, &recv_buf, buffer_offset, &buffer_len, cfg)) return;
+                if (!accumulateHeaders(maybe_tls_ptr, &io_mut, stream, &recv_buf, buffer_offset, &buffer_len, cfg, connection_id)) return;
                 const read_elapsed_ns = realtimeNanos() - read_start_ns;
                 const read_duration_us: u64 = if (read_elapsed_ns >= 0) @intCast(@divFloor(read_elapsed_ns, 1000)) else 0;
                 debugLog("server: conn={d} received bytes={d} read_us={d}", .{ connection_id, buffer_len - buffer_offset, read_duration_us });
@@ -717,6 +728,7 @@ pub fn Server(
                         .maybe_tls = maybe_tls_ptr,
                         .io = &io_mut,
                         .stream = stream,
+                        .conn_id = connection_id,
                     };
 
                     // Set up BodyReader with lazy read capability
@@ -835,8 +847,70 @@ pub fn Server(
                     }
                 }
 
-                // Select upstream and forward
-                var upstream = handler.selectUpstream(&ctx, &parser.request);
+                // Select upstream and forward (or reject if handler returns action)
+                const action_result = handler.selectUpstream(&ctx, &parser.request);
+
+                // Handle action-style return (Router.Action) vs plain Upstream
+                const upstream: types.Upstream = blk: {
+                    if (comptime hooks.hasUpstreamAction(Handler)) {
+                        // Handler returns Action union (e.g., Router)
+                        switch (action_result) {
+                            .forward => |up| break :blk up,
+                            .reject => |rej| {
+                                // Handler rejected request (e.g., 404 Not Found, 421 Misdirected)
+                                ctx.response_status = rej.status;
+                                const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
+                                ctx.duration_ns = duration_ns;
+
+                                // Send reject response (TLS-aware)
+                                sendDirectResponseTls(
+                                    maybe_tls_ptr,
+                                    &io_mut,
+                                    stream,
+                                    .{
+                                        .status = rej.status,
+                                        .body = rej.body,
+                                        .content_type = "text/plain",
+                                    },
+                                );
+
+                                metrics.requestEnd(rej.status, duration_ns);
+                                if (comptime hooks.hasHook(Handler, "onLog")) {
+                                    const log_entry = log.LogEntry{
+                                        .timestamp_s = @intCast(@divFloor(ctx.start_time_ns, std.time.ns_per_s)),
+                                        .start_time_ns = ctx.start_time_ns,
+                                        .duration_ns = duration_ns,
+                                        .method = parser.request.method,
+                                        .path = parser.request.path,
+                                        .request_bytes = ctx.bytes_received,
+                                        .status = rej.status,
+                                        .response_bytes = @intCast(rej.body.len),
+                                        .upstream = null,
+                                        .upstream_duration_ns = 0,
+                                        .error_phase = null,
+                                        .error_name = null,
+                                        .connection_reused = false,
+                                        .keepalive = true,
+                                        .parse_duration_ns = ctx.parse_duration_ns,
+                                        .connection_id = ctx.connection_id,
+                                        .request_number = ctx.request_number,
+                                        .client_addr = ctx.client_addr,
+                                    };
+                                    handler.onLog(&ctx, log_entry);
+                                }
+                                tracer.endSpan(span_handle, null);
+
+                                // Advance buffer past this request and continue with next
+                                const body_length = getBodyLength(&parser.request);
+                                buffer_offset += parser.headers_end + body_length;
+                                continue;
+                            },
+                        }
+                    } else {
+                        // Handler returns plain Upstream (e.g., LbHandler)
+                        break :blk action_result;
+                    }
+                };
                 ctx.upstream = upstream;
 
                 // Extract body info and forward

@@ -6,6 +6,11 @@ Content-based router for serval HTTP server.
 
 **Multi-pool routing** based on host and path matching. Each pool has its own `LbHandler` for health-aware load balancing. Supports path rewriting (strip prefix) for API gateway patterns.
 
+Features:
+- **Host validation**: `allowed_hosts` whitelist with 421 Misdirected Request for unknown hosts
+- **First-match routing**: Routes evaluated in order, 404 Not Found if no match
+- **Per-pool load balancing**: Health-aware upstream selection per backend pool
+
 Use `serval-router` when you need to route requests to different backend pools. For simple single-pool load balancing, see `serval-lb`.
 
 ## When to Use
@@ -61,9 +66,23 @@ Remove matched prefix before forwarding to backend:
 
 Each pool has its own LbHandler with independent health tracking and background probing.
 
+### Host Validation (allowed_hosts)
+
+Optional whitelist of hostnames this router will serve:
+
+```zig
+const allowed_hosts = [_][]const u8{ "api.example.com", "www.example.com" };
+try router.init(&routes, &pool_configs, &allowed_hosts, null, null);
+```
+
+- **Empty `allowed_hosts`**: Allow any host (backwards compatible)
+- **Non-empty**: Reject unknown hosts with 421 Misdirected Request
+- **Case-insensitive** per RFC 9110 §4.2.3
+- **Port stripped** per RFC 9110 §7.2 (`example.com:8080` matches `example.com`)
+
 ### First-Match Routing
 
-Routes are evaluated in order; first match wins. A default route is required when no routes match.
+Routes are evaluated in order; first match wins. Returns 404 Not Found if no route matches.
 
 ## Usage
 
@@ -113,18 +132,19 @@ const routes = [_]serval_router.Route{
         .matcher = .{ .path = .{ .prefix = "/static/" } },
         .pool_idx = 1,       // static-pool
     },
+    .{
+        .name = "default",
+        .matcher = .{ .path = .{ .prefix = "/" } },  // Catch-all
+        .pool_idx = 0,
+    },
 };
 
-// Default route (required)
-const default_route = serval_router.Route{
-    .name = "default",
-    .matcher = .{ .path = .{ .prefix = "/" } },
-    .pool_idx = 0,
-};
+// Optional: Restrict to specific hostnames (empty = allow all)
+const allowed_hosts = [_][]const u8{ "api.example.com", "www.example.com" };
 
 // Initialize router
 var router: serval_router.Router = undefined;
-try router.init(&routes, default_route, &pool_configs, null);
+try router.init(&routes, &pool_configs, &allowed_hosts, null, null);
 defer router.deinit();
 
 // Use with server (implements handler interface)
@@ -139,22 +159,30 @@ defer router.deinit();
 ```zig
 pub const Router = struct {
     routes: []const Route,
-    default_route: Route,
+    allowed_hosts: []const []const u8,  // Empty = allow any host
     pools: []Pool,
+
+    /// Action result from selectUpstream
+    pub const Action = union(enum) {
+        forward: Upstream,                    // Forward to upstream
+        reject: struct { status: u16, body: []const u8 },  // 421 or 404
+    };
 
     pub fn init(
         self: *Self,
         routes: []const Route,
-        default_route: Route,
         pool_configs: []const PoolConfig,
-        client_ctx: ?*ssl.SSL_CTX,  // For TLS health probes
+        allowed_hosts: []const []const u8,   // Empty = allow any host
+        client_ctx: ?*ssl.SSL_CTX,           // For TLS health probes
+        dns_resolver: ?*DnsResolver,         // For health probe DNS
     ) !void
     pub fn deinit(self: *Self) void
-    pub fn selectUpstream(self: *Self, ctx: *Context, request: *const Request) Upstream
+    pub fn selectUpstream(self: *Self, ctx: *Context, request: *const Request) Action
     pub fn onLog(self: *Self, ctx: *Context, entry: LogEntry) void
     pub fn getPool(self: *const Self, idx: u8) ?*const Pool
     pub fn countTotalHealthy(self: *const Self) u32
     pub fn countTotalBackends(self: *const Self) u32
+    pub fn isHostAllowed(self: *const Self, host: ?[]const u8) bool
 };
 ```
 
@@ -255,11 +283,14 @@ See `deploy/README.md` for full deployment commands.
 | Path rewriting (strip prefix) | Complete |
 | Per-pool load balancing | Complete |
 | First-match routing | Complete |
-| Required default route | Complete |
+| Host validation (allowed_hosts) | Complete |
+| 421 Misdirected Request | Complete |
+| 404 Not Found (no match) | Complete |
 | Runtime mutable routes | Not implemented |
 | Header matching | Not implemented |
 | Regex path matching | Not implemented |
 | Method matching | Not implemented |
+| Wildcard host matching | Not implemented |
 
 ## Dependencies
 
@@ -272,12 +303,13 @@ See `deploy/README.md` for full deployment commands.
 ## TigerStyle Compliance
 
 - Out-pointer init for large struct (C3)
-- Bounded arrays: MAX_POOLS=64, MAX_ROUTES=128 (S3)
+- Bounded arrays: MAX_POOLS=64, MAX_ROUTES=128, MAX_ALLOWED_HOSTS=64 (S3)
 - No runtime allocation after init (S5)
 - ~2 assertions per function (S1)
 - Explicit types: u8 for pool_idx, indices (S2)
-- Tagged union for PathMatch prevents invalid states (S7)
-- Case-insensitive host comparison per RFC 9110 (spec compliance)
+- Tagged union for PathMatch and Action prevents invalid states (S7)
+- Case-insensitive host comparison per RFC 9110 §4.2.3 (spec compliance)
+- Port stripping in host validation per RFC 9110 §7.2 (spec compliance)
 - errdefer cleanup on partial initialization failure (S6)
 
 ## Future Work

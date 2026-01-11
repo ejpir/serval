@@ -8,7 +8,8 @@
 //! - Host + path matching (exact or prefix)
 //! - Path rewriting (strip prefix before forwarding)
 //! - Per-pool load balancing with health tracking
-//! - First-match routing with explicit default route
+//! - Host validation (allowed_hosts filtering)
+//! - First-match routing (no implicit default)
 //!
 //! TigerStyle: No allocation after init, bounded loops, explicit types.
 
@@ -38,6 +39,8 @@ const PoolConfig = types.PoolConfig;
 // Re-export routing limits from config (single source of truth).
 pub const MAX_POOLS = config.MAX_POOLS;
 pub const MAX_ROUTES = config.MAX_ROUTES;
+pub const MAX_ALLOWED_HOSTS = config.MAX_ALLOWED_HOSTS;
+pub const MAX_HOSTNAME_LEN = config.MAX_HOSTNAME_LEN;
 
 /// Content-based router with per-pool load balancing.
 ///
@@ -48,14 +51,27 @@ pub const MAX_ROUTES = config.MAX_ROUTES;
 pub const Router = struct {
     /// Route table (evaluated in order, first match wins).
     routes: []const Route,
-    /// Default route when no match found.
-    default_route: Route,
+    /// Allowed hostnames for this router. Empty = allow any host.
+    /// TigerStyle S7: Bounded by MAX_ALLOWED_HOSTS.
+    allowed_hosts: []const []const u8 = &.{},
     /// Backend pools (indexed by Route.pool_idx).
     pools: []Pool,
     /// Embedded storage for pools (avoids heap allocation).
     pool_storage: [MAX_POOLS]Pool = undefined,
 
     const Self = @This();
+
+    /// Action result for selectUpstream.
+    /// TigerStyle: Tagged union with explicit variants.
+    pub const Action = union(enum) {
+        /// Forward to this upstream.
+        forward: Upstream,
+        /// Reject with status code and body.
+        reject: struct {
+            status: u16,
+            body: []const u8,
+        },
+    };
 
     /// A backend pool with embedded load balancer.
     pub const Pool = struct {
@@ -68,14 +84,14 @@ pub const Router = struct {
     /// Initialize router with routes and backend pools.
     ///
     /// TigerStyle C3: Out-pointer for stable addresses (LbHandler has prober thread).
-    /// IMPORTANT: Caller must ensure routes, pool_configs, and all referenced strings
-    /// remain valid for the lifetime of this Router instance.
+    /// IMPORTANT: Caller must ensure routes, pool_configs, allowed_hosts, and all
+    /// referenced strings remain valid for the lifetime of this Router instance.
     ///
     /// Arguments:
     ///   self: Out-pointer for Router instance (caller owns storage).
     ///   routes: Route table (evaluated in order, first match wins).
-    ///   default_route: Fallback route when no match found.
     ///   pool_configs: Backend pool configurations (one per pool_idx).
+    ///   allowed_hosts: Hostnames this router will serve. Empty = allow any host.
     ///   client_ctx: SSL_CTX for TLS health probes (null if all upstreams are plaintext).
     ///   dns_resolver: DNS resolver for hostname resolution in health probes.
     ///                 Required if any pool has probing enabled. Caller owns lifetime.
@@ -83,20 +99,22 @@ pub const Router = struct {
     /// Errors:
     ///   error.TooManyPools: pool_configs.len > MAX_POOLS
     ///   error.TooManyRoutes: routes.len > MAX_ROUTES
+    ///   error.TooManyAllowedHosts: allowed_hosts.len > MAX_ALLOWED_HOSTS
     ///   error.InvalidPoolIndex: Route references non-existent pool
     ///   error.EmptyPool: Pool has no upstreams
     ///   (+ any errors from LbHandler.init)
     pub fn init(
         self: *Self,
         routes: []const Route,
-        default_route: Route,
         pool_configs: []const PoolConfig,
+        allowed_hosts: []const []const u8,
         client_ctx: ?*ssl.SSL_CTX,
         dns_resolver: ?*DnsResolver,
     ) !void {
         // Preconditions
         assert(pool_configs.len > 0); // S1: At least one pool required
         assert(routes.len <= MAX_ROUTES); // S1: Route count within bounds
+        assert(allowed_hosts.len <= MAX_ALLOWED_HOSTS); // S1: allowed_hosts within bounds
 
         // Validate pool count
         if (pool_configs.len > MAX_POOLS) {
@@ -108,14 +126,16 @@ pub const Router = struct {
             return error.TooManyRoutes;
         }
 
+        // Validate allowed_hosts count
+        if (allowed_hosts.len > MAX_ALLOWED_HOSTS) {
+            return error.TooManyAllowedHosts;
+        }
+
         // Validate all route pool indices before initialization
         for (routes) |route| {
             if (route.pool_idx >= pool_configs.len) {
                 return error.InvalidPoolIndex;
             }
-        }
-        if (default_route.pool_idx >= pool_configs.len) {
-            return error.InvalidPoolIndex;
         }
 
         // Validate pool configurations
@@ -125,9 +145,9 @@ pub const Router = struct {
             }
         }
 
-        // Store route pointers (caller ensures data remains valid).
+        // Store route and allowed_hosts pointers (caller ensures data remains valid).
         self.routes = routes;
-        self.default_route = default_route;
+        self.allowed_hosts = allowed_hosts;
 
         // Initialize pools with embedded LbHandlers.
         var initialized_count: usize = 0;
@@ -156,6 +176,7 @@ pub const Router = struct {
         assert(self.routes.len == routes.len); // S2: All routes copied
         assert(self.pools.len == pool_configs.len); // S2: All pools initialized
         assert(self.pools.len > 0); // S2: At least one pool
+        assert(self.allowed_hosts.len == allowed_hosts.len); // S2: allowed_hosts stored
     }
 
     /// Clean up all pools and stop background probers.
@@ -167,23 +188,54 @@ pub const Router = struct {
 
     /// Handler interface: select upstream for request.
     ///
-    /// Matches request against routes (first match wins), then delegates
-    /// to the matched pool's LbHandler for health-aware upstream selection.
+    /// Validates host against allowed_hosts (if configured), matches request
+    /// against routes (first match wins), then delegates to the matched pool's
+    /// LbHandler for health-aware upstream selection.
+    ///
+    /// Returns Action.reject for:
+    /// - 421 Misdirected Request: Host not in allowed_hosts
+    /// - 404 Not Found: No matching route
     ///
     /// Sets ctx.rewritten_path if route has strip_prefix enabled.
     ///
     /// TigerStyle: Bounded loop (MAX_ROUTES), no allocation.
-    pub fn selectUpstream(self: *Self, ctx: *Context, request: *const Request) Upstream {
+    pub fn selectUpstream(self: *Self, ctx: *Context, request: *const Request) Action {
         assert(self.pools.len > 0); // S1: Router initialized
+        assert(self.allowed_hosts.len <= MAX_ALLOWED_HOSTS); // S1: Bounds check
 
-        const route = self.findRoute(request);
+        const host = request.headers.getHost();
+        std.log.debug("router: selectUpstream host={s} path={s}", .{ host orelse "(no host)", request.path });
+
+        // Validate Host against allowed_hosts (if any configured).
+        // RFC 9110 §15.5.20: 421 for requests not intended for this server.
+        if (self.allowed_hosts.len > 0) {
+            if (!self.isHostAllowed(host)) {
+                std.log.debug("router: host not allowed, rejecting with 421", .{});
+                return .{ .reject = .{
+                    .status = 421,
+                    .body = "Misdirected Request",
+                } };
+            }
+        }
+
+        // Find matching route - no default fallback
+        const route = self.findRoute(request) orelse {
+            std.log.debug("router: no matching route, rejecting with 404", .{});
+            return .{ .reject = .{
+                .status = 404,
+                .body = "Not Found",
+            } };
+        };
+        std.log.debug("router: matched route={s} pool_idx={d}", .{ route.name, route.pool_idx });
 
         // Store rewritten path if strip_prefix enabled
         ctx.rewritten_path = self.rewritePath(route, request.path);
 
         // Delegate to pool's LbHandler for health-aware selection
         assert(route.pool_idx < self.pools.len); // S1: Valid pool index
-        return self.pools[route.pool_idx].lb_handler.selectUpstream(ctx, request);
+        const upstream = self.pools[route.pool_idx].lb_handler.selectUpstream(ctx, request);
+        std.log.debug("router: selected upstream host={s} port={d}", .{ upstream.host, upstream.port });
+        return .{ .forward = upstream };
     }
 
     /// Handler interface: forward health tracking to correct pool.
@@ -218,24 +270,76 @@ pub const Router = struct {
         // Upstream not found in any pool - ignore (may be from different handler)
     }
 
-    /// Find matching route. Returns default_route if no match.
+    /// Find matching route. Returns null if no match.
     ///
     /// Routes are evaluated in order; first match wins.
     /// TigerStyle S3: Bounded loop (routes.len <= MAX_ROUTES).
-    fn findRoute(self: *const Self, request: *const Request) *const Route {
+    fn findRoute(self: *const Self, request: *const Request) ?*const Route {
         assert(self.routes.len <= MAX_ROUTES); // S1: Bounded
 
         const host = request.headers.getHost(); // O(1) cached lookup
         const path = request.path;
 
+        std.log.debug("router: findRoute checking {d} routes for host={s} path={s}", .{
+            self.routes.len,
+            host orelse "(null)",
+            path,
+        });
+
         // TigerStyle S3: Bounded loop, explicit exit
-        for (self.routes) |*route| {
-            if (route.matcher.matches(host, path)) {
+        for (self.routes, 0..) |*route, i| {
+            const route_host = route.matcher.host orelse "*";
+            const route_path = route.matcher.path.getPattern();
+            const matched = route.matcher.matches(host, path);
+            std.log.debug("router: route[{d}] name={s} host={s} path={s} matched={}", .{
+                i,
+                route.name,
+                route_host,
+                route_path,
+                matched,
+            });
+            if (matched) {
                 return route;
             }
         }
 
-        return &self.default_route;
+        std.log.debug("router: no matching route found", .{});
+        return null;
+    }
+
+    /// Check if Host header matches any allowed hostname.
+    /// Returns true if allowed_hosts is empty (allow-all mode).
+    ///
+    /// RFC 9110 §7.2: Host header may include port, which is stripped.
+    /// RFC 9110 §4.2.3: Host comparison is case-insensitive.
+    ///
+    /// TigerStyle S4: Bounded loop over allowed_hosts.
+    fn isHostAllowed(self: *const Self, host: ?[]const u8) bool {
+        // S1: Preconditions
+        assert(self.allowed_hosts.len <= MAX_ALLOWED_HOSTS);
+
+        // Empty allowed_hosts = allow any host (backwards compatible)
+        if (self.allowed_hosts.len == 0) {
+            return true;
+        }
+
+        const h = host orelse return false;
+
+        // Strip port if present. RFC 9110 §7.2: Host may include port.
+        const hostname = if (std.mem.indexOfScalar(u8, h, ':')) |i| h[0..i] else h;
+
+        // S1: Postcondition - hostname length check
+        assert(hostname.len <= h.len);
+
+        // S4: Bounded loop
+        for (self.allowed_hosts, 0..) |allowed, i| {
+            assert(i < MAX_ALLOWED_HOSTS); // S1: Loop invariant
+            // RFC 9110 §4.2.3: Host comparison is case-insensitive.
+            if (std.ascii.eqlIgnoreCase(allowed, hostname)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /// Rewrite path if route has strip_prefix enabled.
@@ -337,12 +441,6 @@ test "Router findRoute matches first route" {
         },
     };
 
-    const default_route = Route{
-        .name = "default",
-        .matcher = .{ .path = .{ .prefix = "/" } },
-        .pool_idx = 0,
-    };
-
     const upstreams = [_]Upstream{
         .{ .host = "127.0.0.1", .port = 8001, .idx = 0 },
     };
@@ -353,7 +451,7 @@ test "Router findRoute matches first route" {
     };
 
     var router: Router = undefined;
-    try router.init(&routes, default_route, &pool_configs, null, null);
+    try router.init(&routes, &pool_configs, &.{}, null, null);
     defer router.deinit();
 
     // Request that matches both routes
@@ -361,22 +459,17 @@ test "Router findRoute matches first route" {
     const matched = router.findRoute(&request);
 
     // First match wins (api-v1, not api-v2)
-    try std.testing.expectEqualStrings("api-v1", matched.name);
+    try std.testing.expect(matched != null);
+    try std.testing.expectEqualStrings("api-v1", matched.?.name);
 }
 
-test "Router findRoute returns default when no match" {
+test "Router findRoute returns null when no match" {
     const routes = [_]Route{
         .{
             .name = "api",
             .matcher = .{ .host = "api.example.com", .path = .{ .prefix = "/api/" } },
             .pool_idx = 0,
         },
-    };
-
-    const default_route = Route{
-        .name = "default",
-        .matcher = .{ .path = .{ .prefix = "/" } },
-        .pool_idx = 0,
     };
 
     const upstreams = [_]Upstream{
@@ -388,7 +481,7 @@ test "Router findRoute returns default when no match" {
     };
 
     var router: Router = undefined;
-    try router.init(&routes, default_route, &pool_configs, null, null);
+    try router.init(&routes, &pool_configs, &.{}, null, null);
     defer router.deinit();
 
     // Request that doesn't match (wrong host)
@@ -396,7 +489,7 @@ test "Router findRoute returns default when no match" {
     try request.headers.put("Host", "www.example.com");
 
     const matched = router.findRoute(&request);
-    try std.testing.expectEqualStrings("default", matched.name);
+    try std.testing.expect(matched == null);
 }
 
 test "Router rewritePath strips prefix" {
@@ -409,12 +502,6 @@ test "Router rewritePath strips prefix" {
         },
     };
 
-    const default_route = Route{
-        .name = "default",
-        .matcher = .{ .path = .{ .prefix = "/" } },
-        .pool_idx = 0,
-    };
-
     const upstreams = [_]Upstream{
         .{ .host = "127.0.0.1", .port = 8001, .idx = 0 },
     };
@@ -424,7 +511,7 @@ test "Router rewritePath strips prefix" {
     };
 
     var router: Router = undefined;
-    try router.init(&routes, default_route, &pool_configs, null, null);
+    try router.init(&routes, &pool_configs, &.{}, null, null);
     defer router.deinit();
 
     // Test: "/api/users" -> "/users"
@@ -443,12 +530,6 @@ test "Router rewritePath returns root for exact prefix match" {
         },
     };
 
-    const default_route = Route{
-        .name = "default",
-        .matcher = .{ .path = .{ .prefix = "/" } },
-        .pool_idx = 0,
-    };
-
     const upstreams = [_]Upstream{
         .{ .host = "127.0.0.1", .port = 8001, .idx = 0 },
     };
@@ -458,7 +539,7 @@ test "Router rewritePath returns root for exact prefix match" {
     };
 
     var router: Router = undefined;
-    try router.init(&routes, default_route, &pool_configs, null, null);
+    try router.init(&routes, &pool_configs, &.{}, null, null);
     defer router.deinit();
 
     // Test: "/api/" -> "/"
@@ -477,12 +558,6 @@ test "Router rewritePath returns null when strip_prefix is false" {
         },
     };
 
-    const default_route = Route{
-        .name = "default",
-        .matcher = .{ .path = .{ .prefix = "/" } },
-        .pool_idx = 0,
-    };
-
     const upstreams = [_]Upstream{
         .{ .host = "127.0.0.1", .port = 8001, .idx = 0 },
     };
@@ -492,7 +567,7 @@ test "Router rewritePath returns null when strip_prefix is false" {
     };
 
     var router: Router = undefined;
-    try router.init(&routes, default_route, &pool_configs, null, null);
+    try router.init(&routes, &pool_configs, &.{}, null, null);
     defer router.deinit();
 
     const route = &routes[0];
@@ -510,12 +585,6 @@ test "Router rewritePath returns null for exact match" {
         },
     };
 
-    const default_route = Route{
-        .name = "default",
-        .matcher = .{ .path = .{ .prefix = "/" } },
-        .pool_idx = 0,
-    };
-
     const upstreams = [_]Upstream{
         .{ .host = "127.0.0.1", .port = 8001, .idx = 0 },
     };
@@ -525,7 +594,7 @@ test "Router rewritePath returns null for exact match" {
     };
 
     var router: Router = undefined;
-    try router.init(&routes, default_route, &pool_configs, null, null);
+    try router.init(&routes, &pool_configs, &.{}, null, null);
     defer router.deinit();
 
     const route = &routes[0];
@@ -542,12 +611,6 @@ test "Router init validates pool index" {
         },
     };
 
-    const default_route = Route{
-        .name = "default",
-        .matcher = .{ .path = .{ .prefix = "/" } },
-        .pool_idx = 0,
-    };
-
     const upstreams = [_]Upstream{
         .{ .host = "127.0.0.1", .port = 8001, .idx = 0 },
     };
@@ -557,29 +620,7 @@ test "Router init validates pool index" {
     };
 
     var router: Router = undefined;
-    const result = router.init(&routes, default_route, &pool_configs, null, null);
-    try std.testing.expectError(error.InvalidPoolIndex, result);
-}
-
-test "Router init validates default route pool index" {
-    const routes = [_]Route{};
-
-    const default_route = Route{
-        .name = "default",
-        .matcher = .{ .path = .{ .prefix = "/" } },
-        .pool_idx = 99, // Invalid
-    };
-
-    const upstreams = [_]Upstream{
-        .{ .host = "127.0.0.1", .port = 8001, .idx = 0 },
-    };
-
-    const pool_configs = [_]PoolConfig{
-        .{ .name = "pool-0", .upstreams = &upstreams, .lb_config = .{ .enable_probing = false } },
-    };
-
-    var router: Router = undefined;
-    const result = router.init(&routes, default_route, &pool_configs, null, null);
+    const result = router.init(&routes, &pool_configs, &.{}, null, null);
     try std.testing.expectError(error.InvalidPoolIndex, result);
 }
 
@@ -593,12 +634,6 @@ test "Router selectUpstream sets rewritten_path" {
         },
     };
 
-    const default_route = Route{
-        .name = "default",
-        .matcher = .{ .path = .{ .prefix = "/" } },
-        .pool_idx = 0,
-    };
-
     const upstreams = [_]Upstream{
         .{ .host = "127.0.0.1", .port = 8001, .idx = 0 },
     };
@@ -608,13 +643,16 @@ test "Router selectUpstream sets rewritten_path" {
     };
 
     var router: Router = undefined;
-    try router.init(&routes, default_route, &pool_configs, null, null);
+    try router.init(&routes, &pool_configs, &.{}, null, null);
     defer router.deinit();
 
     var ctx = Context.init();
     const request = Request{ .path = "/api/users" };
 
-    _ = router.selectUpstream(&ctx, &request);
+    const action = router.selectUpstream(&ctx, &request);
+
+    // Should forward (route matches)
+    try std.testing.expect(action == .forward);
 
     // rewritten_path should be set
     try std.testing.expectEqualStrings("/users", ctx.rewritten_path.?);
@@ -634,12 +672,6 @@ test "Router selectUpstream delegates to pool LbHandler" {
         },
     };
 
-    const default_route = Route{
-        .name = "default",
-        .matcher = .{ .path = .{ .prefix = "/" } },
-        .pool_idx = 0,
-    };
-
     const api_upstreams = [_]Upstream{
         .{ .host = "api-1", .port = 8001, .idx = 0 },
         .{ .host = "api-2", .port = 8002, .idx = 1 },
@@ -655,30 +687,65 @@ test "Router selectUpstream delegates to pool LbHandler" {
     };
 
     var router: Router = undefined;
-    try router.init(&routes, default_route, &pool_configs, null, null);
+    try router.init(&routes, &pool_configs, &.{}, null, null);
     defer router.deinit();
 
     var ctx = Context.init();
 
     // Request to /api/ should go to api-pool
     const api_request = Request{ .path = "/api/users" };
-    const api_upstream = router.selectUpstream(&ctx, &api_request);
-    try std.testing.expect(std.mem.startsWith(u8, api_upstream.host, "api-"));
+    const api_action = router.selectUpstream(&ctx, &api_request);
+    try std.testing.expect(api_action == .forward);
+    try std.testing.expect(std.mem.startsWith(u8, api_action.forward.host, "api-"));
 
     // Request to /static/ should go to static-pool
     const static_request = Request{ .path = "/static/image.png" };
-    const static_upstream = router.selectUpstream(&ctx, &static_request);
-    try std.testing.expectEqualStrings("static-1", static_upstream.host);
-    try std.testing.expectEqual(@as(u16, 9001), static_upstream.port);
+    const static_action = router.selectUpstream(&ctx, &static_request);
+    try std.testing.expect(static_action == .forward);
+    try std.testing.expectEqualStrings("static-1", static_action.forward.host);
+    try std.testing.expectEqual(@as(u16, 9001), static_action.forward.port);
+}
+
+test "Router selectUpstream returns 404 when no route matches" {
+    const routes = [_]Route{
+        .{
+            .name = "api",
+            .matcher = .{ .path = .{ .prefix = "/api/" } },
+            .pool_idx = 0,
+        },
+    };
+
+    const upstreams = [_]Upstream{
+        .{ .host = "127.0.0.1", .port = 8001, .idx = 0 },
+    };
+
+    const pool_configs = [_]PoolConfig{
+        .{ .name = "pool-0", .upstreams = &upstreams, .lb_config = .{ .enable_probing = false } },
+    };
+
+    var router: Router = undefined;
+    try router.init(&routes, &pool_configs, &.{}, null, null);
+    defer router.deinit();
+
+    var ctx = Context.init();
+    const request = Request{ .path = "/unknown/path" };
+
+    const action = router.selectUpstream(&ctx, &request);
+
+    // Should reject with 404
+    try std.testing.expect(action == .reject);
+    try std.testing.expectEqual(@as(u16, 404), action.reject.status);
+    try std.testing.expectEqualStrings("Not Found", action.reject.body);
 }
 
 test "Router countTotalHealthy" {
-    const routes = [_]Route{};
-
-    const default_route = Route{
-        .name = "default",
-        .matcher = .{ .path = .{ .prefix = "/" } },
-        .pool_idx = 0,
+    // Need at least one route to have a valid router
+    const routes = [_]Route{
+        .{
+            .name = "default",
+            .matcher = .{ .path = .{ .prefix = "/" } },
+            .pool_idx = 0,
+        },
     };
 
     const upstreams_pool0 = [_]Upstream{
@@ -696,7 +763,7 @@ test "Router countTotalHealthy" {
     };
 
     var router: Router = undefined;
-    try router.init(&routes, default_route, &pool_configs, null, null);
+    try router.init(&routes, &pool_configs, &.{}, null, null);
     defer router.deinit();
 
     // All 3 backends should start healthy
@@ -705,12 +772,12 @@ test "Router countTotalHealthy" {
 }
 
 test "Router getPool returns pool by index" {
-    const routes = [_]Route{};
-
-    const default_route = Route{
-        .name = "default",
-        .matcher = .{ .path = .{ .prefix = "/" } },
-        .pool_idx = 0,
+    const routes = [_]Route{
+        .{
+            .name = "default",
+            .matcher = .{ .path = .{ .prefix = "/" } },
+            .pool_idx = 0,
+        },
     };
 
     const upstreams = [_]Upstream{
@@ -722,7 +789,7 @@ test "Router getPool returns pool by index" {
     };
 
     var router: Router = undefined;
-    try router.init(&routes, default_route, &pool_configs, null, null);
+    try router.init(&routes, &pool_configs, &.{}, null, null);
     defer router.deinit();
 
     const pool = router.getPool(0);
@@ -731,4 +798,193 @@ test "Router getPool returns pool by index" {
 
     // Invalid index returns null
     try std.testing.expect(router.getPool(99) == null);
+}
+
+// =============================================================================
+// allowed_hosts Tests
+// =============================================================================
+
+test "Router isHostAllowed allows any host when allowed_hosts is empty" {
+    const routes = [_]Route{
+        .{
+            .name = "default",
+            .matcher = .{ .path = .{ .prefix = "/" } },
+            .pool_idx = 0,
+        },
+    };
+
+    const upstreams = [_]Upstream{
+        .{ .host = "127.0.0.1", .port = 8001, .idx = 0 },
+    };
+
+    const pool_configs = [_]PoolConfig{
+        .{ .name = "pool-0", .upstreams = &upstreams, .lb_config = .{ .enable_probing = false } },
+    };
+
+    var router: Router = undefined;
+    try router.init(&routes, &pool_configs, &.{}, null, null);
+    defer router.deinit();
+
+    // With empty allowed_hosts, any host should be allowed
+    try std.testing.expect(router.isHostAllowed("example.com"));
+    try std.testing.expect(router.isHostAllowed("any.host.name"));
+    try std.testing.expect(router.isHostAllowed(null));
+}
+
+test "Router isHostAllowed matches configured hosts" {
+    const routes = [_]Route{
+        .{
+            .name = "default",
+            .matcher = .{ .path = .{ .prefix = "/" } },
+            .pool_idx = 0,
+        },
+    };
+
+    const upstreams = [_]Upstream{
+        .{ .host = "127.0.0.1", .port = 8001, .idx = 0 },
+    };
+
+    const pool_configs = [_]PoolConfig{
+        .{ .name = "pool-0", .upstreams = &upstreams, .lb_config = .{ .enable_probing = false } },
+    };
+
+    const allowed_hosts = [_][]const u8{ "example.com", "api.example.com" };
+
+    var router: Router = undefined;
+    try router.init(&routes, &pool_configs, &allowed_hosts, null, null);
+    defer router.deinit();
+
+    // Allowed hosts should match
+    try std.testing.expect(router.isHostAllowed("example.com"));
+    try std.testing.expect(router.isHostAllowed("api.example.com"));
+
+    // Non-allowed hosts should not match
+    try std.testing.expect(!router.isHostAllowed("other.com"));
+    try std.testing.expect(!router.isHostAllowed(null));
+}
+
+test "Router isHostAllowed is case-insensitive" {
+    const routes = [_]Route{
+        .{
+            .name = "default",
+            .matcher = .{ .path = .{ .prefix = "/" } },
+            .pool_idx = 0,
+        },
+    };
+
+    const upstreams = [_]Upstream{
+        .{ .host = "127.0.0.1", .port = 8001, .idx = 0 },
+    };
+
+    const pool_configs = [_]PoolConfig{
+        .{ .name = "pool-0", .upstreams = &upstreams, .lb_config = .{ .enable_probing = false } },
+    };
+
+    const allowed_hosts = [_][]const u8{"Example.COM"};
+
+    var router: Router = undefined;
+    try router.init(&routes, &pool_configs, &allowed_hosts, null, null);
+    defer router.deinit();
+
+    // Case-insensitive matching per RFC 9110 §4.2.3
+    try std.testing.expect(router.isHostAllowed("example.com"));
+    try std.testing.expect(router.isHostAllowed("EXAMPLE.COM"));
+    try std.testing.expect(router.isHostAllowed("Example.Com"));
+}
+
+test "Router isHostAllowed strips port from host" {
+    const routes = [_]Route{
+        .{
+            .name = "default",
+            .matcher = .{ .path = .{ .prefix = "/" } },
+            .pool_idx = 0,
+        },
+    };
+
+    const upstreams = [_]Upstream{
+        .{ .host = "127.0.0.1", .port = 8001, .idx = 0 },
+    };
+
+    const pool_configs = [_]PoolConfig{
+        .{ .name = "pool-0", .upstreams = &upstreams, .lb_config = .{ .enable_probing = false } },
+    };
+
+    const allowed_hosts = [_][]const u8{"example.com"};
+
+    var router: Router = undefined;
+    try router.init(&routes, &pool_configs, &allowed_hosts, null, null);
+    defer router.deinit();
+
+    // Host with port should match after stripping port (RFC 9110 §7.2)
+    try std.testing.expect(router.isHostAllowed("example.com:8080"));
+    try std.testing.expect(router.isHostAllowed("example.com:443"));
+    try std.testing.expect(!router.isHostAllowed("other.com:8080"));
+}
+
+test "Router selectUpstream returns 421 for disallowed host" {
+    const routes = [_]Route{
+        .{
+            .name = "api",
+            .matcher = .{ .path = .{ .prefix = "/" } },
+            .pool_idx = 0,
+        },
+    };
+
+    const upstreams = [_]Upstream{
+        .{ .host = "127.0.0.1", .port = 8001, .idx = 0 },
+    };
+
+    const pool_configs = [_]PoolConfig{
+        .{ .name = "pool-0", .upstreams = &upstreams, .lb_config = .{ .enable_probing = false } },
+    };
+
+    const allowed_hosts = [_][]const u8{"allowed.example.com"};
+
+    var router: Router = undefined;
+    try router.init(&routes, &pool_configs, &allowed_hosts, null, null);
+    defer router.deinit();
+
+    var ctx = Context.init();
+    var request = Request{ .path = "/api/test" };
+    try request.headers.put("Host", "disallowed.example.com");
+
+    const action = router.selectUpstream(&ctx, &request);
+
+    // Should reject with 421 Misdirected Request
+    try std.testing.expect(action == .reject);
+    try std.testing.expectEqual(@as(u16, 421), action.reject.status);
+    try std.testing.expectEqualStrings("Misdirected Request", action.reject.body);
+}
+
+test "Router selectUpstream allows request for allowed host" {
+    const routes = [_]Route{
+        .{
+            .name = "api",
+            .matcher = .{ .path = .{ .prefix = "/" } },
+            .pool_idx = 0,
+        },
+    };
+
+    const upstreams = [_]Upstream{
+        .{ .host = "127.0.0.1", .port = 8001, .idx = 0 },
+    };
+
+    const pool_configs = [_]PoolConfig{
+        .{ .name = "pool-0", .upstreams = &upstreams, .lb_config = .{ .enable_probing = false } },
+    };
+
+    const allowed_hosts = [_][]const u8{"allowed.example.com"};
+
+    var router: Router = undefined;
+    try router.init(&routes, &pool_configs, &allowed_hosts, null, null);
+    defer router.deinit();
+
+    var ctx = Context.init();
+    var request = Request{ .path = "/api/test" };
+    try request.headers.put("Host", "allowed.example.com");
+
+    const action = router.selectUpstream(&ctx, &request);
+
+    // Should forward (host is allowed and route matches)
+    try std.testing.expect(action == .forward);
 }

@@ -45,11 +45,15 @@
 //!
 //! ```json
 //! {
+//!   "allowed_hosts": ["example.com", "api.example.com"],
 //!   "routes": [{"name": "...", "path_prefix": "/...", "pool_idx": 0, "strip_prefix": false}],
-//!   "default_route": {"name": "default", "path_prefix": "/", "pool_idx": 0},
 //!   "pools": [{"name": "...", "upstreams": [{"host": "...", "port": 8080, "idx": 0}]}]
 //! }
 //! ```
+//!
+//! Note: allowed_hosts is optional (defaults to empty, meaning accept any host).
+//! Routes are evaluated in order; first match wins. Include a catch-all route
+//! (path_prefix: "/") at the end if you want a default fallback.
 
 const std = @import("std");
 const serval = @import("serval");
@@ -69,6 +73,9 @@ const PoolConfig = serval_router.PoolConfig;
 const Upstream = serval_router.Upstream;
 const LbConfig = serval_router.LbConfig;
 const config = serval.config;
+const Context = serval.Context;
+const LogEntry = serval.LogEntry;
+const Request = serval.Request;
 
 /// Version of this binary.
 const VERSION = "0.1.0";
@@ -116,8 +123,8 @@ const RouteJson = struct {
 
 /// JSON representation of full config for parsing.
 const ConfigJson = struct {
+    allowed_hosts: []const []const u8 = &.{},
     routes: []const RouteJson = &.{},
-    default_route: RouteJson,
     pools: []const PoolJson,
 };
 
@@ -185,12 +192,20 @@ const ConfigStorage = struct {
     /// Current offset into string_storage.
     /// TigerStyle S2: Explicit u32 since bounded by ROUTER_STRING_STORAGE_BYTES.
     string_offset: u32 = 0,
+    /// Storage for allowed_hosts strings.
+    /// TigerStyle S7: Bounded by MAX_ALLOWED_HOSTS and MAX_HOSTNAME_LEN.
+    allowed_hosts_storage: [config.MAX_ALLOWED_HOSTS][config.MAX_HOSTNAME_LEN]u8 = undefined,
+    /// Pointers into allowed_hosts_storage.
+    allowed_hosts_ptrs: [config.MAX_ALLOWED_HOSTS][]const u8 = undefined,
+    /// Number of allowed_hosts stored.
+    allowed_hosts_count: u8 = 0,
 
     const Self = @This();
 
     /// Reset storage for fresh config copy.
     fn reset(self: *Self) void {
         self.string_offset = 0;
+        self.allowed_hosts_count = 0;
     }
 
     /// Copy a string into embedded storage, returning slice into storage.
@@ -269,6 +284,27 @@ const ConfigStorage = struct {
         }
         return self.pool_storage[0..pool_configs.len];
     }
+
+    /// Deep copy allowed_hosts into embedded storage, returning slice.
+    /// TigerStyle S7: Bounded by MAX_ALLOWED_HOSTS and MAX_HOSTNAME_LEN.
+    fn copyAllowedHosts(self: *Self, hosts: []const []const u8) ![]const []const u8 {
+        // S1: Precondition - hosts count within bounds
+        assert(hosts.len <= config.MAX_ALLOWED_HOSTS);
+
+        for (hosts, 0..) |host, i| {
+            // S1: Precondition - hostname length within bounds
+            if (host.len > config.MAX_HOSTNAME_LEN) {
+                return error.HostnameTooLong;
+            }
+            @memcpy(self.allowed_hosts_storage[i][0..host.len], host);
+            self.allowed_hosts_ptrs[i] = self.allowed_hosts_storage[i][0..host.len];
+        }
+        self.allowed_hosts_count = @intCast(hosts.len);
+
+        // S2: Postcondition - count matches input
+        assert(self.allowed_hosts_count == hosts.len);
+        return self.allowed_hosts_ptrs[0..hosts.len];
+    }
 };
 
 /// Double-buffered config storage (one per router slot).
@@ -309,8 +345,8 @@ var swap_mutex: std.Thread.Mutex = .{};
 ///
 /// Arguments:
 ///   routes: New route table (evaluated in order, first match wins).
-///   default_route: Fallback route when no match found.
 ///   pool_configs: Backend pool configurations (one per pool_idx).
+///   allowed_hosts: Hostnames this router will serve. Empty = allow any host.
 ///   dns_resolver: DNS resolver for hostname resolution in health probes (nullable).
 ///
 /// Errors:
@@ -318,12 +354,14 @@ var swap_mutex: std.Thread.Mutex = .{};
 ///   - On error, the swap does NOT occur (old config remains active).
 fn swapRouter(
     routes: []const Route,
-    default_route: Route,
     pool_configs: []const PoolConfig,
+    allowed_hosts: []const []const u8,
     dns_resolver: ?*DnsResolver,
 ) !void {
     // S1: Precondition - must have at least one pool config
     assert(pool_configs.len > 0);
+    // S1: Precondition - allowed_hosts within bounds
+    assert(allowed_hosts.len <= config.MAX_ALLOWED_HOSTS);
 
     // Serialize config swaps to prevent race during grace period.
     // TigerStyle: Explicit locking, defer unlock for exception safety.
@@ -351,15 +389,15 @@ fn swapRouter(
     storage.reset();
 
     const persistent_routes = try storage.copyRoutes(routes);
-    const persistent_default = try storage.copyRoute(default_route);
     const persistent_pools = try storage.copyPoolConfigs(pool_configs);
+    const persistent_allowed_hosts = try storage.copyAllowedHosts(allowed_hosts);
 
     // Initialize new router in inactive slot with persistent config data.
     // If init fails, swap does NOT occur (old config remains active).
     try router_storage[inactive_slot].init(
         persistent_routes,
-        persistent_default,
         persistent_pools,
+        persistent_allowed_hosts,
         null, // client_ctx for TLS probes - not used in this example
         dns_resolver,
     );
@@ -404,6 +442,30 @@ fn getActiveRouter() ?*Router {
 fn getRouterGeneration() u64 {
     return router_generation.load(.monotonic);
 }
+
+/// Handler wrapper that dynamically loads the current router on each request.
+///
+/// This enables hot config reload - swapRouter() updates current_router atomically,
+/// and subsequent requests use the new router without server restart.
+///
+/// TigerStyle: Wrapper pattern avoids modifying server internals.
+const RouterHandler = struct {
+    /// Select upstream by loading current router and delegating.
+    /// Returns 503 if no router is available (shouldn't happen in normal operation).
+    pub fn selectUpstream(_: *RouterHandler, ctx: *Context, request: *const Request) Router.Action {
+        const router = current_router.load(.acquire) orelse {
+            std.log.err("RouterHandler: no router available", .{});
+            return .{ .reject = .{ .status = 503, .body = "Service Unavailable" } };
+        };
+        return router.selectUpstream(ctx, request);
+    }
+
+    /// Forward health tracking to current router.
+    pub fn onLog(_: *RouterHandler, ctx: *Context, entry: LogEntry) void {
+        const router = current_router.load(.acquire) orelse return;
+        router.onLog(ctx, entry);
+    }
+};
 
 /// Cleanup all initialized router slots.
 ///
@@ -780,12 +842,30 @@ fn handleRouteUpdate(body: ?[]const u8, response_buf: []u8) RouteUpdateResult {
         };
     }
 
+    if (json_config.allowed_hosts.len > config.MAX_ALLOWED_HOSTS) {
+        return .{
+            .status = 400,
+            .body =
+            \\{"error":"too many allowed_hosts"}
+            ,
+        };
+    }
+
     // Convert JSON config to Route[] and PoolConfig[] with storage
     var route_storage: [config.MAX_ROUTES]Route = undefined;
     var pool_storage: [config.MAX_POOLS]PoolConfig = undefined;
     var upstream_storage: [config.MAX_POOLS][config.MAX_UPSTREAMS_PER_POOL]Upstream = undefined;
 
+    // Convert allowed_hosts (simple copy of slices, they point to parsed JSON)
+    var allowed_hosts: [config.MAX_ALLOWED_HOSTS][]const u8 = undefined;
+    const allowed_hosts_count = @min(json_config.allowed_hosts.len, config.MAX_ALLOWED_HOSTS);
+    for (json_config.allowed_hosts[0..allowed_hosts_count], 0..) |host, i| {
+        allowed_hosts[i] = host;
+    }
+    const allowed_hosts_slice: []const []const u8 = allowed_hosts[0..allowed_hosts_count];
+
     // Convert routes
+    std.log.debug("handleRouteUpdate: converting {d} routes", .{json_config.routes.len});
     for (json_config.routes, 0..) |route_json, i| {
         if (route_json.pool_idx >= json_config.pools.len) {
             return .{
@@ -795,6 +875,14 @@ fn handleRouteUpdate(body: ?[]const u8, response_buf: []u8) RouteUpdateResult {
                 ,
             };
         }
+
+        std.log.debug("handleRouteUpdate: route[{d}] name={s} host={s} path_prefix={s} pool_idx={d}", .{
+            i,
+            route_json.name,
+            route_json.host orelse "(null)",
+            route_json.path_prefix,
+            route_json.pool_idx,
+        });
 
         route_storage[i] = Route{
             .name = route_json.name,
@@ -808,27 +896,8 @@ fn handleRouteUpdate(body: ?[]const u8, response_buf: []u8) RouteUpdateResult {
     }
     const routes: []const Route = route_storage[0..json_config.routes.len];
 
-    // Convert default route
-    if (json_config.default_route.pool_idx >= json_config.pools.len) {
-        return .{
-            .status = 400,
-            .body =
-            \\{"error":"default_route references invalid pool_idx"}
-            ,
-        };
-    }
-
-    const default_route = Route{
-        .name = json_config.default_route.name,
-        .matcher = .{
-            .host = json_config.default_route.host,
-            .path = .{ .prefix = json_config.default_route.path_prefix },
-        },
-        .pool_idx = json_config.default_route.pool_idx,
-        .strip_prefix = json_config.default_route.strip_prefix,
-    };
-
     // Convert pools
+    std.log.debug("handleRouteUpdate: converting {d} pools", .{json_config.pools.len});
     for (json_config.pools, 0..) |pool_json, i| {
         if (pool_json.upstreams.len == 0) {
             return .{
@@ -848,6 +917,12 @@ fn handleRouteUpdate(body: ?[]const u8, response_buf: []u8) RouteUpdateResult {
             };
         }
 
+        std.log.debug("handleRouteUpdate: pool[{d}] name={s} upstreams={d}", .{
+            i,
+            pool_json.name,
+            pool_json.upstreams.len,
+        });
+
         // Convert upstreams for this pool
         for (pool_json.upstreams, 0..) |upstream_json, j| {
             // Validate idx fits in UpstreamIndex
@@ -859,6 +934,13 @@ fn handleRouteUpdate(body: ?[]const u8, response_buf: []u8) RouteUpdateResult {
                     ,
                 };
             }
+
+            std.log.debug("handleRouteUpdate: pool[{d}] upstream[{d}] host={s} port={d}", .{
+                i,
+                j,
+                upstream_json.host,
+                upstream_json.port,
+            });
 
             upstream_storage[i][j] = Upstream{
                 .host = upstream_json.host,
@@ -883,8 +965,14 @@ fn handleRouteUpdate(body: ?[]const u8, response_buf: []u8) RouteUpdateResult {
     }
     const pools: []const PoolConfig = pool_storage[0..json_config.pools.len];
 
+    std.log.debug("handleRouteUpdate: calling swapRouter with {d} routes, {d} pools, {d} allowed_hosts", .{
+        routes.len,
+        pools.len,
+        allowed_hosts_slice.len,
+    });
+
     // Call swapRouter to atomically update configuration
-    swapRouter(routes, default_route, pools, null) catch |err| {
+    swapRouter(routes, pools, allowed_hosts_slice, null) catch |err| {
         std.log.err("Admin: swapRouter failed: {s}", .{@errorName(err)});
         return .{
             .status = 500,
@@ -893,6 +981,8 @@ fn handleRouteUpdate(body: ?[]const u8, response_buf: []u8) RouteUpdateResult {
             ,
         };
     };
+
+    std.log.info("handleRouteUpdate: config swap successful", .{});
 
     const generation = getRouterGeneration();
     const success_body = std.fmt.bufPrint(response_buf, "{{\"status\":\"ok\",\"generation\":{d}}}", .{generation}) catch {
@@ -1040,8 +1130,8 @@ fn handleRoutesAdd(body: ?[]const u8, response_buf: []u8) RouteUpdateResult {
 
     const pools: []const PoolConfig = pool_storage[0..router.pools.len];
 
-    // Swap to new config
-    swapRouter(new_routes, router.default_route, pools, null) catch |err| {
+    // Swap to new config (preserve existing allowed_hosts from current router)
+    swapRouter(new_routes, pools, router.allowed_hosts, null) catch |err| {
         std.log.err("Admin: swapRouter failed: {s}", .{@errorName(err)});
         return .{
             .status = 500,
@@ -1169,8 +1259,8 @@ fn handleRoutesRemove(body: ?[]const u8, response_buf: []u8) RouteUpdateResult {
 
     const pools: []const PoolConfig = pool_storage[0..router.pools.len];
 
-    // Swap to new config
-    swapRouter(new_routes, router.default_route, pools, null) catch |err| {
+    // Swap to new config (preserve existing allowed_hosts from current router)
+    swapRouter(new_routes, pools, router.allowed_hosts, null) catch |err| {
         std.log.err("Admin: swapRouter failed: {s}", .{@errorName(err)});
         return .{
             .status = 500,
@@ -1350,8 +1440,8 @@ fn handlePoolsAdd(body: ?[]const u8, response_buf: []u8) RouteUpdateResult {
 
     const pools: []const PoolConfig = pool_storage[0 .. router.pools.len + 1];
 
-    // Swap to new config
-    swapRouter(routes, router.default_route, pools, null) catch |err| {
+    // Swap to new config (preserve existing allowed_hosts from current router)
+    swapRouter(routes, pools, router.allowed_hosts, null) catch |err| {
         std.log.err("Admin: swapRouter failed: {s}", .{@errorName(err)});
         return .{
             .status = 500,
@@ -1464,16 +1554,6 @@ fn handlePoolsRemove(body: ?[]const u8, response_buf: []u8) RouteUpdateResult {
         }
     }
 
-    // Check if default route references this pool
-    if (router.default_route.pool_idx == pool_idx_to_remove) {
-        return .{
-            .status = 409,
-            .body =
-            \\{"error":"pool is referenced by default route"}
-            ,
-        };
-    }
-
     // Must have at least one pool remaining
     if (router.pools.len <= 1) {
         return .{
@@ -1499,12 +1579,6 @@ fn handlePoolsRemove(body: ?[]const u8, response_buf: []u8) RouteUpdateResult {
     }
     const routes: []const Route = route_storage[0..router.routes.len];
 
-    // Adjust default route pool_idx if needed
-    var default_route = router.default_route;
-    if (default_route.pool_idx > pool_idx_to_remove) {
-        default_route.pool_idx = default_route.pool_idx - 1;
-    }
-
     // Copy pools except the one to remove
     var new_pool_count: usize = 0;
     for (router.pools, 0..) |*pool, i| {
@@ -1523,8 +1597,8 @@ fn handlePoolsRemove(body: ?[]const u8, response_buf: []u8) RouteUpdateResult {
 
     const pools: []const PoolConfig = pool_storage[0..new_pool_count];
 
-    // Swap to new config
-    swapRouter(routes, default_route, pools, null) catch |err| {
+    // Swap to new config (preserve existing allowed_hosts from current router)
+    swapRouter(routes, pools, router.allowed_hosts, null) catch |err| {
         std.log.err("Admin: swapRouter failed: {s}", .{@errorName(err)});
         return .{
             .status = 500,
@@ -1696,8 +1770,8 @@ fn handleUpstreamsAdd(body: ?[]const u8, response_buf: []u8) RouteUpdateResult {
 
     const pools: []const PoolConfig = pool_storage[0..router.pools.len];
 
-    // Swap to new config
-    swapRouter(routes, router.default_route, pools, null) catch |err| {
+    // Swap to new config (preserve existing allowed_hosts from current router)
+    swapRouter(routes, pools, router.allowed_hosts, null) catch |err| {
         std.log.err("Admin: swapRouter failed: {s}", .{@errorName(err)});
         return .{
             .status = 500,
@@ -1869,8 +1943,8 @@ fn handleUpstreamsRemove(body: ?[]const u8, response_buf: []u8) RouteUpdateResul
 
     const pools: []const PoolConfig = pool_storage[0..router.pools.len];
 
-    // Swap to new config
-    swapRouter(routes, router.default_route, pools, null) catch |err| {
+    // Swap to new config (preserve existing allowed_hosts from current router)
+    swapRouter(routes, pools, router.allowed_hosts, null) catch |err| {
         std.log.err("Admin: swapRouter failed: {s}", .{@errorName(err)});
         return .{
             .status = 500,
@@ -1938,6 +2012,16 @@ fn formatRoutesJson(router: *Router, buf: []u8) ![]const u8 {
     try writer.writeAll("{\"generation\":");
     try writer.writeInt(getRouterGeneration());
 
+    // Write allowed_hosts array
+    try writer.writeAll(",\"allowed_hosts\":[");
+    for (router.allowed_hosts, 0..) |host, i| {
+        if (i > 0) try writer.writeAll(",");
+        try writer.writeAll("\"");
+        try writeJsonString(&writer, host);
+        try writer.writeAll("\"");
+    }
+    try writer.writeAll("]");
+
     // Write routes array
     try writer.writeAll(",\"routes\":[");
     for (router.routes, 0..) |route, i| {
@@ -1945,10 +2029,6 @@ fn formatRoutesJson(router: *Router, buf: []u8) ![]const u8 {
         try writeRouteJson(&writer, route);
     }
     try writer.writeAll("]");
-
-    // Write default route
-    try writer.writeAll(",\"default_route\":");
-    try writeRouteJson(&writer, router.default_route);
 
     // Write pools array
     try writer.writeAll(",\"pools\":[");
@@ -2086,7 +2166,8 @@ pub fn main() !void {
     const STATIC_POOL: u8 = 1;
 
     // Define routes
-    // TigerStyle: Routes are evaluated in order, first match wins
+    // TigerStyle: Routes are evaluated in order, first match wins.
+    // Unmatched requests return 404 Not Found.
     const routes = [_]Route{
         // /api/* -> api-pool (strip prefix so /api/users becomes /users)
         .{
@@ -2102,14 +2183,6 @@ pub fn main() !void {
             .pool_idx = STATIC_POOL,
             .strip_prefix = true,
         },
-    };
-
-    // Default route: /* -> api-pool (no strip_prefix)
-    const default_route = Route{
-        .name = "default",
-        .matcher = .{ .path = .{ .prefix = "/" } },
-        .pool_idx = API_POOL,
-        .strip_prefix = false,
     };
 
     // Pool configurations
@@ -2130,16 +2203,17 @@ pub fn main() !void {
     // Initialize router in slot 0 of double-buffered storage.
     // TigerStyle: dns_resolver is null since probing is disabled for all pools.
     // Using atomic storage enables future config updates via swapRouter().
-    try router_storage[0].init(&routes, default_route, &pool_configs, null, null);
+    // Empty allowed_hosts means accept any host.
+    try router_storage[0].init(&routes, &pool_configs, &.{}, null, null);
     slot_initialized[0] = true;
     current_router.store(&router_storage[0], .release);
     defer deinitAllRouters();
 
-    // S2: Postcondition - router pointer must be valid after init
-    const router_ptr = getActiveRouter() orelse {
+    // S2: Postcondition - router must be available after init
+    if (getActiveRouter() == null) {
         std.debug.print("Error: router initialization failed\n", .{});
         return error.RouterInitFailed;
-    };
+    }
 
     // Initialize connection pool
     var pool = serval.SimplePool.init();
@@ -2213,23 +2287,22 @@ pub fn main() !void {
     std.debug.print("  /static/* -> static-pool (strip prefix) ", .{});
     formatUpstreams(static_upstreams);
     std.debug.print("\n", .{});
-    std.debug.print("  /* (default) -> api-pool ", .{});
-    formatUpstreams(api_upstreams);
-    std.debug.print("\n", .{});
+    std.debug.print("  (other paths) -> 404 Not Found\n", .{});
     std.debug.print("Debug logging: {}\n", .{args.debug});
     std.debug.print("Config generation: {d}\n", .{getRouterGeneration()});
 
-    // Run main server
+    // Run main server with RouterHandler wrapper.
+    // RouterHandler dynamically loads current_router on each request,
+    // enabling hot config reload via swapRouter() without server restart.
     const ServerType = serval.Server(
-        Router,
+        RouterHandler,
         serval.SimplePool,
         serval.NoopMetrics,
         serval.NoopTracer,
     );
 
-    // DnsConfig{} uses default TTL (60s) and timeout (5s) values.
-    // Pass router_ptr from atomic storage (enables hot config reload via swapRouter).
-    var server = ServerType.init(router_ptr, &pool, &metrics, &tracer, .{
+    var handler = RouterHandler{};
+    var server = ServerType.init(&handler, &pool, &metrics, &tracer, .{
         .port = args.port,
         .tls = null, // No TLS for simplicity
     }, null, DnsConfig{});

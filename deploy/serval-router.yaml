@@ -17,7 +17,7 @@ metadata:
     name: serval-router
     namespace: default
 spec:
-    replicas: 2
+    replicas: 1
     selector:
         matchLabels:
             app: serval-router
@@ -33,23 +33,28 @@ spec:
                   args:
                       - "--port"
                       - "8080"
+                      - "--admin-port"
+                      - "9901"
                       - "--api-backends"
                       - "echo-backend:8080"
                       - "--static-backends"
                       - "echo-backend:8080"
+                      - "--debug"
                   ports:
                       - containerPort: 8080
                         name: http
+                      - containerPort: 9901
+                        name: admin
                   readinessProbe:
                       httpGet:
-                          path: /health
-                          port: 8080
+                          path: /readyz
+                          port: 9901
                       initialDelaySeconds: 2
                       periodSeconds: 5
                   livenessProbe:
                       httpGet:
-                          path: /health
-                          port: 8080
+                          path: /healthz
+                          port: 9901
                       initialDelaySeconds: 5
                       periodSeconds: 10
 ---
@@ -66,3 +71,6 @@ spec:
         - name: http
           port: 80
           targetPort: 8080
+        - name: admin
+          port: 9901
+          targetPort: 9901

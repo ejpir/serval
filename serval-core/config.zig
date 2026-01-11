@@ -117,6 +117,14 @@ pub const MAX_UPSTREAMS_PER_POOL: u8 = 64;
 /// TigerStyle: Bounded buffer for all config strings, avoids use-after-free.
 pub const ROUTER_STRING_STORAGE_BYTES: u32 = 64 * 1024;
 
+/// Maximum allowed hosts per router for virtual host filtering.
+/// TigerStyle S7: Bounded array for host matching.
+pub const MAX_ALLOWED_HOSTS: u8 = 64;
+
+/// Maximum hostname length in bytes (RFC 1035: 253 octets max).
+/// Used for allowed_hosts validation and storage sizing.
+pub const MAX_HOSTNAME_LEN: u16 = 253;
+
 // =============================================================================
 // Type Aliases for Bounds (TigerStyle: Single source of truth)
 // =============================================================================

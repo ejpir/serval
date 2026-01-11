@@ -9,92 +9,96 @@
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: serval-gateway
-  namespace: default
+    name: serval-gateway
+    namespace: default
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: serval-gateway
+    name: serval-gateway
 rules:
-  # Gateway API resources
-  - apiGroups: ["gateway.networking.k8s.io"]
-    resources: ["gatewayclasses", "gateways", "httproutes"]
-    verbs: ["get", "list", "watch"]
-  # Core resources for resolution
-  - apiGroups: [""]
-    resources: ["services", "endpoints", "secrets"]
-    verbs: ["get", "list", "watch"]
+    # Gateway API resources - read access
+    - apiGroups: ["gateway.networking.k8s.io"]
+      resources: ["gatewayclasses", "gateways", "httproutes"]
+      verbs: ["get", "list", "watch"]
+    # Gateway API status subresources - write access for status updates
+    - apiGroups: ["gateway.networking.k8s.io"]
+      resources:
+          ["gatewayclasses/status", "gateways/status", "httproutes/status"]
+      verbs: ["get", "patch", "update"]
+    # Core resources for resolution
+    - apiGroups: [""]
+      resources: ["services", "endpoints", "secrets"]
+      verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: serval-gateway
-subjects:
-  - kind: ServiceAccount
     name: serval-gateway
-    namespace: default
+subjects:
+    - kind: ServiceAccount
+      name: serval-gateway
+      namespace: default
 roleRef:
-  kind: ClusterRole
-  name: serval-gateway
-  apiGroup: rbac.authorization.k8s.io
+    kind: ClusterRole
+    name: serval-gateway
+    apiGroup: rbac.authorization.k8s.io
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
 metadata:
-  name: serval
+    name: serval
 spec:
-  controllerName: serval.dev/gateway-controller
+    controllerName: serval.dev/gateway-controller
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: serval-gateway
-  namespace: default
+    name: serval-gateway
+    namespace: default
 spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: serval-gateway
-  template:
-    metadata:
-      labels:
-        app: serval-gateway
-    spec:
-      serviceAccountName: serval-gateway
-      containers:
-        - name: serval-gateway
-          image: serval-gateway:latest  # Build with: docker build -t serval-gateway .
-          imagePullPolicy: Never  # Use local image
-          ports:
-            - containerPort: 8080
-              name: http
-            - containerPort: 8443
-              name: https
-            - containerPort: 9901
-              name: admin
-          livenessProbe:
-            httpGet:
-              path: /healthz
-              port: admin
-          readinessProbe:
-            httpGet:
-              path: /readyz
-              port: admin
+    replicas: 1
+    selector:
+        matchLabels:
+            app: serval-gateway
+    template:
+        metadata:
+            labels:
+                app: serval-gateway
+        spec:
+            serviceAccountName: serval-gateway
+            containers:
+                - name: serval-gateway
+                  image: serval-gateway:latest # Build with: docker build -t serval-gateway .
+                  imagePullPolicy: Never # Use local image
+                  ports:
+                      - containerPort: 8080
+                        name: admin
+                  livenessProbe:
+                      httpGet:
+                          path: /healthz
+                          port: 8080
+                      initialDelaySeconds: 5
+                      periodSeconds: 10
+                  readinessProbe:
+                      httpGet:
+                          path: /readyz
+                          port: 8080
+                      initialDelaySeconds: 5
+                      periodSeconds: 10
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: serval-gateway
-  namespace: default
+    name: serval-gateway
+    namespace: default
 spec:
-  type: LoadBalancer
-  selector:
-    app: serval-gateway
-  ports:
-    - name: http
-      port: 80
-      targetPort: 8080
-    - name: https
-      port: 443
-      targetPort: 8443
+    # ClusterIP for internal admin access only (health probes, metrics)
+    # Gateway controller doesn't serve traffic - that's the router's job
+    type: ClusterIP
+    selector:
+        app: serval-gateway
+    ports:
+        - name: admin
+          port: 8080
+          targetPort: 8080

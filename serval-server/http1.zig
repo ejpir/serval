@@ -543,8 +543,65 @@ pub fn Server(
                     }
                 }
 
-                // Select upstream and forward
-                var upstream = handler.selectUpstream(&ctx, &parser.request);
+                // Select upstream and forward (or reject if handler returns action)
+                const action_result = handler.selectUpstream(&ctx, &parser.request);
+
+                // Handle action-style return (Router.Action) vs plain Upstream
+                const upstream: types.Upstream = blk: {
+                    if (comptime hooks.hasUpstreamAction(Handler)) {
+                        // Handler returns Action union (e.g., Router)
+                        switch (action_result) {
+                            .forward => |up| break :blk up,
+                            .reject => |rej| {
+                                // Handler rejected request (e.g., 404 Not Found, 421 Misdirected)
+                                ctx.response_status = rej.status;
+                                const rej_duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
+                                ctx.duration_ns = rej_duration_ns;
+
+                                // Send reject response
+                                sendDirectResponseImpl(io, stream, .{
+                                    .status = rej.status,
+                                    .body = rej.body,
+                                    .content_type = "text/plain",
+                                });
+
+                                metrics.requestEnd(rej.status, rej_duration_ns);
+                                if (comptime hooks.hasHook(Handler, "onLog")) {
+                                    const log_entry = log.LogEntry{
+                                        .timestamp_s = @intCast(@divFloor(ctx.start_time_ns, std.time.ns_per_s)),
+                                        .start_time_ns = ctx.start_time_ns,
+                                        .duration_ns = rej_duration_ns,
+                                        .method = parser.request.method,
+                                        .path = parser.request.path,
+                                        .request_bytes = ctx.bytes_received,
+                                        .status = rej.status,
+                                        .response_bytes = @intCast(rej.body.len),
+                                        .upstream = null,
+                                        .upstream_duration_ns = 0,
+                                        .error_phase = null,
+                                        .error_name = null,
+                                        .connection_reused = false,
+                                        .keepalive = true,
+                                        .parse_duration_ns = ctx.parse_duration_ns,
+                                        .connection_id = ctx.connection_id,
+                                        .request_number = ctx.request_number,
+                                        .client_addr = ctx.client_addr,
+                                    };
+                                    handler.onLog(&ctx, log_entry);
+                                }
+                                tracer.endSpan(span_handle, null);
+
+                                // Advance buffer past this request and continue
+                                const rej_body_length = getBodyLength(&parser.request);
+                                buffer_offset += parser.headers_end + rej_body_length;
+                                continue;
+                            },
+                        }
+                    } else {
+                        // Handler returns plain Upstream (e.g., LbHandler)
+                        break :blk action_result;
+                    }
+                };
                 ctx.upstream = upstream;
 
                 // Call onUpstreamRequest hook after selectUpstream, before forwarding

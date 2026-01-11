@@ -71,6 +71,8 @@ pub const DataPlaneError = error{
     Rejected,
     /// All retries exhausted.
     RetriesExhausted,
+    /// Backends not yet resolved (endpoints not available).
+    BackendsNotReady,
 };
 
 // ============================================================================
@@ -98,6 +100,10 @@ pub const DataPlaneClient = struct {
     /// Resolved backends buffer (TigerStyle S7: bounded).
     resolved_backends: [gateway.config.MAX_RESOLVED_BACKENDS]ResolvedBackend,
 
+    /// Hash of last successfully pushed config (0 = no config pushed yet).
+    /// Used to skip redundant pushes when config hasn't changed.
+    last_config_hash: u64,
+
     /// Create data plane client on heap.
     ///
     /// TigerStyle C3: Large struct (~1MB) must be heap-allocated.
@@ -116,6 +122,7 @@ pub const DataPlaneClient = struct {
             .json_buffer = undefined,
             .response_header_buffer = undefined,
             .resolved_backends = undefined,
+            .last_config_hash = 0, // No config pushed yet
         };
 
         return self;
@@ -152,23 +159,61 @@ pub const DataPlaneClient = struct {
         // S1: precondition - config has content
         assert(config_ptr.http_routes.len > 0 or config_ptr.gateways.len > 0);
 
+        std.log.debug("data_plane: pushConfig routes={d} gateways={d}", .{
+            config_ptr.http_routes.len,
+            config_ptr.gateways.len,
+        });
+
+        // Count expected backends from config
+        const expected_backends = countExpectedBackends(config_ptr);
+        std.log.debug("data_plane: expecting {d} backends", .{expected_backends});
+
         // Step 1: Resolve backends to IPs
-        const resolved_count = try self.resolveBackends(config_ptr, resolver);
+        const resolved_count = self.resolveBackends(config_ptr, resolver) catch |err| {
+            std.log.err("data_plane: resolveBackends failed: {s}", .{@errorName(err)});
+            return err;
+        };
+        std.log.debug("data_plane: resolved {d} backends", .{resolved_count});
+
+        // Check if all expected backends were resolved
+        // Don't push config with unresolved backends - wait for endpoints to arrive
+        if (expected_backends > 0 and resolved_count < expected_backends) {
+            std.log.info("data_plane: waiting for backends ({d}/{d} resolved)", .{
+                resolved_count,
+                expected_backends,
+            });
+            return DataPlaneError.BackendsNotReady;
+        }
 
         // Step 2: Translate to JSON using resolved backends
         const json_len = gateway.translator.translateToJson(
             config_ptr,
             self.resolved_backends[0..resolved_count],
             &self.json_buffer,
-        ) catch {
+        ) catch |err| {
+            std.log.err("data_plane: translateToJson failed: {s}", .{@errorName(err)});
             return DataPlaneError.TranslationFailed;
         };
 
         // S2: postcondition - non-empty JSON
         assert(json_len > 0);
 
-        // Step 3: Push to data plane using serval-client
+        // Step 3: Check if config changed (skip redundant pushes)
+        const config_hash = std.hash.Wyhash.hash(0, self.json_buffer[0..json_len]);
+        if (config_hash == self.last_config_hash) {
+            std.log.debug("data_plane: config unchanged (hash={x}), skipping push", .{config_hash});
+            return;
+        }
+
+        std.log.debug("data_plane: generated JSON len={d}", .{json_len});
+        std.log.debug("data_plane: JSON preview: {s}", .{self.json_buffer[0..@min(500, json_len)]});
+
+        // Step 4: Push to data plane using serval-client
         try self.sendConfigRequest(self.json_buffer[0..json_len], io);
+
+        // Step 5: Update hash after successful push
+        self.last_config_hash = config_hash;
+        std.log.info("data_plane: config pushed successfully (hash={x})", .{config_hash});
     }
 
     /// Push configuration with retry logic.
@@ -190,6 +235,12 @@ pub const DataPlaneClient = struct {
         // S3: bounded loop - MAX_RETRIES iterations maximum
         while (attempt < MAX_RETRIES) : (attempt += 1) {
             self.pushConfig(config_ptr, resolver, io) catch |err| {
+                // BackendsNotReady is not a failure - endpoints haven't arrived yet.
+                // Return immediately without retries; next reconciliation will try again.
+                if (err == DataPlaneError.BackendsNotReady) {
+                    return err;
+                }
+
                 // If last attempt, return the appropriate error
                 if (attempt + 1 >= MAX_RETRIES) {
                     // S6: explicit error - distinguish exhausted retries vs other failures
@@ -204,7 +255,11 @@ pub const DataPlaneClient = struct {
                 }
 
                 // Sleep with exponential backoff
-                std.time.sleep(backoff_ms * std.time.ns_per_ms);
+                // TigerStyle: Use posix nanosleep for sleeping
+                const backoff_ns = backoff_ms * std.time.ns_per_ms;
+                const backoff_secs: u64 = backoff_ns / std.time.ns_per_s;
+                const backoff_remaining_ns: u64 = backoff_ns % std.time.ns_per_s;
+                std.posix.nanosleep(backoff_secs, backoff_remaining_ns);
 
                 // Increase backoff (capped at MAX_BACKOFF_MS)
                 backoff_ms = @min(backoff_ms * 2, MAX_BACKOFF_MS);
@@ -231,19 +286,32 @@ pub const DataPlaneClient = struct {
         // S1: precondition - config is valid
         assert(config_ptr.http_routes.len <= gateway.config.MAX_HTTP_ROUTES);
 
+        std.log.debug("resolveBackends: resolver has {d} services", .{resolver.serviceCount()});
+
         var count: u16 = 0;
 
         // S3: bounded loop - limited by MAX_HTTP_ROUTES
         for (config_ptr.http_routes, 0..) |http_route, route_i| {
             if (route_i >= gateway.config.MAX_HTTP_ROUTES) break;
 
+            std.log.debug("resolveBackends: route[{d}] has {d} rules", .{ route_i, http_route.rules.len });
+
             // S3: bounded loop - limited by MAX_RULES
             for (http_route.rules, 0..) |rule, rule_i| {
                 if (rule_i >= gateway.config.MAX_RULES) break;
 
+                std.log.debug("resolveBackends: rule[{d}] has {d} backend_refs", .{ rule_i, rule.backend_refs.len });
+
                 // S3: bounded loop - limited by MAX_BACKEND_REFS
                 for (rule.backend_refs, 0..) |backend_ref, ref_i| {
                     if (ref_i >= gateway.config.MAX_BACKEND_REFS) break;
+
+                    std.log.debug("resolveBackends: trying to resolve backend_ref[{d}]: {s}/{s}:{d}", .{
+                        ref_i,
+                        backend_ref.namespace,
+                        backend_ref.name,
+                        backend_ref.port,
+                    });
 
                     if (count >= gateway.config.MAX_RESOLVED_BACKENDS) {
                         return DataPlaneError.ResolutionFailed;
@@ -254,10 +322,21 @@ pub const DataPlaneClient = struct {
                         backend_ref.name,
                         backend_ref.namespace,
                         &self.resolved_backends[count],
-                    ) catch {
+                    ) catch |err| {
                         // Skip backends that can't be resolved (service not found)
+                        std.log.debug("resolveBackends: failed to resolve {s}/{s}: {s}", .{
+                            backend_ref.namespace,
+                            backend_ref.name,
+                            @errorName(err),
+                        });
                         continue;
                     };
+
+                    std.log.debug("resolveBackends: resolved {s}/{s} with {d} endpoints", .{
+                        backend_ref.namespace,
+                        backend_ref.name,
+                        self.resolved_backends[count].endpoint_count,
+                    });
 
                     count += 1;
                 }
@@ -284,8 +363,8 @@ pub const DataPlaneClient = struct {
         assert(json_body.len <= MAX_JSON_SIZE_BYTES);
 
         // Create DNS resolver for client (admin is typically localhost)
+        // TigerStyle: DnsResolver has no heap allocations, no deinit needed
         var dns_resolver = serval_net.DnsResolver.init(.{});
-        defer dns_resolver.deinit();
 
         // Create HTTP client (no TLS for admin API)
         var client = Client.init(
@@ -324,11 +403,15 @@ pub const DataPlaneClient = struct {
         const response = client.readResponseHeaders(
             &connect_result.conn,
             &self.response_header_buffer,
-        ) catch {
+        ) catch |err| {
+            std.log.err("data_plane: failed to read response: {s}", .{@errorName(err)});
             return DataPlaneError.ReceiveFailed;
         };
 
+        std.log.debug("data_plane: response status={d}", .{response.status});
+
         if (response.status < 200 or response.status >= 300) {
+            std.log.err("data_plane: rejected with status {d}", .{response.status});
             return DataPlaneError.Rejected;
         }
 
@@ -355,14 +438,18 @@ fn buildConfigRequest(
         return null;
     };
 
-    // Build headers
+    // Build headers.
+    // Connection: close is required because we close the connection after receiving
+    // the response (defer conn.close()). Without it, HTTP/1.1 defaults to keep-alive
+    // and the server waits for more requests, causing ConnectionResetByPeer when we close.
     var header_map = serval_core.types.HeaderMap.init();
     header_map.put("Host", host) catch return null;
     header_map.put("Content-Type", "application/json") catch return null;
     header_map.put("Content-Length", content_len_str) catch return null;
+    header_map.put("Connection", "close") catch return null;
 
     // S2: postcondition - headers populated
-    assert(header_map.entries_len > 0);
+    assert(header_map.count > 0);
 
     return serval_core.types.Request{
         .method = .POST,
@@ -371,6 +458,25 @@ fn buildConfigRequest(
         .headers = header_map,
         .body = json_body,
     };
+}
+
+/// Count expected backends from config.
+///
+/// Counts unique backend_refs across all HTTPRoutes.
+/// TigerStyle S3: Bounded loops over config arrays.
+fn countExpectedBackends(config_ptr: *const GatewayConfig) u16 {
+    var count: u16 = 0;
+
+    // S3: bounded loop - limited by MAX_HTTP_ROUTES
+    for (config_ptr.http_routes) |http_route| {
+        // S3: bounded loop - limited by MAX_RULES
+        for (http_route.rules) |rule| {
+            // S3: bounded loop - limited by MAX_BACKEND_REFS
+            count += @intCast(rule.backend_refs.len);
+        }
+    }
+
+    return count;
 }
 
 // ============================================================================

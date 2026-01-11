@@ -19,7 +19,8 @@ const Gateway = gateway.Gateway;
 
 const core_config = serval_core.config;
 
-const DataPlaneClient = @import("data_plane.zig").DataPlaneClient;
+const data_plane = @import("data_plane.zig");
+const DataPlaneClient = data_plane.DataPlaneClient;
 const Resolver = @import("resolver/mod.zig").Resolver;
 const AdminHandler = @import("admin_handler.zig").AdminHandler;
 const status_mod = @import("status.zig");
@@ -213,15 +214,32 @@ pub const Controller = struct {
     /// - io: Io runtime for async status update operations
     pub fn updateConfig(self: *Self, config_ptr: *const GatewayConfig, io: Io) ControllerError!void {
         assert(@intFromPtr(config_ptr) != 0); // S1: precondition - valid pointer
-        assert(config_ptr.gateways.len > 0 or config_ptr.http_routes.len > 0); // S1: precondition - non-empty config
+        // Note: Empty config is valid (e.g., during startup before Gateways match,
+        // or when all Gateways are deleted). We still update and send status.
 
         self.gateway_config = config_ptr;
 
-        // TODO: Push to data plane after Task 11 updates translator API
-        // self.data_plane_client.pushConfigWithRetry(config_ptr, &self.resolver, io) catch |err| {
-        //     std.log.err("failed to push config to data plane: {s}", .{@errorName(err)});
-        //     return error.DataPlanePushFailed;
-        // };
+        // Push to data plane only if config has content
+        // Empty configs (no routes/gateways) are valid during startup or when
+        // all resources are deleted - skip push but still update status
+        const has_content = config_ptr.http_routes.len > 0 or config_ptr.gateways.len > 0;
+        if (has_content) {
+            self.data_plane_client.pushConfigWithRetry(
+                config_ptr,
+                self.resolver,
+                io,
+            ) catch |err| {
+                // BackendsNotReady is not a failure - endpoints haven't arrived yet.
+                // The next reconciliation (when endpoints arrive) will push the config.
+                if (err == data_plane.DataPlaneError.BackendsNotReady) {
+                    std.log.info("config push deferred: waiting for endpoint data", .{});
+                    // Continue to update status - don't return error
+                } else {
+                    std.log.err("failed to push config to data plane: {s}", .{@errorName(err)});
+                    return error.DataPlanePushFailed;
+                }
+            };
+        }
 
         // TODO: GatewayClass status updates are not yet implemented.
         //

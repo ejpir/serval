@@ -45,6 +45,7 @@ const upstream = Upstream{
 var request = Request{ .method = .GET, .path = "/api/users", .headers = .{} };
 try request.headers.put("Host", "api.example.com");
 try request.headers.put("Accept", "application/json");
+try request.headers.put("Connection", "close"); // One-shot, close after response
 
 // One-shot request
 var header_buf: [8192]u8 = undefined;
@@ -52,6 +53,31 @@ const result = try client.request(upstream, &request, &header_buf, io);
 defer result.conn.close();
 
 // result.response.status, result.response.headers, result.response.body_framing
+```
+
+### Connection Header (Keep-Alive vs Close)
+
+serval-client is a low-level library that gives callers full control over HTTP semantics. **You must set the `Connection` header yourself** based on your use case:
+
+**One-shot requests (close after response):**
+```zig
+try request.headers.put("Connection", "close");
+// ... make request ...
+defer conn.close();
+```
+
+Without `Connection: close`, HTTP/1.1 defaults to keep-alive. The server will wait for more requests on the same connection. If you then close the connection, the server sees `ConnectionResetByPeer`.
+
+**Pooled/reusable connections:**
+```zig
+// Do NOT set Connection: close
+// Connection will be returned to pool for reuse
+```
+
+**Long-lived streaming (watches, SSE):**
+```zig
+// Do NOT set Connection: close
+// Keep connection open for streaming events
 ```
 
 ### Low-Level API (Explicit Lifecycle)

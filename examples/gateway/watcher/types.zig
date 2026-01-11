@@ -43,7 +43,7 @@ pub const MAX_GATEWAYS: u32 = gw_config.MAX_GATEWAYS;
 pub const MAX_HTTP_ROUTES: u32 = gw_config.MAX_HTTP_ROUTES;
 pub const MAX_SERVICES: u32 = 256;
 pub const MAX_ENDPOINTS: u32 = 256;
-pub const MAX_SECRETS: u32 = 64;
+pub const MAX_SECRETS: u32 = 16; // Reduced: 16 × 1MB = 16MB for TLS certs
 
 /// Maximum string length for names/namespaces in parsed gw_config.
 /// K8s DNS-1123 subdomain max is 253 chars.
@@ -154,18 +154,45 @@ pub const ResourceMeta = struct {
 // Resource Store
 // =============================================================================
 
+/// Maximum size of raw JSON to store per resource.
+/// Secrets with TLS certs can be 500KB+.
+/// TigerStyle: Explicit bound for heap-allocated storage.
+pub const MAX_RAW_JSON_LEN: u32 = 1024 * 1024;
+
 /// Tracked resource with metadata and raw JSON.
-/// TigerStyle: Fixed-size entry for bounded storage.
+/// Raw JSON buffer is heap-allocated to avoid stack overflow.
+/// TigerStyle: Heap allocation at init, no allocation after init.
 pub const TrackedResource = struct {
     meta: ResourceMeta,
-    raw_json: []const u8,
+    /// Heap-allocated buffer for raw JSON.
+    raw_json_buf: ?[]u8,
+    raw_json_len: u32,
     /// Indicates if this slot is in use.
     active: bool,
+
+    /// Get the raw JSON as a slice.
+    pub fn rawJson(self: *const TrackedResource) []const u8 {
+        if (self.raw_json_buf) |buf| {
+            return buf[0..self.raw_json_len];
+        }
+        return "";
+    }
+
+    /// Set the raw JSON by copying from source.
+    /// Truncates if source exceeds buffer size.
+    pub fn setRawJson(self: *TrackedResource, source: []const u8) void {
+        if (self.raw_json_buf) |buf| {
+            const copy_len = @min(source.len, buf.len);
+            @memcpy(buf[0..copy_len], source[0..copy_len]);
+            self.raw_json_len = @intCast(copy_len);
+        }
+    }
 };
 
 /// Storage for tracked resources of a single type.
-/// TigerStyle: Fixed-size array with bounded capacity.
-pub fn ResourceStore(comptime capacity: u32) type {
+/// Raw JSON buffers are heap-allocated at init to avoid stack overflow.
+/// TigerStyle: Fixed-size array with bounded capacity, heap buffers.
+pub fn ResourceStore(comptime capacity: u32, comptime buffer_size: u32) type {
     return struct {
         const Self = @This();
 
@@ -176,22 +203,55 @@ pub fn ResourceStore(comptime capacity: u32) type {
         /// Latest resource version seen (for watch resumption).
         latest_resource_version: [64]u8,
         latest_resource_version_len: u8,
+        /// Allocator used for buffer allocation.
+        allocator: std.mem.Allocator,
 
-        /// Initialize empty store.
-        pub fn init() Self {
+        /// Initialize empty store with heap-allocated buffers.
+        /// TigerStyle: All allocation happens at init, none after.
+        pub fn init(allocator: std.mem.Allocator) WatcherError!Self {
             var self = Self{
                 .items = undefined,
                 .count = 0,
                 .latest_resource_version = std.mem.zeroes([64]u8),
                 .latest_resource_version_len = 0,
+                .allocator = allocator,
             };
-            // TigerStyle: Initialize all slots as inactive.
-            for (&self.items) |*item| {
-                item.active = false;
+
+            // Allocate raw_json buffers for each slot.
+            var allocated: u32 = 0;
+            errdefer {
+                // Clean up on failure.
+                var cleanup: u32 = 0;
+                while (cleanup < allocated) : (cleanup += 1) {
+                    if (self.items[cleanup].raw_json_buf) |buf| {
+                        allocator.free(buf);
+                    }
+                }
             }
+
+            while (allocated < capacity) : (allocated += 1) {
+                self.items[allocated].raw_json_buf = allocator.alloc(u8, buffer_size) catch {
+                    return WatcherError.OutOfMemory;
+                };
+                self.items[allocated].raw_json_len = 0;
+                self.items[allocated].active = false;
+            }
+
             assert(self.count == 0); // S1: postcondition - empty store
             assert(self.latest_resource_version_len == 0); // S1: postcondition - no version yet
             return self;
+        }
+
+        /// Free all heap-allocated buffers.
+        /// TigerStyle: Explicit cleanup paired with init.
+        pub fn deinit(self: *Self) void {
+            var idx: u32 = 0;
+            while (idx < capacity) : (idx += 1) {
+                if (self.items[idx].raw_json_buf) |buf| {
+                    self.allocator.free(buf);
+                    self.items[idx].raw_json_buf = null;
+                }
+            }
         }
 
         /// Add or update a resource.
@@ -222,7 +282,7 @@ pub fn ResourceStore(comptime capacity: u32) type {
             if (found_idx) |idx| {
                 // Update existing entry.
                 self.items[idx].meta = meta;
-                self.items[idx].raw_json = raw_json;
+                self.items[idx].setRawJson(raw_json);
             } else {
                 // Find first inactive slot.
                 var slot_idx: ?u32 = null;
@@ -235,11 +295,9 @@ pub fn ResourceStore(comptime capacity: u32) type {
                 }
 
                 if (slot_idx) |idx| {
-                    self.items[idx] = .{
-                        .meta = meta,
-                        .raw_json = raw_json,
-                        .active = true,
-                    };
+                    self.items[idx].meta = meta;
+                    self.items[idx].setRawJson(raw_json);
+                    self.items[idx].active = true;
                     self.count += 1;
                     assert(self.count <= capacity); // S1: postcondition - count within bounds
                 } else {
@@ -306,6 +364,14 @@ pub fn ResourceStore(comptime capacity: u32) type {
             self.latest_resource_version_len = @intCast(len);
 
             assert(self.latest_resource_version_len <= 64); // S1: postcondition - length within bounds
+        }
+
+        /// Reset resource version to empty.
+        /// Called when K8s returns ERROR (410 Gone) indicating resourceVersion expired.
+        /// Next watch will start fresh without resourceVersion parameter.
+        pub fn resetResourceVersion(self: *Self) void {
+            self.latest_resource_version_len = 0;
+            assert(self.latest_resource_version_len == 0); // S1: postcondition - version cleared
         }
     };
 }
