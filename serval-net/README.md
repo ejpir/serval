@@ -28,6 +28,18 @@ Unified socket abstraction (plain TCP + TLS) and TCP configuration helpers.
 | `tcp.setTcpQuickAck(fd)` | Disable delayed ACKs (Linux) |
 | `tcp.setSoLinger(fd, timeout)` | Configure SO_LINGER |
 | `parseIPv4(host)` | Parse IPv4 address to network-order u32 |
+| `DnsResolver` | Thread-safe DNS resolver with TTL caching |
+| `DnsResolver.init(config)` | Create resolver with configuration |
+| `resolver.resolve(hostname, port, io)` | Resolve hostname to single IP address |
+| `resolver.resolveAll(hostname, port, io, out)` | Resolve hostname to all IP addresses (out-pointer) |
+| `DnsResolver.normalizeFqdn(hostname, buf)` | Add trailing dot to FQDNs (bypass search domains) |
+| `resolver.invalidate(hostname)` | Invalidate cached entry for hostname |
+| `resolver.invalidateAll()` | Clear entire DNS cache |
+| `resolver.getStats()` | Get cache hit/miss statistics |
+| `DnsConfig` | DNS resolver configuration (ttl_ns, timeout_ns) |
+| `DnsError` | DNS resolution error type |
+| `ResolveResult` | Single address resolution result |
+| `ResolveAllResult` | Multi-address resolution result |
 
 ## Socket API
 
@@ -290,6 +302,53 @@ _ = net.setSoLinger(socket_fd, 0); // Immediate close with RST
 _ = net.setSoLinger(socket_fd, 5); // Wait up to 5s for data to send
 ```
 
+### DNS Resolution
+
+```zig
+const net = @import("serval-net");
+
+// Initialize resolver with default config (30s TTL, 5s timeout)
+var resolver = net.DnsResolver.init(.{});
+
+// Or with custom config
+var resolver_custom = net.DnsResolver.init(.{
+    .ttl_ns = 60_000_000_000, // 60 second cache TTL
+    .timeout_ns = 10_000_000_000, // 10 second timeout
+});
+
+// Single address resolution (existing API)
+const result = try resolver.resolve("example.com", 80, io);
+// result.address contains the resolved IP
+// result.from_cache indicates if result was cached
+// result.resolution_ns is time spent resolving (0 if cached)
+
+// All addresses resolution (out-pointer pattern per TigerStyle C3)
+var all_result: net.ResolveAllResult = undefined;
+try resolver.resolveAll("example.com", 80, io, &all_result);
+for (all_result.slice()) |addr| {
+    // Use each address (e.g., for connection failover)
+    _ = addr;
+}
+
+// FQDN normalization for search domain bypass
+// Adds trailing dot to FQDNs with 4+ dots (e.g., Kubernetes service names)
+var buf: [256]u8 = undefined;
+const normalized = net.DnsResolver.normalizeFqdn(
+    "service.namespace.svc.cluster.local",
+    &buf,
+);
+// Returns "service.namespace.svc.cluster.local."
+// The trailing dot tells DNS resolvers to skip search domain expansion
+
+// Cache management
+resolver.invalidate("example.com"); // Invalidate single entry
+resolver.invalidateAll(); // Clear entire cache
+
+// Statistics
+const stats = resolver.getStats();
+std.debug.print("Cache hits: {d}, misses: {d}\n", .{ stats.hits, stats.misses });
+```
+
 ## Design Decisions
 
 | Decision | Rationale |
@@ -299,11 +358,16 @@ _ = net.setSoLinger(socket_fd, 5); // Wait up to 5s for data to send
 | Zero-copy splice only for plain | TLS requires encryption/decryption - can't splice ciphertext |
 | SNI max 253 chars | RFC 6066 limit, bounded stack buffer (no allocation) |
 | SocketError unifies errors | Single error type for both plain and TLS operations |
+| Fixed-size DNS cache | TigerStyle: no runtime allocation, bounded memory |
+| DNS TTL caching | Reduces DNS queries, configurable expiration |
+| FQDN trailing dot | Bypasses search domain expansion in Kubernetes/Docker environments |
+| ResolveAllResult out-pointer | TigerStyle C3: struct >64 bytes uses init(out: *T) to avoid stack copies |
 
 ## Dependencies
 
+- `serval-core` - Configuration constants and timing utilities
 - `serval-tls` - TLS handshake and stream operations
-- `std` - POSIX socket operations
+- `std` - POSIX socket operations, DNS resolution
 
 ## Implementation Status
 
@@ -323,6 +387,12 @@ _ = net.setSoLinger(socket_fd, 5); // Wait up to 5s for data to send
 | TCP_QUICKACK | Complete (Linux) |
 | SO_LINGER | Complete |
 | parseIPv4 | Complete |
+| DNS resolver with TTL caching | Complete |
+| DNS resolve (single address) | Complete |
+| DNS resolveAll (all addresses) | Complete |
+| DNS normalizeFqdn (trailing dot) | Complete |
+| DNS cache invalidation | Complete |
+| DNS cache statistics | Complete |
 | Socket buffers (SO_RCVBUF/SO_SNDBUF) | Not implemented |
 
 ## TigerStyle Compliance

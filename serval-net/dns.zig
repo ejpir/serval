@@ -37,6 +37,34 @@ pub const DnsError = error{
     CacheFull,
 };
 
+/// Map std DNS errors to DnsError.
+/// TigerStyle: Single source of truth for error mapping.
+fn mapDnsError(err: anyerror) DnsError {
+    return switch (err) {
+        error.UnknownHostName,
+        error.ResolvConfParseFailed,
+        error.InvalidDnsARecord,
+        error.InvalidDnsAAAARecord,
+        error.InvalidDnsCnameRecord,
+        error.NameServerFailure,
+        error.DetectingNetworkConfigurationFailed,
+        => DnsError.DnsResolutionFailed,
+        error.NameTooLong,
+        error.InvalidHostName,
+        => DnsError.InvalidHostname,
+        else => DnsError.DnsResolutionFailed,
+    };
+}
+
+/// Copy an IP address with a new port.
+/// TigerStyle: Pure function, handles both IPv4 and IPv6.
+fn copyAddressWithPort(addr: Io.net.IpAddress, port: u16) Io.net.IpAddress {
+    return switch (addr) {
+        .ip4 => |v| .{ .ip4 = .{ .bytes = v.bytes, .port = port } },
+        .ip6 => |v| .{ .ip6 = .{ .bytes = v.bytes, .port = port, .flow = v.flow, .interface = v.interface } },
+    };
+}
+
 // =============================================================================
 // Result Types
 // =============================================================================
@@ -72,9 +100,10 @@ pub const ResolveAllResult = struct {
         return self.addresses[0..self.count];
     }
 
-    /// Initialize empty result.
-    pub fn empty() ResolveAllResult {
-        return .{
+    /// Initialize result to empty state.
+    /// TigerStyle C3: Out-pointer pattern for struct >64 bytes.
+    pub fn init(out: *ResolveAllResult) void {
+        out.* = .{
             .addresses = undefined,
             .count = 0,
             .from_cache = false,
@@ -208,13 +237,8 @@ pub const DnsResolver = struct {
 
             if (self.findInCache(hostname, now_ns)) |entry| {
                 self.stats_hits +|= 1; // S4: saturating add to prevent overflow
-                // Copy address and update port based on variant
-                const result_addr: Io.net.IpAddress = switch (entry.address) {
-                    .ip4 => |v| .{ .ip4 = .{ .bytes = v.bytes, .port = port } },
-                    .ip6 => |v| .{ .ip6 = .{ .bytes = v.bytes, .port = port, .flow = v.flow, .interface = v.interface } },
-                };
                 return .{
-                    .address = result_addr,
+                    .address = copyAddressWithPort(entry.address, port),
                     .from_cache = true,
                     .resolution_ns = 0,
                 };
@@ -226,23 +250,8 @@ pub const DnsResolver = struct {
         // Cache miss - resolve (outside lock to avoid blocking other threads)
         const start_ns = time.monotonicNanos();
         const address = self.doResolve(hostname, port, io) catch |err| {
-            // Log actual error for debugging
             debugLog("DNS resolve failed for '{s}': {s}", .{ hostname, @errorName(err) });
-            // Map HostName errors to DnsError
-            return switch (err) {
-                error.UnknownHostName,
-                error.ResolvConfParseFailed,
-                error.InvalidDnsARecord,
-                error.InvalidDnsAAAARecord,
-                error.InvalidDnsCnameRecord,
-                error.NameServerFailure,
-                error.DetectingNetworkConfigurationFailed,
-                => DnsError.DnsResolutionFailed,
-                error.NameTooLong,
-                error.InvalidHostName,
-                => DnsError.InvalidHostname,
-                else => DnsError.DnsResolutionFailed,
-            };
+            return mapDnsError(err);
         };
         const end_ns = time.monotonicNanos();
         const elapsed_ns = time.elapsedNanos(start_ns, end_ns);
@@ -266,13 +275,15 @@ pub const DnsResolver = struct {
 
     /// Resolve a hostname to all IP addresses.
     /// Returns all addresses from DNS response (up to MAX_ADDRESSES).
+    /// TigerStyle C3: Out-pointer pattern for struct >64 bytes (~460 bytes).
     /// TigerStyle: Async via Io, thread-safe via mutex.
     pub fn resolveAll(
         self: *DnsResolver,
         hostname: []const u8,
         port: u16,
         io: Io,
-    ) DnsError!ResolveAllResult {
+        out: *ResolveAllResult,
+    ) DnsError!void {
         // S1: preconditions
         if (hostname.len == 0) return DnsError.InvalidHostname;
         if (hostname.len > config.DNS_MAX_HOSTNAME_LEN) return DnsError.InvalidHostname;
@@ -288,15 +299,11 @@ pub const DnsResolver = struct {
 
             if (self.findInCache(hostname, now_ns)) |entry| {
                 self.stats_hits +|= 1;
-                var result = ResolveAllResult.empty();
-                result.addresses[0] = switch (entry.address) {
-                    .ip4 => |v| .{ .ip4 = .{ .bytes = v.bytes, .port = port } },
-                    .ip6 => |v| .{ .ip6 = .{ .bytes = v.bytes, .port = port, .flow = v.flow, .interface = v.interface } },
-                };
-                result.count = 1;
-                result.from_cache = true;
-                result.resolution_ns = 0;
-                return result;
+                ResolveAllResult.init(out);
+                out.addresses[0] = copyAddressWithPort(entry.address, port);
+                out.count = 1;
+                out.from_cache = true;
+                return;
             }
 
             self.stats_misses +|= 1;
@@ -304,39 +311,24 @@ pub const DnsResolver = struct {
 
         // Cache miss - resolve all addresses
         const start_ns = time.monotonicNanos();
-        var result = self.doResolveAll(hostname, port, io) catch |err| {
+        self.doResolveAll(hostname, port, io, out) catch |err| {
             debugLog("DNS resolveAll failed for '{s}': {s}", .{ hostname, @errorName(err) });
-            return switch (err) {
-                error.UnknownHostName,
-                error.ResolvConfParseFailed,
-                error.InvalidDnsARecord,
-                error.InvalidDnsAAAARecord,
-                error.InvalidDnsCnameRecord,
-                error.NameServerFailure,
-                error.DetectingNetworkConfigurationFailed,
-                => DnsError.DnsResolutionFailed,
-                error.NameTooLong,
-                error.InvalidHostName,
-                => DnsError.InvalidHostname,
-                else => DnsError.DnsResolutionFailed,
-            };
+            return mapDnsError(err);
         };
         const end_ns = time.monotonicNanos();
-        result.resolution_ns = time.elapsedNanos(start_ns, end_ns);
+        out.resolution_ns = time.elapsedNanos(start_ns, end_ns);
 
         // Store first address in cache (under lock)
-        if (result.count > 0) {
+        if (out.count > 0) {
             self.mutex.lock();
             defer self.mutex.unlock();
-            self.storeInCache(hostname, result.addresses[0], now_ns);
+            self.storeInCache(hostname, out.addresses[0], now_ns);
         }
 
         // S2: postcondition - all addresses have correct port
-        for (result.addresses[0..result.count]) |addr| {
+        for (out.addresses[0..out.count]) |addr| {
             assert(addr.getPort() == port);
         }
-
-        return result;
     }
 
     /// Invalidate a cached entry for a hostname.
@@ -467,7 +459,10 @@ pub const DnsResolver = struct {
                 .canonical_name_buffer = &canonical_name_buffer,
             },
         });
-        defer lookup_future.cancel(io) catch {};
+        defer lookup_future.cancel(io) catch |err| switch (err) {
+            error.Canceled => {}, // Expected - future already done
+            else => debugLog("DNS: lookup_future.cancel failed: {s}", .{@errorName(err)}),
+        };
 
         debugLog("DNS: waiting for lookup results", .{});
 
@@ -503,19 +498,61 @@ pub const DnsResolver = struct {
         }
     }
 
+    /// Collect addresses from DNS lookup queue into result.
+    /// TigerStyle Y1: Extracted from doResolveAll to stay under 70 lines.
+    /// TigerStyle S3: Bounded loop with explicit max iterations.
+    fn collectDnsAddresses(
+        lookup_queue: *Io.Queue(Io.net.HostName.LookupResult),
+        io: Io,
+        out: *ResolveAllResult,
+    ) error{Canceled}!void {
+        // S1: precondition - out must be initialized
+        assert(out.count == 0);
+
+        var iteration: u8 = 0;
+        const max_iterations: u8 = 64; // S3: bounded loop
+        while (iteration < max_iterations) : (iteration += 1) {
+            const queue_result = lookup_queue.getOne(io) catch |err| {
+                switch (err) {
+                    error.Canceled => return error.Canceled,
+                    error.Closed => break, // Queue closed, done collecting
+                }
+            };
+
+            switch (queue_result) {
+                .address => |addr| {
+                    if (out.count < ResolveAllResult.MAX_ADDRESSES) {
+                        out.addresses[out.count] = addr;
+                        out.count += 1;
+                        debugLog("DNS: collected address #{d}: {}", .{ out.count, addr });
+                    }
+                },
+                .canonical_name => |cn| {
+                    debugLog("DNS: got canonical_name: {s}", .{cn.bytes});
+                },
+            }
+        }
+    }
+
     /// Perform DNS resolution returning all addresses.
+    /// TigerStyle C3: Out-pointer pattern for struct >64 bytes.
     /// TigerStyle: Bounded by MAX_ADDRESSES.
-    fn doResolveAll(self: *DnsResolver, hostname: []const u8, port: u16, io: Io) !ResolveAllResult {
+    fn doResolveAll(self: *DnsResolver, hostname: []const u8, port: u16, io: Io, out: *ResolveAllResult) !void {
         _ = self;
 
-        var result = ResolveAllResult.empty();
+        // S1: preconditions - hostname validated by caller, but verify invariants
+        assert(hostname.len > 0);
+        assert(hostname.len <= config.DNS_MAX_HOSTNAME_LEN);
+        assert(port > 0);
+
+        ResolveAllResult.init(out);
 
         // First try parsing as IP address directly
         if (Io.net.IpAddress.parse(hostname, port)) |addr| {
             debugLog("DNS: '{s}' parsed as IP address directly", .{hostname});
-            result.addresses[0] = addr;
-            result.count = 1;
-            return result;
+            out.addresses[0] = addr;
+            out.count = 1;
+            return;
         } else |_| {}
 
         // Debug: Read and log resolv.conf contents
@@ -541,34 +578,15 @@ pub const DnsResolver = struct {
                 .canonical_name_buffer = &canonical_name_buffer,
             },
         });
-        defer lookup_future.cancel(io) catch {};
+        defer lookup_future.cancel(io) catch |err| switch (err) {
+            error.Canceled => {}, // Expected - future already done
+            else => debugLog("DNS: lookup_future.cancel failed: {s}", .{@errorName(err)}),
+        };
 
         // Collect all address results (bounded by MAX_ADDRESSES)
-        var iteration: u8 = 0;
-        const max_iterations: u8 = 64; // S3: bounded loop
-        while (iteration < max_iterations) : (iteration += 1) {
-            const queue_result = lookup_queue.getOne(io) catch |err| {
-                switch (err) {
-                    error.Canceled => return error.Canceled,
-                    error.Closed => break, // Queue closed, done collecting
-                }
-            };
+        try collectDnsAddresses(&lookup_queue, io, out);
 
-            switch (queue_result) {
-                .address => |addr| {
-                    if (result.count < ResolveAllResult.MAX_ADDRESSES) {
-                        result.addresses[result.count] = addr;
-                        result.count += 1;
-                        debugLog("DNS: collected address #{d}: {}", .{ result.count, addr });
-                    }
-                },
-                .canonical_name => |cn| {
-                    debugLog("DNS: got canonical_name: {s}", .{cn.bytes});
-                },
-            }
-        }
-
-        if (result.count == 0) {
+        if (out.count == 0) {
             // No addresses found - check if lookup had an error
             lookup_future.await(io) catch |lookup_err| {
                 std.log.err("DNS: lookup_future.await returned error: {s}", .{@errorName(lookup_err)});
@@ -577,8 +595,7 @@ pub const DnsResolver = struct {
             return error.UnknownHostName;
         }
 
-        debugLog("DNS: resolveAll found {d} addresses for '{s}'", .{ result.count, hostname });
-        return result;
+        debugLog("DNS: resolveAll found {d} addresses for '{s}'", .{ out.count, hostname });
     }
 
     /// Normalize FQDN by adding trailing dot to bypass search domain resolution.
@@ -587,50 +604,58 @@ pub const DnsResolver = struct {
     /// append search suffixes to hostnames before absolute lookup. Adding a
     /// trailing dot tells the resolver "this is the complete name."
     ///
-    /// This is a general DNS utility - works in any environment (Kubernetes,
-    /// Docker, bare metal) where search domains might interfere with resolution.
-    ///
     /// Heuristic: Only adds dot to names with 4+ dots (likely FQDNs).
     /// IP addresses and short names are returned unchanged.
     ///
     /// TigerStyle: Pure function, no allocation, returns slice into buffer.
     pub fn normalizeFqdn(hostname: []const u8, buf: *[config.DNS_MAX_HOSTNAME_LEN + 1]u8) []const u8 {
-        // S1: precondition - handle empty case
         if (hostname.len == 0) return hostname;
-
-        // Already has trailing dot - return as-is
         if (hostname[hostname.len - 1] == '.') return hostname;
+        if (looksLikeIpAddress(hostname)) return hostname;
 
-        // Check if it looks like an IP address (contains only digits and dots, starts with digit)
-        if (hostname[0] >= '0' and hostname[0] <= '9') {
-            var is_ip = true;
-            for (hostname) |c| {
-                if ((c < '0' or c > '9') and c != '.' and c != ':') {
-                    is_ip = false;
-                    break;
-                }
-            }
-            if (is_ip) return hostname;
-        }
-
-        // Count dots to detect FQDN-like names
-        var dot_count: u8 = 0;
-        for (hostname) |c| {
-            if (c == '.') dot_count += 1;
-        }
-
-        // Heuristic: 4+ dots suggests FQDN (e.g., service.namespace.svc.cluster.local)
-        // Common patterns: Kubernetes (5 parts), AWS internal DNS (4-5 parts), etc.
-        // Short names like "api.example.com" (2 dots) should use search domains.
+        const dot_count = countDots(hostname);
         const FQDN_DOT_THRESHOLD: u8 = 4;
         if (dot_count < FQDN_DOT_THRESHOLD) return hostname;
-
-        // Add trailing dot to hostname
-        if (hostname.len >= config.DNS_MAX_HOSTNAME_LEN) return hostname; // Can't add dot
+        if (hostname.len >= config.DNS_MAX_HOSTNAME_LEN) return hostname;
 
         @memcpy(buf[0..hostname.len], hostname);
         buf[hostname.len] = '.';
-        return buf[0 .. hostname.len + 1];
+        const result = buf[0 .. hostname.len + 1];
+
+        // S2: postcondition - result ends with dot
+        assert(result[result.len - 1] == '.');
+        return result;
+    }
+
+    /// Check if hostname looks like an IP address (IPv4 or IPv6).
+    /// TigerStyle: Pure function, bounded loop.
+    fn looksLikeIpAddress(hostname: []const u8) bool {
+        if (hostname.len == 0) return false;
+        // Must start with digit for IPv4, or contain ':' for IPv6
+        const first = hostname[0];
+        if (first < '0' or first > '9') {
+            // Check for IPv6 (contains ':')
+            for (hostname) |c| {
+                if (c == ':') return true;
+            }
+            return false;
+        }
+        // Starts with digit - check if all chars are valid IP chars
+        for (hostname) |c| {
+            const is_digit = c >= '0' and c <= '9';
+            const is_separator = c == '.' or c == ':';
+            if (!is_digit and !is_separator) return false;
+        }
+        return true;
+    }
+
+    /// Count dots in hostname.
+    fn countDots(hostname: []const u8) u8 {
+        var count: u8 = 0;
+        for (hostname) |c| {
+            if (c == '.') count +|= 1;
+        }
+        return count;
     }
 
     /// Debug helper: read and log /etc/resolv.conf contents using posix
@@ -859,8 +884,9 @@ test "DnsResolver: resolveAll returns multiple addresses" {
     try testing.expect(@sizeOf(ResolveAllResult) > 0);
     try testing.expect(ResolveAllResult.MAX_ADDRESSES == config.DNS_MAX_ADDRESSES);
 
-    // Test empty result initialization
-    const empty_result = ResolveAllResult.empty();
+    // Test empty result initialization via out-pointer pattern (TigerStyle C3)
+    var empty_result: ResolveAllResult = undefined;
+    ResolveAllResult.init(&empty_result);
     try testing.expectEqual(@as(u8, 0), empty_result.count);
     try testing.expect(!empty_result.from_cache);
     try testing.expectEqual(@as(u64, 0), empty_result.resolution_ns);
@@ -875,20 +901,22 @@ test "DnsResolver: resolveAll returns multiple addresses" {
 
 test "DnsResolver: resolveAll invalid hostname rejected" {
     var resolver = DnsResolver.init(.{});
+    var result: ResolveAllResult = undefined;
 
     // Empty hostname
-    const result1 = resolver.resolveAll("", 80, undefined);
+    const result1 = resolver.resolveAll("", 80, undefined, &result);
     try testing.expectError(DnsError.InvalidHostname, result1);
 
     // Hostname too long
     var too_long: [config.DNS_MAX_HOSTNAME_LEN + 10]u8 = undefined;
     @memset(&too_long, 'a');
-    const result2 = resolver.resolveAll(&too_long, 80, undefined);
+    const result2 = resolver.resolveAll(&too_long, 80, undefined, &result);
     try testing.expectError(DnsError.InvalidHostname, result2);
 }
 
 test "ResolveAllResult: slice returns correct view" {
-    var result = ResolveAllResult.empty();
+    var result: ResolveAllResult = undefined;
+    ResolveAllResult.init(&result);
 
     // Add some addresses
     result.addresses[0] = .{ .ip4 = .{ .bytes = .{ 1, 2, 3, 4 }, .port = 80 } };
