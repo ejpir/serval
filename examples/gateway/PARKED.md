@@ -63,19 +63,14 @@ See:
 
 ## Wildcard Host Matching
 
-**Current State**: Router does exact string matching on Host header. `*.example.com` is treated as a literal string, not a wildcard pattern.
+**Status**: ✅ IMPLEMENTED
 
-**Expected Behavior**: `*.example.com` should match `foo.example.com`, `bar.example.com`, etc.
+Router supports wildcard host matching:
+- `*.example.com` matches `foo.example.com`, `bar.example.com`, etc.
+- Case-insensitive comparison per RFC 9110
+- Works in both route matching and `allowed_hosts` validation
 
-**Impact**: Routes with wildcard hostnames don't work correctly - they only match if the request has the literal `Host: *.example.com` header.
-
-**Implementation Plan**:
-- [ ] Add wildcard matching logic to `RouteMatcher.matches()` in `serval-router/types.zig`
-- [ ] Handle `*` prefix: `*.example.com` matches any subdomain of `example.com`
-- [ ] Ensure case-insensitive comparison per RFC 9110
-- [ ] Add tests for wildcard matching edge cases
-
-**Priority**: High - wildcard hostnames are commonly used in Gateway API
+See: `serval-router/types.zig` - `matchesHost()` function
 
 ---
 
@@ -234,70 +229,52 @@ As the Kubernetes Gateway API specification evolves, these additional features m
 
 ## Multi-Instance Config Push
 
-**Current State**: Gateway pushes config to first data plane endpoint only (single router instance).
+**Status**: ✅ IMPLEMENTED
 
-**Root Cause**: Not round-robin. The DNS resolver returns only the first address:
-```zig
-// dns.zig line 370-376
-while (lookup_queue.getOne(io)) |result| {
-    switch (result) {
-        .address => |addr| {
-            return addr;  // Returns FIRST address, ignores rest
-        },
-        ...
-    }
-}
-```
+Gateway now pushes config to ALL data plane endpoints:
+- Accepts comma-separated endpoint list via `--data-plane-endpoints`
+- Pushes config to each endpoint in parallel
+- Reports per-endpoint success/failure
+- Supports both DNS names and direct IPs
 
-When resolving the headless service `serval-router-admin.default.svc.cluster.local.`:
-1. DNS returns multiple A records (one per router pod)
-2. DnsResolver.resolve() returns first IP only
-3. Gateway connects to that one IP
-4. Other router pods never receive config
-
-**Expected Behavior**: Push to ALL router instances on edge nodes.
-
-**Impact**: Only one edge node has correct config; others serve stale routes.
-
-**Implementation Options**:
-
-| Option | Pros | Cons |
-|--------|------|------|
-| **Fix DNS resolver** | Simple change | Still depends on DNS returning all IPs |
-| **Watch EndpointSlices** | Already watching for backends | More code, but consistent pattern |
-| **Sidecar pattern** | Push to localhost only | Requires gateway on every edge node |
-
-**Recommended**: Option 2 - Watch EndpointSlices for router service, push to each pod IP directly. Already have the pattern from backend resolution.
-
-**Implementation Plan**:
-- [ ] Add EndpointSlice watcher for data plane service (reuse existing watcher)
-- [ ] Store list of data plane endpoints in DataPlaneClient
-- [ ] Push config to each endpoint in parallel
-- [ ] Handle partial failures (some routers accept, some reject)
-- [ ] Log which endpoints succeeded/failed
-
-**Priority**: High - required for production HA deployments
+See: `examples/gateway/data_plane.zig` - `pushConfig()` iterates over all endpoints
 
 ---
 
 ## DNS Resolver in Containers
 
-**Current State**: Zig's `std.net.HostName.lookup` fails with `NameServerFailure` in container environments (k3d/Docker).
+**Status**: ✅ PARTIALLY ADDRESSED
 
-**Workaround**:
+Added `DnsResolver.normalizeFqdn()` to auto-append trailing dot to FQDN-like hostnames (4+ dots).
+This is a general-purpose DNS utility that helps bypass search domain resolution in any
+environment (Kubernetes, Docker, bare metal) where resolv.conf has search domains configured.
+
+**Remaining Issues**:
+- Zig's async DNS still may have issues in some container environments
+- Not all resolution failures have been debugged
+
+**Workaround** (still recommended for reliability):
 - Use FQDN with trailing dot: `service.namespace.svc.cluster.local.`
-- The trailing dot bypasses `ndots:5` search domain appending
-- Use `hostNetwork: true` on gateway pod
+- Or use `normalizeFqdn()` helper before resolving
+- In Kubernetes: use `hostNetwork: true` on gateway pod
 
-**Impact**: Without trailing dot, DNS resolution fails silently.
+See: `serval-net/dns.zig` - `normalizeFqdn()` function
 
-**Implementation Plan**:
-- [ ] Investigate why Zig async DNS doesn't work in containers
-- [ ] Consider fallback to synchronous DNS resolution
-- [ ] Add automatic FQDN detection/conversion
-- [ ] Document FQDN requirement in deployment guide
+---
 
-**Priority**: Medium - workaround exists but is fragile
+## DNS Returns Only First IP
+
+**Status**: ✅ IMPLEMENTED
+
+Added `DnsResolver.resolveAll()` to return all IP addresses from DNS response:
+- Returns up to `DNS_MAX_ADDRESSES` (16) addresses
+- Backwards compatible - existing `resolve()` unchanged
+- Cache only stores first address (multi-address caching not needed)
+
+Note: Gateway controller uses EndpointSlice discovery (not DNS) for multi-instance
+config push, so this was not blocking HA deployments.
+
+See: `serval-net/dns.zig` - `resolveAll()` and `ResolveAllResult`
 
 ---
 
