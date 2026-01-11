@@ -581,6 +581,58 @@ pub const DnsResolver = struct {
         return result;
     }
 
+    /// Normalize FQDN by adding trailing dot to bypass search domain resolution.
+    ///
+    /// DNS resolvers with search domains (e.g., resolv.conf with ndots setting)
+    /// append search suffixes to hostnames before absolute lookup. Adding a
+    /// trailing dot tells the resolver "this is the complete name."
+    ///
+    /// This is a general DNS utility - works in any environment (Kubernetes,
+    /// Docker, bare metal) where search domains might interfere with resolution.
+    ///
+    /// Heuristic: Only adds dot to names with 4+ dots (likely FQDNs).
+    /// IP addresses and short names are returned unchanged.
+    ///
+    /// TigerStyle: Pure function, no allocation, returns slice into buffer.
+    pub fn normalizeFqdn(hostname: []const u8, buf: *[config.DNS_MAX_HOSTNAME_LEN + 1]u8) []const u8 {
+        // S1: precondition - handle empty case
+        if (hostname.len == 0) return hostname;
+
+        // Already has trailing dot - return as-is
+        if (hostname[hostname.len - 1] == '.') return hostname;
+
+        // Check if it looks like an IP address (contains only digits and dots, starts with digit)
+        if (hostname[0] >= '0' and hostname[0] <= '9') {
+            var is_ip = true;
+            for (hostname) |c| {
+                if ((c < '0' or c > '9') and c != '.' and c != ':') {
+                    is_ip = false;
+                    break;
+                }
+            }
+            if (is_ip) return hostname;
+        }
+
+        // Count dots to detect FQDN-like names
+        var dot_count: u8 = 0;
+        for (hostname) |c| {
+            if (c == '.') dot_count += 1;
+        }
+
+        // Heuristic: 4+ dots suggests FQDN (e.g., service.namespace.svc.cluster.local)
+        // Common patterns: Kubernetes (5 parts), AWS internal DNS (4-5 parts), etc.
+        // Short names like "api.example.com" (2 dots) should use search domains.
+        const FQDN_DOT_THRESHOLD: u8 = 4;
+        if (dot_count < FQDN_DOT_THRESHOLD) return hostname;
+
+        // Add trailing dot to hostname
+        if (hostname.len >= config.DNS_MAX_HOSTNAME_LEN) return hostname; // Can't add dot
+
+        @memcpy(buf[0..hostname.len], hostname);
+        buf[hostname.len] = '.';
+        return buf[0 .. hostname.len + 1];
+    }
+
     /// Debug helper: read and log /etc/resolv.conf contents using posix
     fn logResolvConf(io: Io) void {
         _ = io;
@@ -847,4 +899,44 @@ test "ResolveAllResult: slice returns correct view" {
     try testing.expectEqual(@as(usize, 2), slice_view.len);
     try testing.expectEqual(@as(u16, 80), slice_view[0].getPort());
     try testing.expectEqual(@as(u16, 80), slice_view[1].getPort());
+}
+
+test "DnsResolver: normalizeFqdn adds trailing dot" {
+    var buf: [config.DNS_MAX_HOSTNAME_LEN + 1]u8 = undefined;
+
+    // Already has trailing dot - unchanged
+    const fqdn1 = DnsResolver.normalizeFqdn("service.ns.svc.cluster.local.", &buf);
+    try testing.expectEqualStrings("service.ns.svc.cluster.local.", fqdn1);
+
+    // No trailing dot - add one
+    const fqdn2 = DnsResolver.normalizeFqdn("service.ns.svc.cluster.local", &buf);
+    try testing.expectEqualStrings("service.ns.svc.cluster.local.", fqdn2);
+
+    // Short name - unchanged (not FQDN)
+    const fqdn3 = DnsResolver.normalizeFqdn("localhost", &buf);
+    try testing.expectEqualStrings("localhost", fqdn3);
+
+    // IP address - unchanged
+    const fqdn4 = DnsResolver.normalizeFqdn("10.0.0.1", &buf);
+    try testing.expectEqualStrings("10.0.0.1", fqdn4);
+}
+
+test "DnsResolver: normalizeFqdn edge cases" {
+    var buf: [config.DNS_MAX_HOSTNAME_LEN + 1]u8 = undefined;
+
+    // Empty string
+    const empty = DnsResolver.normalizeFqdn("", &buf);
+    try testing.expectEqualStrings("", empty);
+
+    // IPv6 address - unchanged
+    const ipv6 = DnsResolver.normalizeFqdn("::1", &buf);
+    try testing.expectEqualStrings("::1", ipv6);
+
+    // 3 dots - not enough for FQDN threshold
+    const three_dots = DnsResolver.normalizeFqdn("a.b.c.d", &buf);
+    try testing.expectEqualStrings("a.b.c.d", three_dots);
+
+    // 4 dots - meets threshold, gets trailing dot
+    const four_dots = DnsResolver.normalizeFqdn("a.b.c.d.e", &buf);
+    try testing.expectEqualStrings("a.b.c.d.e.", four_dots);
 }
