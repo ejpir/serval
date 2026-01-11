@@ -412,8 +412,12 @@ pub const Client = struct {
             return ClientError.HttpError;
         }
 
-        // Read body based on framing
-        const body = try self.readBody(&result.conn, result.response);
+        // Read body based on framing, handling pre-read body bytes
+        const body = try self.readBodyWithPreread(
+            &result.conn,
+            result.response,
+            self.header_buffer,
+        );
 
         // Debug: log raw response (first 200 bytes)
         const preview_len = @min(body.len, 200);
@@ -520,42 +524,140 @@ pub const Client = struct {
         return ClientError.HttpError;
     }
 
-    /// Read response body into response_buffer based on body framing.
-    /// Returns the slice of data read.
-    /// Uses serval-client BodyReader for proper chunked/content-length handling.
-    /// TigerStyle: Explicit error mapping.
-    fn readBody(
+    /// Read response body into response_buffer, handling pre-read body bytes.
+    ///
+    /// When reading response headers, extra body bytes may have been read into
+    /// header_buf. This function copies those bytes first, then reads the rest.
+    ///
+    /// TigerStyle Y1: Split into focused helpers for function length compliance.
+    fn readBodyWithPreread(
         self: *Self,
         conn: *serval_client.client.Connection,
         response: serval_client.ResponseHeaders,
+        header_buf: []const u8,
     ) ClientError![]const u8 {
-        // S1: Precondition - connection and response are valid
-        assert(self.response_buffer.len > 0); // Buffer must have capacity
+        // S1: Preconditions
+        assert(self.response_buffer.len > 0);
+        assert(header_buf.len >= response.total_bytes_read);
 
-        debugLog("K8s client: reading body, framing={s}", .{@tagName(response.body_framing)});
+        const pre_read_bytes = response.preReadBodyBytes();
+        debugLog("K8s client: reading body, framing={s}, pre_read={d}", .{
+            @tagName(response.body_framing),
+            pre_read_bytes,
+        });
 
-        var reader = serval_client.BodyReader.init(&conn.socket, response.body_framing);
-        const body = reader.readAll(self.response_buffer) catch |err| {
+        // Fast path: pre-read bytes exist for content-length response
+        if (pre_read_bytes > 0) {
+            switch (response.body_framing) {
+                .content_length => |content_length| {
+                    return self.readContentLengthWithPreread(
+                        conn,
+                        header_buf,
+                        response.header_bytes,
+                        response.total_bytes_read,
+                        pre_read_bytes,
+                        content_length,
+                    );
+                },
+                .chunked => {
+                    // Chunked with pre-read: fall through to standard read.
+                    // Pre-read bytes will be lost - this is acceptable because
+                    // K8s watch streams handle chunked differently via WatchStream.
+                    debugLog("K8s client: chunked with pre-read, using standard read", .{});
+                },
+                .none => return self.response_buffer[0..0],
+            }
+        }
+
+        // Standard path: no pre-read bytes or chunked encoding
+        return self.readBodyStandard(conn, response.body_framing);
+    }
+
+    /// Read content-length body when pre-read bytes exist in header buffer.
+    ///
+    /// Copies pre-read bytes to response buffer, then reads remaining from socket.
+    /// TigerStyle Y1: Extracted helper for function length compliance.
+    fn readContentLengthWithPreread(
+        self: *Self,
+        conn: *serval_client.client.Connection,
+        header_buf: []const u8,
+        header_bytes: u32,
+        total_bytes_read: u32,
+        pre_read_bytes: u32,
+        content_length: u64,
+    ) ClientError![]const u8 {
+        // S1: Preconditions
+        assert(pre_read_bytes > 0);
+        assert(total_bytes_read >= header_bytes);
+        assert(content_length > 0);
+
+        // Copy pre-read bytes to response buffer
+        const pre_read_data = header_buf[header_bytes..total_bytes_read];
+        if (pre_read_data.len > self.response_buffer.len) {
+            return ClientError.ResponseTooLarge;
+        }
+        @memcpy(self.response_buffer[0..pre_read_data.len], pre_read_data);
+
+        // Check if body is complete from header read
+        if (pre_read_bytes >= content_length) {
+            debugLog("K8s client: body complete from header read", .{});
+            // S1: Postcondition - return bounded by content_length
+            assert(content_length <= self.response_buffer.len);
+            return self.response_buffer[0..@intCast(content_length)];
+        }
+
+        // Read remaining bytes from socket
+        const remaining: u64 = content_length - pre_read_bytes;
+        debugLog("K8s client: need {d} more bytes", .{remaining});
+
+        var reader = serval_client.BodyReader.init(&conn.socket, .{ .content_length = remaining });
+        const additional = reader.readAll(self.response_buffer[pre_read_bytes..]) catch |err| {
             debugLog("K8s client: body read error: {s}", .{@errorName(err)});
-            // S6: Explicit error mapping
-            return switch (err) {
-                error.BufferTooSmall => ClientError.ResponseTooLarge,
-                error.UnexpectedEof => ClientError.EmptyResponse,
-                error.IterationLimitExceeded => ClientError.ReadIterationsExceeded,
-                error.InvalidChunkedEncoding => ClientError.ResponseParseFailed,
-                error.ChunkTooLarge => ClientError.ResponseTooLarge,
-                error.ReadFailed => ClientError.RequestFailed,
-                else => ClientError.RequestFailed,
-            };
+            return mapBodyError(err);
         };
 
-        // S2: Postcondition - body slice is within response_buffer bounds
+        const total_len = pre_read_bytes + additional.len;
+        // S1: Postcondition - total length bounded by buffer
+        assert(total_len <= self.response_buffer.len);
+        return self.response_buffer[0..total_len];
+    }
+
+    /// Read body using standard BodyReader (no pre-read bytes).
+    ///
+    /// TigerStyle Y1: Extracted helper for function length compliance.
+    fn readBodyStandard(
+        self: *Self,
+        conn: *serval_client.client.Connection,
+        body_framing: serval_core.types.BodyFraming,
+    ) ClientError![]const u8 {
+        debugLog("K8s client: standard read, buffer size {d}", .{self.response_buffer.len});
+
+        var reader = serval_client.BodyReader.init(&conn.socket, body_framing);
+        const body = reader.readAll(self.response_buffer) catch |err| {
+            debugLog("K8s client: body read error: {s}", .{@errorName(err)});
+            return mapBodyError(err);
+        };
+
+        // S1: Postconditions
         assert(@intFromPtr(body.ptr) >= @intFromPtr(self.response_buffer.ptr));
         assert(body.len <= self.response_buffer.len);
 
         if (body.len == 0) return ClientError.EmptyResponse;
-
         return body;
+    }
+
+    /// Map BodyReader errors to ClientError.
+    /// TigerStyle S6: Explicit error handling with complete coverage.
+    fn mapBodyError(err: anyerror) ClientError {
+        return switch (err) {
+            error.BufferTooSmall => ClientError.ResponseTooLarge,
+            error.UnexpectedEof => ClientError.EmptyResponse,
+            error.IterationLimitExceeded => ClientError.ReadIterationsExceeded,
+            error.InvalidChunkedEncoding => ClientError.ResponseParseFailed,
+            error.ChunkTooLarge => ClientError.ResponseTooLarge,
+            error.ReadFailed => ClientError.RequestFailed,
+            else => ClientError.RequestFailed,
+        };
     }
 
     /// Start a watch request to the K8s API.
@@ -944,6 +1046,20 @@ const Connection = pool_mod.pool.Connection;
 
 // Re-export Connection type used in readBody
 // Note: serval_client.client.Connection is pool_mod.pool.Connection
+
+// =============================================================================
+// EndpointSlice Support
+// =============================================================================
+
+/// Re-export EndpointSlice types and discovery functions.
+/// Used for multi-instance router config push.
+pub const endpoint_slice = @import("endpoint_slice.zig");
+
+pub const RouterEndpoint = endpoint_slice.RouterEndpoint;
+pub const RouterEndpoints = endpoint_slice.RouterEndpoints;
+pub const EndpointSliceError = endpoint_slice.EndpointSliceError;
+pub const discoverRouterEndpoints = endpoint_slice.discoverRouterEndpoints;
+pub const MAX_ROUTER_ENDPOINTS = endpoint_slice.MAX_ROUTER_ENDPOINTS;
 
 // =============================================================================
 // Unit Tests

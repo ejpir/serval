@@ -71,14 +71,79 @@ pub const RouteMatcher = struct {
         // Check host match (if specified)
         if (self.host) |expected_host| {
             const actual_host = request_host orelse return false;
-            // Case-insensitive host comparison (RFC 9110)
-            if (!std.ascii.eqlIgnoreCase(expected_host, actual_host)) {
+            // Strip port if present. RFC 9110 §7.2: Host header may include port.
+            const hostname = if (std.mem.indexOfScalar(u8, actual_host, ':')) |i| actual_host[0..i] else actual_host;
+
+            if (!matchHost(expected_host, hostname)) {
                 return false;
             }
         }
 
         // Check path match
         return self.path.matches(request_path);
+    }
+
+    /// Match hostname against pattern, supporting wildcards.
+    ///
+    /// Wildcard patterns (e.g., "*.example.com") match exactly one subdomain level:
+    /// - "*.example.com" matches "foo.example.com", "bar.example.com"
+    /// - Does NOT match "example.com" (requires a subdomain)
+    /// - Does NOT match "foo.bar.example.com" (only one subdomain level)
+    ///
+    /// TigerStyle: Pure function, no allocation, bounded iteration.
+    fn matchHost(pattern: []const u8, hostname: []const u8) bool {
+        // Preconditions: pattern comes from route config, hostname from request
+        std.debug.assert(pattern.len > 0); // Route config validation ensures non-empty
+        std.debug.assert(hostname.len > 0); // Caller strips port, empty hostname rejected earlier
+
+        // Check for wildcard pattern: must start with "*."
+        if (std.mem.startsWith(u8, pattern, "*.")) {
+            const base_domain = pattern[2..]; // Skip "*."
+
+            // Base domain must be non-empty (e.g., "*.com" has base "com")
+            if (base_domain.len == 0) {
+                return false;
+            }
+
+            // Hostname must be longer than base domain + 1 (for subdomain + dot)
+            // This ensures there's room for at least "x." before the base domain
+            if (hostname.len <= base_domain.len + 1) {
+                return false;
+            }
+
+            // Hostname must end with "." + base_domain (case-insensitive)
+            // We check if hostname ends with the base domain pattern
+            const suffix_start = hostname.len - base_domain.len;
+            const suffix = hostname[suffix_start..];
+            if (!std.ascii.eqlIgnoreCase(suffix, base_domain)) {
+                return false;
+            }
+
+            // Character before suffix must be a dot
+            if (hostname[suffix_start - 1] != '.') {
+                return false;
+            }
+
+            // Extract the subdomain part (everything before the dot + base_domain)
+            const subdomain = hostname[0 .. suffix_start - 1];
+
+            // Subdomain must not be empty and must not contain dots
+            // (ensures exactly one subdomain level: "foo" OK, "foo.bar" NOT OK)
+            if (subdomain.len == 0) {
+                return false;
+            }
+
+            // Check for dots in subdomain - if found, reject (multi-level subdomain)
+            // TigerStyle: indexOfScalar is bounded by subdomain.len
+            if (std.mem.indexOfScalar(u8, subdomain, '.') != null) {
+                return false;
+            }
+
+            return true;
+        }
+
+        // Non-wildcard: exact case-insensitive match (RFC 9110 §4.2.3)
+        return std.ascii.eqlIgnoreCase(pattern, hostname);
     }
 };
 
@@ -218,6 +283,24 @@ test "RouteMatcher case insensitive host" {
     try std.testing.expect(matcher.matches("Api.Example.Com", "/"));
 }
 
+test "RouteMatcher strips port from host" {
+    const matcher = RouteMatcher{
+        .host = "api.example.com",
+        .path = .{ .prefix = "/" },
+    };
+
+    // Host with port should match after stripping (RFC 9110 §7.2)
+    try std.testing.expect(matcher.matches("api.example.com:8080", "/"));
+    try std.testing.expect(matcher.matches("api.example.com:443", "/"));
+    try std.testing.expect(matcher.matches("api.example.com:31588", "/")); // NodePort
+
+    // Without port still works
+    try std.testing.expect(matcher.matches("api.example.com", "/"));
+
+    // Different host with port should not match
+    try std.testing.expect(!matcher.matches("other.example.com:8080", "/"));
+}
+
 test "Route defaults" {
     const route = Route{
         .name = "default",
@@ -277,4 +360,61 @@ test "PoolConfig with custom lb_config" {
     try std.testing.expectEqual(@as(u8, 5), pool.lb_config.unhealthy_threshold);
     try std.testing.expectEqual(@as(u8, 3), pool.lb_config.healthy_threshold);
     try std.testing.expect(!pool.lb_config.enable_probing);
+}
+
+test "RouteMatcher wildcard host" {
+    const matcher = RouteMatcher{
+        .host = "*.example.com",
+        .path = .{ .prefix = "/" },
+    };
+
+    // Should match single subdomain
+    try std.testing.expect(matcher.matches("foo.example.com", "/"));
+    try std.testing.expect(matcher.matches("bar.example.com", "/"));
+    try std.testing.expect(matcher.matches("FOO.EXAMPLE.COM", "/")); // case-insensitive
+    try std.testing.expect(matcher.matches("foo.example.com:8080", "/")); // with port
+
+    // Should NOT match base domain
+    try std.testing.expect(!matcher.matches("example.com", "/"));
+
+    // Should NOT match multiple subdomains
+    try std.testing.expect(!matcher.matches("foo.bar.example.com", "/"));
+
+    // Should NOT match different domain
+    try std.testing.expect(!matcher.matches("foo.other.com", "/"));
+}
+
+test "RouteMatcher wildcard host edge cases" {
+    // Wildcard with deeper base domain
+    const matcher_deep = RouteMatcher{
+        .host = "*.api.example.com",
+        .path = .{ .prefix = "/" },
+    };
+
+    try std.testing.expect(matcher_deep.matches("v1.api.example.com", "/"));
+    try std.testing.expect(matcher_deep.matches("v2.api.example.com", "/"));
+    try std.testing.expect(!matcher_deep.matches("api.example.com", "/")); // no subdomain
+    try std.testing.expect(!matcher_deep.matches("foo.v1.api.example.com", "/")); // multi-level
+
+    // Single-label base domain (e.g., *.localhost - unusual but valid)
+    const matcher_single = RouteMatcher{
+        .host = "*.localhost",
+        .path = .{ .prefix = "/" },
+    };
+
+    try std.testing.expect(matcher_single.matches("app.localhost", "/"));
+    try std.testing.expect(!matcher_single.matches("localhost", "/"));
+    try std.testing.expect(!matcher_single.matches("foo.app.localhost", "/"));
+}
+
+test "RouteMatcher wildcard host with path matching" {
+    const matcher = RouteMatcher{
+        .host = "*.example.com",
+        .path = .{ .prefix = "/api/" },
+    };
+
+    // Both host and path must match
+    try std.testing.expect(matcher.matches("foo.example.com", "/api/users"));
+    try std.testing.expect(!matcher.matches("foo.example.com", "/other")); // path mismatch
+    try std.testing.expect(!matcher.matches("example.com", "/api/users")); // host mismatch
 }

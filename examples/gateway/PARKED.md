@@ -24,23 +24,18 @@ This document tracks features that are supported by the Kubernetes Gateway API s
 
 ## Exact Path Match Type
 
-**Current State**: All path matches are treated as prefix matches
+**Status**: ✅ IMPLEMENTED (Exact and PathPrefix)
 
-**Kubernetes Gateway API Support**:
-- `type: Exact` - exact string match only
-- `type: PathPrefix` - prefix match (default, currently-implemented)
-- `type: RegularExpression` - regex pattern match
+Supports both match types from Kubernetes Gateway API:
+- `type: Exact` - outputs `path_exact` in router JSON, matches only exact path
+- `type: PathPrefix` - outputs `path_prefix` in router JSON, matches prefix
 
-**Current Workaround**: Use prefix matching (works for most cases, but `/health` will incorrectly match `/healthcheck`)
+**Regex**: Not implemented - would require regex library.
 
-**Implementation Plan**:
-- [ ] Add `PathMatchType` enum to translator types
-- [ ] Parse `type` field from HTTPRoute PathMatch spec
-- [ ] Pass match type through GatewayConfig to router
-- [ ] Implement exact match logic in router handler
-- [ ] Implement regex match logic in router handler (requires regex library)
-
-**Priority**: High - exact matching is critical for precise routing and avoiding false matches
+See:
+- `serval-router/types.zig` - `PathMatch` union with `.exact` and `.prefix`
+- `serval-k8s-gateway/translator.zig` - `writeRoute()` outputs correct field
+- `examples/router_example.zig` - Admin API accepts both `path_prefix` and `path_exact`
 
 ---
 
@@ -233,3 +228,142 @@ As the Kubernetes Gateway API specification evolves, these additional features m
 - **Timeout Configuration**: Per-route timeout settings (separate from serval's hardcoded values)
 - **Retry Configuration**: Per-route retry policies with configurable max attempts and backoff
 - **Circuit Breaking**: Per-route circuit breaker configuration (future serval-health feature)
+
+
+---
+
+## Multi-Instance Config Push
+
+**Current State**: Gateway pushes config to first data plane endpoint only (single router instance).
+
+**Root Cause**: Not round-robin. The DNS resolver returns only the first address:
+```zig
+// dns.zig line 370-376
+while (lookup_queue.getOne(io)) |result| {
+    switch (result) {
+        .address => |addr| {
+            return addr;  // Returns FIRST address, ignores rest
+        },
+        ...
+    }
+}
+```
+
+When resolving the headless service `serval-router-admin.default.svc.cluster.local.`:
+1. DNS returns multiple A records (one per router pod)
+2. DnsResolver.resolve() returns first IP only
+3. Gateway connects to that one IP
+4. Other router pods never receive config
+
+**Expected Behavior**: Push to ALL router instances on edge nodes.
+
+**Impact**: Only one edge node has correct config; others serve stale routes.
+
+**Implementation Options**:
+
+| Option | Pros | Cons |
+|--------|------|------|
+| **Fix DNS resolver** | Simple change | Still depends on DNS returning all IPs |
+| **Watch EndpointSlices** | Already watching for backends | More code, but consistent pattern |
+| **Sidecar pattern** | Push to localhost only | Requires gateway on every edge node |
+
+**Recommended**: Option 2 - Watch EndpointSlices for router service, push to each pod IP directly. Already have the pattern from backend resolution.
+
+**Implementation Plan**:
+- [ ] Add EndpointSlice watcher for data plane service (reuse existing watcher)
+- [ ] Store list of data plane endpoints in DataPlaneClient
+- [ ] Push config to each endpoint in parallel
+- [ ] Handle partial failures (some routers accept, some reject)
+- [ ] Log which endpoints succeeded/failed
+
+**Priority**: High - required for production HA deployments
+
+---
+
+## DNS Resolver in Containers
+
+**Current State**: Zig's `std.net.HostName.lookup` fails with `NameServerFailure` in container environments (k3d/Docker).
+
+**Workaround**:
+- Use FQDN with trailing dot: `service.namespace.svc.cluster.local.`
+- The trailing dot bypasses `ndots:5` search domain appending
+- Use `hostNetwork: true` on gateway pod
+
+**Impact**: Without trailing dot, DNS resolution fails silently.
+
+**Implementation Plan**:
+- [ ] Investigate why Zig async DNS doesn't work in containers
+- [ ] Consider fallback to synchronous DNS resolution
+- [ ] Add automatic FQDN detection/conversion
+- [ ] Document FQDN requirement in deployment guide
+
+**Priority**: Medium - workaround exists but is fragile
+
+---
+
+## CLI Argument Parsing Format
+
+**Current State**: Args parsed as `--flag value` (two elements), not `--flag=value` (one element).
+
+**Impact**: Kubernetes deployments using `--flag=value` format silently ignore the values.
+
+**Implementation Plan**:
+- [ ] Support both `--flag=value` and `--flag value` formats
+- [ ] Use standard arg parsing library or add split logic
+- [ ] Document expected format in help text
+
+**Priority**: Low - documented workaround (use separate array elements)
+
+---
+
+# Known Bugs
+
+## Empty Routes Returns 400
+
+**Symptom**: Pushing config with `{"routes":[],"pools":[]}` returns HTTP 400 from router.
+
+**Expected**: Accept empty config (removes all routes).
+
+**Workaround**: Ensure at least one route exists.
+
+---
+
+## Host Header Port Stripping
+
+**Status**: ✅ IMPLEMENTED
+
+Router now strips port from Host header before matching routes:
+- `test1.example.com:31588` matches route with host `test1.example.com`
+- Case-insensitive comparison per RFC 9110 §4.2.3
+- Port stripping per RFC 9110 §7.2
+
+See: `serval-router/types.zig` - `RouteMatcher.matches()`
+
+---
+
+# Local Testing with k3d
+
+See `docs/plans/2026-01-11-deployment-architecture.md` for full deployment guide.
+
+**Quick Start**:
+```bash
+# Create cluster
+./deploy/k3d-setup.sh
+
+# Build and import images
+./deploy/k3d-build-images.sh
+
+# Deploy
+kubectl apply -f examples/gateway/k8s/router-daemonset.yaml
+kubectl apply -f examples/gateway/k8s/gateway-deployment.yaml
+kubectl apply -f examples/gateway/k8s/test-backend.yaml
+
+# Test
+curl -H "Host: echo.example.com" http://localhost:30180/
+```
+
+**Key Learnings**:
+1. Use FQDN with trailing dot for DNS names
+2. Use separate array elements for args (`--flag` then `value`)
+3. Gateway needs `hostNetwork: true` + `dnsPolicy: ClusterFirstWithHostNet`
+4. Config only pushed to first endpoint (multi-instance TODO)

@@ -64,6 +64,19 @@ pub const ResponseHeaders = struct {
     /// This is the offset after \r\n\r\n in header_buf.
     /// TigerStyle S2: Use u32 for bounded values (max is MAX_HEADER_SIZE_BYTES = 8192).
     header_bytes: u32,
+    /// Total bytes read into header_buf (may include body bytes past header_bytes).
+    /// Pre-read body bytes are at header_buf[header_bytes..total_bytes_read].
+    /// TigerStyle S2: Use u32 for bounded values.
+    total_bytes_read: u32,
+
+    /// Get the number of pre-read body bytes in header_buf.
+    /// Returns 0 if no body bytes were read during header reading.
+    /// TigerStyle S1: Assertion prevents underflow from invalid state.
+    pub fn preReadBodyBytes(self: ResponseHeaders) u32 {
+        // S1: Invariant - total_bytes_read always >= header_bytes (enforced at construction)
+        assert(self.total_bytes_read >= self.header_bytes);
+        return self.total_bytes_read - self.header_bytes;
+    }
 };
 
 // =============================================================================
@@ -189,8 +202,12 @@ pub fn readResponseHeaders(
     assert(result.header_end <= result.total_bytes);
 
     // Parse the headers
-    // TigerStyle S2: Cast to u32 - header_end is bounded by MAX_HEADER_SIZE_BYTES (8192).
-    return parseResponseHeaders(header_buf[0..result.total_bytes], @intCast(result.header_end));
+    // TigerStyle S2: Cast to u32 - bounded by MAX_HEADER_SIZE_BYTES (8192).
+    return parseResponseHeaders(
+        header_buf[0..result.total_bytes],
+        @intCast(result.header_end),
+        @intCast(result.total_bytes),
+    );
 }
 
 /// Parse already-buffered response headers.
@@ -205,10 +222,12 @@ pub fn readResponseHeaders(
 fn parseResponseHeaders(
     buffer: []const u8,
     header_bytes: u32,
+    total_bytes_read: u32,
 ) ResponseError!ResponseHeaders {
     // S1: Preconditions
     assert(buffer.len >= header_bytes);
     assert(header_bytes >= 4); // At minimum "\r\n\r\n"
+    assert(total_bytes_read >= header_bytes); // Total must include headers
 
     // Parse status line
     const status = parseStatusLine(buffer) orelse {
@@ -235,6 +254,7 @@ fn parseResponseHeaders(
         .headers = headers,
         .body_framing = body_framing,
         .header_bytes = header_bytes,
+        .total_bytes_read = total_bytes_read,
     };
 }
 

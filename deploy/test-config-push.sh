@@ -2,7 +2,7 @@
 # test-config-push.sh - Test router_example admin API config push
 #
 # Usage:
-#   ./scripts/test-config-push.sh [ADMIN_PORT]
+#   ./deploy/test-config-push.sh [ADMIN_PORT]
 #
 # Prerequisites:
 #   1. Build: zig build

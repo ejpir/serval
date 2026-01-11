@@ -58,6 +58,11 @@ const CliConfig = struct {
     /// Controller name for GatewayClass filtering.
     /// Only Gateways referencing GatewayClasses with this controllerName are managed.
     controller_name: []const u8 = "serval.dev/gateway-controller",
+    /// Router service name for multi-endpoint discovery (enables HA mode).
+    /// When set, discovers all router pod IPs via EndpointSlice and pushes to all.
+    router_service: ?[]const u8 = null,
+    /// Router service namespace for multi-endpoint discovery.
+    router_namespace: []const u8 = "default",
 };
 
 /// Maximum number of CLI arguments to process.
@@ -107,6 +112,12 @@ fn parseArgs() CliConfig {
             if (args.next()) |val| {
                 config.controller_name = val;
             }
+        } else if (std.mem.eql(u8, arg, "--router-service")) {
+            config.router_service = args.next();
+        } else if (std.mem.eql(u8, arg, "--router-namespace")) {
+            if (args.next()) |val| {
+                config.router_namespace = val;
+            }
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             std.process.exit(0);
@@ -136,12 +147,19 @@ fn printUsage() void {
         \\  --namespace <NS>          Namespace to watch (default: "default")
         \\  --controller-name <NAME>  Controller name for GatewayClass filtering
         \\                            (default: "serval.dev/gateway-controller")
+        \\  --router-service <NAME>   Router service name for multi-endpoint discovery (HA mode)
+        \\                            When set, discovers all router pods via EndpointSlice
+        \\  --router-namespace <NS>   Router service namespace (default: "default")
         \\  --help, -h                Show this help message
         \\
         \\When running inside a Kubernetes pod, credentials are read from
         \\/var/run/secrets/kubernetes.io/serviceaccount/.
         \\
         \\When running outside a cluster, provide --api-server and --token.
+        \\
+        \\Multi-endpoint mode (HA):
+        \\  Use --router-service to enable pushing config to ALL router pods.
+        \\  Example: --router-service serval-router-admin --router-namespace serval-system
         \\
     ;
     std.debug.print("{s}", .{usage});
@@ -214,6 +232,13 @@ fn run(allocator: std.mem.Allocator, config: CliConfig) !void {
     );
     defer ctrl.destroy();
 
+    // Enable multi-endpoint mode if router-service is specified
+    // This discovers all router pod IPs via EndpointSlice and pushes to all
+    if (config.router_service) |service| {
+        ctrl.enableMultiEndpoint(config.router_namespace, service);
+        std.log.info("multi-endpoint mode enabled: {s}/{s}", .{ config.router_namespace, service });
+    }
+
     // Start admin server thread for K8s health probes
     var admin_shutdown = std.atomic.Value(bool).init(false);
     const admin_thread = startAdminServer(ctrl.getAdminHandler(), config.admin_port, &admin_shutdown) catch |err| {
@@ -253,6 +278,11 @@ fn logStartupBanner(config: CliConfig) void {
     std.log.info("=== serval-k8s-gateway v{s} ===", .{VERSION});
     std.log.info("Admin API: http://localhost:{d}", .{config.admin_port});
     std.log.info("Data plane: {s}:{d}", .{ config.data_plane_host, config.data_plane_port });
+    if (config.router_service) |service| {
+        std.log.info("Multi-endpoint mode: {s}/{s} (HA)", .{ config.router_namespace, service });
+    } else {
+        std.log.info("Single-endpoint mode (use --router-service for HA)", .{});
+    }
 }
 
 /// Initialize watcher and start thread. Returns watcher and thread, or null on failure.

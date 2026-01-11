@@ -21,6 +21,8 @@ const core_config = serval_core.config;
 
 const data_plane = @import("data_plane.zig");
 const DataPlaneClient = data_plane.DataPlaneClient;
+const DataPlaneError = data_plane.DataPlaneError;
+const PushResult = data_plane.PushResult;
 const Resolver = @import("resolver/mod.zig").Resolver;
 const AdminHandler = @import("admin_handler.zig").AdminHandler;
 const status_mod = @import("status.zig");
@@ -28,6 +30,16 @@ const StatusManager = status_mod.StatusManager;
 const GatewayReconcileResult = status_mod.GatewayReconcileResult;
 const k8s_client_mod = @import("k8s_client/mod.zig");
 const K8sClient = k8s_client_mod.Client;
+
+// ============================================================================
+// Constants (TigerStyle Y3: Units in names)
+// ============================================================================
+
+/// Maximum length for router service namespace.
+pub const MAX_ROUTER_NAMESPACE_LEN: u8 = 63;
+
+/// Maximum length for router service name.
+pub const MAX_ROUTER_SERVICE_NAME_LEN: u8 = 63;
 
 // ============================================================================
 // Error Types
@@ -83,6 +95,24 @@ pub const Controller = struct {
     /// Status manager for K8s resource status updates (heap-allocated ~70KB).
     status_manager: *StatusManager,
 
+    /// K8s API client for endpoint discovery (borrowed reference).
+    /// TigerStyle: Controller does not own this client's lifecycle.
+    k8s_client: *K8sClient,
+
+    /// Router service namespace for multi-endpoint discovery.
+    /// TigerStyle S7: Fixed-size storage, no allocation.
+    router_namespace: [MAX_ROUTER_NAMESPACE_LEN]u8,
+    router_namespace_len: u8,
+
+    /// Router admin service name for multi-endpoint discovery.
+    /// TigerStyle S7: Fixed-size storage, no allocation.
+    router_service_name: [MAX_ROUTER_SERVICE_NAME_LEN]u8,
+    router_service_name_len: u8,
+
+    /// Whether multi-endpoint mode is enabled.
+    /// When true, discovers router endpoints before each config push.
+    multi_endpoint_enabled: bool,
+
     /// Create controller on heap.
     ///
     /// TigerStyle C3: Large struct (~2.5MB) must be heap-allocated.
@@ -135,6 +165,12 @@ pub const Controller = struct {
             .shutdown = std.atomic.Value(bool).init(false),
             .admin_handler = undefined, // Set below after self is initialized
             .status_manager = status_manager,
+            .k8s_client = k8s_client,
+            .router_namespace = undefined,
+            .router_namespace_len = 0,
+            .router_service_name = undefined,
+            .router_service_name_len = 0,
+            .multi_endpoint_enabled = false, // Single-instance mode by default
         };
 
         // Initialize admin handler with pointers to our state
@@ -145,6 +181,63 @@ pub const Controller = struct {
         assert(!self.ready.load(.acquire)); // S1: postcondition - not ready initially
         assert(@intFromPtr(self.status_manager) != 0); // S1: postcondition - status manager initialized
         return self;
+    }
+
+    /// Enable multi-endpoint mode for pushing config to all router replicas.
+    ///
+    /// Call this after create() to enable EndpointSlice-based discovery.
+    /// When enabled, updateConfig will discover router pod IPs and push to all.
+    ///
+    /// TigerStyle S1: ~2 assertions per function.
+    ///
+    /// Parameters:
+    /// - namespace: Namespace where router service lives (e.g., "serval-system")
+    /// - service_name: Router admin service name (e.g., "serval-router-admin")
+    pub fn enableMultiEndpoint(
+        self: *Self,
+        namespace: []const u8,
+        service_name: []const u8,
+    ) void {
+        // S1: Preconditions
+        assert(namespace.len > 0 and namespace.len <= MAX_ROUTER_NAMESPACE_LEN);
+        assert(service_name.len > 0 and service_name.len <= MAX_ROUTER_SERVICE_NAME_LEN);
+
+        @memcpy(self.router_namespace[0..namespace.len], namespace);
+        self.router_namespace_len = @intCast(namespace.len);
+
+        @memcpy(self.router_service_name[0..service_name.len], service_name);
+        self.router_service_name_len = @intCast(service_name.len);
+
+        self.multi_endpoint_enabled = true;
+
+        std.log.info("controller: multi-endpoint mode enabled for {s}/{s}", .{
+            namespace,
+            service_name,
+        });
+
+        // S2: Postcondition
+        assert(self.multi_endpoint_enabled);
+    }
+
+    /// Get router namespace as slice.
+    ///
+    /// TigerStyle: Trivial accessor.
+    pub fn getRouterNamespace(self: *const Self) []const u8 {
+        return self.router_namespace[0..self.router_namespace_len];
+    }
+
+    /// Get router service name as slice.
+    ///
+    /// TigerStyle: Trivial accessor.
+    pub fn getRouterServiceName(self: *const Self) []const u8 {
+        return self.router_service_name[0..self.router_service_name_len];
+    }
+
+    /// Check if multi-endpoint mode is enabled.
+    ///
+    /// TigerStyle: Trivial accessor.
+    pub fn isMultiEndpointEnabled(self: *const Self) bool {
+        return self.multi_endpoint_enabled;
     }
 
     /// Destroy controller and free heap memory.
@@ -206,6 +299,9 @@ pub const Controller = struct {
 
     /// Update gateway config, push to data plane, and update K8s status.
     ///
+    /// In multi-endpoint mode, discovers router endpoints from EndpointSlice
+    /// and pushes config to all router pods.
+    ///
     /// TigerStyle S1: ~2 assertions per function.
     /// Status updates are best-effort (StatusManager logs errors internally).
     ///
@@ -224,21 +320,27 @@ pub const Controller = struct {
         // all resources are deleted - skip push but still update status
         const has_content = config_ptr.http_routes.len > 0 or config_ptr.gateways.len > 0;
         if (has_content) {
-            self.data_plane_client.pushConfigWithRetry(
-                config_ptr,
-                self.resolver,
-                io,
-            ) catch |err| {
-                // BackendsNotReady is not a failure - endpoints haven't arrived yet.
-                // The next reconciliation (when endpoints arrive) will push the config.
-                if (err == data_plane.DataPlaneError.BackendsNotReady) {
-                    std.log.info("config push deferred: waiting for endpoint data", .{});
-                    // Continue to update status - don't return error
-                } else {
-                    std.log.err("failed to push config to data plane: {s}", .{@errorName(err)});
-                    return error.DataPlanePushFailed;
-                }
-            };
+            // In multi-endpoint mode, discover endpoints and push to all
+            if (self.multi_endpoint_enabled) {
+                try self.pushConfigMultiEndpoint(config_ptr, io);
+            } else {
+                // Single-endpoint mode: use existing pushConfigWithRetry
+                self.data_plane_client.pushConfigWithRetry(
+                    config_ptr,
+                    self.resolver,
+                    io,
+                ) catch |err| {
+                    // BackendsNotReady is not a failure - endpoints haven't arrived yet.
+                    // The next reconciliation (when endpoints arrive) will push the config.
+                    if (err == DataPlaneError.BackendsNotReady) {
+                        std.log.info("config push deferred: waiting for endpoint data", .{});
+                        // Continue to update status - don't return error
+                    } else {
+                        std.log.err("failed to push config to data plane: {s}", .{@errorName(err)});
+                        return error.DataPlanePushFailed;
+                    }
+                };
+            }
         }
 
         // TODO: GatewayClass status updates are not yet implemented.
@@ -334,6 +436,88 @@ pub const Controller = struct {
     /// TigerStyle: Trivial accessor, assertion-exempt.
     pub fn getDataPlanePort(self: *Self) u16 {
         return self.data_plane_port;
+    }
+
+    /// Push config to multiple router endpoints via EndpointSlice discovery.
+    ///
+    /// Discovers router pod IPs from K8s EndpointSlice API, then pushes
+    /// config to all discovered endpoints.
+    ///
+    /// TigerStyle S1: ~2 assertions per function.
+    fn pushConfigMultiEndpoint(
+        self: *Self,
+        config_ptr: *const GatewayConfig,
+        io: Io,
+    ) ControllerError!void {
+        // S1: Preconditions
+        assert(self.multi_endpoint_enabled);
+        assert(self.router_namespace_len > 0);
+        assert(self.router_service_name_len > 0);
+
+        const namespace = self.getRouterNamespace();
+        const service_name = self.getRouterServiceName();
+
+        // Discover router endpoints from EndpointSlice
+        const endpoint_count = self.data_plane_client.refreshEndpoints(
+            self.k8s_client,
+            namespace,
+            service_name,
+            io,
+        ) catch |err| {
+            // Endpoint discovery failed - fall back to single endpoint
+            std.log.warn("controller: endpoint discovery failed ({s}), using single endpoint", .{
+                @errorName(err),
+            });
+            // Try single-endpoint push as fallback
+            self.data_plane_client.pushConfigWithRetry(
+                config_ptr,
+                self.resolver,
+                io,
+            ) catch |push_err| {
+                if (push_err == DataPlaneError.BackendsNotReady) {
+                    std.log.info("config push deferred: waiting for endpoint data", .{});
+                    return;
+                }
+                std.log.err("failed to push config (fallback): {s}", .{@errorName(push_err)});
+                return error.DataPlanePushFailed;
+            };
+            return;
+        };
+
+        std.log.info("controller: discovered {d} router endpoints", .{endpoint_count});
+
+        // Push config to all discovered endpoints
+        const result = self.data_plane_client.pushConfigToAll(
+            config_ptr,
+            self.resolver,
+            io,
+        ) catch |err| {
+            if (err == DataPlaneError.BackendsNotReady) {
+                std.log.info("config push deferred: waiting for backend endpoint data", .{});
+                return;
+            }
+            if (err == DataPlaneError.AllPushesFailed) {
+                std.log.err("config push failed: all {d} router endpoints failed", .{endpoint_count});
+                return error.DataPlanePushFailed;
+            }
+            std.log.err("failed to push config to routers: {s}", .{@errorName(err)});
+            return error.DataPlanePushFailed;
+        };
+
+        // Log push results
+        if (result.total == 0) {
+            std.log.debug("controller: config unchanged, no push needed", .{});
+        } else if (result.isFullSuccess()) {
+            std.log.info("controller: config pushed to all {d} routers", .{result.success_count});
+        } else if (result.hasAnySuccess()) {
+            std.log.warn("controller: config push partial: {d}/{d} succeeded", .{
+                result.success_count,
+                result.total,
+            });
+        }
+
+        // S2: Postcondition
+        assert(result.success_count <= result.total);
     }
 };
 

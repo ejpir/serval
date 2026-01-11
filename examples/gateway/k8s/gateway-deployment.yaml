@@ -1,0 +1,130 @@
+# serval-gateway Deployment for internal nodes
+#
+# Runs on internal nodes (NOT edge nodes)
+# Watches Gateway API resources and pushes config to routers
+#
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: serval-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: serval-gateway
+  namespace: serval-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: serval-gateway
+rules:
+# Gateway API resources
+- apiGroups: ["gateway.networking.k8s.io"]
+  resources: ["gateways", "httproutes", "gatewayclasses"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["gateway.networking.k8s.io"]
+  resources: ["gateways/status", "httproutes/status", "gatewayclasses/status"]
+  verbs: ["update", "patch"]
+# Core resources for endpoint discovery
+- apiGroups: [""]
+  resources: ["services", "endpoints"]
+  verbs: ["get", "list", "watch"]
+# EndpointSlices are in discovery.k8s.io API group
+- apiGroups: ["discovery.k8s.io"]
+  resources: ["endpointslices"]
+  verbs: ["get", "list", "watch"]
+# Secrets for TLS certificates
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "list", "watch"]
+# Events for debugging
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: serval-gateway
+subjects:
+- kind: ServiceAccount
+  name: serval-gateway
+  namespace: serval-system
+roleRef:
+  kind: ClusterRole
+  name: serval-gateway
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: serval-gateway
+  namespace: serval-system
+  labels:
+    app: serval-gateway
+    component: control-plane
+spec:
+  replicas: 1  # Single replica for now; add leader election for HA
+  selector:
+    matchLabels:
+      app: serval-gateway
+  template:
+    metadata:
+      labels:
+        app: serval-gateway
+        component: control-plane
+    spec:
+      serviceAccountName: serval-gateway
+
+      # Use host network to work around DNS resolver issues in Zig
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+
+      # Run on internal nodes (NOT edge nodes)
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: node-role.kubernetes.io/edge
+                operator: DoesNotExist
+
+      containers:
+      - name: gateway
+        image: serval-gateway:local
+        imagePullPolicy: Never  # Use locally built image
+        args:
+        # Use FQDN with trailing dot to bypass ndots search domain appending
+        - "--data-plane-host"
+        - "serval-router-admin.default.svc.cluster.local."
+        - "--data-plane-port"
+        - "9901"
+        # Multi-endpoint mode: discover all router pods via EndpointSlice
+        - "--router-service"
+        - "serval-router-admin"
+        - "--router-namespace"
+        - "default"
+        - "--gateway-class"
+        - "serval"
+        env:
+        # Use IP directly to avoid DNS resolution issues
+        - name: KUBERNETES_SERVICE_HOST
+          value: "10.43.0.1"
+        - name: KUBERNETES_SERVICE_PORT
+          value: "443"
+        resources:
+          requests:
+            cpu: 50m
+            memory: 32Mi
+          limits:
+            cpu: 500m
+            memory: 128Mi
+---
+# GatewayClass for serval
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: serval
+spec:
+  controllerName: serval.dev/gateway-controller

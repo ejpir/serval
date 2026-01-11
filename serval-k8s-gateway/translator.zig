@@ -206,7 +206,8 @@ pub fn translateToJson(
                     if (route_count > 0) {
                         writer.writeRaw(",") catch return error.BufferTooSmall;
                     }
-                    try writeRoute(&writer, http_route.name, host, "/", pool_idx, false);
+                    // Catch-all routes default to prefix match on "/"
+                    try writeRoute(&writer, http_route.name, host, null, pool_idx, false);
                     route_count += 1;
                 } else {
                     for (rule.matches, 0..) |match, match_i| {
@@ -221,8 +222,8 @@ pub fn translateToJson(
                             writer.writeRaw(",") catch return error.BufferTooSmall;
                         }
 
-                        const path_value = if (match.path) |p| p.value else "/";
-                        try writeRoute(&writer, http_route.name, host, path_value, pool_idx, strip_prefix);
+                        // Pass full PathMatch to preserve match type (Exact vs PathPrefix)
+                        try writeRoute(&writer, http_route.name, host, match.path, pool_idx, strip_prefix);
                         route_count += 1;
                     }
                 }
@@ -293,17 +294,17 @@ fn hasUrlRewriteFilter(filters: []const gw_config.HTTPRouteFilter) bool {
 }
 
 /// Write a single route object to JSON.
+/// TigerStyle: Outputs path_exact or path_prefix based on match type.
 fn writeRoute(
     writer: *JsonWriter,
     name: []const u8,
     host: ?[]const u8,
-    path_prefix: []const u8,
+    path_match: ?gw_config.PathMatch,
     pool_idx: u8,
     strip_prefix: bool,
 ) TranslatorError!void {
     // S1: Preconditions
     assert(name.len > 0);
-    assert(path_prefix.len > 0);
     assert(pool_idx < MAX_POOLS);
 
     writer.writeRaw("{") catch return error.BufferTooSmall;
@@ -317,8 +318,17 @@ fn writeRoute(
         writer.writeRaw("\",") catch return error.BufferTooSmall;
     }
 
-    writer.writeRaw("\"path_prefix\":\"") catch return error.BufferTooSmall;
-    writer.writeRaw(path_prefix) catch return error.BufferTooSmall;
+    // Output path_exact or path_prefix based on match type.
+    // TigerStyle: Explicit match type handling, defaults to prefix for "/" catch-all.
+    const path_value = if (path_match) |pm| pm.value else "/";
+    const is_exact = if (path_match) |pm| pm.type == .Exact else false;
+
+    if (is_exact) {
+        writer.writeRaw("\"path_exact\":\"") catch return error.BufferTooSmall;
+    } else {
+        writer.writeRaw("\"path_prefix\":\"") catch return error.BufferTooSmall;
+    }
+    writer.writeRaw(path_value) catch return error.BufferTooSmall;
     writer.writeRaw("\",") catch return error.BufferTooSmall;
 
     writer.writeRaw("\"pool_idx\":") catch return error.BufferTooSmall;
@@ -607,6 +617,52 @@ test "translateToJson with simple HTTPRoute" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"upstreams\":[") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"host\":\"10.0.1.1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"host\":\"10.0.1.2\"") != null);
+}
+
+test "translateToJson with exact path match" {
+    // HTTPRoute with Exact path match type should output path_exact in JSON
+    var matches = [_]gw_config.HTTPRouteMatch{
+        .{ .path = .{ .type = .Exact, .value = "/health" } },
+    };
+    var backend_refs = [_]gw_config.BackendRef{
+        .{ .name = "health-svc", .namespace = "default", .port = 8080 },
+    };
+    var rules = [_]gw_config.HTTPRouteRule{
+        .{
+            .matches = &matches,
+            .filters = &.{},
+            .backend_refs = &backend_refs,
+        },
+    };
+    var http_routes = [_]gw_config.HTTPRoute{
+        .{
+            .name = "health-route",
+            .namespace = "default",
+            .hostnames = &.{},
+            .rules = &rules,
+        },
+    };
+
+    const config_data = gw_config.GatewayConfig{
+        .gateways = &.{},
+        .http_routes = &http_routes,
+    };
+
+    const ips = [_][]const u8{"10.0.1.1"};
+    var resolved_backends = [_]gw_config.ResolvedBackend{
+        createTestBackend("health-svc", "default", &ips, 8080),
+    };
+
+    var out_buf: [MAX_JSON_SIZE_BYTES]u8 = undefined;
+    const len = try translateToJson(&config_data, &resolved_backends, &out_buf);
+
+    try std.testing.expect(len > 0);
+
+    const json = out_buf[0..len];
+
+    // Verify path_exact is used (not path_prefix)
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"path_exact\":\"/health\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"path_prefix\":\"/health\"") == null);
 }
 
 test "translateToJson with host matching" {
