@@ -697,6 +697,11 @@ pub fn Server(
                 const span_handle = tracer.startSpan(span_name, parent_span);
                 ctx.span_handle = span_handle;
 
+                // Add HTTP semantic convention attributes for Jaeger SPM (spanmetrics connector)
+                // These attributes enable RED (Request, Error, Duration) metrics generation
+                tracer.setStringAttribute(span_handle, "http.request.method", @tagName(parser.request.method));
+                tracer.setStringAttribute(span_handle, "url.path", parser.request.path);
+
                 // Call onRequest hook if present
                 if (comptime has_on_request) {
                     // Set up lazy body reader for handlers to read body on demand.
@@ -743,6 +748,7 @@ pub fn Server(
                             sendDirectResponseTls(maybe_tls_ptr, &io_mut, stream, resp);
                             const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
                             metrics.requestEnd(resp.status, duration_ns);
+                            tracer.setIntAttribute(span_handle, "http.response.status_code", @intCast(resp.status));
                             tracer.endSpan(span_handle, null);
                             buffer_offset += parser.headers_end + body_length_for_offset;
                             continue;
@@ -752,6 +758,7 @@ pub fn Server(
                             sendErrorResponseTls(maybe_tls_ptr, &io_mut, stream, reject.status, reject.reason);
                             const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
                             metrics.requestEnd(reject.status, duration_ns);
+                            tracer.setIntAttribute(span_handle, "http.response.status_code", @intCast(reject.status));
                             tracer.endSpan(span_handle, reject.reason);
                             buffer_offset += parser.headers_end + body_length_for_offset;
                             continue;
@@ -765,6 +772,7 @@ pub fn Server(
                                 sendErrorResponseTls(maybe_tls_ptr, &io_mut, stream, 501, "Handler missing nextChunk method");
                                 const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
                                 metrics.requestEnd(501, duration_ns);
+                                tracer.setIntAttribute(span_handle, "http.response.status_code", 501);
                                 tracer.endSpan(span_handle, "missing_nextChunk");
                                 buffer_offset += parser.headers_end + body_length_for_offset;
                                 continue;
@@ -781,6 +789,7 @@ pub fn Server(
                                     log.err("streaming response: failed to send headers: {s}", .{@errorName(err)});
                                     const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
                                     metrics.requestEnd(500, duration_ns);
+                                    tracer.setIntAttribute(span_handle, "http.response.status_code", 500);
                                     tracer.endSpan(span_handle, "stream_headers_failed");
                                     buffer_offset += parser.headers_end + body_length_for_offset;
                                     continue;
@@ -825,6 +834,7 @@ pub fn Server(
                                 const final_status: u16 = if (stream_error) 500 else stream_resp.status;
                                 const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
                                 metrics.requestEnd(final_status, duration_ns);
+                                tracer.setIntAttribute(span_handle, "http.response.status_code", @intCast(final_status));
                                 if (stream_error) {
                                     tracer.endSpan(span_handle, "stream_error");
                                 } else {
@@ -888,6 +898,7 @@ pub fn Server(
                                     };
                                     handler.onLog(&ctx, log_entry);
                                 }
+                                tracer.setIntAttribute(span_handle, "http.response.status_code", @intCast(rej.status));
                                 tracer.endSpan(span_handle, null);
 
                                 // Advance buffer past this request and continue with next
@@ -918,6 +929,7 @@ pub fn Server(
                 // Process result and determine connection state
                 const result: ProcessResult = if (forward_result) |fwd_result| blk: {
                     handleForwardSuccessImpl(handler, metrics, &ctx, &parser.request, fwd_result, duration_ns);
+                    tracer.setIntAttribute(span_handle, "http.response.status_code", @intCast(fwd_result.status));
                     tracer.endSpan(span_handle, null);
 
                     const should_close = clientWantsClose(&parser.request.headers) or
@@ -926,6 +938,7 @@ pub fn Server(
                     break :blk if (should_close) .close_connection else .keep_alive;
                 } else |err| blk: {
                     handleForwardErrorImpl(handler, metrics, maybe_tls_ptr, &io_mut, stream, &ctx, &parser.request, upstream, err, duration_ns);
+                    tracer.setIntAttribute(span_handle, "http.response.status_code", 502);
                     tracer.endSpan(span_handle, @errorName(err));
                     break :blk .fatal_error;
                 };

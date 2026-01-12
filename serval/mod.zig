@@ -125,6 +125,16 @@ pub const Server = server.Server;
 pub const MinimalServer = server.MinimalServer;
 
 // =============================================================================
+// Router (from serval-router)
+// =============================================================================
+
+pub const router = @import("serval-router");
+pub const Router = router.Router;
+pub const Route = router.Route;
+pub const PathMatch = router.PathMatch;
+pub const PoolConfig = router.PoolConfig;
+
+// =============================================================================
 // Tests
 // =============================================================================
 

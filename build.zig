@@ -200,6 +200,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "serval-tracing", .module = serval_tracing_module },
             .{ .name = "serval-otel", .module = serval_otel_module },
             .{ .name = "serval-server", .module = serval_server_module },
+            .{ .name = "serval-router", .module = serval_router_module },
         },
     });
 

@@ -1,8 +1,184 @@
-# Jaeger all-in-one Deployment for tracing
+# Jaeger all-in-one Deployment for tracing with SPM (Service Performance Monitoring)
 #
 # Collects traces from serval components via OTLP
 # Provides web UI for trace visualization
+# Enables Service Performance Monitoring via spanmetrics connector
 #
+# Architecture:
+#   serval-router --OTLP--> Jaeger --spanmetrics--> Prometheus exporter
+#                                                          |
+#   Jaeger UI <--PromQL query-- Prometheus <--scrape-------+
+#
+---
+# Prometheus ConfigMap for scraping Jaeger's spanmetrics
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: default
+  labels:
+    app: prometheus
+    component: observability
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+
+    scrape_configs:
+      # Scrape Jaeger's spanmetrics prometheus exporter
+      - job_name: 'jaeger-spanmetrics'
+        static_configs:
+          - targets: ['jaeger:8889']
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: default
+  labels:
+    app: prometheus
+    component: observability
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+        component: observability
+    spec:
+      # Run on internal nodes (NOT edge nodes)
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: node-role.kubernetes.io/edge
+                operator: DoesNotExist
+      containers:
+      - name: prometheus
+        image: prom/prometheus:v2.54.1
+        args:
+          - '--config.file=/etc/prometheus/prometheus.yml'
+          - '--storage.tsdb.path=/prometheus'
+          - '--storage.tsdb.retention.time=1h'
+          - '--web.enable-lifecycle'
+          - '--web.enable-remote-write-receiver'
+        ports:
+        - name: http
+          containerPort: 9090
+          protocol: TCP
+        volumeMounts:
+        - name: config
+          mountPath: /etc/prometheus
+          readOnly: true
+        - name: data
+          mountPath: /prometheus
+        readinessProbe:
+          httpGet:
+            path: /-/ready
+            port: 9090
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /-/healthy
+            port: 9090
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+      volumes:
+      - name: config
+        configMap:
+          name: prometheus-config
+      - name: data
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: default
+  labels:
+    app: prometheus
+spec:
+  type: ClusterIP
+  selector:
+    app: prometheus
+  ports:
+  - name: http
+    port: 9090
+    targetPort: 9090
+---
+# Jaeger ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jaeger-config
+  namespace: default
+  labels:
+    app: jaeger
+    component: observability
+data:
+  config.yaml: |
+    service:
+      extensions: [jaeger_storage, jaeger_query]
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [jaeger_storage_exporter, spanmetrics]
+        metrics/spanmetrics:
+          receivers: [spanmetrics]
+          exporters: [prometheus]
+
+    extensions:
+      jaeger_query:
+        storage:
+          traces: memory_store
+          metrics: prometheus_metrics
+      jaeger_storage:
+        backends:
+          memory_store:
+            memory:
+              max_traces: 100000
+        metric_backends:
+          prometheus_metrics:
+            prometheus:
+              # Query the Prometheus server (NOT the exporter)
+              endpoint: http://prometheus:9090
+              normalize_calls: true
+              normalize_duration: true
+
+    connectors:
+      spanmetrics:
+
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+          http:
+            endpoint: "0.0.0.0:4318"
+
+    processors:
+      batch:
+
+    exporters:
+      jaeger_storage_exporter:
+        trace_storage: memory_store
+      # Exposes metrics for Prometheus to scrape
+      prometheus:
+        endpoint: "0.0.0.0:8889"
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -33,6 +209,7 @@ spec:
       containers:
       - name: jaeger
         image: cr.jaegertracing.io/jaegertracing/jaeger:2.14.0
+        args: ["--config=/etc/jaeger/config.yaml"]
         ports:
         - name: ui
           containerPort: 16686
@@ -49,6 +226,13 @@ spec:
         - name: zipkin
           containerPort: 9411
           protocol: TCP
+        - name: prometheus
+          containerPort: 8889
+          protocol: TCP
+        volumeMounts:
+        - name: config
+          mountPath: /etc/jaeger
+          readOnly: true
         readinessProbe:
           httpGet:
             path: /
@@ -68,6 +252,10 @@ spec:
           limits:
             cpu: 500m
             memory: 512Mi
+      volumes:
+      - name: config
+        configMap:
+          name: jaeger-config
 ---
 apiVersion: v1
 kind: Service
@@ -96,3 +284,6 @@ spec:
   - name: zipkin
     port: 9411
     targetPort: 9411
+  - name: prometheus
+    port: 8889
+    targetPort: 8889
