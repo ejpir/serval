@@ -25,6 +25,9 @@ pub const MAX_ROUTER_ENDPOINTS: u8 = 32;
 /// Maximum IP address length (IPv4 = 15, IPv6 = 45 with scope).
 pub const MAX_IP_LEN: u8 = 45;
 
+/// Maximum pod name length (K8s DNS label limit).
+pub const MAX_POD_NAME_LEN: u8 = 63;
+
 /// Maximum namespace length (K8s DNS label limit).
 pub const MAX_NAMESPACE_LEN: u8 = 63;
 
@@ -70,6 +73,10 @@ pub const RouterEndpoint = struct {
     ip: [MAX_IP_LEN]u8,
     ip_len: u8,
 
+    /// Pod name for identity tracking (changes on pod restart).
+    pod_name: [MAX_POD_NAME_LEN]u8,
+    pod_name_len: u8,
+
     /// Admin port number.
     port: u16,
 
@@ -84,11 +91,21 @@ pub const RouterEndpoint = struct {
         return self.ip[0..self.ip_len];
     }
 
+    /// Get pod name as slice.
+    ///
+    /// TigerStyle S1: Precondition - pod_name_len within bounds.
+    pub fn getPodName(self: *const RouterEndpoint) []const u8 {
+        assert(self.pod_name_len <= MAX_POD_NAME_LEN); // S1: precondition
+        return self.pod_name[0..self.pod_name_len];
+    }
+
     /// Initialize an empty endpoint.
     pub fn init() RouterEndpoint {
         return RouterEndpoint{
             .ip = undefined,
             .ip_len = 0,
+            .pod_name = undefined,
+            .pod_name_len = 0,
             .port = 0,
             .ready = false,
         };
@@ -101,6 +118,15 @@ pub const RouterEndpoint = struct {
         assert(ip.len <= MAX_IP_LEN); // S1: precondition
         @memcpy(self.ip[0..ip.len], ip);
         self.ip_len = @intCast(ip.len);
+    }
+
+    /// Set pod name from slice.
+    ///
+    /// TigerStyle S1: Precondition - name fits in buffer.
+    pub fn setPodName(self: *RouterEndpoint, name: []const u8) void {
+        assert(name.len <= MAX_POD_NAME_LEN); // S1: precondition
+        @memcpy(self.pod_name[0..name.len], name);
+        self.pod_name_len = @intCast(name.len);
     }
 };
 
@@ -354,6 +380,9 @@ fn parseEndpointsFromSlice(
         // Check if endpoint is ready
         const ready = checkEndpointReady(endpoint_item.object);
 
+        // Get pod name from targetRef
+        const pod_name = getPodName(endpoint_item.object);
+
         // Get addresses array
         const addresses = endpoint_item.object.get("addresses") orelse continue;
         if (addresses != .array) continue;
@@ -380,17 +409,39 @@ fn parseEndpointsFromSlice(
             // Add endpoint to result
             var endpoint = &result.endpoints[result.count];
             endpoint.setIp(ip_str);
+            if (pod_name) |name| {
+                endpoint.setPodName(name);
+            }
             endpoint.port = target_port;
             endpoint.ready = ready;
             result.count += 1;
 
-            std.log.debug("endpoint_slice: found endpoint {s}:{d} ready={}", .{
+            std.log.debug("endpoint_slice: found endpoint {s}:{d} pod={s} ready={}", .{
                 ip_str,
                 target_port,
+                if (pod_name) |n| n else "<unknown>",
                 ready,
             });
         }
     }
+}
+
+/// Get pod name from endpoint's targetRef.
+///
+/// Returns null if targetRef or name is missing.
+fn getPodName(endpoint_obj: std.json.ObjectMap) ?[]const u8 {
+    const target_ref = endpoint_obj.get("targetRef") orelse return null;
+    if (target_ref != .object) return null;
+
+    const name = target_ref.object.get("name") orelse return null;
+    if (name != .string) return null;
+
+    if (name.string.len > MAX_POD_NAME_LEN) {
+        std.log.warn("endpoint_slice: pod name too long: {d} chars", .{name.string.len});
+        return null;
+    }
+
+    return name.string;
 }
 
 /// Check if an endpoint is ready based on conditions.

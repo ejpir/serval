@@ -257,6 +257,18 @@ fn run(allocator: std.mem.Allocator, config: CliConfig) !void {
     const watcher_result = initAndStartWatcher(allocator, k8s_client, ctrl, &shutdown_ctx, config.controller_name) orelse return;
     defer watcher_result.watcher.deinit();
 
+    // Start endpoint sync thread if multi-endpoint mode is enabled
+    // This ensures new router pods receive the current config
+    var sync_thread: ?std.Thread = null;
+    if (ctrl.isMultiEndpointEnabled()) {
+        if (std.Thread.spawn(.{}, runEndpointSyncLoop, .{ allocator, ctrl })) |t| {
+            sync_thread = t;
+            std.log.info("endpoint sync thread started (interval: 5s)", .{});
+        } else |err| {
+            std.log.warn("failed to start endpoint sync thread: {s}", .{@errorName(err)});
+        }
+    }
+
     // Mark ready and run until shutdown
     ctrl.setReady(true);
     std.log.info("controller ready, watching for Gateway API resources...", .{});
@@ -265,6 +277,7 @@ fn run(allocator: std.mem.Allocator, config: CliConfig) !void {
     // Graceful shutdown: stop all threads
     std.log.info("shutdown requested, stopping services...", .{});
     watcher_result.watcher.stop(); // stop() internally joins all watch threads
+    if (sync_thread) |t| t.join();
     admin_shutdown.store(true, .release);
     admin_thread.join();
     std.log.info("gateway controller stopped", .{});
@@ -429,6 +442,43 @@ fn adminServerLoop(
     server.run(io, shutdown) catch |err| {
         std.log.err("admin server error: {s}", .{@errorName(err)});
     };
+}
+
+/// Endpoint sync loop running in dedicated thread.
+/// Periodically checks for new router endpoints and pushes config to them.
+///
+/// TigerStyle S3: Bounded loop with explicit iteration limit.
+fn runEndpointSyncLoop(allocator: std.mem.Allocator, ctrl: *Controller) void {
+    std.debug.assert(@intFromPtr(ctrl) != 0); // S1: precondition - valid controller pointer
+
+    // Initialize async I/O runtime for this thread
+    var threaded: Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Sync interval: 5 seconds
+    const sync_interval_ns: u64 = 5_000_000_000;
+    const max_iterations: u32 = 1_000_000_000; // Effectively unbounded
+    var iteration: u32 = 0;
+
+    std.log.debug("endpoint sync loop started", .{});
+
+    while (iteration < max_iterations) : (iteration += 1) {
+        if (ctrl.isShutdown()) break;
+
+        // Sleep first to allow initial config to be pushed
+        std.posix.nanosleep(sync_interval_ns / std.time.ns_per_s, sync_interval_ns % std.time.ns_per_s);
+
+        if (ctrl.isShutdown()) break;
+
+        // Sync config to any new router endpoints
+        const synced = ctrl.syncRouterEndpoints(io);
+        if (synced > 0) {
+            std.log.info("endpoint sync: pushed config to {d} new router(s)", .{synced});
+        }
+    }
+
+    std.log.debug("endpoint sync loop stopped", .{});
 }
 
 test "main module compiles" {

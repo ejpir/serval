@@ -149,6 +149,17 @@ pub const DataPlaneClient = struct {
     /// When true, uses router_endpoints; when false, uses admin_host/admin_port.
     multi_endpoint_mode: bool,
 
+    /// Pod names of endpoints that have received the current config.
+    /// Used to detect new endpoints that need config push.
+    /// TigerStyle S7: Fixed-size storage, no allocation.
+    synced_pod_names: [MAX_ROUTER_ENDPOINTS][k8s_client_mod.MAX_POD_NAME_LEN]u8,
+    synced_pod_name_lens: [MAX_ROUTER_ENDPOINTS]u8,
+    synced_endpoint_count: u8,
+
+    /// Flag indicating endpoints were refreshed since last push.
+    /// When true, we should push even if config hash matches.
+    endpoints_refreshed: bool,
+
     /// Create data plane client on heap.
     ///
     /// TigerStyle C3: Large struct (~1MB) must be heap-allocated.
@@ -170,6 +181,10 @@ pub const DataPlaneClient = struct {
             .last_config_hash = 0, // No config pushed yet
             .router_endpoints = RouterEndpoints.init(),
             .multi_endpoint_mode = false, // Single-instance mode by default
+            .synced_pod_names = undefined,
+            .synced_pod_name_lens = std.mem.zeroes([MAX_ROUTER_ENDPOINTS]u8),
+            .synced_endpoint_count = 0,
+            .endpoints_refreshed = false,
         };
 
         return self;
@@ -231,10 +246,14 @@ pub const DataPlaneClient = struct {
             return DataPlaneError.EndpointDiscoveryFailed;
         };
 
+        // Check if pod names changed (not just IPs - IPs can be reused)
+        const pods_changed = self.havePodNamesChanged(&endpoints);
         self.router_endpoints = endpoints;
         self.multi_endpoint_mode = true;
-
-        std.log.info("data_plane: discovered {d} router endpoints", .{endpoints.count});
+        if (pods_changed) {
+            self.endpoints_refreshed = true;
+            std.log.info("data_plane: router pods changed, will push config", .{});
+        }
 
         // S1: Postcondition
         assert(self.router_endpoints.count <= MAX_ROUTER_ENDPOINTS);
@@ -657,6 +676,10 @@ pub const DataPlaneClient = struct {
         result.total = self.router_endpoints.count;
         std.log.info("data_plane: pushing to {d} router endpoints", .{result.total});
 
+        // Clear synced list and refresh flag - we're pushing new config
+        self.clearSyncedEndpoints();
+        self.endpoints_refreshed = false;
+
         // S3: bounded loop - limited by MAX_ROUTER_ENDPOINTS
         var idx: u8 = 0;
         while (idx < self.router_endpoints.count) : (idx += 1) {
@@ -682,8 +705,10 @@ pub const DataPlaneClient = struct {
                 continue;
             };
 
+            // Record this endpoint as synced (by pod name)
+            self.addSyncedEndpoint(endpoint.getPodName());
             result.success_count += 1;
-            std.log.info("data_plane: pushed to {s}:{d}", .{ ip, endpoint.port });
+            std.log.info("data_plane: pushed to {s}:{d} (pod={s})", .{ ip, endpoint.port, endpoint.getPodName() });
         }
 
         // Log summary
@@ -755,9 +780,10 @@ pub const DataPlaneClient = struct {
         // S2: postcondition - non-empty JSON
         assert(json_len > 0);
 
-        // Step 3: Check if config changed (skip redundant pushes)
+        // Step 3: Check if config changed OR router endpoints were refreshed
         const config_hash = std.hash.Wyhash.hash(0, self.json_buffer[0..json_len]);
-        if (config_hash == self.last_config_hash) {
+
+        if (config_hash == self.last_config_hash and !self.endpoints_refreshed) {
             std.log.debug("data_plane: config unchanged (hash={x}), skipping push", .{config_hash});
             // Return success with 0 endpoints pushed (config unchanged)
             return PushResult{
@@ -765,6 +791,10 @@ pub const DataPlaneClient = struct {
                 .failure_count = 0,
                 .total = 0,
             };
+        }
+
+        if (self.endpoints_refreshed) {
+            std.log.info("data_plane: endpoints refreshed, pushing config to all", .{});
         }
 
         std.log.debug("data_plane: generated JSON len={d}", .{json_len});
@@ -784,6 +814,203 @@ pub const DataPlaneClient = struct {
         }
 
         return result;
+    }
+
+    /// Sync router endpoints and push config to any new endpoints.
+    ///
+    /// Call this when router EndpointSlice changes to ensure new pods
+    /// receive the current config. Only pushes to endpoints that haven't
+    /// received the current config version.
+    ///
+    /// TigerStyle S1: ~2 assertions per function.
+    /// TigerStyle S3: Bounded loops.
+    ///
+    /// Parameters:
+    /// - k8s: K8s API client for EndpointSlice discovery
+    /// - namespace: Namespace where router service lives
+    /// - service_name: Router admin service name
+    /// - config_ptr: Current gateway config to push
+    /// - resolver: Backend resolver
+    /// - io: Io runtime for async operations
+    ///
+    /// Returns number of new endpoints that received config.
+    pub fn syncNewEndpoints(
+        self: *Self,
+        k8s: *K8sClient,
+        namespace: []const u8,
+        service_name: []const u8,
+        config_ptr: *const GatewayConfig,
+        resolver: *const Resolver,
+        io: Io,
+    ) DataPlaneError!u8 {
+        // S1: Preconditions
+        assert(namespace.len > 0);
+        assert(service_name.len > 0);
+
+        // Skip if no config has been pushed yet
+        if (self.last_config_hash == 0) {
+            std.log.info("data_plane: syncNewEndpoints skipped - no config pushed yet", .{});
+            return 0;
+        }
+
+        // Refresh endpoints from K8s
+        _ = self.refreshEndpoints(k8s, namespace, service_name, io) catch |err| {
+            std.log.warn("data_plane: syncNewEndpoints discovery failed: {s}", .{@errorName(err)});
+            return err;
+        };
+
+        // Find new endpoints not in synced list
+        var new_endpoints: [MAX_ROUTER_ENDPOINTS]RouterEndpoint = undefined;
+        var new_count: u8 = 0;
+
+        // S3: Bounded loop
+        var ep_idx: u8 = 0;
+        while (ep_idx < self.router_endpoints.count) : (ep_idx += 1) {
+            const ep = &self.router_endpoints.endpoints[ep_idx];
+            if (!ep.ready) continue;
+
+            const pod_name = ep.getPodName();
+            if (!self.isEndpointSynced(pod_name)) {
+                if (new_count < MAX_ROUTER_ENDPOINTS) {
+                    new_endpoints[new_count] = ep.*;
+                    new_count += 1;
+                    std.log.info("data_plane: found new endpoint {s}:{d} (pod={s})", .{ ep.getIp(), ep.port, pod_name });
+                }
+            }
+        }
+
+        if (new_count == 0) {
+            std.log.info("data_plane: no new endpoints to sync (synced={d}, current={d})", .{
+                self.synced_endpoint_count,
+                self.router_endpoints.count,
+            });
+            return 0;
+        }
+
+        std.log.info("data_plane: syncing config to {d} new endpoints", .{new_count});
+
+        // Resolve backends (reuse existing resolution if valid)
+        const expected_backends = countExpectedBackends(config_ptr);
+        const resolved_count = self.resolveBackends(config_ptr, resolver) catch |err| {
+            std.log.err("data_plane: syncNewEndpoints resolveBackends failed: {s}", .{@errorName(err)});
+            return err;
+        };
+
+        if (expected_backends > 0 and resolved_count < expected_backends) {
+            return DataPlaneError.BackendsNotReady;
+        }
+
+        // Translate to JSON
+        const json_len = gateway.translator.translateToJson(
+            config_ptr,
+            self.resolved_backends[0..resolved_count],
+            &self.json_buffer,
+        ) catch |err| {
+            std.log.err("data_plane: syncNewEndpoints translateToJson failed: {s}", .{@errorName(err)});
+            return DataPlaneError.TranslationFailed;
+        };
+
+        // Push to each new endpoint
+        var success_count: u8 = 0;
+        var push_idx: u8 = 0;
+        while (push_idx < new_count) : (push_idx += 1) {
+            const ep = &new_endpoints[push_idx];
+            const ip = ep.getIp();
+
+            self.sendConfigToEndpoint(ip, ep.port, self.json_buffer[0..json_len], io) catch |err| {
+                std.log.warn("data_plane: push to {s}:{d} failed: {s}", .{ ip, ep.port, @errorName(err) });
+                continue;
+            };
+
+            // Record successful sync (by pod name)
+            self.addSyncedEndpoint(ep.getPodName());
+            success_count += 1;
+            std.log.info("data_plane: synced config to {s}:{d} (pod={s})", .{ ip, ep.port, ep.getPodName() });
+        }
+
+        // S1: Postcondition
+        assert(success_count <= new_count);
+
+        return success_count;
+    }
+
+    /// Check if pod names in new endpoints differ from current endpoints.
+    ///
+    /// Returns true if any pod name changed, even if IPs are the same.
+    /// TigerStyle S3: Bounded loops.
+    fn havePodNamesChanged(self: *const Self, new_endpoints: *const RouterEndpoints) bool {
+        // Different count means changed
+        if (new_endpoints.count != self.router_endpoints.count) {
+            return true;
+        }
+
+        // Check each new endpoint's pod name exists in current list
+        var new_idx: u8 = 0;
+        while (new_idx < new_endpoints.count) : (new_idx += 1) {
+            const new_ep = &new_endpoints.endpoints[new_idx];
+            const new_pod = new_ep.getPodName();
+            if (new_pod.len == 0) continue; // Skip if pod name unknown
+
+            var found = false;
+            var cur_idx: u8 = 0;
+            while (cur_idx < self.router_endpoints.count) : (cur_idx += 1) {
+                const cur_ep = &self.router_endpoints.endpoints[cur_idx];
+                if (std.mem.eql(u8, new_pod, cur_ep.getPodName())) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// Check if an endpoint pod name is in the synced list.
+    ///
+    /// TigerStyle S3: Bounded loop.
+    fn isEndpointSynced(self: *const Self, pod_name: []const u8) bool {
+        if (pod_name.len == 0) return false; // Unknown pod name, treat as not synced
+
+        var idx: u8 = 0;
+        while (idx < self.synced_endpoint_count) : (idx += 1) {
+            const synced_len = self.synced_pod_name_lens[idx];
+            if (synced_len == pod_name.len) {
+                if (std.mem.eql(u8, self.synced_pod_names[idx][0..synced_len], pod_name)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Add an endpoint pod name to the synced list.
+    ///
+    /// TigerStyle S1: Precondition - pod name fits in buffer.
+    fn addSyncedEndpoint(self: *Self, pod_name: []const u8) void {
+        if (pod_name.len == 0) return; // Skip unknown pod names
+
+        assert(pod_name.len <= k8s_client_mod.MAX_POD_NAME_LEN); // S1: precondition
+
+        if (self.synced_endpoint_count >= MAX_ROUTER_ENDPOINTS) {
+            std.log.warn("data_plane: synced endpoint list full, cannot add {s}", .{pod_name});
+            return;
+        }
+
+        const idx = self.synced_endpoint_count;
+        @memcpy(self.synced_pod_names[idx][0..pod_name.len], pod_name);
+        self.synced_pod_name_lens[idx] = @intCast(pod_name.len);
+        self.synced_endpoint_count += 1;
+    }
+
+    /// Clear the synced endpoint list.
+    ///
+    /// Call this when config changes to ensure all endpoints get the new config.
+    pub fn clearSyncedEndpoints(self: *Self) void {
+        self.synced_endpoint_count = 0;
+        self.synced_pod_name_lens = std.mem.zeroes([MAX_ROUTER_ENDPOINTS]u8);
     }
 };
 

@@ -519,6 +519,50 @@ pub const Controller = struct {
         // S2: Postcondition
         assert(result.success_count <= result.total);
     }
+
+    /// Sync config to any new router endpoints.
+    ///
+    /// Call this when router EndpointSlice changes to ensure new pods
+    /// receive the current config. Only pushes to endpoints that haven't
+    /// received the current config version.
+    ///
+    /// TigerStyle S1: ~2 assertions per function.
+    ///
+    /// Parameters:
+    /// - io: Io runtime for async operations
+    ///
+    /// Returns number of new endpoints that received config.
+    pub fn syncRouterEndpoints(self: *Self, io: Io) u8 {
+        // S1: Preconditions
+        assert(self.multi_endpoint_enabled);
+
+        // Skip if no config has been set yet
+        const config_ptr = self.gateway_config orelse {
+            std.log.debug("controller: syncRouterEndpoints skipped - no config yet", .{});
+            return 0;
+        };
+
+        const namespace = self.getRouterNamespace();
+        const service_name = self.getRouterServiceName();
+
+        const synced = self.data_plane_client.syncNewEndpoints(
+            self.k8s_client,
+            namespace,
+            service_name,
+            config_ptr,
+            self.resolver,
+            io,
+        ) catch |err| {
+            std.log.warn("controller: syncRouterEndpoints failed: {s}", .{@errorName(err)});
+            return 0;
+        };
+
+        if (synced > 0) {
+            std.log.info("controller: synced config to {d} new router endpoints", .{synced});
+        }
+
+        return synced;
+    }
 };
 
 // ============================================================================

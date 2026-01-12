@@ -39,6 +39,20 @@ warn() { echo -e "${YELLOW}[!]${NC} $1"; }
 
 cd "$PROJECT_ROOT"
 
+# Set up k3d kubeconfig
+setup_kubeconfig() {
+    if k3d cluster list 2>/dev/null | grep -q "^${CLUSTER_NAME} "; then
+        KUBECONFIG_FILE=$(mktemp)
+        k3d kubeconfig get "${CLUSTER_NAME}" > "${KUBECONFIG_FILE}"
+        export KUBECONFIG="${KUBECONFIG_FILE}"
+        log "Using k3d cluster '${CLUSTER_NAME}' kubeconfig"
+    else
+        warn "k3d cluster '${CLUSTER_NAME}' not found - run k3d-setup.sh first"
+    fi
+}
+
+setup_kubeconfig
+
 # Build the Zig binaries
 if [[ "$DEBUG_MODE" == "true" ]]; then
     log "Building serval binaries (DEBUG mode)..."
@@ -116,7 +130,10 @@ if [[ "$BUILD_GATEWAY" == "true" ]]; then
     echo "  - serval-gateway:local"
 fi
 echo ""
-echo "Deploy with:"
+echo "Deploy with (KUBECONFIG already set in this shell):"
 echo "  kubectl apply -f examples/gateway/k8s/router-daemonset.yaml"
 echo "  kubectl apply -f examples/gateway/k8s/gateway-deployment.yaml"
 echo "  kubectl apply -f examples/gateway/k8s/test-backend.yaml"
+echo ""
+echo "Or in a new shell, first set:"
+echo "  export KUBECONFIG=\$(k3d kubeconfig write ${CLUSTER_NAME})"

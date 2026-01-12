@@ -1060,6 +1060,8 @@ pub const RouterEndpoints = endpoint_slice.RouterEndpoints;
 pub const EndpointSliceError = endpoint_slice.EndpointSliceError;
 pub const discoverRouterEndpoints = endpoint_slice.discoverRouterEndpoints;
 pub const MAX_ROUTER_ENDPOINTS = endpoint_slice.MAX_ROUTER_ENDPOINTS;
+pub const MAX_IP_LEN = endpoint_slice.MAX_IP_LEN;
+pub const MAX_POD_NAME_LEN = endpoint_slice.MAX_POD_NAME_LEN;
 
 // =============================================================================
 // Unit Tests
