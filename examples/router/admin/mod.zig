@@ -248,6 +248,73 @@ pub fn AdminHandler(comptime Tracer: type) type {
             self.tracer.setIntAttribute(ctx.span_handle, "config.generation", @intCast(generation));
             self.tracer.setIntAttribute(ctx.span_handle, "routes.count", @intCast(router.routes.len));
             self.tracer.setIntAttribute(ctx.span_handle, "pools.count", @intCast(router.pools.len));
+
+            // Add route names (comma-separated, truncated to fit attribute limit)
+            var route_names_buf: [256]u8 = undefined;
+            var route_names_len: usize = 0;
+            for (router.routes, 0..) |route, i| {
+                if (i > 0 and route_names_len < route_names_buf.len - 1) {
+                    route_names_buf[route_names_len] = ',';
+                    route_names_len += 1;
+                }
+                const name = route.name;
+                const copy_len = @min(name.len, route_names_buf.len - route_names_len);
+                if (copy_len == 0) break;
+                @memcpy(route_names_buf[route_names_len..][0..copy_len], name[0..copy_len]);
+                route_names_len += copy_len;
+            }
+            if (route_names_len > 0) {
+                self.tracer.setStringAttribute(ctx.span_handle, "routes.names", route_names_buf[0..route_names_len]);
+            }
+
+            // Add pool names (comma-separated, truncated to fit attribute limit)
+            var pool_names_buf: [256]u8 = undefined;
+            var pool_names_len: usize = 0;
+            for (router.pools, 0..) |pool, i| {
+                if (i > 0 and pool_names_len < pool_names_buf.len - 1) {
+                    pool_names_buf[pool_names_len] = ',';
+                    pool_names_len += 1;
+                }
+                const name = pool.name;
+                const copy_len = @min(name.len, pool_names_buf.len - pool_names_len);
+                if (copy_len == 0) break;
+                @memcpy(pool_names_buf[pool_names_len..][0..copy_len], name[0..copy_len]);
+                pool_names_len += copy_len;
+            }
+            if (pool_names_len > 0) {
+                self.tracer.setStringAttribute(ctx.span_handle, "pools.names", pool_names_buf[0..pool_names_len]);
+            }
+
+            // Add upstream count and list (host:port, truncated to fit)
+            var upstream_count: usize = 0;
+            for (router.pools) |pool| {
+                upstream_count += pool.lb_handler.upstreams.len;
+            }
+            self.tracer.setIntAttribute(ctx.span_handle, "upstreams.count", @intCast(upstream_count));
+
+            // Format upstreams as "host:port,host:port,..."
+            var upstreams_buf: [256]u8 = undefined;
+            var upstreams_len: usize = 0;
+            var first: bool = true;
+            outer: for (router.pools) |pool| {
+                for (pool.lb_handler.upstreams) |upstream| {
+                    if (!first and upstreams_len < upstreams_buf.len - 1) {
+                        upstreams_buf[upstreams_len] = ',';
+                        upstreams_len += 1;
+                    }
+                    first = false;
+                    // Format "host:port"
+                    const formatted = std.fmt.bufPrint(
+                        upstreams_buf[upstreams_len..],
+                        "{s}:{d}",
+                        .{ upstream.host, upstream.port },
+                    ) catch break :outer;
+                    upstreams_len += formatted.len;
+                }
+            }
+            if (upstreams_len > 0) {
+                self.tracer.setStringAttribute(ctx.span_handle, "upstreams.list", upstreams_buf[0..upstreams_len]);
+            }
         }
     };
 }

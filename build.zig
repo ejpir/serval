@@ -68,15 +68,6 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // OpenTelemetry module - depends on core + tracing
-    const serval_otel_module = b.addModule("serval-otel", .{
-        .root_source_file = b.path("serval-otel/mod.zig"),
-        .imports = &.{
-            .{ .name = "serval-core", .module = serval_core_module },
-            .{ .name = "serval-tracing", .module = serval_tracing_module },
-        },
-    });
-
     // Health module - depends on core
     const serval_health_module = b.addModule("serval-health", .{
         .root_source_file = b.path("serval-health/mod.zig"),
@@ -95,6 +86,20 @@ pub fn build(b: *std.Build) void {
             .{ .name = "serval-net", .module = serval_net_module },
             .{ .name = "serval-pool", .module = serval_pool_module },
             .{ .name = "serval-tls", .module = serval_tls_module },
+        },
+    });
+
+    // OpenTelemetry module - depends on core, tracing, client, net, tls, pool
+    // Uses serval-client for HTTP export with proper K8s DNS resolution
+    const serval_otel_module = b.addModule("serval-otel", .{
+        .root_source_file = b.path("serval-otel/mod.zig"),
+        .imports = &.{
+            .{ .name = "serval-core", .module = serval_core_module },
+            .{ .name = "serval-tracing", .module = serval_tracing_module },
+            .{ .name = "serval-client", .module = serval_client_module },
+            .{ .name = "serval-net", .module = serval_net_module },
+            .{ .name = "serval-tls", .module = serval_tls_module },
+            .{ .name = "serval-pool", .module = serval_pool_module },
         },
     });
 
@@ -562,11 +567,15 @@ pub fn build(b: *std.Build) void {
     run_echo_backend_step.dependOn(&run_echo_backend.step);
 
     // OTLP test example
+    // Note: Links SSL libraries since serval-otel uses serval-client which uses serval-tls
     const otel_test_mod = b.createModule(.{
         .root_source_file = b.path("examples/otel_test.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
+    otel_test_mod.linkSystemLibrary("ssl", .{});
+    otel_test_mod.linkSystemLibrary("crypto", .{});
     otel_test_mod.addImport("serval-otel", serval_otel_module);
     const otel_test = b.addExecutable(.{
         .name = "otel_test",
@@ -577,6 +586,28 @@ pub fn build(b: *std.Build) void {
     const run_otel_test = b.addRunArtifact(otel_test);
     const run_otel_test_step = b.step("run-otel-test", "Run OTLP export test");
     run_otel_test_step.dependOn(&run_otel_test.step);
+
+    // DNS test example (for debugging DNS resolution issues)
+    const dns_test_mod = b.createModule(.{
+        .root_source_file = b.path("examples/dns_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    dns_test_mod.addImport("serval-net", serval_net_module);
+    dns_test_mod.addImport("serval-core", serval_core_module);
+    const dns_test = b.addExecutable(.{
+        .name = "dns_test",
+        .root_module = dns_test_mod,
+    });
+    const build_dns_test = b.addInstallArtifact(dns_test, .{});
+    _ = build_dns_test;
+
+    const run_dns_test = b.addRunArtifact(dns_test);
+    if (b.args) |args| {
+        run_dns_test.addArgs(args);
+    }
+    const run_dns_test_step = b.step("run-dns-test", "Run DNS resolution test");
+    run_dns_test_step.dependOn(&run_dns_test.step);
 
     // LLM streaming example (demonstrates Action.stream and nextChunk)
     // Note: Links SSL libraries since serval depends on serval-server which depends on serval-tls
