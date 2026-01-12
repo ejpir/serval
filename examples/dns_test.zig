@@ -59,8 +59,8 @@ pub fn main() !void {
 
     // Initialize DNS resolver
     var resolver = DnsResolver.init(.{
-        .ttl_ns = 60 * std.time.ns_per_s,
-        .timeout_ns = 10 * std.time.ns_per_s,
+        .ttl_ns = 60 * time.ns_per_s,
+        .timeout_ns = 10 * time.ns_per_s,
     });
 
     // Try resolving

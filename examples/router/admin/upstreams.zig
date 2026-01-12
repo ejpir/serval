@@ -31,17 +31,11 @@ pub fn handleUpstreamsAdd(body: ?[]const u8, response_buf: []u8) RouteUpdateResu
     // S1: Precondition - response buffer must be valid
     assert(response_buf.len > 0);
 
-    const request_body = body orelse {
-        return .{ .status = 400, .body = response.errors.missing_body };
+    const validation = response.validateBody(body, MAX_JSON_BODY_SIZE);
+    const request_body = switch (validation) {
+        .valid => |b| b,
+        .err => |e| return .{ .status = e.status, .body = e.body },
     };
-
-    if (request_body.len == 0) {
-        return .{ .status = 400, .body = response.errors.empty_body };
-    }
-
-    if (request_body.len > MAX_JSON_BODY_SIZE) {
-        return .{ .status = 413, .body = response.errors.body_too_large };
-    }
 
     // Get current router
     const router = config_storage.getActiveRouter() orelse {
@@ -145,17 +139,11 @@ pub fn handleUpstreamsRemove(body: ?[]const u8, response_buf: []u8) RouteUpdateR
     // S1: Precondition - response buffer must be valid
     assert(response_buf.len > 0);
 
-    const request_body = body orelse {
-        return .{ .status = 400, .body = response.errors.missing_body };
+    const validation = response.validateBody(body, MAX_JSON_BODY_SIZE);
+    const request_body = switch (validation) {
+        .valid => |b| b,
+        .err => |e| return .{ .status = e.status, .body = e.body },
     };
-
-    if (request_body.len == 0) {
-        return .{ .status = 400, .body = response.errors.empty_body };
-    }
-
-    if (request_body.len > MAX_JSON_BODY_SIZE) {
-        return .{ .status = 413, .body = response.errors.body_too_large };
-    }
 
     // Get current router
     const router = config_storage.getActiveRouter() orelse {

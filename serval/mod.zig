@@ -42,6 +42,9 @@ pub const UpstreamConnectInfo = core.UpstreamConnectInfo;
 pub const config = core.config;
 pub const Config = core.Config;
 
+// Time utilities
+pub const time = core.time;
+
 // Errors
 pub const errors = core.errors;
 pub const ParseError = core.ParseError;

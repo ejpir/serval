@@ -78,6 +78,68 @@ fn runAdminServer(
     };
 }
 
+/// Run both admin and main servers with the given tracer.
+/// TigerStyle: Generic function to avoid code duplication between tracer modes.
+fn runServers(
+    comptime Tracer: type,
+    tracer: *Tracer,
+    router_handler: *RouterHandler,
+    main_port: u16,
+    admin_port: u16,
+    io: std.Io,
+    shutdown: *std.atomic.Value(bool),
+) !void {
+    const AdminHandlerType = admin.AdminHandler(Tracer);
+    const AdminServerType = serval.Server(
+        AdminHandlerType,
+        serval.SimplePool,
+        serval.NoopMetrics,
+        Tracer,
+    );
+    const RouterServerType = serval.Server(
+        RouterHandler,
+        serval.SimplePool,
+        serval.NoopMetrics,
+        Tracer,
+    );
+
+    // Initialize admin handler and server
+    var admin_handler = AdminHandlerType.init(tracer);
+    var admin_pool = serval.SimplePool.init();
+    var admin_metrics = serval.NoopMetrics{};
+    var admin_server = AdminServerType.init(&admin_handler, &admin_pool, &admin_metrics, tracer, .{
+        .port = admin_port,
+        .tls = null,
+    }, null, DnsConfig{});
+
+    // Start admin server in separate thread
+    const admin_thread = std.Thread.spawn(.{}, runAdminServer, .{
+        &admin_server,
+        io,
+        shutdown,
+    }) catch |err| {
+        std.debug.print("Failed to start admin server: {s}\n", .{@errorName(err)});
+        return error.AdminServerFailed;
+    };
+    defer {
+        shutdown.store(true, .release);
+        admin_thread.join();
+    }
+
+    // Initialize main server resources
+    var pool = serval.SimplePool.init();
+    var metrics = serval.NoopMetrics{};
+    var server = RouterServerType.init(router_handler, &pool, &metrics, tracer, .{
+        .port = main_port,
+        .tls = null,
+    }, null, DnsConfig{});
+
+    server.run(io, shutdown) catch |err| {
+        std.debug.print("Server error: {}\n", .{err});
+        return;
+    };
+}
+
 pub fn main() !void {
     // Parse command-line arguments
     var args = cli.Args(RouterExtra).init("router", VERSION);
@@ -166,12 +228,6 @@ pub fn main() !void {
     }
     defer config_storage.deinitAllRouters();
 
-    // Initialize connection pool
-    var pool = serval.SimplePool.init();
-
-    // Initialize metrics (noop for simplicity)
-    var metrics = serval.NoopMetrics{};
-
     // Initialize async IO runtime
     var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
     defer threaded.deinit();
@@ -179,7 +235,7 @@ pub fn main() !void {
 
     var shutdown = std.atomic.Value(bool).init(false);
 
-    // Initialize router handler (admin handler initialized with tracer in each branch below)
+    // Initialize router handler
     var router_handler = RouterHandler{};
 
     // Print startup info (before creating servers so it's visible regardless of tracing mode)
@@ -215,9 +271,8 @@ pub fn main() !void {
     std.debug.print("Debug logging: {}\n", .{args.debug});
 
     // Run servers with appropriate tracer type.
-    // Both admin server and main server share the same tracer.
     if (args.extra.trace) {
-        // OpenTelemetry tracing enabled for both servers
+        // OpenTelemetry tracing enabled
         var gpa = std.heap.GeneralPurposeAllocator(.{}){};
         defer _ = gpa.deinit();
         const allocator = gpa.allocator();
@@ -245,108 +300,10 @@ pub fn main() !void {
         );
         defer otel_tracer.destroy(allocator);
 
-        // Server types with OtelTracer
-        const OtelAdminHandler = admin.AdminHandler(otel.OtelTracer);
-        const OtelAdminServerType = serval.Server(
-            OtelAdminHandler,
-            serval.SimplePool,
-            serval.NoopMetrics,
-            otel.OtelTracer,
-        );
-        const OtelRouterServerType = serval.Server(
-            RouterHandler,
-            serval.SimplePool,
-            serval.NoopMetrics,
-            otel.OtelTracer,
-        );
-
-        // Initialize admin handler with tracer
-        var admin_handler = OtelAdminHandler.init(otel_tracer);
-
-        // Initialize admin server
-        var admin_pool = serval.SimplePool.init();
-        var admin_metrics = serval.NoopMetrics{};
-        var admin_server = OtelAdminServerType.init(&admin_handler, &admin_pool, &admin_metrics, otel_tracer, .{
-            .port = args.extra.@"admin-port",
-            .tls = null,
-        }, null, DnsConfig{});
-
-        // Start admin server in separate thread
-        const admin_thread = std.Thread.spawn(.{}, runAdminServer, .{
-            &admin_server,
-            io,
-            &shutdown,
-        }) catch |err| {
-            std.debug.print("Failed to start admin server: {s}\n", .{@errorName(err)});
-            return error.AdminServerFailed;
-        };
-        defer {
-            shutdown.store(true, .release);
-            admin_thread.join();
-        }
-
-        // Initialize and run main server
-        var server = OtelRouterServerType.init(&router_handler, &pool, &metrics, otel_tracer, .{
-            .port = args.port,
-            .tls = null,
-        }, null, DnsConfig{});
-
-        server.run(io, &shutdown) catch |err| {
-            std.debug.print("Server error: {}\n", .{err});
-            return;
-        };
+        try runServers(otel.OtelTracer, otel_tracer, &router_handler, args.port, args.extra.@"admin-port", io, &shutdown);
     } else {
-        // No tracing (default) - both servers use NoopTracer
+        // No tracing (default)
         var noop_tracer = serval.NoopTracer{};
-
-        const NoopAdminHandler = admin.AdminHandler(serval.NoopTracer);
-        const NoopAdminServerType = serval.Server(
-            NoopAdminHandler,
-            serval.SimplePool,
-            serval.NoopMetrics,
-            serval.NoopTracer,
-        );
-        const NoopRouterServerType = serval.Server(
-            RouterHandler,
-            serval.SimplePool,
-            serval.NoopMetrics,
-            serval.NoopTracer,
-        );
-
-        // Initialize admin handler with tracer
-        var admin_handler = NoopAdminHandler.init(&noop_tracer);
-
-        // Initialize admin server
-        var admin_pool = serval.SimplePool.init();
-        var admin_metrics = serval.NoopMetrics{};
-        var admin_server = NoopAdminServerType.init(&admin_handler, &admin_pool, &admin_metrics, &noop_tracer, .{
-            .port = args.extra.@"admin-port",
-            .tls = null,
-        }, null, DnsConfig{});
-
-        // Start admin server in separate thread
-        const admin_thread = std.Thread.spawn(.{}, runAdminServer, .{
-            &admin_server,
-            io,
-            &shutdown,
-        }) catch |err| {
-            std.debug.print("Failed to start admin server: {s}\n", .{@errorName(err)});
-            return error.AdminServerFailed;
-        };
-        defer {
-            shutdown.store(true, .release);
-            admin_thread.join();
-        }
-
-        // Initialize and run main server
-        var server = NoopRouterServerType.init(&router_handler, &pool, &metrics, &noop_tracer, .{
-            .port = args.port,
-            .tls = null,
-        }, null, DnsConfig{});
-
-        server.run(io, &shutdown) catch |err| {
-            std.debug.print("Server error: {}\n", .{err});
-            return;
-        };
+        try runServers(serval.NoopTracer, &noop_tracer, &router_handler, args.port, args.extra.@"admin-port", io, &shutdown);
     }
 }

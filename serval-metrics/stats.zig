@@ -16,13 +16,11 @@ const PrometheusMetrics = metrics.PrometheusMetrics;
 // Constants
 // =============================================================================
 
-/// Maximum number of upstreams tracked.
-/// TigerStyle: Single source of truth from config.
+/// Maximum number of upstreams tracked (from serval-core.config).
 const MAX_UPSTREAMS = config.MAX_UPSTREAMS;
 const UpstreamIndex = config.UpstreamIndex;
 
 /// Error rate threshold for marking upstream as unhealthy (50% = 1/2).
-/// TigerStyle: Named constant for magic number.
 const UNHEALTHY_ERROR_RATE_DIVISOR: u64 = 2;
 
 // =============================================================================
@@ -61,12 +59,29 @@ pub const StatsSnapshot = struct {
 };
 
 // =============================================================================
+// Internal Types
+// =============================================================================
+
+/// Result type for buildUpstreamStats helper.
+const UpstreamStatsResult = struct {
+    stats: [MAX_UPSTREAMS]UpstreamStats,
+    count: u8,
+};
+
+/// Latency percentile results.
+const LatencyPercentiles = struct {
+    p50: u32,
+    p95: u32,
+    p99: u32,
+};
+
+// =============================================================================
 // RealTimeMetrics
 // =============================================================================
 
 /// Real-time metrics collector with per-upstream tracking and rate calculation.
 /// Extends PrometheusMetrics with upstream-level granularity.
-/// TigerStyle: Fixed arrays, atomic operations, no allocation after init.
+/// Fixed arrays, atomic operations, no allocation after init.
 pub const RealTimeMetrics = struct {
     base: PrometheusMetrics = .{},
 
@@ -85,26 +100,23 @@ pub const RealTimeMetrics = struct {
     prev_timestamp_ns: u64 = 0,
     prev_upstream_requests: [MAX_UPSTREAMS]u64 = [_]u64{0} ** MAX_UPSTREAMS,
 
-    /// Initialize a new RealTimeMetrics instance.
-    /// TigerStyle: Explicit init, all fields zeroed.
+    /// Initialize a new RealTimeMetrics instance with all fields zeroed.
     pub fn init() RealTimeMetrics {
         return .{};
     }
 
     /// Take a point-in-time snapshot of all metrics.
     /// Calculates rates from deltas since the last snapshot.
-    /// TigerStyle: Snapshot captures consistent state for reporting.
     pub fn snapshot(self: *RealTimeMetrics) StatsSnapshot {
         const now_ns = time.monotonicNanos();
         const requests_total = self.base.requests_total.load(.monotonic);
-        const errors_total = self.getErrorsTotal();
+        const errors_total = self.calculateTotalErrors();
         const connections_active = self.base.connections_active.load(.monotonic);
 
-        // Calculate time delta in seconds
         const elapsed_ns = time.elapsedNanos(self.prev_timestamp_ns, now_ns);
-        // TigerStyle: Guard against division by zero, minimum 1ms window.
+        // Guard against division by zero with minimum 1ms window
         const elapsed_sec: f64 = if (elapsed_ns > 0)
-            @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(std.time.ns_per_s))
+            @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(time.ns_per_s))
         else
             0.001; // Minimum 1ms to avoid division by zero
 
@@ -140,12 +152,6 @@ pub const RealTimeMetrics = struct {
     }
 
     /// Build per-upstream stats from atomic counters.
-    /// TigerStyle: Extracted helper to keep snapshot() under 70 lines.
-    const UpstreamStatsResult = struct {
-        stats: [MAX_UPSTREAMS]UpstreamStats,
-        count: u8,
-    };
-
     fn buildUpstreamStats(self: *RealTimeMetrics, elapsed_sec: f64) UpstreamStatsResult {
         assert(elapsed_sec > 0);
 
@@ -165,7 +171,7 @@ pub const RealTimeMetrics = struct {
 
                 // Calculate average latency in milliseconds (req_count already > 0 here)
                 const avg_latency_ns = latency_sum / req_count;
-                const avg_latency_ms: u32 = @intCast(avg_latency_ns / std.time.ns_per_ms);
+                const avg_latency_ms: u32 = @intCast(avg_latency_ns / time.ns_per_ms);
 
                 stats[idx] = .{
                     .requests_total = req_count,
@@ -198,75 +204,61 @@ pub const RealTimeMetrics = struct {
     }
 
     /// Record request start.
-    /// TigerStyle: Delegates to base metrics.
     pub fn requestStart(self: *RealTimeMetrics) void {
         self.base.requestStart();
     }
 
     /// Record request end with status and duration.
-    /// TigerStyle: Delegates to base metrics.
     pub fn requestEnd(self: *RealTimeMetrics, status: u16, duration_ns: u64) void {
-        // TigerStyle: Assert valid HTTP status range.
         assert(status >= 100 and status <= 599);
         self.base.requestEnd(status, duration_ns);
     }
 
-    /// Record request end with upstream tracking.
-    /// TigerStyle: Per-upstream stats for load balancer visibility.
+    /// Record request end with upstream tracking for per-upstream load balancer visibility.
     pub fn requestEndWithUpstream(
         self: *RealTimeMetrics,
         status: u16,
         duration_ns: u64,
         upstream_idx: UpstreamIndex,
     ) void {
-        // TigerStyle: Assert valid upstream index and status.
         assert(upstream_idx < MAX_UPSTREAMS);
         assert(status >= 100 and status <= 599);
 
-        // Update base metrics
         self.base.requestEnd(status, duration_ns);
 
-        // Update per-upstream counters
         _ = self.upstream_requests[upstream_idx].fetchAdd(1, .monotonic);
         _ = self.upstream_latency_sum_ns[upstream_idx].fetchAdd(duration_ns, .monotonic);
 
-        // Track errors (5xx responses)
         if (status >= 500 and status <= 599) {
             _ = self.upstream_errors[upstream_idx].fetchAdd(1, .monotonic);
         }
     }
 
     /// Record per-upstream stats only (no base metrics update).
-    /// Use when server already called requestEnd() for totals.
-    /// TigerStyle: Avoids double-counting when used with onLog hook.
+    /// Use when server already called requestEnd() to avoid double-counting totals.
     pub fn recordUpstreamStats(
         self: *RealTimeMetrics,
         status: u16,
         duration_ns: u64,
         upstream_idx: UpstreamIndex,
     ) void {
-        // TigerStyle: Assert valid upstream index and status range.
         assert(upstream_idx < MAX_UPSTREAMS);
         assert(status >= 100 and status <= 599);
 
-        // Update per-upstream counters only
         _ = self.upstream_requests[upstream_idx].fetchAdd(1, .monotonic);
         _ = self.upstream_latency_sum_ns[upstream_idx].fetchAdd(duration_ns, .monotonic);
 
-        // Track errors (4xx and 5xx responses)
         if (status >= 400) {
             _ = self.upstream_errors[upstream_idx].fetchAdd(1, .monotonic);
         }
     }
 
     /// Record connection opened.
-    /// TigerStyle: Delegates to base metrics.
     pub fn connectionOpened(self: *RealTimeMetrics) void {
         self.base.connectionOpened();
     }
 
     /// Record connection closed.
-    /// TigerStyle: Delegates to base metrics.
     pub fn connectionClosed(self: *RealTimeMetrics) void {
         self.base.connectionClosed();
     }
@@ -275,24 +267,14 @@ pub const RealTimeMetrics = struct {
     // Internal Helpers
     // =========================================================================
 
-    /// Get total errors (4xx + 5xx responses).
-    fn getErrorsTotal(self: *RealTimeMetrics) u64 {
-        // 4xx bucket (index 3) + 5xx bucket (index 4)
+    /// Sum of 4xx and 5xx response counts.
+    fn calculateTotalErrors(self: *RealTimeMetrics) u64 {
         const errors_4xx = self.base.requests_by_status[3].load(.monotonic);
         const errors_5xx = self.base.requests_by_status[4].load(.monotonic);
         return errors_4xx + errors_5xx;
     }
 
-    /// Latency percentile results.
-    const LatencyPercentiles = struct {
-        p50: u32,
-        p95: u32,
-        p99: u32,
-    };
-
-    /// Calculate approximate latency percentiles from histogram buckets.
-    /// Uses bucket midpoints for approximation.
-    /// TigerStyle: Approximate percentiles from fixed buckets (no exact calculation).
+    /// Calculate approximate latency percentiles from histogram bucket midpoints.
     fn calculateLatencyPercentiles(self: *RealTimeMetrics) LatencyPercentiles {
         // Bucket boundaries in ms: 1, 5, 10, 50, 100, 500, 1000, 5000+
         const bucket_midpoints_ms = [_]u32{ 1, 3, 7, 30, 75, 300, 750, 5000 };
@@ -322,7 +304,7 @@ pub const RealTimeMetrics = struct {
     }
 
     /// Find the bucket index where cumulative count reaches the percentile threshold.
-    /// TigerStyle: Bounded loop (8 iterations max), returns last bucket if threshold not reached.
+    /// Returns last bucket (7) if threshold not reached within 8 iterations.
     fn findPercentileBucket(counts: *const [8]u64, total: u64, percentile: u8) u8 {
         assert(percentile > 0 and percentile <= 100);
         assert(total > 0);
@@ -360,7 +342,7 @@ test "RealTimeMetrics requestStart increments counter" {
 test "RealTimeMetrics requestEnd tracks status" {
     var m = RealTimeMetrics.init();
     m.requestStart();
-    m.requestEnd(200, 5 * std.time.ns_per_ms);
+    m.requestEnd(200, 5 * time.ns_per_ms);
 
     // 2xx bucket (index 1)
     try std.testing.expectEqual(@as(u64, 1), m.base.requests_by_status[1].load(.monotonic));
@@ -371,13 +353,13 @@ test "RealTimeMetrics requestEndWithUpstream tracks per-upstream" {
 
     // Upstream 0: 2 requests, 1 error
     m.requestStart();
-    m.requestEndWithUpstream(200, 10 * std.time.ns_per_ms, 0);
+    m.requestEndWithUpstream(200, 10 * time.ns_per_ms, 0);
     m.requestStart();
-    m.requestEndWithUpstream(500, 20 * std.time.ns_per_ms, 0);
+    m.requestEndWithUpstream(500, 20 * time.ns_per_ms, 0);
 
     // Upstream 1: 1 request, no errors
     m.requestStart();
-    m.requestEndWithUpstream(200, 5 * std.time.ns_per_ms, 1);
+    m.requestEndWithUpstream(200, 5 * time.ns_per_ms, 1);
 
     try std.testing.expectEqual(@as(u64, 2), m.upstream_requests[0].load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), m.upstream_errors[0].load(.monotonic));
@@ -402,9 +384,9 @@ test "RealTimeMetrics snapshot captures state" {
     // Add some traffic
     m.connectionOpened();
     m.requestStart();
-    m.requestEndWithUpstream(200, 10 * std.time.ns_per_ms, 0);
+    m.requestEndWithUpstream(200, 10 * time.ns_per_ms, 0);
     m.requestStart();
-    m.requestEndWithUpstream(500, 20 * std.time.ns_per_ms, 0);
+    m.requestEndWithUpstream(500, 20 * time.ns_per_ms, 0);
 
     const snap = m.snapshot();
 
@@ -424,9 +406,9 @@ test "RealTimeMetrics snapshot calculates rates" {
 
     // Add traffic
     m.requestStart();
-    m.requestEnd(200, 5 * std.time.ns_per_ms);
+    m.requestEnd(200, 5 * time.ns_per_ms);
     m.requestStart();
-    m.requestEnd(200, 5 * std.time.ns_per_ms);
+    m.requestEnd(200, 5 * time.ns_per_ms);
 
     // Second snapshot calculates rates
     const snap = m.snapshot();
@@ -452,17 +434,17 @@ test "RealTimeMetrics latency percentiles with data" {
     // Bucket 0 (<=1ms): 50 requests
     for (0..50) |_| {
         m.requestStart();
-        m.requestEnd(200, 1 * std.time.ns_per_ms);
+        m.requestEnd(200, 1 * time.ns_per_ms);
     }
     // Bucket 2 (6-10ms): 45 requests
     for (0..45) |_| {
         m.requestStart();
-        m.requestEnd(200, 10 * std.time.ns_per_ms);
+        m.requestEnd(200, 10 * time.ns_per_ms);
     }
     // Bucket 6 (501-1000ms): 5 requests
     for (0..5) |_| {
         m.requestStart();
-        m.requestEnd(200, 1000 * std.time.ns_per_ms);
+        m.requestEnd(200, 1000 * time.ns_per_ms);
     }
 
     const snap = m.snapshot();
@@ -481,17 +463,17 @@ test "UpstreamStats healthy flag" {
     // Upstream 0: healthy (no errors)
     for (0..10) |_| {
         m.requestStart();
-        m.requestEndWithUpstream(200, 5 * std.time.ns_per_ms, 0);
+        m.requestEndWithUpstream(200, 5 * time.ns_per_ms, 0);
     }
 
     // Upstream 1: unhealthy (>50% errors)
     for (0..3) |_| {
         m.requestStart();
-        m.requestEndWithUpstream(200, 5 * std.time.ns_per_ms, 1);
+        m.requestEndWithUpstream(200, 5 * time.ns_per_ms, 1);
     }
     for (0..7) |_| {
         m.requestStart();
-        m.requestEndWithUpstream(500, 5 * std.time.ns_per_ms, 1);
+        m.requestEndWithUpstream(500, 5 * time.ns_per_ms, 1);
     }
 
     const snap = m.snapshot();

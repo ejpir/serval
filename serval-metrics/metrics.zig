@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const time = @import("serval-core").time;
 
 // =============================================================================
 // Metrics Interface Verification
@@ -80,7 +81,7 @@ pub const PrometheusMetrics = struct {
 
     // TigerStyle: Return u8 for bucket index (only 8 buckets).
     fn durationToBucket(duration_ns: u64) u8 {
-        const ms = duration_ns / std.time.ns_per_ms;
+        const ms = duration_ns / time.ns_per_ms;
         return switch (ms) {
             0...1 => 0,
             2...5 => 1,
@@ -123,8 +124,8 @@ test "PrometheusMetrics counts requests" {
     m.requestStart();
     try std.testing.expectEqual(@as(u64, 2), m.getRequestsTotal());
 
-    m.requestEnd(200, 5 * std.time.ns_per_ms);
-    m.requestEnd(404, 100 * std.time.ns_per_ms);
+    m.requestEnd(200, 5 * time.ns_per_ms);
+    m.requestEnd(404, 100 * time.ns_per_ms);
 
     // 2xx bucket
     try std.testing.expectEqual(@as(u64, 1), m.requests_by_status[1].load(.monotonic));
@@ -135,9 +136,9 @@ test "PrometheusMetrics counts requests" {
 test "PrometheusMetrics duration buckets" {
     var m = PrometheusMetrics{};
 
-    m.requestEnd(200, 1 * std.time.ns_per_ms); // bucket 0
-    m.requestEnd(200, 10 * std.time.ns_per_ms); // bucket 2
-    m.requestEnd(200, 1000 * std.time.ns_per_ms); // bucket 6
+    m.requestEnd(200, 1 * time.ns_per_ms); // bucket 0
+    m.requestEnd(200, 10 * time.ns_per_ms); // bucket 2
+    m.requestEnd(200, 1000 * time.ns_per_ms); // bucket 6
 
     try std.testing.expectEqual(@as(u64, 1), m.request_duration_buckets[0].load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), m.request_duration_buckets[2].load(.monotonic));

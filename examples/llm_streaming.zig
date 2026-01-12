@@ -24,6 +24,7 @@
 
 const std = @import("std");
 const serval = @import("serval");
+const time = serval.time;
 const serval_net = @import("serval-net");
 const cli = @import("serval-cli");
 const DnsConfig = serval_net.DnsConfig;
@@ -54,7 +55,7 @@ const RESPONSE_TOKENS: []const []const u8 = &.{
 
 /// Delay between tokens in nanoseconds (50ms = simulated thinking time).
 /// TigerStyle: Explicit unit in name.
-const TOKEN_DELAY_NS: u64 = 50 * std.time.ns_per_ms;
+const TOKEN_DELAY_NS: u64 = 50 * time.ns_per_ms;
 
 /// Maximum tokens per response.
 /// TigerStyle: S3 bounded loop limit.

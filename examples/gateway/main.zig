@@ -24,6 +24,7 @@
 
 const std = @import("std");
 const Io = std.Io;
+const time = @import("serval-core").time;
 const gateway = @import("serval-k8s-gateway");
 const gw_config = gateway.config;
 const serval_server = @import("serval-server");
@@ -468,7 +469,7 @@ fn runEndpointSyncLoop(allocator: std.mem.Allocator, ctrl: *Controller) void {
         if (ctrl.isShutdown()) break;
 
         // Sleep first to allow initial config to be pushed
-        std.posix.nanosleep(sync_interval_ns / std.time.ns_per_s, sync_interval_ns % std.time.ns_per_s);
+        std.posix.nanosleep(sync_interval_ns / time.ns_per_s, sync_interval_ns % time.ns_per_s);
 
         if (ctrl.isShutdown()) break;
 

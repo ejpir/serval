@@ -868,7 +868,7 @@ pub fn Server(
                                 metrics.requestEnd(rej.status, duration_ns);
                                 if (comptime hooks.hasHook(Handler, "onLog")) {
                                     const log_entry = log.LogEntry{
-                                        .timestamp_s = @intCast(@divFloor(ctx.start_time_ns, std.time.ns_per_s)),
+                                        .timestamp_s = time.nanosToSecondsI128(ctx.start_time_ns),
                                         .start_time_ns = ctx.start_time_ns,
                                         .duration_ns = duration_ns,
                                         .method = parser.request.method,
@@ -966,7 +966,7 @@ pub fn Server(
 
             if (comptime hooks.hasHook(Handler, "onLog")) {
                 const log_entry = log.LogEntry{
-                    .timestamp_s = @intCast(@divFloor(ctx.start_time_ns, std.time.ns_per_s)),
+                    .timestamp_s = time.nanosToSecondsI128(ctx.start_time_ns),
                     .start_time_ns = ctx.start_time_ns,
                     .duration_ns = duration_ns,
                     .method = request.method,
@@ -1037,7 +1037,7 @@ pub fn Server(
 
             if (comptime hooks.hasHook(Handler, "onLog")) {
                 const log_entry = log.LogEntry{
-                    .timestamp_s = @intCast(@divFloor(ctx.start_time_ns, std.time.ns_per_s)),
+                    .timestamp_s = time.nanosToSecondsI128(ctx.start_time_ns),
                     .start_time_ns = ctx.start_time_ns,
                     .duration_ns = duration_ns,
                     .method = request.method,

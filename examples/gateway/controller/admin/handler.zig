@@ -112,10 +112,7 @@ pub const AdminHandler = struct {
     }
 
     /// Build 200 OK response.
-    ///
-    /// TigerStyle: Trivial response builder, assertion-exempt.
-    fn okResponse(self: *Self, body: []const u8) Action {
-        _ = self;
+    fn okResponse(_: *Self, body: []const u8) Action {
         return Action{ .send_response = DirectResponse{
             .status = 200,
             .content_type = "text/plain",
@@ -124,11 +121,8 @@ pub const AdminHandler = struct {
         } };
     }
 
-    /// Build error response.
-    ///
-    /// TigerStyle: Trivial response builder, assertion-exempt.
-    fn errorResponse(self: *Self, status: u16, body: []const u8) Action {
-        _ = self;
+    /// Build error response with custom status.
+    fn errorResponse(_: *Self, status: u16, body: []const u8) Action {
         return Action{ .send_response = DirectResponse{
             .status = status,
             .content_type = "text/plain",
@@ -137,11 +131,8 @@ pub const AdminHandler = struct {
         } };
     }
 
-    /// Build JSON response.
-    ///
-    /// TigerStyle: Trivial response builder, assertion-exempt.
-    fn jsonResponse(self: *Self, status: u16, body: []const u8) Action {
-        _ = self;
+    /// Build JSON response with custom status.
+    fn jsonResponse(_: *Self, status: u16, body: []const u8) Action {
         return Action{ .send_response = DirectResponse{
             .status = status,
             .content_type = "application/json",

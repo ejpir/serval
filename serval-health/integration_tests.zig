@@ -14,7 +14,6 @@ const UpstreamIndex = health.UpstreamIndex;
 const TestUpstream = struct {
     host: []const u8,
     port: u16,
-    idx: u8,
 };
 
 // =============================================================================
@@ -24,8 +23,8 @@ const TestUpstream = struct {
 test "integration: 2 backends with health-aware round-robin" {
     // This is the exact scenario that caused the panic in lb_example.
     const upstreams = [_]TestUpstream{
-        .{ .host = "backend1", .port = 8001, .idx = 0 },
-        .{ .host = "backend2", .port = 8002, .idx = 1 },
+        .{ .host = "backend1", .port = 8001 },
+        .{ .host = "backend2", .port = 8002 },
     };
     const upstream_count: u8 = upstreams.len;
 
@@ -54,9 +53,9 @@ test "integration: 2 backends with health-aware round-robin" {
 
 test "integration: health transitions with upstream selection" {
     const upstreams = [_]TestUpstream{
-        .{ .host = "backend1", .port = 8001, .idx = 0 },
-        .{ .host = "backend2", .port = 8002, .idx = 1 },
-        .{ .host = "backend3", .port = 8003, .idx = 2 },
+        .{ .host = "backend1", .port = 8001 },
+        .{ .host = "backend2", .port = 8002 },
+        .{ .host = "backend3", .port = 8003 },
     };
     const upstream_count: u8 = upstreams.len;
 
@@ -92,8 +91,8 @@ test "integration: health transitions with upstream selection" {
 
 test "integration: all backends unhealthy graceful degradation" {
     const upstreams = [_]TestUpstream{
-        .{ .host = "backend1", .port = 8001, .idx = 0 },
-        .{ .host = "backend2", .port = 8002, .idx = 1 },
+        .{ .host = "backend1", .port = 8001 },
+        .{ .host = "backend2", .port = 8002 },
     };
     const upstream_count: u8 = upstreams.len;
 
@@ -148,10 +147,10 @@ test "integration: single backend" {
 test "integration: concurrent selection simulation" {
     // Simulates multiple "threads" doing selections.
     const upstreams = [_]TestUpstream{
-        .{ .host = "backend1", .port = 8001, .idx = 0 },
-        .{ .host = "backend2", .port = 8002, .idx = 1 },
-        .{ .host = "backend3", .port = 8003, .idx = 2 },
-        .{ .host = "backend4", .port = 8004, .idx = 3 },
+        .{ .host = "backend1", .port = 8001 },
+        .{ .host = "backend2", .port = 8002 },
+        .{ .host = "backend3", .port = 8003 },
+        .{ .host = "backend4", .port = 8004 },
     };
     const upstream_count: u8 = upstreams.len;
 

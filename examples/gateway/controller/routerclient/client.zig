@@ -11,6 +11,7 @@ const assert = std.debug.assert;
 
 const serval_client = @import("serval-client");
 const serval_core = @import("serval-core");
+const time = serval_core.time;
 const serval_net = @import("serval-net");
 const gateway = @import("serval-k8s-gateway");
 const resolver_mod = @import("../../resolver/mod.zig");
@@ -317,9 +318,9 @@ pub const RouterClient = struct {
 
                 // Sleep with exponential backoff
                 // TigerStyle: Use posix nanosleep for sleeping
-                const backoff_ns = backoff_ms * std.time.ns_per_ms;
-                const backoff_secs: u64 = backoff_ns / std.time.ns_per_s;
-                const backoff_remaining_ns: u64 = backoff_ns % std.time.ns_per_s;
+                const backoff_ns = backoff_ms * time.ns_per_ms;
+                const backoff_secs: u64 = backoff_ns / time.ns_per_s;
+                const backoff_remaining_ns: u64 = backoff_ns % time.ns_per_s;
                 std.posix.nanosleep(backoff_secs, backoff_remaining_ns);
 
                 // Increase backoff (capped at MAX_BACKOFF_MS)
@@ -410,74 +411,15 @@ pub const RouterClient = struct {
         return count;
     }
 
-    /// Send config JSON to router admin API.
+    /// Send config JSON to router admin API using default admin_host:admin_port.
     ///
-    /// TigerStyle: Uses serval-client for HTTP, explicit error handling.
-    /// TigerStyle Y1: Refactored to stay under 70 lines by extracting buildConfigRequest.
+    /// TigerStyle: Delegates to sendConfigToEndpoint for code reuse.
     fn sendConfigRequest(
         self: *Self,
         json_body: []const u8,
         io: Io,
     ) RouterClientError!void {
-        // S1: preconditions
-        assert(json_body.len > 0);
-        assert(json_body.len <= MAX_JSON_SIZE_BYTES);
-
-        // Create DNS resolver for client (admin is typically localhost)
-        // TigerStyle: DnsResolver has no heap allocations, no deinit needed
-        var dns_resolver = serval_net.DnsResolver.init(.{});
-
-        // Create HTTP client (no TLS for admin API)
-        var client = Client.init(
-            self.allocator,
-            &dns_resolver,
-            null, // No TLS for admin API
-            false,
-        );
-        defer client.deinit();
-
-        // Connect to router admin port
-        const upstream = Upstream{
-            .host = self.admin_host,
-            .port = self.admin_port,
-            .tls = false,
-        };
-
-        var connect_result = client.connect(upstream, io) catch {
-            return RouterClientError.ConnectionFailed;
-        };
-        defer connect_result.conn.close();
-
-        // Build and send request
-        var content_len_buf: [16]u8 = undefined;
-        const request = buildConfigRequest(
-            self.admin_host,
-            json_body,
-            &content_len_buf,
-        ) orelse return RouterClientError.SendFailed;
-
-        client.sendRequest(&connect_result.conn, &request, null) catch {
-            return RouterClientError.SendFailed;
-        };
-
-        // Read and validate response
-        const response = client.readResponseHeaders(
-            &connect_result.conn,
-            &self.response_header_buffer,
-        ) catch |err| {
-            std.log.err("router_client: failed to read response: {s}", .{@errorName(err)});
-            return RouterClientError.ReceiveFailed;
-        };
-
-        std.log.debug("router_client: response status={d}", .{response.status});
-
-        if (response.status < 200 or response.status >= 300) {
-            std.log.err("router_client: rejected with status {d}", .{response.status});
-            return RouterClientError.Rejected;
-        }
-
-        // S2: postcondition - successful response
-        assert(response.status >= 200 and response.status < 300);
+        return self.sendConfigToEndpoint(self.admin_host, self.admin_port, json_body, io);
     }
 
     /// Send config JSON to a specific endpoint (host:port).
@@ -509,7 +451,7 @@ pub const RouterClient = struct {
         );
         defer client.deinit();
 
-        // Connect to specific endpoint
+        // Connect to endpoint
         const upstream = Upstream{
             .host = host,
             .port = port,
@@ -545,6 +487,8 @@ pub const RouterClient = struct {
             });
             return RouterClientError.ReceiveFailed;
         };
+
+        std.log.debug("router_client: response status={d}", .{response.status});
 
         if (response.status < 200 or response.status >= 300) {
             std.log.err("router_client: {s}:{d} rejected with status {d}", .{

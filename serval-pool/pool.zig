@@ -165,12 +165,12 @@ pub const SimplePool = struct {
     /// Default idle timeout: 60 seconds.
     /// Connections idle longer than this are evicted on acquire.
     /// TigerStyle: Explicit constant, unit in name.
-    const IDLE_TIMEOUT_NS: u64 = 60 * std.time.ns_per_s;
+    const IDLE_TIMEOUT_NS: u64 = 60 * time.ns_per_s;
 
     /// Default max connection age: 5 minutes.
     /// Connections older than this are evicted regardless of activity.
     /// TigerStyle: Prevents stale connections from backend restarts.
-    const MAX_CONNECTION_AGE_NS: u64 = 5 * 60 * std.time.ns_per_s;
+    const MAX_CONNECTION_AGE_NS: u64 = 5 * 60 * time.ns_per_s;
 
     /// Mutex protects connections and counts arrays.
     /// TigerStyle: Simple mutex over complex lock-free for correctness.
@@ -618,10 +618,10 @@ test "Pool evicts connections exceeding max age (5 minutes)" {
     var pool = SimplePool.init();
     const now_ns = time.monotonicNanos();
 
-    const max_age_ns = 5 * 60 * std.time.ns_per_s;
+    const max_age_ns = 5 * 60 * time.ns_per_s;
     const old_conn: Connection = .{
         .socket = undefined,
-        .created_ns = now_ns - (max_age_ns + (60 * std.time.ns_per_s)), // 6 min old
+        .created_ns = now_ns - (max_age_ns + (60 * time.ns_per_s)), // 6 min old
         .last_used_ns = now_ns - 1000, // Used recently, but too old overall
         .pool_sentinel = Connection.IN_POOL_SENTINEL,
     };
@@ -639,11 +639,11 @@ test "Pool evicts connections exceeding idle timeout (60 seconds)" {
     var pool = SimplePool.init();
     const now_ns = time.monotonicNanos();
 
-    const idle_timeout_ns = 60 * std.time.ns_per_s;
+    const idle_timeout_ns = 60 * time.ns_per_s;
     const idle_conn: Connection = .{
         .socket = undefined,
-        .created_ns = now_ns - (10 * std.time.ns_per_s), // 10s old
-        .last_used_ns = now_ns - (idle_timeout_ns + std.time.ns_per_s), // 61s idle
+        .created_ns = now_ns - (10 * time.ns_per_s), // 10s old
+        .last_used_ns = now_ns - (idle_timeout_ns + time.ns_per_s), // 61s idle
         .pool_sentinel = Connection.IN_POOL_SENTINEL,
     };
 
@@ -662,8 +662,8 @@ test "Pool retains fresh, recently-used connections" {
 
     const fresh_conn: Connection = .{
         .socket = undefined,
-        .created_ns = now_ns - (30 * std.time.ns_per_s), // 30s old
-        .last_used_ns = now_ns - (5 * std.time.ns_per_s), // Used 5s ago
+        .created_ns = now_ns - (30 * time.ns_per_s), // 30s old
+        .last_used_ns = now_ns - (5 * time.ns_per_s), // Used 5s ago
         .pool_sentinel = Connection.IN_POOL_SENTINEL,
     };
 
@@ -945,7 +945,7 @@ test "CRITICAL: Boundary - connection at exactly max age threshold" {
     // Off-by-one errors at boundaries are common
     var pool = SimplePool.init();
     const now_ns = time.monotonicNanos();
-    const max_age_ns = 5 * 60 * std.time.ns_per_s;
+    const max_age_ns = 5 * 60 * time.ns_per_s;
 
     // Connection at EXACTLY max age (not over)
     const boundary_conn: Connection = .{
@@ -970,7 +970,7 @@ test "CRITICAL: Boundary - connection at exactly idle timeout threshold" {
     // Off-by-one errors at boundaries are common
     var pool = SimplePool.init();
     const now_ns = time.monotonicNanos();
-    const idle_timeout_ns = 60 * std.time.ns_per_s;
+    const idle_timeout_ns = 60 * time.ns_per_s;
 
     // Connection at EXACTLY idle timeout (not over)
     const boundary_conn: Connection = .{

@@ -145,78 +145,47 @@ pub fn AdminHandler(comptime Tracer: type) type {
 
             // Incremental CRUD endpoints - all require POST with JSON body
             if (request.method == .POST) {
-                // Read request body for POST endpoints
-                var body_buf: [MAX_JSON_BODY_SIZE]u8 = undefined;
-                const body = ctx.readBody(&body_buf) catch |err| {
-                    return makeBodyReadErrorResponse(err, response_buf);
-                };
-                const body_or_null: ?[]const u8 = if (body.len > 0) body else null;
+                return self.handlePostEndpoint(ctx, request.path, response_buf);
+            }
 
-                // Route to appropriate handler
-                if (std.mem.eql(u8, request.path, "/routes/add")) {
-                    const result = routes.handleRoutesAdd(body_or_null, response_buf);
-                    if (result.status == 200) {
-                        self.tracer.addEvent(ctx.span_handle, "route_added");
-                    }
-                    return .{ .send_response = .{
-                        .status = result.status,
-                        .body = result.body,
-                        .content_type = "application/json",
-                    } };
-                }
+            return .{ .send_response = .{
+                .status = 404,
+                .body = "Not Found",
+                .content_type = "text/plain",
+            } };
+        }
 
-                if (std.mem.eql(u8, request.path, "/routes/remove")) {
-                    const result = routes.handleRoutesRemove(body_or_null, response_buf);
-                    if (result.status == 200) {
-                        self.tracer.addEvent(ctx.span_handle, "route_removed");
-                    }
-                    return .{ .send_response = .{
-                        .status = result.status,
-                        .body = result.body,
-                        .content_type = "application/json",
-                    } };
-                }
+        /// Handle POST endpoints for incremental CRUD operations.
+        /// TigerStyle: Route table pattern consolidates repetitive dispatching.
+        fn handlePostEndpoint(self: *Self, ctx: *serval.Context, path: []const u8, response_buf: []u8) serval.Action {
+            // Read request body once for all POST endpoints
+            var body_buf: [MAX_JSON_BODY_SIZE]u8 = undefined;
+            const body = ctx.readBody(&body_buf) catch |err| {
+                return makeBodyReadErrorResponse(err, response_buf);
+            };
+            const body_or_null: ?[]const u8 = if (body.len > 0) body else null;
 
-                if (std.mem.eql(u8, request.path, "/pools/add")) {
-                    const result = pools.handlePoolsAdd(body_or_null, response_buf);
-                    if (result.status == 200) {
-                        self.tracer.addEvent(ctx.span_handle, "pool_added");
-                    }
-                    return .{ .send_response = .{
-                        .status = result.status,
-                        .body = result.body,
-                        .content_type = "application/json",
-                    } };
-                }
+            // Route table: (path, handler, trace_event)
+            const PostRoute = struct {
+                path: []const u8,
+                handler: *const fn (?[]const u8, []u8) routes.RouteUpdateResult,
+                trace_event: []const u8,
+            };
 
-                if (std.mem.eql(u8, request.path, "/pools/remove")) {
-                    const result = pools.handlePoolsRemove(body_or_null, response_buf);
-                    if (result.status == 200) {
-                        self.tracer.addEvent(ctx.span_handle, "pool_removed");
-                    }
-                    return .{ .send_response = .{
-                        .status = result.status,
-                        .body = result.body,
-                        .content_type = "application/json",
-                    } };
-                }
+            const post_routes = [_]PostRoute{
+                .{ .path = "/routes/add", .handler = routes.handleRoutesAdd, .trace_event = "route_added" },
+                .{ .path = "/routes/remove", .handler = routes.handleRoutesRemove, .trace_event = "route_removed" },
+                .{ .path = "/pools/add", .handler = pools.handlePoolsAdd, .trace_event = "pool_added" },
+                .{ .path = "/pools/remove", .handler = pools.handlePoolsRemove, .trace_event = "pool_removed" },
+                .{ .path = "/upstreams/add", .handler = upstreams.handleUpstreamsAdd, .trace_event = "upstream_added" },
+                .{ .path = "/upstreams/remove", .handler = upstreams.handleUpstreamsRemove, .trace_event = "upstream_removed" },
+            };
 
-                if (std.mem.eql(u8, request.path, "/upstreams/add")) {
-                    const result = upstreams.handleUpstreamsAdd(body_or_null, response_buf);
+            for (post_routes) |route| {
+                if (std.mem.eql(u8, path, route.path)) {
+                    const result = route.handler(body_or_null, response_buf);
                     if (result.status == 200) {
-                        self.tracer.addEvent(ctx.span_handle, "upstream_added");
-                    }
-                    return .{ .send_response = .{
-                        .status = result.status,
-                        .body = result.body,
-                        .content_type = "application/json",
-                    } };
-                }
-
-                if (std.mem.eql(u8, request.path, "/upstreams/remove")) {
-                    const result = upstreams.handleUpstreamsRemove(body_or_null, response_buf);
-                    if (result.status == 200) {
-                        self.tracer.addEvent(ctx.span_handle, "upstream_removed");
+                        self.tracer.addEvent(ctx.span_handle, route.trace_event);
                     }
                     return .{ .send_response = .{
                         .status = result.status,

@@ -18,6 +18,7 @@ const posix = std.posix;
 const assert = std.debug.assert;
 
 const serval = @import("serval");
+const time = serval.time;
 const serval_router = @import("serval-router");
 const serval_net = @import("serval-net");
 
@@ -280,9 +281,9 @@ pub fn swapRouter(
     // Grace period: allow in-flight requests using old config to complete.
     // TigerStyle: Bounded wait with explicit timeout from config.
     // TigerStyle: Grace period in milliseconds converted to seconds + nanoseconds
-    const grace_ns: u64 = config.CONFIG_SWAP_GRACE_MS * std.time.ns_per_ms;
-    const grace_secs: u64 = grace_ns / std.time.ns_per_s;
-    const grace_remaining_ns: u64 = grace_ns % std.time.ns_per_s;
+    const grace_ns: u64 = config.CONFIG_SWAP_GRACE_MS * time.ns_per_ms;
+    const grace_secs: u64 = grace_ns / time.ns_per_s;
+    const grace_remaining_ns: u64 = grace_ns % time.ns_per_s;
     posix.nanosleep(grace_secs, grace_remaining_ns);
 
     // S2: Postcondition - current_router points to newly initialized slot

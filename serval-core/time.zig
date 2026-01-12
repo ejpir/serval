@@ -8,6 +8,61 @@ const std = @import("std");
 const posix = std.posix;
 
 // =============================================================================
+// Time Unit Constants
+// =============================================================================
+
+/// Nanoseconds per second (1,000,000,000).
+pub const ns_per_s: u64 = std.time.ns_per_s;
+
+/// Nanoseconds per millisecond (1,000,000).
+pub const ns_per_ms: u64 = std.time.ns_per_ms;
+
+// =============================================================================
+// Time Unit Conversions
+// =============================================================================
+
+/// Convert seconds to nanoseconds.
+/// TigerStyle: Explicit conversion function, no magic multiplication.
+pub inline fn secondsToNanos(seconds: u64) u64 {
+    return seconds * ns_per_s;
+}
+
+/// Convert milliseconds to nanoseconds.
+pub inline fn millisToNanos(millis: u64) u64 {
+    return millis * ns_per_ms;
+}
+
+/// Convert nanoseconds to seconds (truncating).
+pub inline fn nanosToSeconds(nanos: u64) u64 {
+    return nanos / ns_per_s;
+}
+
+/// Convert nanoseconds to milliseconds (truncating).
+pub inline fn nanosToMillis(nanos: u64) u64 {
+    return nanos / ns_per_ms;
+}
+
+/// Convert i128 nanoseconds to u64 seconds (for realtimeNanos timestamps).
+/// Returns 0 for negative values (graceful degradation).
+/// TigerStyle: Safe conversion with explicit handling of edge cases.
+pub inline fn nanosToSecondsI128(nanos: i128) u64 {
+    if (nanos <= 0) return 0;
+    return @intCast(@divFloor(nanos, ns_per_s));
+}
+
+// =============================================================================
+// Sleep
+// =============================================================================
+
+/// Sleep for the specified number of nanoseconds.
+/// TigerStyle: Single sleep function, hides sec/nsec split.
+pub fn sleep(duration_ns: u64) void {
+    const seconds: u64 = duration_ns / ns_per_s;
+    const remaining_ns: u64 = duration_ns % ns_per_s;
+    posix.nanosleep(seconds, remaining_ns);
+}
+
+// =============================================================================
 // Wall Clock Time
 // =============================================================================
 
@@ -19,7 +74,7 @@ pub fn realtimeNanos() i128 {
     const ts = posix.clock_gettime(.REALTIME) catch return 0;
     // TigerStyle: Assert precondition - REALTIME clock should represent valid Unix time.
     std.debug.assert(ts.sec >= 0);
-    return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
+    return @as(i128, ts.sec) * ns_per_s + ts.nsec;
 }
 
 // =============================================================================
@@ -34,7 +89,7 @@ pub fn monotonicNanos() u64 {
     const ts = posix.clock_gettime(.MONOTONIC) catch return 0;
     // TigerStyle: Assert precondition - MONOTONIC clock starts at boot, always positive.
     std.debug.assert(ts.sec >= 0);
-    const sec_ns: u64 = @as(u64, @intCast(ts.sec)) *% std.time.ns_per_s;
+    const sec_ns: u64 = @as(u64, @intCast(ts.sec)) *% ns_per_s;
     const nsec: u64 = @intCast(ts.nsec);
     return sec_ns +% nsec;
 }
@@ -58,7 +113,27 @@ pub fn elapsedSince(start_ns: u64) u64 {
 test "realtimeNanos returns positive value" {
     const ts = realtimeNanos();
     // Should be after year 2020 (1577836800 seconds = 2020-01-01)
-    try std.testing.expect(ts > 1577836800 * std.time.ns_per_s);
+    try std.testing.expect(ts > 1577836800 * ns_per_s);
+}
+
+test "secondsToNanos converts correctly" {
+    try std.testing.expectEqual(@as(u64, 5_000_000_000), secondsToNanos(5));
+    try std.testing.expectEqual(@as(u64, 0), secondsToNanos(0));
+}
+
+test "millisToNanos converts correctly" {
+    try std.testing.expectEqual(@as(u64, 5_000_000), millisToNanos(5));
+    try std.testing.expectEqual(@as(u64, 1_000_000_000), millisToNanos(1000));
+}
+
+test "nanosToSeconds converts correctly" {
+    try std.testing.expectEqual(@as(u64, 5), nanosToSeconds(5_000_000_000));
+    try std.testing.expectEqual(@as(u64, 0), nanosToSeconds(999_999_999));
+}
+
+test "nanosToMillis converts correctly" {
+    try std.testing.expectEqual(@as(u64, 5), nanosToMillis(5_000_000));
+    try std.testing.expectEqual(@as(u64, 1000), nanosToMillis(1_000_000_000));
 }
 
 test "monotonicNanos returns positive value" {

@@ -10,6 +10,7 @@ const config = @import("serval-core").config;
 pub const MAX_UPSTREAMS: u8 = config.MAX_UPSTREAMS;
 pub const UpstreamIndex = config.UpstreamIndex;
 
+/// Cache line size for alignment to prevent false sharing.
 const CACHE_LINE_BYTES: usize = 64;
 
 /// Unified health state with embedded threshold tracking.
@@ -33,15 +34,14 @@ pub const HealthState = struct {
     /// Consecutive successes required to mark healthy.
     healthy_threshold: u8,
 
-    const Self = @This();
-
     // Compile-time verification
     comptime {
-        std.debug.assert(@alignOf(Self) == CACHE_LINE_BYTES);
-        std.debug.assert(MAX_UPSTREAMS <= 64);
+        std.debug.assert(@alignOf(HealthState) == CACHE_LINE_BYTES);
+        std.debug.assert(MAX_UPSTREAMS <= 64); // Bitmap is u64
     }
 
-    /// Compute bitmask for configured backends.
+    /// Compute bitmask for first `count` backends.
+    /// Returns mask where bits 0..(count-1) are set.
     fn backendMask(count: u8) u64 {
         std.debug.assert(count <= MAX_UPSTREAMS);
         if (count == 0) return 0;
@@ -51,12 +51,12 @@ pub const HealthState = struct {
 
     /// Initialize with backend count and thresholds.
     /// Only first backend_count backends start healthy.
-    pub fn init(backend_count: u8, unhealthy_threshold: u8, healthy_threshold: u8) Self {
+    pub fn init(backend_count: u8, unhealthy_threshold: u8, healthy_threshold: u8) HealthState {
         std.debug.assert(backend_count <= MAX_UPSTREAMS);
         std.debug.assert(unhealthy_threshold > 0);
         std.debug.assert(healthy_threshold > 0);
 
-        return Self{
+        return HealthState{
             .health_bitmap = std.atomic.Value(u64).init(backendMask(backend_count)),
             .failure_counts = std.mem.zeroes([MAX_UPSTREAMS]u8),
             .success_counts = std.mem.zeroes([MAX_UPSTREAMS]u8),
@@ -67,7 +67,9 @@ pub const HealthState = struct {
     }
 
     /// Record successful request/probe for backend.
-    pub inline fn recordSuccess(self: *Self, idx: UpstreamIndex) void {
+    /// Resets failure counter; increments success counter if unhealthy.
+    /// Transitions to healthy when success threshold is reached.
+    pub inline fn recordSuccess(self: *HealthState, idx: UpstreamIndex) void {
         std.debug.assert(idx < self.backend_count);
 
         // Reset failure counter on any success
@@ -88,7 +90,9 @@ pub const HealthState = struct {
     }
 
     /// Record failed request/probe for backend.
-    pub inline fn recordFailure(self: *Self, idx: UpstreamIndex) void {
+    /// Resets success counter; increments failure counter if healthy.
+    /// Transitions to unhealthy when failure threshold is reached.
+    pub inline fn recordFailure(self: *HealthState, idx: UpstreamIndex) void {
         std.debug.assert(idx < self.backend_count);
 
         // Reset success counter on any failure
@@ -108,23 +112,24 @@ pub const HealthState = struct {
         }
     }
 
-    /// Check if backend is healthy.
-    pub inline fn isHealthy(self: *const Self, idx: UpstreamIndex) bool {
+    /// Check if backend is healthy (atomic read).
+    pub inline fn isHealthy(self: *const HealthState, idx: UpstreamIndex) bool {
         std.debug.assert(idx < self.backend_count);
         const bitmap = self.health_bitmap.load(.acquire);
         const mask: u64 = @as(u64, 1) << idx;
         return (bitmap & mask) != 0;
     }
 
-    /// Count healthy backends.
-    pub fn countHealthy(self: *const Self) u32 {
+    /// Count healthy backends (atomic read).
+    pub fn countHealthy(self: *const HealthState) u32 {
         const bitmap = self.health_bitmap.load(.acquire);
         return @popCount(bitmap & backendMask(self.backend_count));
     }
 
     /// Find Nth healthy backend, wrapping around.
-    /// Returns null only if NO healthy backends exist.
-    pub fn findNthHealthy(self: *const Self, n: u32) ?UpstreamIndex {
+    /// Returns null only if no healthy backends exist.
+    /// Used for round-robin selection across healthy backends.
+    pub fn findNthHealthy(self: *const HealthState, n: u32) ?UpstreamIndex {
         var bitmap = self.health_bitmap.load(.acquire) & backendMask(self.backend_count);
 
         const healthy_count = @popCount(bitmap);
@@ -148,7 +153,8 @@ pub const HealthState = struct {
     }
 
     /// Find first healthy backend, optionally excluding one.
-    pub fn findFirstHealthy(self: *const Self, exclude_idx: ?UpstreamIndex) ?UpstreamIndex {
+    /// Useful for failover when current backend fails.
+    pub fn findFirstHealthy(self: *const HealthState, exclude_idx: ?UpstreamIndex) ?UpstreamIndex {
         var bitmap = self.health_bitmap.load(.acquire) & backendMask(self.backend_count);
 
         if (exclude_idx) |idx| {
@@ -163,22 +169,22 @@ pub const HealthState = struct {
         return @intCast(first);
     }
 
-    /// Mark backend as healthy (internal).
-    fn markHealthy(self: *Self, idx: UpstreamIndex) void {
+    /// Mark backend as healthy (atomic set bit).
+    fn markHealthy(self: *HealthState, idx: UpstreamIndex) void {
         std.debug.assert(idx < self.backend_count);
         const mask: u64 = @as(u64, 1) << idx;
         _ = self.health_bitmap.fetchOr(mask, .release);
     }
 
-    /// Mark backend as unhealthy (internal).
-    fn markUnhealthy(self: *Self, idx: UpstreamIndex) void {
+    /// Mark backend as unhealthy (atomic clear bit).
+    fn markUnhealthy(self: *HealthState, idx: UpstreamIndex) void {
         std.debug.assert(idx < self.backend_count);
         const mask: u64 = @as(u64, 1) << idx;
         _ = self.health_bitmap.fetchAnd(~mask, .release);
     }
 
-    /// Reset all backends to healthy.
-    pub fn reset(self: *Self) void {
+    /// Reset all backends to healthy and clear counters.
+    pub fn reset(self: *HealthState) void {
         self.health_bitmap.store(backendMask(self.backend_count), .release);
         self.failure_counts = std.mem.zeroes([MAX_UPSTREAMS]u8);
         self.success_counts = std.mem.zeroes([MAX_UPSTREAMS]u8);

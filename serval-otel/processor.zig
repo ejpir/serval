@@ -8,6 +8,7 @@
 const std = @import("std");
 const core = @import("serval-core");
 const config = core.config;
+const time = core.time;
 const span_mod = @import("span.zig");
 const tracer_mod = @import("tracer.zig");
 
@@ -232,7 +233,7 @@ pub const BatchingProcessor = struct {
             if (self.queue_len < self.config.max_export_batch_size) {
                 self.condition.timedWait(
                     &self.mutex,
-                    @as(u64, self.config.scheduled_delay_ms) * std.time.ns_per_ms,
+                    @as(u64, self.config.scheduled_delay_ms) * time.ns_per_ms,
                 ) catch {};
             }
 
@@ -423,7 +424,7 @@ test "BatchingProcessor batches spans" {
     }
 
     // Wait for timer to trigger export
-    std.posix.nanosleep(0, 150 * std.time.ns_per_ms);
+    time.sleep(time.millisToNanos(150));
 
     // Force flush and shutdown
     try processor.forceFlush();

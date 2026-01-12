@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const time = @import("time.zig");
 
 // =============================================================================
 // Compile-time Flags
@@ -256,10 +257,10 @@ pub const DNS_MAX_CACHE_ENTRIES: u32 = 64;
 pub const DNS_MAX_HOSTNAME_LEN: u32 = 253;
 
 /// Default DNS cache TTL in nanoseconds (60 seconds).
-pub const DNS_DEFAULT_TTL_NS: u64 = 60 * std.time.ns_per_s;
+pub const DNS_DEFAULT_TTL_NS: u64 = time.secondsToNanos(60);
 
 /// DNS resolution timeout in nanoseconds (5 seconds).
-pub const DNS_TIMEOUT_NS: u64 = 5 * std.time.ns_per_s;
+pub const DNS_TIMEOUT_NS: u64 = time.secondsToNanos(5);
 
 /// Maximum addresses returned from a single DNS lookup.
 pub const DNS_MAX_ADDRESSES: u8 = 16;
@@ -278,10 +279,10 @@ pub const MAX_ADMIN_REQUEST_BYTES: u32 = 1024 * 1024;
 pub const MAX_ADMIN_RESPONSE_BYTES: u32 = 1024 * 1024;
 
 /// Admin request read timeout in nanoseconds (5 seconds).
-pub const ADMIN_READ_TIMEOUT_NS: u64 = 5 * std.time.ns_per_s;
+pub const ADMIN_READ_TIMEOUT_NS: u64 = time.secondsToNanos(5);
 
 /// Admin response write timeout in nanoseconds (5 seconds).
-pub const ADMIN_WRITE_TIMEOUT_NS: u64 = 5 * std.time.ns_per_s;
+pub const ADMIN_WRITE_TIMEOUT_NS: u64 = time.secondsToNanos(5);
 
 /// Maximum accept iterations per cycle for admin server.
 pub const MAX_ADMIN_ACCEPT_ITERATIONS: u32 = 100;
@@ -301,7 +302,7 @@ pub const MAX_ROUTER_SLOTS: u8 = 2;
 pub const MAX_CONFIG_PUSH_RETRIES: u8 = 3;
 
 /// Timeout for config push to data plane in nanoseconds (5 seconds).
-pub const CONFIG_PUSH_TIMEOUT_NS: u64 = 5 * std.time.ns_per_s;
+pub const CONFIG_PUSH_TIMEOUT_NS: u64 = time.secondsToNanos(5);
 
 /// Base delay for exponential backoff on config push retry (milliseconds).
 pub const CONFIG_PUSH_BACKOFF_BASE_MS: u64 = 100;
@@ -315,15 +316,15 @@ pub const MAX_CONFIG_PUSH_BACKOFF_MS: u64 = 5000;
 
 /// Client connection timeout in nanoseconds.
 /// TigerStyle: u64 nanoseconds, 5 seconds default.
-pub const CLIENT_CONNECT_TIMEOUT_NS: u64 = 5 * std.time.ns_per_s;
+pub const CLIENT_CONNECT_TIMEOUT_NS: u64 = time.secondsToNanos(5);
 
 /// Client read timeout in nanoseconds.
 /// TigerStyle: u64 nanoseconds, 30 seconds default.
-pub const CLIENT_READ_TIMEOUT_NS: u64 = 30 * std.time.ns_per_s;
+pub const CLIENT_READ_TIMEOUT_NS: u64 = time.secondsToNanos(30);
 
 /// Client write timeout in nanoseconds.
 /// TigerStyle: u64 nanoseconds, 30 seconds default.
-pub const CLIENT_WRITE_TIMEOUT_NS: u64 = 30 * std.time.ns_per_s;
+pub const CLIENT_WRITE_TIMEOUT_NS: u64 = time.secondsToNanos(30);
 
 // =============================================================================
 // Runtime Configuration
@@ -371,10 +372,10 @@ pub const TlsConfig = struct {
     // Timeouts
     /// TLS handshake timeout in nanoseconds.
     /// Default: 10 seconds (typical handshake completes in <1s, allows retry).
-    handshake_timeout_ns: u64 = 10 * std.time.ns_per_s,
+    handshake_timeout_ns: u64 = time.secondsToNanos(10),
     /// I/O operation timeout in nanoseconds.
     /// Default: 30 seconds (read/write operations during TLS session).
-    io_timeout_ns: u64 = 30 * std.time.ns_per_s,
+    io_timeout_ns: u64 = time.secondsToNanos(30),
 };
 
 test "Config has sensible defaults" {

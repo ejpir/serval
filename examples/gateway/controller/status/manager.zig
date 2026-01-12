@@ -384,7 +384,7 @@ pub const StatusManager = struct {
         // Use serval-core time (returns nanoseconds since epoch)
         const nanos: i128 = core_time.realtimeNanos();
         // Convert to seconds, handling potential negative values gracefully
-        const epoch_seconds: u64 = if (nanos > 0) @intCast(@divTrunc(nanos, std.time.ns_per_s)) else 0;
+        const epoch_seconds: u64 = if (nanos > 0) @intCast(@divTrunc(nanos, core_time.ns_per_s)) else 0;
 
         // Calculate date/time components from epoch seconds
         // Simplified: use days since epoch approach

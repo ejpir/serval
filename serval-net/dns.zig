@@ -698,8 +698,8 @@ test "DnsResolver: init with default config" {
 }
 
 test "DnsResolver: init with custom config" {
-    const custom_ttl: u64 = 30 * std.time.ns_per_s;
-    const custom_timeout: u64 = 2 * std.time.ns_per_s;
+    const custom_ttl: u64 = 30 * time.ns_per_s;
+    const custom_timeout: u64 = 2 * time.ns_per_s;
     const resolver = DnsResolver.init(.{
         .ttl_ns = custom_ttl,
         .timeout_ns = custom_timeout,

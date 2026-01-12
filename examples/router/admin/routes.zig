@@ -35,17 +35,11 @@ pub const RouteUpdateResult = struct {
 /// Handle POST /routes/update - parse JSON and call swapRouter().
 /// TigerStyle: Bounded buffer, explicit error handling, validates all input.
 pub fn handleRouteUpdate(body: ?[]const u8, response_buf: []u8) RouteUpdateResult {
-    const request_body = body orelse {
-        return .{ .status = 400, .body = response.errors.missing_body };
+    const validation = response.validateBody(body, MAX_JSON_BODY_SIZE);
+    const request_body = switch (validation) {
+        .valid => |b| b,
+        .err => |e| return .{ .status = e.status, .body = e.body },
     };
-
-    if (request_body.len == 0) {
-        return .{ .status = 400, .body = response.errors.empty_body };
-    }
-
-    if (request_body.len > MAX_JSON_BODY_SIZE) {
-        return .{ .status = 413, .body = response.errors.body_too_large };
-    }
 
     // Parse JSON
     const parsed = std.json.parseFromSlice(ConfigJson, std.heap.page_allocator, request_body, .{}) catch |err| {
@@ -210,17 +204,11 @@ pub fn handleRoutesAdd(body: ?[]const u8, response_buf: []u8) RouteUpdateResult 
     // S1: Precondition - response buffer must be valid
     assert(response_buf.len > 0);
 
-    const request_body = body orelse {
-        return .{ .status = 400, .body = response.errors.missing_body };
+    const validation = response.validateBody(body, MAX_JSON_BODY_SIZE);
+    const request_body = switch (validation) {
+        .valid => |b| b,
+        .err => |e| return .{ .status = e.status, .body = e.body },
     };
-
-    if (request_body.len == 0) {
-        return .{ .status = 400, .body = response.errors.empty_body };
-    }
-
-    if (request_body.len > MAX_JSON_BODY_SIZE) {
-        return .{ .status = 413, .body = response.errors.body_too_large };
-    }
 
     // Get current router
     const router = config_storage.getActiveRouter() orelse {
@@ -315,17 +303,11 @@ pub fn handleRoutesRemove(body: ?[]const u8, response_buf: []u8) RouteUpdateResu
     // S1: Precondition - response buffer must be valid
     assert(response_buf.len > 0);
 
-    const request_body = body orelse {
-        return .{ .status = 400, .body = response.errors.missing_body };
+    const validation = response.validateBody(body, MAX_JSON_BODY_SIZE);
+    const request_body = switch (validation) {
+        .valid => |b| b,
+        .err => |e| return .{ .status = e.status, .body = e.body },
     };
-
-    if (request_body.len == 0) {
-        return .{ .status = 400, .body = response.errors.empty_body };
-    }
-
-    if (request_body.len > MAX_JSON_BODY_SIZE) {
-        return .{ .status = 413, .body = response.errors.body_too_large };
-    }
 
     // Get current router
     const router = config_storage.getActiveRouter() orelse {
