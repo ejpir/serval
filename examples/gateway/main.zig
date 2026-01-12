@@ -32,8 +32,9 @@ const serval_pool = @import("serval-pool");
 const serval_metrics = @import("serval-metrics");
 const serval_tracing = @import("serval-tracing");
 
-const Controller = @import("controller.zig").Controller;
-const AdminHandler = @import("admin_handler.zig").AdminHandler;
+const controller_mod = @import("controller/mod.zig");
+const Controller = controller_mod.Controller;
+const AdminHandler = controller_mod.admin.AdminHandler;
 const k8s_client_mod = @import("k8s_client/mod.zig");
 const K8sClient = k8s_client_mod.Client;
 const Watcher = @import("watcher/mod.zig").Watcher;

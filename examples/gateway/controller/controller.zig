@@ -1,4 +1,4 @@
-//! Gateway Controller
+//! Controller Implementation
 //!
 //! Manages gateway state, admin server, and config updates.
 //! Coordinates between K8s watcher and data plane.
@@ -19,44 +19,23 @@ const Gateway = gateway.Gateway;
 
 const core_config = serval_core.config;
 
-const data_plane = @import("data_plane.zig");
-const DataPlaneClient = data_plane.DataPlaneClient;
-const DataPlaneError = data_plane.DataPlaneError;
-const PushResult = data_plane.PushResult;
-const Resolver = @import("resolver/mod.zig").Resolver;
-const AdminHandler = @import("admin_handler.zig").AdminHandler;
-const status_mod = @import("status.zig");
+const routerclient = @import("routerclient/mod.zig");
+const RouterClient = routerclient.RouterClient;
+const RouterClientError = routerclient.RouterClientError;
+const PushResult = routerclient.PushResult;
+const Resolver = @import("../resolver/mod.zig").Resolver;
+const AdminHandler = @import("admin/mod.zig").AdminHandler;
+const status_mod = @import("status/mod.zig");
 const StatusManager = status_mod.StatusManager;
 const GatewayReconcileResult = status_mod.GatewayReconcileResult;
-const k8s_client_mod = @import("k8s_client/mod.zig");
+const k8s_client_mod = @import("../k8s_client/mod.zig");
 const K8sClient = k8s_client_mod.Client;
 
-// ============================================================================
-// Constants (TigerStyle Y3: Units in names)
-// ============================================================================
-
-/// Maximum length for router service namespace.
-pub const MAX_ROUTER_NAMESPACE_LEN: u8 = 63;
-
-/// Maximum length for router service name.
-pub const MAX_ROUTER_SERVICE_NAME_LEN: u8 = 63;
-
-// ============================================================================
-// Error Types
-// ============================================================================
-
-pub const ControllerError = error{
-    /// Admin server bind failed.
-    AdminBindFailed,
-    /// Admin server listen failed.
-    AdminListenFailed,
-    /// Admin server thread spawn failed.
-    AdminThreadFailed,
-    /// Memory allocation failed.
-    OutOfMemory,
-    /// Failed to push config to data plane.
-    DataPlanePushFailed,
-};
+const mod = @import("mod.zig");
+const ControllerError = mod.ControllerError;
+const MAX_ROUTER_NAMESPACE_LEN = mod.MAX_ROUTER_NAMESPACE_LEN;
+const MAX_ROUTER_SERVICE_NAME_LEN = mod.MAX_ROUTER_SERVICE_NAME_LEN;
+const evaluateGateway = mod.evaluator.evaluateGateway;
 
 // ============================================================================
 // Controller
@@ -80,8 +59,8 @@ pub const Controller = struct {
     /// Current gateway config (atomic pointer for lock-free access).
     gateway_config: ?*const GatewayConfig,
 
-    /// Data plane client (heap-allocated, TigerStyle C3).
-    data_plane_client: *DataPlaneClient,
+    /// Router client (heap-allocated, TigerStyle C3).
+    router_client: *RouterClient,
 
     /// Service resolver (heap-allocated due to large size ~2.5MB).
     resolver: *Resolver,
@@ -143,9 +122,9 @@ pub const Controller = struct {
         const resolver = try Resolver.create(allocator);
         errdefer resolver.destroy();
 
-        // Create data plane client (can fail)
-        const data_plane_client = try DataPlaneClient.create(allocator, data_plane_host, data_plane_port);
-        errdefer data_plane_client.destroy();
+        // Create router client (can fail)
+        const router_client = try RouterClient.create(allocator, data_plane_host, data_plane_port);
+        errdefer router_client.destroy();
 
         // Create status manager (can fail)
         const status_manager = try StatusManager.init(allocator, k8s_client, controller_name);
@@ -160,7 +139,7 @@ pub const Controller = struct {
             .admin_port = admin_port,
             .data_plane_port = data_plane_port,
             .gateway_config = null,
-            .data_plane_client = data_plane_client,
+            .router_client = router_client,
             .resolver = resolver,
             .shutdown = std.atomic.Value(bool).init(false),
             .admin_handler = undefined, // Set below after self is initialized
@@ -245,12 +224,12 @@ pub const Controller = struct {
     /// TigerStyle: Explicit cleanup, pairs with create.
     pub fn destroy(self: *Self) void {
         assert(@intFromPtr(self) != 0); // S1: precondition - valid self pointer
-        assert(@intFromPtr(self.data_plane_client) != 0); // S1: precondition - valid client pointer
+        assert(@intFromPtr(self.router_client) != 0); // S1: precondition - valid client pointer
         assert(@intFromPtr(self.status_manager) != 0); // S1: precondition - valid status manager
 
         self.shutdown.store(true, .release);
         self.status_manager.deinit();
-        self.data_plane_client.destroy();
+        self.router_client.destroy();
         self.resolver.destroy();
         self.allocator.destroy(self);
     }
@@ -325,18 +304,18 @@ pub const Controller = struct {
                 try self.pushConfigMultiEndpoint(config_ptr, io);
             } else {
                 // Single-endpoint mode: use existing pushConfigWithRetry
-                self.data_plane_client.pushConfigWithRetry(
+                self.router_client.pushConfigWithRetry(
                     config_ptr,
                     self.resolver,
                     io,
                 ) catch |err| {
                     // BackendsNotReady is not a failure - endpoints haven't arrived yet.
                     // The next reconciliation (when endpoints arrive) will push the config.
-                    if (err == DataPlaneError.BackendsNotReady) {
+                    if (err == RouterClientError.BackendsNotReady) {
                         std.log.info("config push deferred: waiting for endpoint data", .{});
                         // Continue to update status - don't return error
                     } else {
-                        std.log.err("failed to push config to data plane: {s}", .{@errorName(err)});
+                        std.log.err("failed to push config to router: {s}", .{@errorName(err)});
                         return error.DataPlanePushFailed;
                     }
                 };
@@ -366,7 +345,7 @@ pub const Controller = struct {
             if (gateway_idx >= max_gateways) break;
             gateway_idx += 1;
 
-            const result = self.evaluateGateway(&gw);
+            const result = evaluateGateway(&gw);
             self.status_manager.updateGatewayStatus(
                 gw.name,
                 gw.namespace,
@@ -381,40 +360,6 @@ pub const Controller = struct {
         });
 
         assert(self.gateway_config != null); // S2: postcondition - config stored
-    }
-
-    /// Evaluate a Gateway and produce a reconcile result for status updates.
-    ///
-    /// Currently returns success status (Accepted=true, Programmed=true).
-    /// Future: validate gateway config, check data plane status, track generation.
-    ///
-    /// TigerStyle S1: ~2 assertions per function.
-    fn evaluateGateway(self: *Self, gw: *const Gateway) GatewayReconcileResult {
-        // S1: Preconditions
-        assert(gw.name.len > 0); // gateway must have a name
-        assert(gw.namespace.len > 0); // gateway must have a namespace
-        _ = self; // Will be used when we add config validation
-
-        // For now, accept all gateways as valid and programmed
-        // TODO: Validate listener config (port conflicts, TLS refs, etc.)
-        // TODO: Check if data plane actually programmed the config
-        // TODO: Track actual generation from K8s resource metadata
-        const result = GatewayReconcileResult{
-            .accepted = true,
-            .accepted_reason = "Accepted",
-            .accepted_message = "Gateway configuration is valid",
-            .programmed = true,
-            .programmed_reason = "Programmed",
-            .programmed_message = "Configuration applied to data plane",
-            .observed_generation = 1, // TODO: track actual generation from Gateway metadata
-            .listener_results = &.{}, // Empty for now - listener status tracking is future work
-        };
-
-        // S2: Postcondition - result has valid strings
-        assert(result.accepted_reason.len > 0);
-        assert(result.programmed_reason.len > 0);
-
-        return result;
     }
 
     /// Get current gateway config.
@@ -458,7 +403,7 @@ pub const Controller = struct {
         const service_name = self.getRouterServiceName();
 
         // Discover router endpoints from EndpointSlice
-        const endpoint_count = self.data_plane_client.refreshEndpoints(
+        const endpoint_count = self.router_client.refreshEndpoints(
             self.k8s_client,
             namespace,
             service_name,
@@ -469,12 +414,12 @@ pub const Controller = struct {
                 @errorName(err),
             });
             // Try single-endpoint push as fallback
-            self.data_plane_client.pushConfigWithRetry(
+            self.router_client.pushConfigWithRetry(
                 config_ptr,
                 self.resolver,
                 io,
             ) catch |push_err| {
-                if (push_err == DataPlaneError.BackendsNotReady) {
+                if (push_err == RouterClientError.BackendsNotReady) {
                     std.log.info("config push deferred: waiting for endpoint data", .{});
                     return;
                 }
@@ -487,16 +432,16 @@ pub const Controller = struct {
         std.log.info("controller: discovered {d} router endpoints", .{endpoint_count});
 
         // Push config to all discovered endpoints
-        const result = self.data_plane_client.pushConfigToAll(
+        const result = self.router_client.pushConfigToAll(
             config_ptr,
             self.resolver,
             io,
         ) catch |err| {
-            if (err == DataPlaneError.BackendsNotReady) {
+            if (err == RouterClientError.BackendsNotReady) {
                 std.log.info("config push deferred: waiting for backend endpoint data", .{});
                 return;
             }
-            if (err == DataPlaneError.AllPushesFailed) {
+            if (err == RouterClientError.AllPushesFailed) {
                 std.log.err("config push failed: all {d} router endpoints failed", .{endpoint_count});
                 return error.DataPlanePushFailed;
             }
@@ -545,7 +490,7 @@ pub const Controller = struct {
         const namespace = self.getRouterNamespace();
         const service_name = self.getRouterServiceName();
 
-        const synced = self.data_plane_client.syncNewEndpoints(
+        const synced = self.router_client.syncNewEndpoints(
             self.k8s_client,
             namespace,
             service_name,
@@ -739,35 +684,4 @@ test "Controller uses default admin port from config" {
     defer ctrl.destroy();
 
     try std.testing.expectEqual(default_port, ctrl.admin_port);
-}
-
-test "Controller evaluateGateway returns accepted" {
-    const k8s_client = try createTestK8sClient(std.testing.allocator);
-    defer k8s_client.deinit();
-
-    const ctrl = try Controller.create(
-        std.testing.allocator,
-        9901,
-        "localhost",
-        8080,
-        k8s_client,
-        TEST_CONTROLLER_NAME,
-    );
-    defer ctrl.destroy();
-
-    // Create a test gateway
-    const gw = Gateway{
-        .name = "test-gateway",
-        .namespace = "default",
-        .listeners = &.{},
-    };
-
-    const result = ctrl.evaluateGateway(&gw);
-
-    // Verify the result indicates success
-    try std.testing.expect(result.accepted);
-    try std.testing.expect(result.programmed);
-    try std.testing.expectEqualStrings("Accepted", result.accepted_reason);
-    try std.testing.expectEqualStrings("Programmed", result.programmed_reason);
-    try std.testing.expectEqual(@as(i64, 1), result.observed_generation);
 }

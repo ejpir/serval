@@ -1,10 +1,9 @@
-//! Data Plane Client
+//! Router Client
 //!
-//! Pushes configuration to serval-router admin API using serval-client.
-//! Resolves backends before translation to decouple from K8s-specific Resolver.
-//! Supports multi-instance config push via EndpointSlice discovery.
+//! Main client struct for pushing configuration to serval-router admin API.
+//! Uses serval-client for HTTP requests, supports multi-instance config push.
 //!
-//! TigerStyle: Uses serval-client, bounded buffers, explicit errors, ~2 assertions per function.
+//! TigerStyle: No allocation after init, bounded buffers, ~2 assertions per function.
 
 const std = @import("std");
 const Io = std.Io;
@@ -14,118 +13,45 @@ const serval_client = @import("serval-client");
 const serval_core = @import("serval-core");
 const serval_net = @import("serval-net");
 const gateway = @import("serval-k8s-gateway");
-const resolver_mod = @import("resolver/mod.zig");
-const k8s_client_mod = @import("k8s_client/mod.zig");
+const resolver_mod = @import("../../resolver/mod.zig");
+const k8s_client_mod = @import("../../k8s_client/mod.zig");
+const push = @import("push.zig");
 
 const Client = serval_client.Client;
 const Upstream = serval_core.types.Upstream;
-const core_config = serval_core.config;
 const GatewayConfig = gateway.GatewayConfig;
 const ResolvedBackend = gateway.config.ResolvedBackend;
-const FixedResolvedEndpoint = gateway.config.FixedResolvedEndpoint;
 const Resolver = resolver_mod.Resolver;
 const K8sClient = k8s_client_mod.Client;
 const RouterEndpoint = k8s_client_mod.RouterEndpoint;
 const RouterEndpoints = k8s_client_mod.RouterEndpoints;
 const MAX_ROUTER_ENDPOINTS = k8s_client_mod.MAX_ROUTER_ENDPOINTS;
+const MAX_POD_NAME_LEN = k8s_client_mod.MAX_POD_NAME_LEN;
+
+const mod = @import("mod.zig");
+const RouterClientError = mod.RouterClientError;
+const MAX_JSON_SIZE_BYTES = mod.MAX_JSON_SIZE_BYTES;
+const MAX_RESPONSE_HEADER_SIZE_BYTES = mod.MAX_RESPONSE_HEADER_SIZE_BYTES;
+const MAX_RETRIES = mod.MAX_RETRIES;
+const BACKOFF_BASE_MS = mod.BACKOFF_BASE_MS;
+const MAX_BACKOFF_MS = mod.MAX_BACKOFF_MS;
+const ADMIN_ROUTES_PATH = mod.ADMIN_ROUTES_PATH;
+const PushResult = @import("types.zig").PushResult;
 
 // ============================================================================
-// Constants (TigerStyle Y3: Units in names)
+// Router Client (TigerStyle: No allocation after init)
 // ============================================================================
 
-/// Default admin port for data plane.
-pub const DEFAULT_ADMIN_PORT: u16 = core_config.DEFAULT_ADMIN_PORT;
-
-/// Maximum JSON payload size in bytes.
-pub const MAX_JSON_SIZE_BYTES: u32 = gateway.translator.MAX_JSON_SIZE_BYTES;
-
-/// Maximum response header size in bytes.
-const MAX_RESPONSE_HEADER_SIZE_BYTES: u32 = core_config.MAX_HEADER_SIZE_BYTES;
-
-/// Maximum retries for config push (TigerStyle S4: bounded).
-pub const MAX_RETRIES: u8 = core_config.MAX_CONFIG_PUSH_RETRIES;
-
-/// Base backoff delay in milliseconds.
-const BACKOFF_BASE_MS: u64 = core_config.CONFIG_PUSH_BACKOFF_BASE_MS;
-
-/// Maximum backoff delay in milliseconds.
-const MAX_BACKOFF_MS: u64 = core_config.MAX_CONFIG_PUSH_BACKOFF_MS;
-
-/// Admin endpoint path for route updates.
-const ADMIN_ROUTES_PATH: []const u8 = "/routes/update";
-
-// ============================================================================
-// Error Types (TigerStyle S6: Explicit error set)
-// ============================================================================
-
-pub const DataPlaneError = error{
-    /// No config to push.
-    NoConfig,
-    /// Backend resolution failed.
-    ResolutionFailed,
-    /// Translation to JSON failed.
-    TranslationFailed,
-    /// Connection to data plane failed.
-    ConnectionFailed,
-    /// Request send failed.
-    SendFailed,
-    /// Response receive failed.
-    ReceiveFailed,
-    /// Empty response from data plane.
-    EmptyResponse,
-    /// Data plane rejected config (non-2xx response).
-    Rejected,
-    /// All retries exhausted.
-    RetriesExhausted,
-    /// Backends not yet resolved (endpoints not available).
-    BackendsNotReady,
-    /// No router endpoints discovered.
-    NoRouterEndpoints,
-    /// All router pushes failed.
-    AllPushesFailed,
-    /// Endpoint discovery failed.
-    EndpointDiscoveryFailed,
-};
-
-// ============================================================================
-// Push Result (TigerStyle: Explicit result type)
-// ============================================================================
-
-/// Result of pushing config to multiple router endpoints.
-/// TigerStyle: Explicit success/failure counts for partial failures.
-pub const PushResult = struct {
-    /// Number of successful pushes.
-    success_count: u8,
-    /// Number of failed pushes.
-    failure_count: u8,
-    /// Total endpoints attempted.
-    total: u8,
-
-    /// Check if push was fully successful.
-    pub fn isFullSuccess(self: PushResult) bool {
-        return self.failure_count == 0 and self.success_count > 0;
-    }
-
-    /// Check if any pushes succeeded (partial success).
-    pub fn hasAnySuccess(self: PushResult) bool {
-        return self.success_count > 0;
-    }
-};
-
-// ============================================================================
-// Data Plane Client (TigerStyle: No allocation after init)
-// ============================================================================
-
-pub const DataPlaneClient = struct {
+pub const RouterClient = struct {
     const Self = @This();
 
     /// Allocator for client resources.
     allocator: std.mem.Allocator,
 
-    /// Data plane admin port (default port for single-instance mode).
+    /// Router admin port (default port for single-instance mode).
     admin_port: u16,
 
-    /// Data plane host (typically localhost for sidecar pattern, or service name).
+    /// Router admin host (typically localhost for sidecar pattern, or service name).
     admin_host: []const u8,
 
     /// JSON buffer for config serialization (TigerStyle S7: bounded).
@@ -152,7 +78,7 @@ pub const DataPlaneClient = struct {
     /// Pod names of endpoints that have received the current config.
     /// Used to detect new endpoints that need config push.
     /// TigerStyle S7: Fixed-size storage, no allocation.
-    synced_pod_names: [MAX_ROUTER_ENDPOINTS][k8s_client_mod.MAX_POD_NAME_LEN]u8,
+    synced_pod_names: [MAX_ROUTER_ENDPOINTS][MAX_POD_NAME_LEN]u8,
     synced_pod_name_lens: [MAX_ROUTER_ENDPOINTS]u8,
     synced_endpoint_count: u8,
 
@@ -160,7 +86,7 @@ pub const DataPlaneClient = struct {
     /// When true, we should push even if config hash matches.
     endpoints_refreshed: bool,
 
-    /// Create data plane client on heap.
+    /// Create router client on heap.
     ///
     /// TigerStyle C3: Large struct (~1MB) must be heap-allocated.
     /// TigerStyle S1: Assertions for preconditions.
@@ -190,7 +116,7 @@ pub const DataPlaneClient = struct {
         return self;
     }
 
-    /// Create data plane client with default localhost host.
+    /// Create router client with default localhost host.
     ///
     /// TigerStyle C3: Large struct (~1MB) must be heap-allocated.
     /// TigerStyle S1: Assertions for preconditions.
@@ -225,13 +151,13 @@ pub const DataPlaneClient = struct {
         namespace: []const u8,
         service_name: []const u8,
         io: Io,
-    ) DataPlaneError!u8 {
+    ) RouterClientError!u8 {
         // S1: Preconditions
         assert(@intFromPtr(k8s) != 0);
         assert(namespace.len > 0);
         assert(service_name.len > 0);
 
-        std.log.debug("data_plane: refreshEndpoints for {s}/{s}", .{ namespace, service_name });
+        std.log.debug("router_client: refreshEndpoints for {s}/{s}", .{ namespace, service_name });
 
         const endpoints = k8s_client_mod.discoverRouterEndpoints(
             k8s,
@@ -240,19 +166,19 @@ pub const DataPlaneClient = struct {
             self.admin_port,
             io,
         ) catch |err| {
-            std.log.warn("data_plane: endpoint discovery failed: {s}", .{@errorName(err)});
+            std.log.warn("router_client: endpoint discovery failed: {s}", .{@errorName(err)});
             // Fall back to single-instance mode
             self.multi_endpoint_mode = false;
-            return DataPlaneError.EndpointDiscoveryFailed;
+            return RouterClientError.EndpointDiscoveryFailed;
         };
 
         // Check if pod names changed (not just IPs - IPs can be reused)
-        const pods_changed = self.havePodNamesChanged(&endpoints);
+        const pods_changed = push.havePodNamesChanged(&self.router_endpoints, &endpoints);
         self.router_endpoints = endpoints;
         self.multi_endpoint_mode = true;
         if (pods_changed) {
             self.endpoints_refreshed = true;
-            std.log.info("data_plane: router pods changed, will push config", .{});
+            std.log.info("router_client: router pods changed, will push config", .{});
         }
 
         // S1: Postcondition
@@ -278,10 +204,10 @@ pub const DataPlaneClient = struct {
         return self.multi_endpoint_mode;
     }
 
-    /// Push configuration to data plane.
+    /// Push configuration to router.
     ///
     /// Resolves backends using the provided resolver, translates to JSON,
-    /// and POSTs to the data plane admin API.
+    /// and POSTs to the router admin API.
     ///
     /// TigerStyle S1: ~2 assertions per function.
     /// TigerStyle S3: Bounded operations via serval-client.
@@ -290,34 +216,34 @@ pub const DataPlaneClient = struct {
         config_ptr: *const GatewayConfig,
         resolver: *const Resolver,
         io: Io,
-    ) DataPlaneError!void {
+    ) RouterClientError!void {
         // S1: precondition - config has content
         assert(config_ptr.http_routes.len > 0 or config_ptr.gateways.len > 0);
 
-        std.log.debug("data_plane: pushConfig routes={d} gateways={d}", .{
+        std.log.debug("router_client: pushConfig routes={d} gateways={d}", .{
             config_ptr.http_routes.len,
             config_ptr.gateways.len,
         });
 
         // Count expected backends from config
         const expected_backends = countExpectedBackends(config_ptr);
-        std.log.debug("data_plane: expecting {d} backends", .{expected_backends});
+        std.log.debug("router_client: expecting {d} backends", .{expected_backends});
 
         // Step 1: Resolve backends to IPs
         const resolved_count = self.resolveBackends(config_ptr, resolver) catch |err| {
-            std.log.err("data_plane: resolveBackends failed: {s}", .{@errorName(err)});
+            std.log.err("router_client: resolveBackends failed: {s}", .{@errorName(err)});
             return err;
         };
-        std.log.debug("data_plane: resolved {d} backends", .{resolved_count});
+        std.log.debug("router_client: resolved {d} backends", .{resolved_count});
 
         // Check if all expected backends were resolved
         // Don't push config with unresolved backends - wait for endpoints to arrive
         if (expected_backends > 0 and resolved_count < expected_backends) {
-            std.log.info("data_plane: waiting for backends ({d}/{d} resolved)", .{
+            std.log.info("router_client: waiting for backends ({d}/{d} resolved)", .{
                 resolved_count,
                 expected_backends,
             });
-            return DataPlaneError.BackendsNotReady;
+            return RouterClientError.BackendsNotReady;
         }
 
         // Step 2: Translate to JSON using resolved backends
@@ -326,8 +252,8 @@ pub const DataPlaneClient = struct {
             self.resolved_backends[0..resolved_count],
             &self.json_buffer,
         ) catch |err| {
-            std.log.err("data_plane: translateToJson failed: {s}", .{@errorName(err)});
-            return DataPlaneError.TranslationFailed;
+            std.log.err("router_client: translateToJson failed: {s}", .{@errorName(err)});
+            return RouterClientError.TranslationFailed;
         };
 
         // S2: postcondition - non-empty JSON
@@ -336,19 +262,19 @@ pub const DataPlaneClient = struct {
         // Step 3: Check if config changed (skip redundant pushes)
         const config_hash = std.hash.Wyhash.hash(0, self.json_buffer[0..json_len]);
         if (config_hash == self.last_config_hash) {
-            std.log.debug("data_plane: config unchanged (hash={x}), skipping push", .{config_hash});
+            std.log.debug("router_client: config unchanged (hash={x}), skipping push", .{config_hash});
             return;
         }
 
-        std.log.debug("data_plane: generated JSON len={d}", .{json_len});
-        std.log.debug("data_plane: JSON preview: {s}", .{self.json_buffer[0..@min(500, json_len)]});
+        std.log.debug("router_client: generated JSON len={d}", .{json_len});
+        std.log.debug("router_client: JSON preview: {s}", .{self.json_buffer[0..@min(500, json_len)]});
 
-        // Step 4: Push to data plane using serval-client
+        // Step 4: Push to router using serval-client
         try self.sendConfigRequest(self.json_buffer[0..json_len], io);
 
         // Step 5: Update hash after successful push
         self.last_config_hash = config_hash;
-        std.log.info("data_plane: config pushed successfully (hash={x})", .{config_hash});
+        std.log.info("router_client: config pushed successfully (hash={x})", .{config_hash});
     }
 
     /// Push configuration with retry logic.
@@ -360,7 +286,7 @@ pub const DataPlaneClient = struct {
         config_ptr: *const GatewayConfig,
         resolver: *const Resolver,
         io: Io,
-    ) DataPlaneError!void {
+    ) RouterClientError!void {
         // S1: precondition - valid config
         assert(config_ptr.http_routes.len > 0 or config_ptr.gateways.len > 0);
 
@@ -372,7 +298,7 @@ pub const DataPlaneClient = struct {
             self.pushConfig(config_ptr, resolver, io) catch |err| {
                 // BackendsNotReady is not a failure - endpoints haven't arrived yet.
                 // Return immediately without retries; next reconciliation will try again.
-                if (err == DataPlaneError.BackendsNotReady) {
+                if (err == RouterClientError.BackendsNotReady) {
                     return err;
                 }
 
@@ -380,11 +306,11 @@ pub const DataPlaneClient = struct {
                 if (attempt + 1 >= MAX_RETRIES) {
                     // S6: explicit error - distinguish exhausted retries vs other failures
                     return switch (err) {
-                        DataPlaneError.ConnectionFailed,
-                        DataPlaneError.SendFailed,
-                        DataPlaneError.ReceiveFailed,
-                        DataPlaneError.Rejected,
-                        => DataPlaneError.RetriesExhausted,
+                        RouterClientError.ConnectionFailed,
+                        RouterClientError.SendFailed,
+                        RouterClientError.ReceiveFailed,
+                        RouterClientError.Rejected,
+                        => RouterClientError.RetriesExhausted,
                         else => err,
                     };
                 }
@@ -406,7 +332,7 @@ pub const DataPlaneClient = struct {
         }
 
         // S1: postcondition - should never reach here due to loop logic
-        return DataPlaneError.RetriesExhausted;
+        return RouterClientError.RetriesExhausted;
     }
 
     /// Resolve all backends in config to IP addresses.
@@ -417,7 +343,7 @@ pub const DataPlaneClient = struct {
         self: *Self,
         config_ptr: *const GatewayConfig,
         resolver: *const Resolver,
-    ) DataPlaneError!u16 {
+    ) RouterClientError!u16 {
         // S1: precondition - config is valid
         assert(config_ptr.http_routes.len <= gateway.config.MAX_HTTP_ROUTES);
 
@@ -449,7 +375,7 @@ pub const DataPlaneClient = struct {
                     });
 
                     if (count >= gateway.config.MAX_RESOLVED_BACKENDS) {
-                        return DataPlaneError.ResolutionFailed;
+                        return RouterClientError.ResolutionFailed;
                     }
 
                     // Resolve backend to endpoints using resolver
@@ -484,7 +410,7 @@ pub const DataPlaneClient = struct {
         return count;
     }
 
-    /// Send config JSON to data plane admin API.
+    /// Send config JSON to router admin API.
     ///
     /// TigerStyle: Uses serval-client for HTTP, explicit error handling.
     /// TigerStyle Y1: Refactored to stay under 70 lines by extracting buildConfigRequest.
@@ -492,7 +418,7 @@ pub const DataPlaneClient = struct {
         self: *Self,
         json_body: []const u8,
         io: Io,
-    ) DataPlaneError!void {
+    ) RouterClientError!void {
         // S1: preconditions
         assert(json_body.len > 0);
         assert(json_body.len <= MAX_JSON_SIZE_BYTES);
@@ -510,7 +436,7 @@ pub const DataPlaneClient = struct {
         );
         defer client.deinit();
 
-        // Connect to data plane admin port
+        // Connect to router admin port
         const upstream = Upstream{
             .host = self.admin_host,
             .port = self.admin_port,
@@ -518,7 +444,7 @@ pub const DataPlaneClient = struct {
         };
 
         var connect_result = client.connect(upstream, io) catch {
-            return DataPlaneError.ConnectionFailed;
+            return RouterClientError.ConnectionFailed;
         };
         defer connect_result.conn.close();
 
@@ -528,10 +454,10 @@ pub const DataPlaneClient = struct {
             self.admin_host,
             json_body,
             &content_len_buf,
-        ) orelse return DataPlaneError.SendFailed;
+        ) orelse return RouterClientError.SendFailed;
 
         client.sendRequest(&connect_result.conn, &request, null) catch {
-            return DataPlaneError.SendFailed;
+            return RouterClientError.SendFailed;
         };
 
         // Read and validate response
@@ -539,15 +465,15 @@ pub const DataPlaneClient = struct {
             &connect_result.conn,
             &self.response_header_buffer,
         ) catch |err| {
-            std.log.err("data_plane: failed to read response: {s}", .{@errorName(err)});
-            return DataPlaneError.ReceiveFailed;
+            std.log.err("router_client: failed to read response: {s}", .{@errorName(err)});
+            return RouterClientError.ReceiveFailed;
         };
 
-        std.log.debug("data_plane: response status={d}", .{response.status});
+        std.log.debug("router_client: response status={d}", .{response.status});
 
         if (response.status < 200 or response.status >= 300) {
-            std.log.err("data_plane: rejected with status {d}", .{response.status});
-            return DataPlaneError.Rejected;
+            std.log.err("router_client: rejected with status {d}", .{response.status});
+            return RouterClientError.Rejected;
         }
 
         // S2: postcondition - successful response
@@ -563,7 +489,7 @@ pub const DataPlaneClient = struct {
         port: u16,
         json_body: []const u8,
         io: Io,
-    ) DataPlaneError!void {
+    ) RouterClientError!void {
         // S1: preconditions
         assert(host.len > 0);
         assert(port > 0);
@@ -591,7 +517,7 @@ pub const DataPlaneClient = struct {
         };
 
         var connect_result = client.connect(upstream, io) catch {
-            return DataPlaneError.ConnectionFailed;
+            return RouterClientError.ConnectionFailed;
         };
         defer connect_result.conn.close();
 
@@ -601,10 +527,10 @@ pub const DataPlaneClient = struct {
             host,
             json_body,
             &content_len_buf,
-        ) orelse return DataPlaneError.SendFailed;
+        ) orelse return RouterClientError.SendFailed;
 
         client.sendRequest(&connect_result.conn, &request, null) catch {
-            return DataPlaneError.SendFailed;
+            return RouterClientError.SendFailed;
         };
 
         // Read and validate response
@@ -612,30 +538,31 @@ pub const DataPlaneClient = struct {
             &connect_result.conn,
             &self.response_header_buffer,
         ) catch |err| {
-            std.log.err("data_plane: failed to read response from {s}:{d}: {s}", .{
+            std.log.err("router_client: failed to read response from {s}:{d}: {s}", .{
                 host,
                 port,
                 @errorName(err),
             });
-            return DataPlaneError.ReceiveFailed;
+            return RouterClientError.ReceiveFailed;
         };
 
         if (response.status < 200 or response.status >= 300) {
-            std.log.err("data_plane: {s}:{d} rejected with status {d}", .{
+            std.log.err("router_client: {s}:{d} rejected with status {d}", .{
                 host,
                 port,
                 response.status,
             });
-            return DataPlaneError.Rejected;
+            return RouterClientError.Rejected;
         }
 
         // S2: postcondition - successful response
         assert(response.status >= 200 and response.status < 300);
     }
 
-    /// Push config JSON to all discovered router endpoints.
+    /// Push config JSON to router endpoints.
     ///
-    /// Iterates over router_endpoints and pushes to each one.
+    /// When clear_synced is true: clears synced list and pushes to ALL endpoints (full update).
+    /// When clear_synced is false: pushes only to endpoints NOT in synced list (incremental).
     /// Returns PushResult with success/failure counts.
     ///
     /// TigerStyle S1: ~2 assertions per function.
@@ -644,7 +571,8 @@ pub const DataPlaneClient = struct {
         self: *Self,
         json_body: []const u8,
         io: Io,
-    ) DataPlaneError!PushResult {
+        clear_synced: bool,
+    ) RouterClientError!PushResult {
         // S1: preconditions
         assert(json_body.len > 0);
         assert(json_body.len <= MAX_JSON_SIZE_BYTES);
@@ -659,7 +587,7 @@ pub const DataPlaneClient = struct {
         if (!self.multi_endpoint_mode or self.router_endpoints.count == 0) {
             result.total = 1;
             self.sendConfigRequest(json_body, io) catch |err| {
-                std.log.err("data_plane: push to {s}:{d} failed: {s}", .{
+                std.log.err("router_client: push to {s}:{d} failed: {s}", .{
                     self.admin_host,
                     self.admin_port,
                     @errorName(err),
@@ -668,35 +596,34 @@ pub const DataPlaneClient = struct {
                 return result;
             };
             result.success_count = 1;
-            std.log.info("data_plane: pushed to {s}:{d}", .{ self.admin_host, self.admin_port });
+            std.log.info("router_client: pushed to {s}:{d}", .{ self.admin_host, self.admin_port });
             return result;
         }
 
-        // Multi-endpoint mode: push to all discovered endpoints
-        result.total = self.router_endpoints.count;
-        std.log.info("data_plane: pushing to {d} router endpoints", .{result.total});
-
-        // Clear synced list and refresh flag - we're pushing new config
-        self.clearSyncedEndpoints();
+        // Clear synced list if this is a full update (config changed)
+        if (clear_synced) {
+            self.clearSyncedEndpoints();
+        }
         self.endpoints_refreshed = false;
+
+        // Count endpoints to push (all if clear_synced, only unsynced otherwise)
+        var endpoints_to_push: u8 = 0;
 
         // S3: bounded loop - limited by MAX_ROUTER_ENDPOINTS
         var idx: u8 = 0;
         while (idx < self.router_endpoints.count) : (idx += 1) {
             const endpoint = &self.router_endpoints.endpoints[idx];
+            if (!endpoint.ready) continue;
 
-            // Skip non-ready endpoints
-            if (!endpoint.ready) {
-                std.log.debug("data_plane: skipping non-ready endpoint {s}:{d}", .{
-                    endpoint.getIp(),
-                    endpoint.port,
-                });
+            // Skip already-synced endpoints in incremental mode
+            if (!clear_synced and self.isEndpointSynced(endpoint.getPodName())) {
                 continue;
             }
 
+            endpoints_to_push += 1;
             const ip = endpoint.getIp();
             self.sendConfigToEndpoint(ip, endpoint.port, json_body, io) catch |err| {
-                std.log.warn("data_plane: push to {s}:{d} failed: {s}", .{
+                std.log.warn("router_client: push to {s}:{d} failed: {s}", .{
                     ip,
                     endpoint.port,
                     @errorName(err),
@@ -708,17 +635,21 @@ pub const DataPlaneClient = struct {
             // Record this endpoint as synced (by pod name)
             self.addSyncedEndpoint(endpoint.getPodName());
             result.success_count += 1;
-            std.log.info("data_plane: pushed to {s}:{d} (pod={s})", .{ ip, endpoint.port, endpoint.getPodName() });
+            std.log.info("router_client: pushed to {s}:{d} (pod={s})", .{ ip, endpoint.port, endpoint.getPodName() });
         }
 
+        result.total = endpoints_to_push;
+
         // Log summary
-        if (result.failure_count > 0) {
-            std.log.warn("data_plane: config push: {d}/{d} succeeded", .{
+        if (result.total == 0) {
+            std.log.debug("router_client: no endpoints to push (all already synced)", .{});
+        } else if (result.failure_count > 0) {
+            std.log.warn("router_client: config push: {d}/{d} succeeded", .{
                 result.success_count,
                 result.total,
             });
         } else if (result.success_count > 0) {
-            std.log.info("data_plane: config pushed to all {d} routers", .{result.success_count});
+            std.log.info("router_client: config pushed to {d} routers", .{result.success_count});
         }
 
         // S2: postcondition - counts are consistent
@@ -738,33 +669,33 @@ pub const DataPlaneClient = struct {
         config_ptr: *const GatewayConfig,
         resolver: *const Resolver,
         io: Io,
-    ) DataPlaneError!PushResult {
+    ) RouterClientError!PushResult {
         // S1: precondition - config has content
         assert(config_ptr.http_routes.len > 0 or config_ptr.gateways.len > 0);
 
-        std.log.debug("data_plane: pushConfigToAll routes={d} gateways={d}", .{
+        std.log.debug("router_client: pushConfigToAll routes={d} gateways={d}", .{
             config_ptr.http_routes.len,
             config_ptr.gateways.len,
         });
 
         // Count expected backends from config
         const expected_backends = countExpectedBackends(config_ptr);
-        std.log.debug("data_plane: expecting {d} backends", .{expected_backends});
+        std.log.debug("router_client: expecting {d} backends", .{expected_backends});
 
         // Step 1: Resolve backends to IPs
         const resolved_count = self.resolveBackends(config_ptr, resolver) catch |err| {
-            std.log.err("data_plane: resolveBackends failed: {s}", .{@errorName(err)});
+            std.log.err("router_client: resolveBackends failed: {s}", .{@errorName(err)});
             return err;
         };
-        std.log.debug("data_plane: resolved {d} backends", .{resolved_count});
+        std.log.debug("router_client: resolved {d} backends", .{resolved_count});
 
         // Check if all expected backends were resolved
         if (expected_backends > 0 and resolved_count < expected_backends) {
-            std.log.info("data_plane: waiting for backends ({d}/{d} resolved)", .{
+            std.log.info("router_client: waiting for backends ({d}/{d} resolved)", .{
                 resolved_count,
                 expected_backends,
             });
-            return DataPlaneError.BackendsNotReady;
+            return RouterClientError.BackendsNotReady;
         }
 
         // Step 2: Translate to JSON using resolved backends
@@ -773,8 +704,8 @@ pub const DataPlaneClient = struct {
             self.resolved_backends[0..resolved_count],
             &self.json_buffer,
         ) catch |err| {
-            std.log.err("data_plane: translateToJson failed: {s}", .{@errorName(err)});
-            return DataPlaneError.TranslationFailed;
+            std.log.err("router_client: translateToJson failed: {s}", .{@errorName(err)});
+            return RouterClientError.TranslationFailed;
         };
 
         // S2: postcondition - non-empty JSON
@@ -782,9 +713,10 @@ pub const DataPlaneClient = struct {
 
         // Step 3: Check if config changed OR router endpoints were refreshed
         const config_hash = std.hash.Wyhash.hash(0, self.json_buffer[0..json_len]);
+        const config_changed = config_hash != self.last_config_hash;
 
-        if (config_hash == self.last_config_hash and !self.endpoints_refreshed) {
-            std.log.debug("data_plane: config unchanged (hash={x}), skipping push", .{config_hash});
+        if (!config_changed and !self.endpoints_refreshed) {
+            std.log.debug("router_client: config unchanged (hash={x}), skipping push", .{config_hash});
             // Return success with 0 endpoints pushed (config unchanged)
             return PushResult{
                 .success_count = 0,
@@ -793,24 +725,34 @@ pub const DataPlaneClient = struct {
             };
         }
 
-        if (self.endpoints_refreshed) {
-            std.log.info("data_plane: endpoints refreshed, pushing config to all", .{});
+        std.log.debug("router_client: generated JSON len={d}", .{json_len});
+
+        // Step 4: Push config
+        // - If config changed: clear synced list and push to ALL endpoints (full update)
+        // - If only endpoints refreshed: push only to NEW endpoints (incremental)
+        var result: PushResult = undefined;
+
+        if (config_changed) {
+            std.log.info("router_client: config changed, pushing to all endpoints", .{});
+            result = try self.pushToAll(self.json_buffer[0..json_len], io, true);
+        } else {
+            // Only endpoints refreshed - push incrementally to new endpoints only
+            std.log.info("router_client: endpoints refreshed, pushing to new endpoints only", .{});
+            self.pruneStaleSyncedEndpoints();
+            result = try self.pushToAll(self.json_buffer[0..json_len], io, false);
         }
-
-        std.log.debug("data_plane: generated JSON len={d}", .{json_len});
-
-        // Step 4: Push to all discovered router endpoints
-        const result = try self.pushToAll(self.json_buffer[0..json_len], io);
 
         // Step 5: Update hash only if at least one push succeeded
         if (result.success_count > 0) {
             self.last_config_hash = config_hash;
-            std.log.info("data_plane: config updated (hash={x})", .{config_hash});
+            if (config_changed) {
+                std.log.info("router_client: config updated (hash={x})", .{config_hash});
+            }
         }
 
         // Check for total failure
         if (result.success_count == 0 and result.total > 0) {
-            return DataPlaneError.AllPushesFailed;
+            return RouterClientError.AllPushesFailed;
         }
 
         return result;
@@ -842,22 +784,25 @@ pub const DataPlaneClient = struct {
         config_ptr: *const GatewayConfig,
         resolver: *const Resolver,
         io: Io,
-    ) DataPlaneError!u8 {
+    ) RouterClientError!u8 {
         // S1: Preconditions
         assert(namespace.len > 0);
         assert(service_name.len > 0);
 
         // Skip if no config has been pushed yet
         if (self.last_config_hash == 0) {
-            std.log.info("data_plane: syncNewEndpoints skipped - no config pushed yet", .{});
+            std.log.info("router_client: syncNewEndpoints skipped - no config pushed yet", .{});
             return 0;
         }
 
         // Refresh endpoints from K8s
         _ = self.refreshEndpoints(k8s, namespace, service_name, io) catch |err| {
-            std.log.warn("data_plane: syncNewEndpoints discovery failed: {s}", .{@errorName(err)});
+            std.log.warn("router_client: syncNewEndpoints discovery failed: {s}", .{@errorName(err)});
             return err;
         };
+
+        // Prune stale entries from synced list (pods that no longer exist)
+        self.pruneStaleSyncedEndpoints();
 
         // Find new endpoints not in synced list
         var new_endpoints: [MAX_ROUTER_ENDPOINTS]RouterEndpoint = undefined;
@@ -874,30 +819,30 @@ pub const DataPlaneClient = struct {
                 if (new_count < MAX_ROUTER_ENDPOINTS) {
                     new_endpoints[new_count] = ep.*;
                     new_count += 1;
-                    std.log.info("data_plane: found new endpoint {s}:{d} (pod={s})", .{ ep.getIp(), ep.port, pod_name });
+                    std.log.info("router_client: found new endpoint {s}:{d} (pod={s})", .{ ep.getIp(), ep.port, pod_name });
                 }
             }
         }
 
         if (new_count == 0) {
-            std.log.info("data_plane: no new endpoints to sync (synced={d}, current={d})", .{
+            std.log.info("router_client: no new endpoints to sync (synced={d}, current={d})", .{
                 self.synced_endpoint_count,
                 self.router_endpoints.count,
             });
             return 0;
         }
 
-        std.log.info("data_plane: syncing config to {d} new endpoints", .{new_count});
+        std.log.info("router_client: syncing config to {d} new endpoints", .{new_count});
 
         // Resolve backends (reuse existing resolution if valid)
         const expected_backends = countExpectedBackends(config_ptr);
         const resolved_count = self.resolveBackends(config_ptr, resolver) catch |err| {
-            std.log.err("data_plane: syncNewEndpoints resolveBackends failed: {s}", .{@errorName(err)});
+            std.log.err("router_client: syncNewEndpoints resolveBackends failed: {s}", .{@errorName(err)});
             return err;
         };
 
         if (expected_backends > 0 and resolved_count < expected_backends) {
-            return DataPlaneError.BackendsNotReady;
+            return RouterClientError.BackendsNotReady;
         }
 
         // Translate to JSON
@@ -906,8 +851,8 @@ pub const DataPlaneClient = struct {
             self.resolved_backends[0..resolved_count],
             &self.json_buffer,
         ) catch |err| {
-            std.log.err("data_plane: syncNewEndpoints translateToJson failed: {s}", .{@errorName(err)});
-            return DataPlaneError.TranslationFailed;
+            std.log.err("router_client: syncNewEndpoints translateToJson failed: {s}", .{@errorName(err)});
+            return RouterClientError.TranslationFailed;
         };
 
         // Push to each new endpoint
@@ -918,14 +863,14 @@ pub const DataPlaneClient = struct {
             const ip = ep.getIp();
 
             self.sendConfigToEndpoint(ip, ep.port, self.json_buffer[0..json_len], io) catch |err| {
-                std.log.warn("data_plane: push to {s}:{d} failed: {s}", .{ ip, ep.port, @errorName(err) });
+                std.log.warn("router_client: push to {s}:{d} failed: {s}", .{ ip, ep.port, @errorName(err) });
                 continue;
             };
 
             // Record successful sync (by pod name)
             self.addSyncedEndpoint(ep.getPodName());
             success_count += 1;
-            std.log.info("data_plane: synced config to {s}:{d} (pod={s})", .{ ip, ep.port, ep.getPodName() });
+            std.log.info("router_client: synced config to {s}:{d} (pod={s})", .{ ip, ep.port, ep.getPodName() });
         }
 
         // S1: Postcondition
@@ -934,83 +879,42 @@ pub const DataPlaneClient = struct {
         return success_count;
     }
 
-    /// Check if pod names in new endpoints differ from current endpoints.
-    ///
-    /// Returns true if any pod name changed, even if IPs are the same.
-    /// TigerStyle S3: Bounded loops.
-    fn havePodNamesChanged(self: *const Self, new_endpoints: *const RouterEndpoints) bool {
-        // Different count means changed
-        if (new_endpoints.count != self.router_endpoints.count) {
-            return true;
-        }
-
-        // Check each new endpoint's pod name exists in current list
-        var new_idx: u8 = 0;
-        while (new_idx < new_endpoints.count) : (new_idx += 1) {
-            const new_ep = &new_endpoints.endpoints[new_idx];
-            const new_pod = new_ep.getPodName();
-            if (new_pod.len == 0) continue; // Skip if pod name unknown
-
-            var found = false;
-            var cur_idx: u8 = 0;
-            while (cur_idx < self.router_endpoints.count) : (cur_idx += 1) {
-                const cur_ep = &self.router_endpoints.endpoints[cur_idx];
-                if (std.mem.eql(u8, new_pod, cur_ep.getPodName())) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
     /// Check if an endpoint pod name is in the synced list.
-    ///
-    /// TigerStyle S3: Bounded loop.
     fn isEndpointSynced(self: *const Self, pod_name: []const u8) bool {
-        if (pod_name.len == 0) return false; // Unknown pod name, treat as not synced
-
-        var idx: u8 = 0;
-        while (idx < self.synced_endpoint_count) : (idx += 1) {
-            const synced_len = self.synced_pod_name_lens[idx];
-            if (synced_len == pod_name.len) {
-                if (std.mem.eql(u8, self.synced_pod_names[idx][0..synced_len], pod_name)) {
-                    return true;
-                }
-            }
-        }
-        return false;
+        return push.isEndpointSynced(
+            &self.synced_pod_names,
+            &self.synced_pod_name_lens,
+            self.synced_endpoint_count,
+            pod_name,
+        );
     }
 
     /// Add an endpoint pod name to the synced list.
-    ///
-    /// TigerStyle S1: Precondition - pod name fits in buffer.
     fn addSyncedEndpoint(self: *Self, pod_name: []const u8) void {
-        if (pod_name.len == 0) return; // Skip unknown pod names
-
-        assert(pod_name.len <= k8s_client_mod.MAX_POD_NAME_LEN); // S1: precondition
-
-        if (self.synced_endpoint_count >= MAX_ROUTER_ENDPOINTS) {
-            std.log.warn("data_plane: synced endpoint list full, cannot add {s}", .{pod_name});
-            return;
-        }
-
-        const idx = self.synced_endpoint_count;
-        @memcpy(self.synced_pod_names[idx][0..pod_name.len], pod_name);
-        self.synced_pod_name_lens[idx] = @intCast(pod_name.len);
-        self.synced_endpoint_count += 1;
+        push.addSyncedEndpoint(
+            &self.synced_pod_names,
+            &self.synced_pod_name_lens,
+            &self.synced_endpoint_count,
+            pod_name,
+        );
     }
 
     /// Clear the synced endpoint list.
-    ///
-    /// Call this when config changes to ensure all endpoints get the new config.
     pub fn clearSyncedEndpoints(self: *Self) void {
-        self.synced_endpoint_count = 0;
-        self.synced_pod_name_lens = std.mem.zeroes([MAX_ROUTER_ENDPOINTS]u8);
+        push.clearSyncedEndpoints(
+            &self.synced_pod_name_lens,
+            &self.synced_endpoint_count,
+        );
+    }
+
+    /// Prune stale entries from synced list.
+    fn pruneStaleSyncedEndpoints(self: *Self) void {
+        push.pruneStaleSyncedEndpoints(
+            &self.synced_pod_names,
+            &self.synced_pod_name_lens,
+            &self.synced_endpoint_count,
+            &self.router_endpoints,
+        );
     }
 };
 
@@ -1077,111 +981,39 @@ fn countExpectedBackends(config_ptr: *const GatewayConfig) u16 {
 // Tests
 // ============================================================================
 
-test "DataPlaneClient create with custom host and port" {
-    const client = try DataPlaneClient.create(std.testing.allocator, "10.0.0.1", 9901);
+test "RouterClient create with custom host and port" {
+    const client = try RouterClient.create(std.testing.allocator, "10.0.0.1", 9901);
     defer client.destroy();
     try std.testing.expectEqual(@as(u16, 9901), client.admin_port);
     try std.testing.expectEqualStrings("10.0.0.1", client.admin_host);
 }
 
-test "DataPlaneClient createLocalhost uses 127.0.0.1" {
-    const client = try DataPlaneClient.createLocalhost(std.testing.allocator, DEFAULT_ADMIN_PORT);
+test "RouterClient createLocalhost uses 127.0.0.1" {
+    const client = try RouterClient.createLocalhost(std.testing.allocator, mod.DEFAULT_ADMIN_PORT);
     defer client.destroy();
     try std.testing.expectEqual(@as(u16, 9901), client.admin_port);
     try std.testing.expectEqualStrings("127.0.0.1", client.admin_host);
 }
 
-test "DataPlaneClient create with default port" {
-    const client = try DataPlaneClient.create(std.testing.allocator, "localhost", DEFAULT_ADMIN_PORT);
+test "RouterClient create with default port" {
+    const client = try RouterClient.create(std.testing.allocator, "localhost", mod.DEFAULT_ADMIN_PORT);
     defer client.destroy();
     try std.testing.expectEqual(@as(u16, 9901), client.admin_port);
 }
 
-test "Constants match serval-core config" {
-    try std.testing.expectEqual(core_config.DEFAULT_ADMIN_PORT, DEFAULT_ADMIN_PORT);
-    try std.testing.expectEqual(core_config.MAX_CONFIG_PUSH_RETRIES, MAX_RETRIES);
-    try std.testing.expectEqual(core_config.CONFIG_PUSH_BACKOFF_BASE_MS, BACKOFF_BASE_MS);
-    try std.testing.expectEqual(core_config.MAX_CONFIG_PUSH_BACKOFF_MS, MAX_BACKOFF_MS);
-}
-
-test "DataPlaneError has all expected variants" {
-    // Verify all error variants exist
-    const errors = [_]DataPlaneError{
-        DataPlaneError.NoConfig,
-        DataPlaneError.ResolutionFailed,
-        DataPlaneError.TranslationFailed,
-        DataPlaneError.ConnectionFailed,
-        DataPlaneError.SendFailed,
-        DataPlaneError.ReceiveFailed,
-        DataPlaneError.EmptyResponse,
-        DataPlaneError.Rejected,
-        DataPlaneError.RetriesExhausted,
-        DataPlaneError.BackendsNotReady,
-        DataPlaneError.NoRouterEndpoints,
-        DataPlaneError.AllPushesFailed,
-        DataPlaneError.EndpointDiscoveryFailed,
-    };
-
-    // Each error should be distinct
-    for (errors, 0..) |err1, i| {
-        for (errors[i + 1 ..]) |err2| {
-            try std.testing.expect(err1 != err2);
-        }
-    }
-}
-
-test "Buffer sizes are bounded" {
-    // TigerStyle: Verify buffers have explicit bounds
-    try std.testing.expect(MAX_JSON_SIZE_BYTES > 0);
-    try std.testing.expect(MAX_JSON_SIZE_BYTES <= 1024 * 1024); // 1MB max
-    try std.testing.expect(MAX_RESPONSE_HEADER_SIZE_BYTES > 0);
-    try std.testing.expect(MAX_RESPONSE_HEADER_SIZE_BYTES <= 16384); // 16KB max headers
-}
-
-test "Retry constants are reasonable" {
-    // TigerStyle: Verify retry config is bounded
-    try std.testing.expect(MAX_RETRIES > 0);
-    try std.testing.expect(MAX_RETRIES <= 10); // Reasonable retry limit
-    try std.testing.expect(BACKOFF_BASE_MS > 0);
-    try std.testing.expect(MAX_BACKOFF_MS >= BACKOFF_BASE_MS);
-    try std.testing.expect(MAX_BACKOFF_MS <= 30000); // 30s max backoff
-}
-
-test "DataPlaneClient multi-endpoint mode defaults to false" {
-    const client = try DataPlaneClient.create(std.testing.allocator, "localhost", 9901);
+test "RouterClient multi-endpoint mode defaults to false" {
+    const client = try RouterClient.create(std.testing.allocator, "localhost", 9901);
     defer client.destroy();
 
     try std.testing.expect(!client.isMultiEndpointMode());
     try std.testing.expectEqual(@as(u8, 1), client.endpointCount());
 }
 
-test "DataPlaneClient router_endpoints initialized empty" {
-    const client = try DataPlaneClient.create(std.testing.allocator, "localhost", 9901);
+test "RouterClient router_endpoints initialized empty" {
+    const client = try RouterClient.create(std.testing.allocator, "localhost", 9901);
     defer client.destroy();
 
     try std.testing.expectEqual(@as(u8, 0), client.router_endpoints.count);
-}
-
-test "PushResult isFullSuccess" {
-    // Full success
-    const success = PushResult{ .success_count = 3, .failure_count = 0, .total = 3 };
-    try std.testing.expect(success.isFullSuccess());
-    try std.testing.expect(success.hasAnySuccess());
-
-    // Partial success
-    const partial = PushResult{ .success_count = 2, .failure_count = 1, .total = 3 };
-    try std.testing.expect(!partial.isFullSuccess());
-    try std.testing.expect(partial.hasAnySuccess());
-
-    // Total failure
-    const failure = PushResult{ .success_count = 0, .failure_count = 3, .total = 3 };
-    try std.testing.expect(!failure.isFullSuccess());
-    try std.testing.expect(!failure.hasAnySuccess());
-
-    // Empty (config unchanged)
-    const empty = PushResult{ .success_count = 0, .failure_count = 0, .total = 0 };
-    try std.testing.expect(!empty.isFullSuccess()); // No success with 0 total
-    try std.testing.expect(!empty.hasAnySuccess());
 }
 
 test "MAX_ROUTER_ENDPOINTS constant" {
