@@ -76,6 +76,8 @@ pub fn AdminHandler(comptime Tracer: type) type {
             // Route based on path and method
             const healthz = PathMatch{ .exactPath = "/healthz" };
             const readyz = PathMatch{ .exactPath = "/readyz" };
+            const routes_path = PathMatch{ .exactPath = "/routes" };
+            const routes_update = PathMatch{ .exactPath = "/routes/update" };
 
             if (healthz.matches(request.path)) {
                 return .{ .send_response = .{
@@ -101,7 +103,7 @@ pub fn AdminHandler(comptime Tracer: type) type {
                 }
             }
 
-            if (std.mem.eql(u8, request.path, "/routes")) {
+            if (routes_path.matches(request.path)) {
                 const router = config_storage.getActiveRouter() orelse {
                     return .{ .send_response = .{
                         .status = 503,
@@ -126,7 +128,7 @@ pub fn AdminHandler(comptime Tracer: type) type {
                 } };
             }
 
-            if (std.mem.eql(u8, request.path, "/routes/update") and request.method == .POST) {
+            if (routes_update.matches(request.path) and request.method == .POST) {
                 // Read request body lazily using ctx.readBody()
                 var body_buf: [MAX_JSON_BODY_SIZE]u8 = undefined;
                 const body = ctx.readBody(&body_buf) catch |err| {

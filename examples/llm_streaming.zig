@@ -28,6 +28,7 @@ const serval = @import("serval");
 const time = serval.time;
 const serval_net = @import("serval-net");
 const cli = @import("serval-cli");
+const PathMatch = serval.router.PathMatch;
 const DnsConfig = serval_net.DnsConfig;
 
 /// Version of this binary.
@@ -128,9 +129,12 @@ const LlmHandler = struct {
         }
 
         // Route based on path
-        if (std.mem.eql(u8, request.path, "/health")) {
+        const health = PathMatch{ .exactPath = "/health" };
+        const chat = PathMatch{ .exactPath = "/v1/chat/completions" };
+
+        if (health.matches(request.path)) {
             return self.handleHealth(response_buf);
-        } else if (std.mem.eql(u8, request.path, "/v1/chat/completions")) {
+        } else if (chat.matches(request.path)) {
             return self.handleChatCompletions(request);
         } else {
             return self.handleNotFound(response_buf);
