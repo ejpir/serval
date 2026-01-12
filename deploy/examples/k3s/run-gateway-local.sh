@@ -21,7 +21,7 @@ TOKEN=$(sudo kubectl create token serval-gateway -n default --duration=1h 2>/dev
 
 if [ -z "$TOKEN" ]; then
     echo "Error: Failed to get token. Make sure serval-gateway ServiceAccount exists."
-    echo "Run: kubectl apply -f deploy/serval-gateway.yaml"
+    echo "Run: kubectl apply -f deploy/examples/k3s/serval-gateway.yaml"
     exit 1
 fi
 

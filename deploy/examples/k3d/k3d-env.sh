@@ -1,10 +1,10 @@
 #!/bin/bash
 # Source this file to set up kubectl for the k3d serval cluster
 #
-# Usage: source deploy/k3d-env.sh [cluster-name]
+# Usage: source deploy/examples/k3d/k3d-env.sh [cluster-name]
 #
 # After sourcing, kubectl commands will use the k3d cluster.
-# If docker requires sudo, run: sudo -E bash -c 'source deploy/k3d-env.sh'
+# If docker requires sudo, run: sudo -E bash -c 'source deploy/examples/k3d/k3d-env.sh'
 
 CLUSTER_NAME="${1:-serval}"
 
@@ -22,7 +22,7 @@ if ! k3d cluster list 2>/dev/null | grep -q "^${CLUSTER_NAME} "; then
         return 0 2>/dev/null || exit 0
     fi
     echo "Error: k3d cluster '${CLUSTER_NAME}' not found"
-    echo "Run: ./deploy/k3d-setup.sh"
+    echo "Run: ./deploy/examples/k3d/k3d-setup.sh"
     return 1 2>/dev/null || exit 1
 fi
 

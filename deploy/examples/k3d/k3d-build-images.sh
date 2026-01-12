@@ -4,7 +4,7 @@
 # This creates minimal container images from the Zig binaries
 # and imports them into the k3d cluster.
 #
-# Usage: ./deploy/k3d-build-images.sh [--debug] [cluster-name]
+# Usage: ./deploy/examples/k3d/k3d-build-images.sh [--debug] [cluster-name]
 #
 # Options:
 #   --debug    Build with debug mode (enables debug logging)
@@ -27,7 +27,7 @@ for arg in "$@"; do
 done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+PROJECT_ROOT="$(dirname "$(dirname "$(dirname "$SCRIPT_DIR")")")"
 
 # Colors
 GREEN='\033[0;32m'
@@ -76,6 +76,13 @@ else
     BUILD_GATEWAY=true
 fi
 
+if [[ ! -f "zig-out/bin/echo_backend" ]]; then
+    warn "zig-out/bin/echo_backend not found, skipping echo-backend image"
+    BUILD_ECHO=false
+else
+    BUILD_ECHO=true
+fi
+
 # Create temporary directory for Docker builds
 TMPDIR=$(mktemp -d)
 trap "rm -rf $TMPDIR" EXIT
@@ -114,6 +121,24 @@ EOF
     docker build -t serval-gateway:local -f "$TMPDIR/Dockerfile.gateway" "$TMPDIR"
 fi
 
+# Build echo-backend image if available
+if [[ "$BUILD_ECHO" == "true" ]]; then
+    log "Building echo-backend image..."
+    cat > "$TMPDIR/Dockerfile.echo" << 'EOF'
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libssl3 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY echo_backend /usr/local/bin/echo-backend
+RUN chmod +x /usr/local/bin/echo-backend
+ENTRYPOINT ["/usr/local/bin/echo-backend"]
+EOF
+
+    cp zig-out/bin/echo_backend "$TMPDIR/"
+    docker build -t echo-backend:latest -f "$TMPDIR/Dockerfile.echo" "$TMPDIR"
+fi
+
 # Import into k3d
 log "Importing images into k3d cluster '${CLUSTER_NAME}'..."
 k3d image import serval-router:local -c "${CLUSTER_NAME}"
@@ -122,12 +147,19 @@ if [[ "$BUILD_GATEWAY" == "true" ]]; then
     k3d image import serval-gateway:local -c "${CLUSTER_NAME}"
 fi
 
+if [[ "$BUILD_ECHO" == "true" ]]; then
+    k3d image import echo-backend:latest -c "${CLUSTER_NAME}"
+fi
+
 log "Done!"
 echo ""
 echo "Images available in cluster:"
 echo "  - serval-router:local"
 if [[ "$BUILD_GATEWAY" == "true" ]]; then
     echo "  - serval-gateway:local"
+fi
+if [[ "$BUILD_ECHO" == "true" ]]; then
+    echo "  - echo-backend:latest"
 fi
 echo ""
 echo "Deploy with (KUBECONFIG already set in this shell):"

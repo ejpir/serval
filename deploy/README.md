@@ -4,9 +4,82 @@ Kubernetes deployment manifests for serval components.
 
 ## Prerequisites
 
-- k3s or kind cluster running
+- k3d, k3s, or kind cluster running
 - `kubectl` configured
 - `docker` for building images
+
+## k3d Setup (Recommended for Development)
+
+### Quick Start
+
+```bash
+# 1. Create cluster with edge/internal node topology
+./deploy/examples/k3d/k3d-setup.sh
+
+# 2. Build and import images
+./deploy/examples/k3d/k3d-build-images.sh
+
+# 3. Deploy components
+kubectl apply -f deploy/examples/k3d/router-daemonset.yaml
+kubectl apply -f deploy/examples/k3d/gateway-deployment.yaml
+kubectl apply -f deploy/examples/k3d/test-backend.yaml
+
+# 4. Test
+curl -H "Host: echo.example.com" http://localhost:30080/
+```
+
+### Port Mappings
+
+The router runs as a DaemonSet on edge nodes using hostPort. k3d maps these to localhost:
+
+| Service | Edge Node 0 | Edge Node 1 |
+|---------|-------------|-------------|
+| HTTP    | `localhost:30080` | `localhost:30180` |
+| HTTPS   | `localhost:30443` | `localhost:30543` |
+| Admin   | `localhost:30901` | `localhost:30902` |
+
+### Architecture
+
+```
+                    Internet
+                        │
+                        ▼
+┌─────────────────────────────────────────────────────────┐
+│  Edge Nodes (agent-0, agent-1)                          │
+│  ┌───────────────────────────────────────────────────┐  │
+│  │  serval-router (DaemonSet, hostPort 80/443)       │  │
+│  │  - Receives all inbound traffic                   │  │
+│  │  - Routes based on Host header / path             │  │
+│  └───────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────┘
+                        │
+                        ▼
+┌─────────────────────────────────────────────────────────┐
+│  Internal Nodes (agent-2, agent-3)                      │
+│  ┌────────────────┐  ┌────────────────┐                 │
+│  │  echo-backend  │  │  other-backend │  ...            │
+│  └────────────────┘  └────────────────┘                 │
+└─────────────────────────────────────────────────────────┘
+```
+
+**k3d local development:** The `--port` flags in `k3d-setup.sh` tell k3d to expose edge node ports to localhost. k3d handles this internally - you just use `localhost:30080` to reach the router.
+
+### Useful Commands
+
+```bash
+# Check router status
+kubectl get pods -l app=serval-router -o wide
+
+# View router logs
+kubectl logs -l app=serval-router -f
+
+# Check router health
+curl http://localhost:30901/readyz
+
+# Rebuild and redeploy after code changes
+./deploy/examples/k3d/k3d-build-images.sh
+kubectl rollout restart daemonset/serval-router
+```
 
 ## Components
 
@@ -20,20 +93,22 @@ Kubernetes deployment manifests for serval components.
 
 | Script | Purpose |
 |--------|---------|
-| `deploy-k3s.sh` | Full deployment with prereq checks, status, cleanup |
-| `build-and-load.sh` | Quick rebuild helper for iterating on single component |
+| `examples/k3d/k3d-setup.sh` | Create k3d cluster with edge/internal node topology |
+| `examples/k3d/k3d-build-images.sh` | Build Zig binaries, create Docker images, import to k3d |
+| `examples/k3s/deploy-k3s.sh` | Full deployment with prereq checks, status, cleanup (k3s) |
+| `examples/k3s/build-and-load.sh` | Quick rebuild helper for iterating on single component (k3s) |
 
-## Quick Start
+## k3s Quick Start
 
 ```bash
 # Option 1: Full deployment script (recommended)
-./deploy/deploy-k3s.sh
+./deploy/examples/k3s/deploy-k3s.sh
 
 # Option 2: Manual steps
 zig build build-router-example
-./deploy/build-and-load.sh router
-sudo kubectl apply -f deploy/examples/echo-backend.yaml
-sudo kubectl apply -f deploy/serval-router.yaml
+./deploy/examples/k3s/build-and-load.sh router
+sudo kubectl apply -f deploy/examples/k3s/echo-backend.yaml
+sudo kubectl apply -f deploy/examples/k3s/serval-router.yaml
 
 # Test
 curl http://localhost:31588/
@@ -54,9 +129,9 @@ zig build build-gateway-example
 zig build
 
 # Build docker images
-sudo docker build -f deploy/Dockerfile.router -t serval-router:latest .
-sudo docker build -f deploy/Dockerfile.gateway -t serval-k8s-gateway:latest .
-sudo docker build -f deploy/Dockerfile.echo-backend -t echo-backend:latest .
+sudo docker build -f deploy/examples/k3s/Dockerfile.router -t serval-router:latest .
+sudo docker build -f deploy/examples/k3s/Dockerfile.gateway -t serval-k8s-gateway:latest .
+sudo docker build -f deploy/examples/k3s/Dockerfile.echo-backend -t echo-backend:latest .
 
 # Load into k3s
 sudo docker save serval-router:latest | sudo k3s ctr images import -
@@ -68,13 +143,13 @@ sudo docker save echo-backend:latest | sudo k3s ctr images import -
 
 ```bash
 # Deploy echo-backend
-sudo kubectl apply -f deploy/examples/echo-backend.yaml
+sudo kubectl apply -f deploy/examples/k3s/echo-backend.yaml
 
 # Deploy router
-sudo kubectl apply -f deploy/serval-router.yaml
+sudo kubectl apply -f deploy/examples/k3s/serval-router.yaml
 
 # Deploy gateway (WIP)
-sudo kubectl apply -f deploy/serval-k8s-gateway.yaml
+sudo kubectl apply -f deploy/examples/k3s/serval-gateway.yaml
 ```
 
 ## Status Commands

@@ -7,7 +7,7 @@
 #   - Zig compiler available
 #
 # Usage:
-#   ./deploy/deploy-k3s.sh [OPTIONS]
+#   ./deploy/examples/k3s/deploy-k3s.sh [OPTIONS]
 #
 # Options:
 #   --build-only     Only build binaries and images, don't deploy
@@ -102,13 +102,13 @@ build_images() {
     cd "$PROJECT_ROOT"
 
     log_info "  Building echo-backend:latest..."
-    sudo docker build -f deploy/Dockerfile.echo-backend -t echo-backend:latest .
+    sudo docker build -f deploy/examples/k3s/Dockerfile.echo-backend -t echo-backend:latest .
 
     log_info "  Building serval-router:latest..."
-    sudo docker build -f deploy/Dockerfile.router -t serval-router:latest .
+    sudo docker build -f deploy/examples/k3s/Dockerfile.router -t serval-router:latest .
 
     log_info "  Building serval-gateway:latest..."
-    sudo docker build -f deploy/Dockerfile.gateway -t serval-gateway:latest .
+    sudo docker build -f deploy/examples/k3s/Dockerfile.gateway -t serval-gateway:latest .
 
     log_info "Docker images built successfully"
 }
@@ -148,17 +148,17 @@ deploy_components() {
     cd "$PROJECT_ROOT"
 
     log_info "  Deploying echo-backend..."
-    $KUBECTL apply -f deploy/examples/echo-backend.yaml
+    $KUBECTL apply -f deploy/examples/k3s/echo-backend.yaml
 
     log_info "  Deploying serval-router (data plane)..."
-    $KUBECTL apply -f deploy/serval-router.yaml
+    $KUBECTL apply -f deploy/examples/k3s/serval-router.yaml
 
     log_info "  Deploying serval-gateway (control plane - WIP)..."
-    $KUBECTL apply -f deploy/serval-gateway.yaml
+    $KUBECTL apply -f deploy/examples/k3s/serval-gateway.yaml
 
     log_info "  Creating Gateway and HTTPRoute..."
-    $KUBECTL apply -f deploy/examples/basic-gateway.yaml
-    $KUBECTL apply -f deploy/examples/basic-httproute.yaml
+    $KUBECTL apply -f deploy/examples/k3s/basic-gateway.yaml
+    $KUBECTL apply -f deploy/examples/k3s/basic-httproute.yaml
 
     log_info "Waiting for pods to be ready..."
     $KUBECTL wait --for=condition=ready pod -l app=echo-backend --timeout=60s || true
@@ -198,11 +198,11 @@ clean_up() {
     log_info "Cleaning up deployed resources..."
     cd "$PROJECT_ROOT"
 
-    $KUBECTL delete -f deploy/examples/basic-httproute.yaml --ignore-not-found
-    $KUBECTL delete -f deploy/examples/basic-gateway.yaml --ignore-not-found
-    $KUBECTL delete -f deploy/serval-gateway.yaml --ignore-not-found
-    $KUBECTL delete -f deploy/serval-router.yaml --ignore-not-found
-    $KUBECTL delete -f deploy/examples/echo-backend.yaml --ignore-not-found
+    $KUBECTL delete -f deploy/examples/k3s/basic-httproute.yaml --ignore-not-found
+    $KUBECTL delete -f deploy/examples/k3s/basic-gateway.yaml --ignore-not-found
+    $KUBECTL delete -f deploy/examples/k3s/serval-gateway.yaml --ignore-not-found
+    $KUBECTL delete -f deploy/examples/k3s/serval-router.yaml --ignore-not-found
+    $KUBECTL delete -f deploy/examples/k3s/echo-backend.yaml --ignore-not-found
 
     log_info "Clean up complete"
 }

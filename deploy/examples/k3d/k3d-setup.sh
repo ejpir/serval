@@ -6,7 +6,7 @@
 # - 2 edge agents (hostNetwork, public-facing)
 # - 2 internal agents (backends, control plane workloads)
 #
-# Usage: ./deploy/k3d-setup.sh [cluster-name]
+# Usage: ./deploy/examples/k3d/k3d-setup.sh [cluster-name]
 
 set -euo pipefail
 
@@ -170,7 +170,7 @@ print_summary() {
     done
     echo ""
     echo "To use this cluster:"
-    echo "  source deploy/k3d-env.sh"
+    echo "  source deploy/examples/k3d/k3d-env.sh"
     echo ""
     echo "Or manually:"
     echo "  export KUBECONFIG=\$(k3d kubeconfig write ${CLUSTER_NAME})"

@@ -1,10 +1,10 @@
 #!/bin/bash
 # Build serval images and load into k3s
-# Usage: ./deploy/build-and-load.sh [component]
+# Usage: ./deploy/examples/k3s/build-and-load.sh [component]
 # Examples:
-#   ./deploy/build-and-load.sh          # Build all
-#   ./deploy/build-and-load.sh router   # Build router only
-#   ./deploy/build-and-load.sh gateway  # Build gateway only
+#   ./deploy/examples/k3s/build-and-load.sh          # Build all
+#   ./deploy/examples/k3s/build-and-load.sh router   # Build router only
+#   ./deploy/examples/k3s/build-and-load.sh gateway  # Build gateway only
 
 set -e
 
@@ -17,7 +17,7 @@ cd "$PROJECT_DIR"
 build_router() {
     echo "=== Building router ==="
     zig build $ZIG_MODE build-router-example
-    sudo docker build -f deploy/Dockerfile.router -t serval-router:latest .
+    sudo docker build -f deploy/examples/k3s/Dockerfile.router -t serval-router:latest .
     sudo docker save serval-router:latest | sudo k3s ctr images import -
     echo "Router image loaded"
 }
@@ -25,7 +25,7 @@ build_router() {
 build_gateway() {
     echo "=== Building gateway ==="
     zig build $ZIG_MODE build-gateway-example
-    sudo docker build -f deploy/Dockerfile.gateway -t serval-gateway:latest .
+    sudo docker build -f deploy/examples/k3s/Dockerfile.gateway -t serval-gateway:latest .
     sudo docker save serval-gateway:latest | sudo k3s ctr images import -
     echo "Gateway image loaded"
 }
@@ -33,7 +33,7 @@ build_gateway() {
 build_echo() {
     echo "=== Building echo-backend ==="
     zig build $ZIG_MODE
-    sudo docker build -f deploy/Dockerfile.echo-backend -t echo-backend:latest .
+    sudo docker build -f deploy/examples/k3s/Dockerfile.echo-backend -t echo-backend:latest .
     sudo docker save echo-backend:latest | sudo k3s ctr images import -
     echo "Echo-backend image loaded"
 }
