@@ -437,14 +437,17 @@ pub fn main() !void {
             .scheduled_delay_ms = 5000,
             .max_export_batch_size = 512,
         });
-        defer otel_processor.shutdown();
         defer otel_processor.deinit();
+        defer otel_processor.shutdown();
 
-        var tracer = otel.OtelTracer.init(
+        // TigerStyle: OtelTracer is ~240KB, requires heap allocation.
+        const tracer = try otel.OtelTracer.create(
+            allocator,
             otel_processor.asSpanProcessor(),
             "serval-lb",
             VERSION,
         );
+        defer tracer.destroy(allocator);
 
         const OtelServerType = serval.Server(
             LbHandler,
@@ -455,7 +458,7 @@ pub fn main() !void {
         // Pass probe_ctx as client_ctx for upstream TLS connections.
         // Same SSL context is used for probing and forwarding.
         // DnsConfig{} uses default TTL (60s) and timeout (5s) values
-        var server = OtelServerType.init(&handler, &pool, &metrics, &tracer, .{
+        var server = OtelServerType.init(&handler, &pool, &metrics, tracer, .{
             .port = args.port,
             .tls = tls_config,
         }, probe_ctx, DnsConfig{});

@@ -70,28 +70,40 @@ pub const OtelTracer = struct {
         in_use: bool,
     };
 
-    /// Initialize the OtelTracer.
-    /// TigerStyle: all state initialized upfront, no runtime allocation.
-    pub fn init(processor: SpanProcessor, scope_name: []const u8, scope_version: []const u8) Self {
+    /// Create a heap-allocated OtelTracer.
+    /// TigerStyle: ~240KB struct requires heap allocation to avoid stack overflow.
+    /// Pairs with destroy() for cleanup.
+    pub fn create(
+        allocator: std.mem.Allocator,
+        processor: SpanProcessor,
+        scope_name: []const u8,
+        scope_version: []const u8,
+    ) !*Self {
         // TigerStyle: assertions on inputs
         std.debug.assert(scope_name.len <= 64);
         std.debug.assert(scope_version.len <= 32);
 
-        var tracer = Self{
-            .spans = undefined,
-            .active_count = 0,
-            .id_generator = RandomIDGenerator.initRandom(),
-            .processor = processor,
-            .scope = InstrumentationScope.init(scope_name, scope_version),
-            .mutex = .{},
-        };
+        const self = try allocator.create(Self);
+        errdefer allocator.destroy(self);
+
+        self.active_count = 0;
+        self.id_generator = RandomIDGenerator.initRandom();
+        self.processor = processor;
+        self.scope = InstrumentationScope.init(scope_name, scope_version);
+        self.mutex = .{};
 
         // Initialize all slots as not in use
-        for (&tracer.spans) |*slot| {
+        for (&self.spans) |*slot| {
             slot.in_use = false;
         }
 
-        return tracer;
+        return self;
+    }
+
+    /// Destroy a heap-allocated OtelTracer.
+    /// TigerStyle: Pairs with create().
+    pub fn destroy(self: *Self, allocator: std.mem.Allocator) void {
+        allocator.destroy(self);
     }
 
     // =========================================================================
@@ -207,6 +219,18 @@ pub const OtelTracer = struct {
         }
     }
 
+    /// Add an event (log) to an active span.
+    pub fn addEvent(self: *Self, handle: SpanHandle, name: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.findSpanBySpanId(handle.span_id)) |slot_index| {
+            self.spans[slot_index].span.addEvent(name) catch |err| {
+                std.log.debug("addEvent failed for span: {}", .{err});
+            };
+        }
+    }
+
     // =========================================================================
     // Internal helpers
     // =========================================================================
@@ -275,7 +299,8 @@ test "OtelTracer implements serval-tracing interface" {
     };
 
     var proc = TestProcessor{};
-    var tracer = OtelTracer.init(proc.asSpanProcessor(), "test-service", "1.0.0");
+    const tracer = try OtelTracer.create(std.testing.allocator, proc.asSpanProcessor(), "test-service", "1.0.0");
+    defer tracer.destroy(std.testing.allocator);
 
     // Start a root span
     const root = tracer.startSpan("root-operation", null);
@@ -292,6 +317,10 @@ test "OtelTracer implements serval-tracing interface" {
     // Set attributes
     tracer.setStringAttribute(root, "http.method", "GET");
     tracer.setIntAttribute(root, "http.status_code", 200);
+
+    // Add events
+    tracer.addEvent(root, "request_started");
+    tracer.addEvent(child, "processing_request");
 
     // End spans
     tracer.endSpan(child, null);
@@ -323,7 +352,8 @@ test "OtelTracer handles error spans" {
     };
 
     var proc = TestProcessor{};
-    var tracer = OtelTracer.init(proc.asSpanProcessor(), "test", "1.0");
+    const tracer = try OtelTracer.create(std.testing.allocator, proc.asSpanProcessor(), "test", "1.0");
+    defer tracer.destroy(std.testing.allocator);
 
     const handle = tracer.startSpan("failing-operation", null);
     tracer.endSpan(handle, "connection timeout");
@@ -346,7 +376,8 @@ test "OtelTracer pool exhaustion returns invalid handle" {
     };
 
     var proc = NoopProcessor{};
-    var tracer = OtelTracer.init(proc.asSpanProcessor(), "test", "1.0");
+    const tracer = try OtelTracer.create(std.testing.allocator, proc.asSpanProcessor(), "test", "1.0");
+    defer tracer.destroy(std.testing.allocator);
 
     // Exhaust the pool
     var handles: [MAX_ACTIVE_SPANS]SpanHandle = undefined;

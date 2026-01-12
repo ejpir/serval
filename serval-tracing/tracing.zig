@@ -72,6 +72,8 @@ pub const NoopTracer = struct {
     pub fn setStringAttribute(_: *@This(), _: SpanHandle, _: []const u8, _: []const u8) void {}
 
     pub fn setIntAttribute(_: *@This(), _: SpanHandle, _: []const u8, _: i64) void {}
+
+    pub fn addEvent(_: *@This(), _: SpanHandle, _: []const u8) void {}
 };
 
 // =============================================================================
@@ -83,6 +85,7 @@ test "NoopTracer compiles and runs" {
     const span = t.startSpan("test", null);
     t.setStringAttribute(span, "key", "value");
     t.setIntAttribute(span, "count", 42);
+    t.addEvent(span, "request_started");
     t.endSpan(span, null);
 }
 

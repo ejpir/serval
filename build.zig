@@ -476,6 +476,7 @@ pub fn build(b: *std.Build) void {
     router_example_mod.addImport("serval-router", serval_router_module);
     router_example_mod.addImport("serval-net", serval_net_module);
     router_example_mod.addImport("serval-cli", serval_cli_module);
+    router_example_mod.addImport("serval-otel", serval_otel_module);
     const router_example = b.addExecutable(.{
         .name = "router_example",
         .root_module = router_example_mod,

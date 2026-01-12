@@ -46,6 +46,10 @@ spec:
         - "80"
         - "--admin-port"
         - "9901"
+        - "--controller-mode"
+        - "--trace"
+        - "--otel-endpoint"
+        - "http://jaeger.default.svc.cluster.local.:4318/v1/traces"
         - "--debug"
         ports:
         - name: http
@@ -94,6 +98,7 @@ metadata:
     app: serval-router
 spec:
   clusterIP: None  # Headless - returns pod IPs directly
+  publishNotReadyAddresses: true  # Include not-ready pods so controller can push initial config
   selector:
     app: serval-router
   ports:

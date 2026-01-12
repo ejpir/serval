@@ -21,6 +21,9 @@
 //!   --admin-port <PORT>          Admin API port (default: 9901)
 //!   --api-backends <HOSTS>       Comma-separated API backend addresses (default: 127.0.0.1:8001)
 //!   --static-backends <HOSTS>    Comma-separated static backend addresses (default: 127.0.0.1:8002)
+//!   --controller-mode            Start without config, wait for controller push via /routes/update
+//!   --trace                      Enable OpenTelemetry tracing
+//!   --otel-endpoint <URL>        OTLP collector endpoint (default: http://localhost:4318/v1/traces)
 //!   --debug                      Enable debug logging
 //!   --help                       Show help message
 //!   --version                    Show version
@@ -30,6 +33,7 @@ const serval = @import("serval");
 const serval_router = @import("serval-router");
 const serval_net = @import("serval-net");
 const cli = @import("serval-cli");
+const otel = @import("serval-otel");
 
 // Local modules
 const config_storage = @import("config_storage.zig");
@@ -42,7 +46,6 @@ const PoolConfig = serval_router.PoolConfig;
 const Upstream = serval_router.Upstream;
 const DnsConfig = serval_net.DnsConfig;
 const RouterHandler = handler.RouterHandler;
-const AdminHandler = admin.AdminHandler;
 
 /// Version of this binary.
 const VERSION = "0.1.0";
@@ -55,6 +58,13 @@ const RouterExtra = struct {
     @"static-backends": []const u8 = "127.0.0.1:8002",
     /// Admin API port for health checks and configuration.
     @"admin-port": u16 = 9901,
+    /// Start without config, wait for controller to push via /routes/update.
+    /// Router will return 503 on /readyz until first config is received.
+    @"controller-mode": bool = false,
+    /// Enable OpenTelemetry tracing (requires collector at otel-endpoint)
+    trace: bool = false,
+    /// OTLP collector endpoint for trace export
+    @"otel-endpoint": []const u8 = "http://localhost:4318/v1/traces",
 };
 
 /// Admin server thread entry point.
@@ -144,23 +154,23 @@ pub fn main() !void {
     // Initialize router in slot 0 of double-buffered storage.
     // TigerStyle: dns_resolver is null since probing is disabled for all pools.
     // Empty allowed_hosts means accept any host.
-    try config_storage.initRouter(&routes, &pool_configs, &.{}, null);
-    defer config_storage.deinitAllRouters();
+    // In controller-mode, skip init - wait for controller to push config via /routes/update.
+    if (!args.extra.@"controller-mode") {
+        try config_storage.initRouter(&routes, &pool_configs, &.{}, null);
 
-    // S2: Postcondition - router must be available after init
-    if (config_storage.getActiveRouter() == null) {
-        std.debug.print("Error: router initialization failed\n", .{});
-        return error.RouterInitFailed;
+        // S2: Postcondition - router must be available after init (only in normal mode)
+        if (config_storage.getActiveRouter() == null) {
+            std.debug.print("Error: router initialization failed\n", .{});
+            return error.RouterInitFailed;
+        }
     }
+    defer config_storage.deinitAllRouters();
 
     // Initialize connection pool
     var pool = serval.SimplePool.init();
 
     // Initialize metrics (noop for simplicity)
     var metrics = serval.NoopMetrics{};
-
-    // Initialize tracer (noop for simplicity)
-    var tracer = serval.NoopTracer{};
 
     // Initialize async IO runtime
     var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
@@ -169,40 +179,10 @@ pub fn main() !void {
 
     var shutdown = std.atomic.Value(bool).init(false);
 
-    // Initialize admin handler and server
-    var admin_handler = AdminHandler{};
+    // Initialize router handler (admin handler initialized with tracer in each branch below)
+    var router_handler = RouterHandler{};
 
-    const AdminServerType = serval.Server(
-        AdminHandler,
-        serval.SimplePool,
-        serval.NoopMetrics,
-        serval.NoopTracer,
-    );
-
-    var admin_pool = serval.SimplePool.init();
-    var admin_metrics = serval.NoopMetrics{};
-    var admin_tracer = serval.NoopTracer{};
-
-    var admin_server = AdminServerType.init(&admin_handler, &admin_pool, &admin_metrics, &admin_tracer, .{
-        .port = args.extra.@"admin-port",
-        .tls = null,
-    }, null, DnsConfig{});
-
-    // Start admin server in separate thread
-    const admin_thread = std.Thread.spawn(.{}, runAdminServer, .{
-        &admin_server,
-        io,
-        &shutdown,
-    }) catch |err| {
-        std.debug.print("Failed to start admin server: {s}\n", .{@errorName(err)});
-        return error.AdminServerFailed;
-    };
-    defer {
-        shutdown.store(true, .release);
-        admin_thread.join();
-    }
-
-    // Print startup info
+    // Print startup info (before creating servers so it's visible regardless of tracing mode)
     std.debug.print("Router listening on :{d}\n", .{args.port});
     std.debug.print("Admin API listening on :{d}\n", .{args.extra.@"admin-port"});
     std.debug.print("  GET /healthz          - liveness probe\n", .{});
@@ -215,33 +195,158 @@ pub fn main() !void {
     std.debug.print("  POST /pools/remove    - remove pool by name\n", .{});
     std.debug.print("  POST /upstreams/add   - add upstream to pool\n", .{});
     std.debug.print("  POST /upstreams/remove - remove upstream from pool\n", .{});
-    std.debug.print("Routes:\n", .{});
-    std.debug.print("  /api/* -> api-pool (strip prefix) ", .{});
-    backends.formatUpstreams(api_upstreams);
-    std.debug.print("\n", .{});
-    std.debug.print("  /static/* -> static-pool (strip prefix) ", .{});
-    backends.formatUpstreams(static_upstreams);
-    std.debug.print("\n", .{});
-    std.debug.print("  (other paths) -> 404 Not Found\n", .{});
+
+    if (args.extra.@"controller-mode") {
+        std.debug.print("Controller mode: ENABLED\n", .{});
+        std.debug.print("  Waiting for controller to push config via POST /routes/update\n", .{});
+        std.debug.print("  /readyz will return 503 until config is received\n", .{});
+    } else {
+        std.debug.print("Routes:\n", .{});
+        std.debug.print("  /api/* -> api-pool (strip prefix) ", .{});
+        backends.formatUpstreams(api_upstreams);
+        std.debug.print("\n", .{});
+        std.debug.print("  /static/* -> static-pool (strip prefix) ", .{});
+        backends.formatUpstreams(static_upstreams);
+        std.debug.print("\n", .{});
+        std.debug.print("  (other paths) -> 404 Not Found\n", .{});
+        std.debug.print("Config generation: {d}\n", .{config_storage.getRouterGeneration()});
+    }
+    std.debug.print("Tracing: {s}\n", .{if (args.extra.trace) args.extra.@"otel-endpoint" else "disabled"});
     std.debug.print("Debug logging: {}\n", .{args.debug});
-    std.debug.print("Config generation: {d}\n", .{config_storage.getRouterGeneration()});
 
-    // Run main server with RouterHandler wrapper.
-    const ServerType = serval.Server(
-        RouterHandler,
-        serval.SimplePool,
-        serval.NoopMetrics,
-        serval.NoopTracer,
-    );
+    // Run servers with appropriate tracer type.
+    // Both admin server and main server share the same tracer.
+    if (args.extra.trace) {
+        // OpenTelemetry tracing enabled for both servers
+        var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+        defer _ = gpa.deinit();
+        const allocator = gpa.allocator();
 
-    var router_handler = RouterHandler{};
-    var server = ServerType.init(&router_handler, &pool, &metrics, &tracer, .{
-        .port = args.port,
-        .tls = null,
-    }, null, DnsConfig{});
+        var otel_exporter = try otel.OTLPExporter.init(allocator, .{
+            .endpoint = args.extra.@"otel-endpoint",
+            .service_name = "serval-router",
+            .service_version = VERSION,
+        });
+        defer otel_exporter.deinit();
 
-    server.run(io, &shutdown) catch |err| {
-        std.debug.print("Server error: {}\n", .{err});
-        return;
-    };
+        var otel_processor = try otel.BatchingProcessor.init(allocator, otel_exporter.asSpanExporter(), .{
+            .scheduled_delay_ms = 5000,
+            .max_export_batch_size = 512,
+        });
+        defer otel_processor.deinit();
+        defer otel_processor.shutdown();
+
+        // TigerStyle: OtelTracer is ~240KB, requires heap allocation.
+        const otel_tracer = try otel.OtelTracer.create(
+            allocator,
+            otel_processor.asSpanProcessor(),
+            "serval-router",
+            VERSION,
+        );
+        defer otel_tracer.destroy(allocator);
+
+        // Server types with OtelTracer
+        const OtelAdminHandler = admin.AdminHandler(otel.OtelTracer);
+        const OtelAdminServerType = serval.Server(
+            OtelAdminHandler,
+            serval.SimplePool,
+            serval.NoopMetrics,
+            otel.OtelTracer,
+        );
+        const OtelRouterServerType = serval.Server(
+            RouterHandler,
+            serval.SimplePool,
+            serval.NoopMetrics,
+            otel.OtelTracer,
+        );
+
+        // Initialize admin handler with tracer
+        var admin_handler = OtelAdminHandler.init(otel_tracer);
+
+        // Initialize admin server
+        var admin_pool = serval.SimplePool.init();
+        var admin_metrics = serval.NoopMetrics{};
+        var admin_server = OtelAdminServerType.init(&admin_handler, &admin_pool, &admin_metrics, otel_tracer, .{
+            .port = args.extra.@"admin-port",
+            .tls = null,
+        }, null, DnsConfig{});
+
+        // Start admin server in separate thread
+        const admin_thread = std.Thread.spawn(.{}, runAdminServer, .{
+            &admin_server,
+            io,
+            &shutdown,
+        }) catch |err| {
+            std.debug.print("Failed to start admin server: {s}\n", .{@errorName(err)});
+            return error.AdminServerFailed;
+        };
+        defer {
+            shutdown.store(true, .release);
+            admin_thread.join();
+        }
+
+        // Initialize and run main server
+        var server = OtelRouterServerType.init(&router_handler, &pool, &metrics, otel_tracer, .{
+            .port = args.port,
+            .tls = null,
+        }, null, DnsConfig{});
+
+        server.run(io, &shutdown) catch |err| {
+            std.debug.print("Server error: {}\n", .{err});
+            return;
+        };
+    } else {
+        // No tracing (default) - both servers use NoopTracer
+        var noop_tracer = serval.NoopTracer{};
+
+        const NoopAdminHandler = admin.AdminHandler(serval.NoopTracer);
+        const NoopAdminServerType = serval.Server(
+            NoopAdminHandler,
+            serval.SimplePool,
+            serval.NoopMetrics,
+            serval.NoopTracer,
+        );
+        const NoopRouterServerType = serval.Server(
+            RouterHandler,
+            serval.SimplePool,
+            serval.NoopMetrics,
+            serval.NoopTracer,
+        );
+
+        // Initialize admin handler with tracer
+        var admin_handler = NoopAdminHandler.init(&noop_tracer);
+
+        // Initialize admin server
+        var admin_pool = serval.SimplePool.init();
+        var admin_metrics = serval.NoopMetrics{};
+        var admin_server = NoopAdminServerType.init(&admin_handler, &admin_pool, &admin_metrics, &noop_tracer, .{
+            .port = args.extra.@"admin-port",
+            .tls = null,
+        }, null, DnsConfig{});
+
+        // Start admin server in separate thread
+        const admin_thread = std.Thread.spawn(.{}, runAdminServer, .{
+            &admin_server,
+            io,
+            &shutdown,
+        }) catch |err| {
+            std.debug.print("Failed to start admin server: {s}\n", .{@errorName(err)});
+            return error.AdminServerFailed;
+        };
+        defer {
+            shutdown.store(true, .release);
+            admin_thread.join();
+        }
+
+        // Initialize and run main server
+        var server = NoopRouterServerType.init(&router_handler, &pool, &metrics, &noop_tracer, .{
+            .port = args.port,
+            .tls = null,
+        }, null, DnsConfig{});
+
+        server.run(io, &shutdown) catch |err| {
+            std.debug.print("Server error: {}\n", .{err});
+            return;
+        };
+    }
 }

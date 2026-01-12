@@ -105,6 +105,11 @@ pub const Watcher = struct {
     temp_gateways: [MAX_GATEWAYS]gw_config.Gateway,
     temp_http_routes: [MAX_HTTP_ROUTES]gw_config.HTTPRoute,
 
+    /// Current config passed to callback.
+    /// TigerStyle: Owned by watcher, valid until next reconcile().
+    /// Slices point into temp_gateways/temp_http_routes storage.
+    current_config: gw_config.GatewayConfig,
+
     /// Storage for temporary hostname slices per route.
     temp_hostnames: [MAX_HTTP_ROUTES][gw_config.MAX_HOSTNAMES][]const u8,
     /// Storage for temporary rules slices per route.
@@ -257,6 +262,7 @@ pub const Watcher = struct {
             .parsed_http_routes_count = 0,
             .temp_gateways = undefined,
             .temp_http_routes = undefined,
+            .current_config = .{ .gateways = &.{}, .http_routes = &.{} },
             .temp_hostnames = undefined,
             .temp_rules = undefined,
             .temp_matches = undefined,
@@ -644,19 +650,21 @@ pub const Watcher = struct {
         std.log.debug("watcher: triggerReconciliation starting", .{});
 
         // Build GatewayConfig from stored resources.
-        var gateway_config = self.reconcile() catch |err| {
+        // TigerStyle: Store in self.current_config so pointer remains valid after this function returns.
+        self.current_config = self.reconcile() catch |err| {
             std.log.err("watcher: reconciliation failed: {s}", .{@errorName(err)});
             return;
         };
 
         std.log.debug("watcher: reconcile complete, gateways={d} routes={d}", .{
-            gateway_config.gateways.len,
-            gateway_config.http_routes.len,
+            self.current_config.gateways.len,
+            self.current_config.http_routes.len,
         });
 
         // Invoke callback with context, new config, and Io for async operations.
+        // TigerStyle: Pass pointer to self-owned config, valid until next reconcile().
         std.log.debug("watcher: invoking on_config_change callback", .{});
-        self.on_config_change(self.callback_context, &gateway_config, io);
+        self.on_config_change(self.callback_context, &self.current_config, io);
         std.log.debug("watcher: on_config_change callback returned", .{});
     }
 

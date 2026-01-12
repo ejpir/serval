@@ -1,0 +1,98 @@
+# Jaeger all-in-one Deployment for tracing
+#
+# Collects traces from serval components via OTLP
+# Provides web UI for trace visualization
+#
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jaeger
+  namespace: default
+  labels:
+    app: jaeger
+    component: observability
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jaeger
+  template:
+    metadata:
+      labels:
+        app: jaeger
+        component: observability
+    spec:
+      # Run on internal nodes (NOT edge nodes)
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: node-role.kubernetes.io/edge
+                operator: DoesNotExist
+      containers:
+      - name: jaeger
+        image: cr.jaegertracing.io/jaegertracing/jaeger:2.14.0
+        ports:
+        - name: ui
+          containerPort: 16686
+          protocol: TCP
+        - name: otlp-grpc
+          containerPort: 4317
+          protocol: TCP
+        - name: otlp-http
+          containerPort: 4318
+          protocol: TCP
+        - name: agent-configs
+          containerPort: 5778
+          protocol: TCP
+        - name: zipkin
+          containerPort: 9411
+          protocol: TCP
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 16686
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 16686
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger
+  namespace: default
+  labels:
+    app: jaeger
+spec:
+  type: ClusterIP
+  selector:
+    app: jaeger
+  ports:
+  - name: ui
+    port: 16686
+    targetPort: 16686
+  - name: otlp-grpc
+    port: 4317
+    targetPort: 4317
+  - name: otlp-http
+    port: 4318
+    targetPort: 4318
+  - name: agent-configs
+    port: 5778
+    targetPort: 5778
+  - name: zipkin
+    port: 9411
+    targetPort: 9411
