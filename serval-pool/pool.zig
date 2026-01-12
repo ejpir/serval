@@ -14,6 +14,7 @@ const UpstreamIndex = config.UpstreamIndex;
 
 // debug
 const serval_core = @import("serval-core");
+const log = serval_core.log.scoped(.pool);
 const debugLog = serval_core.debugLog;
 
 const net = @import("serval-net");
@@ -117,7 +118,7 @@ pub const Connection = struct {
         // Poll with 0 timeout = non-blocking check
         const result = std.posix.poll(&poll_fds, 0) catch |err| {
             // TigerStyle: Log errors instead of silently swallowing
-            std.log.debug("isUnusable poll failed on fd {d}: {s}", .{ fd, @errorName(err) });
+            log.debug("isUnusable poll failed on fd {d}: {s}", .{ fd, @errorName(err) });
             return true; // Assume unusable on error
         };
 

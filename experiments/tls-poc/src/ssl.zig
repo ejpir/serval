@@ -2,6 +2,7 @@
 // Avoids @cImport issues with complex macros
 
 const std = @import("std");
+const log = @import("serval-core").log.scoped(.tls_experiment);
 
 // Opaque types
 pub const SSL_CTX = opaque {};
@@ -115,7 +116,7 @@ pub fn printErrors() void {
     while (err != 0) {
         var buf: [256]u8 = undefined;
         ERR_error_string_n(err, &buf, buf.len);
-        std.log.err("SSL: {s}", .{std.mem.sliceTo(&buf, 0)});
+        log.err("SSL: {s}", .{std.mem.sliceTo(&buf, 0)});
         err = ERR_get_error();
     }
 }

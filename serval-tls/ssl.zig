@@ -6,6 +6,7 @@
 //! Based on validated POC in experiments/tls-poc/.
 
 const std = @import("std");
+const log = @import("serval-core").log.scoped(.tls);
 
 // Opaque types
 pub const SSL_CTX = opaque {};
@@ -232,7 +233,7 @@ pub fn printErrors() void {
         iteration += 1;
         var buf = std.mem.zeroes([256]u8); // S5: zeroed to prevent information leaks
         ERR_error_string_n(err, &buf, buf.len);
-        std.log.err("SSL: {s}", .{std.mem.sliceTo(&buf, 0)});
+        log.err("SSL: {s}", .{std.mem.sliceTo(&buf, 0)});
         err = ERR_get_error();
     }
 }

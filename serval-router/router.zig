@@ -16,6 +16,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const core = @import("serval-core");
+const log = core.log.scoped(.router);
 const net = @import("serval-net");
 const lb = @import("serval-lb");
 const ssl_mod = @import("serval-tls");
@@ -204,13 +205,13 @@ pub const Router = struct {
         assert(self.allowed_hosts.len <= MAX_ALLOWED_HOSTS); // S1: Bounds check
 
         const host = request.headers.getHost();
-        std.log.debug("router: selectUpstream host={s} path={s}", .{ host orelse "(no host)", request.path });
+        log.debug("router: selectUpstream host={s} path={s}", .{ host orelse "(no host)", request.path });
 
         // Validate Host against allowed_hosts (if any configured).
         // RFC 9110 §15.5.20: 421 for requests not intended for this server.
         if (self.allowed_hosts.len > 0) {
             if (!self.isHostAllowed(host)) {
-                std.log.debug("router: host not allowed, rejecting with 421", .{});
+                log.debug("router: host not allowed, rejecting with 421", .{});
                 return .{ .reject = .{
                     .status = 421,
                     .body = "Misdirected Request",
@@ -220,13 +221,13 @@ pub const Router = struct {
 
         // Find matching route - no default fallback
         const route = self.findRoute(request) orelse {
-            std.log.debug("router: no matching route, rejecting with 404", .{});
+            log.debug("router: no matching route, rejecting with 404", .{});
             return .{ .reject = .{
                 .status = 404,
                 .body = "Not Found",
             } };
         };
-        std.log.debug("router: matched route={s} pool_idx={d}", .{ route.name, route.pool_idx });
+        log.debug("router: matched route={s} pool_idx={d}", .{ route.name, route.pool_idx });
 
         // Store rewritten path if strip_prefix enabled
         ctx.rewritten_path = self.rewritePath(route, request.path);
@@ -234,7 +235,7 @@ pub const Router = struct {
         // Delegate to pool's LbHandler for health-aware selection
         assert(route.pool_idx < self.pools.len); // S1: Valid pool index
         const upstream = self.pools[route.pool_idx].lb_handler.selectUpstream(ctx, request);
-        std.log.debug("router: selected upstream host={s} port={d}", .{ upstream.host, upstream.port });
+        log.debug("router: selected upstream host={s} port={d}", .{ upstream.host, upstream.port });
         return .{ .forward = upstream };
     }
 
@@ -280,7 +281,7 @@ pub const Router = struct {
         const host = request.headers.getHost(); // O(1) cached lookup
         const path = request.path;
 
-        std.log.debug("router: findRoute checking {d} routes for host={s} path={s}", .{
+        log.debug("router: findRoute checking {d} routes for host={s} path={s}", .{
             self.routes.len,
             host orelse "(null)",
             path,
@@ -291,7 +292,7 @@ pub const Router = struct {
             const route_host = route.matcher.host orelse "*";
             const route_path = route.matcher.path.getPattern();
             const matched = route.matcher.matches(host, path);
-            std.log.debug("router: route[{d}] name={s} host={s} path={s} matched={}", .{
+            log.debug("router: route[{d}] name={s} host={s} path={s} matched={}", .{
                 i,
                 route.name,
                 route_host,
@@ -303,7 +304,7 @@ pub const Router = struct {
             }
         }
 
-        std.log.debug("router: no matching route found", .{});
+        log.debug("router: no matching route found", .{});
         return null;
     }
 
@@ -363,7 +364,7 @@ pub const Router = struct {
 
         const prefix = switch (route.matcher.path) {
             .prefix => |p| p,
-            .exact => return null, // Exact match: strip_prefix is no-op
+            .exact, .exactPath => return null, // Exact match: strip_prefix is no-op
         };
 
         assert(prefix.len > 0); // S1: Prefix must be non-empty

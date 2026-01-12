@@ -13,12 +13,15 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("serval-core/mod.zig"),
     });
 
-    // TLS module - no dependencies (Layer 1 - Protocol)
+    // TLS module - depends on core for logging (Layer 1 - Protocol)
     // Note: Linking happens per compilation unit (tests, executables)
     // Modules cannot link libraries directly in Zig build system
     const serval_tls_module = b.addModule("serval-tls", .{
         .root_source_file = b.path("serval-tls/mod.zig"),
         .link_libc = true,
+        .imports = &.{
+            .{ .name = "serval-core", .module = serval_core_module },
+        },
     });
 
     // Network utilities - depends on core (for config, time) and tls for TLSSocket

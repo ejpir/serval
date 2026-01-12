@@ -6,7 +6,9 @@
 //! TigerStyle: fixed-size queue, bounded loops, explicit thread safety.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const core = @import("serval-core");
+const log = core.log.scoped(.otel);
 const config = core.config;
 const time = core.time;
 const span_mod = @import("span.zig");
@@ -81,7 +83,7 @@ pub const SimpleProcessor = struct {
 
         var spans = [_]Span{span};
         self.exporter.exportSpans(&spans) catch |err| {
-            std.log.err("SimpleProcessor export failed: {}", .{err});
+            log.err("SimpleProcessor export failed: {}", .{err});
         };
     }
 
@@ -128,9 +130,9 @@ pub const BatchingProcessor = struct {
 
     pub fn init(allocator: std.mem.Allocator, exporter: SpanExporter, cfg: Config) !*Self {
         // TigerStyle: assertions on config values
-        std.debug.assert(cfg.max_export_batch_size > 0);
-        std.debug.assert(cfg.max_export_batch_size <= MAX_EXPORT_BATCH_SIZE);
-        std.debug.assert(cfg.scheduled_delay_ms > 0);
+        assert(cfg.max_export_batch_size > 0);
+        assert(cfg.max_export_batch_size <= MAX_EXPORT_BATCH_SIZE);
+        assert(cfg.scheduled_delay_ms > 0);
 
         const self = try allocator.create(Self);
         self.* = .{
@@ -154,7 +156,7 @@ pub const BatchingProcessor = struct {
 
     pub fn deinit(self: *Self) void {
         // Shutdown should have been called first
-        std.debug.assert(self.export_thread == null);
+        assert(self.export_thread == null);
         self.allocator.destroy(self);
     }
 
@@ -177,7 +179,7 @@ pub const BatchingProcessor = struct {
         // Drop span if queue is full (TigerStyle: bounded, no panic)
         if (self.queue_len >= MAX_QUEUE_SIZE) {
             self.mutex.unlock();
-            std.log.warn("BatchingProcessor queue full, dropping span", .{});
+            log.warn("BatchingProcessor queue full, dropping span", .{});
             return;
         }
 
@@ -258,7 +260,7 @@ pub const BatchingProcessor = struct {
     /// TigerStyle: I/O happens outside critical section to avoid blocking producers.
     /// IMPORTANT: Caller must hold mutex. This function releases it.
     fn exportBatchUnlocked(self: *Self) void {
-        std.debug.assert(self.queue_len > 0); // Precondition
+        assert(self.queue_len > 0); // Precondition
 
         const batch_size = @min(self.queue_len, self.config.max_export_batch_size);
 
@@ -280,7 +282,7 @@ pub const BatchingProcessor = struct {
 
         // Export spans (outside critical section)
         self.exporter.exportSpans(self.export_buffer[0..batch_size]) catch |err| {
-            std.log.err("BatchingProcessor export failed: {}", .{err});
+            log.err("BatchingProcessor export failed: {}", .{err});
         };
     }
 };

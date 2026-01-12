@@ -4,7 +4,9 @@
 //! TigerStyle: fixed-size arrays, explicit bounds, no runtime allocation.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const core = @import("serval-core");
+const log = core.log.scoped(.otel);
 const config = core.config;
 const types = @import("types.zig");
 
@@ -154,7 +156,7 @@ pub const Span = struct {
         scope: InstrumentationScope,
     ) Self {
         // TigerStyle: assertion on name length
-        std.debug.assert(name.len <= MAX_NAME_LEN);
+        assert(name.len <= MAX_NAME_LEN);
 
         var span = Self{
             .span_context = span_context,
@@ -227,7 +229,7 @@ pub const Span = struct {
     /// TigerStyle: logs on failure rather than swallowing errors.
     pub fn setStringAttribute(self: *Self, key: []const u8, value: []const u8) void {
         self.setAttribute(key, AttributeValue.fromString(value)) catch |err| {
-            std.log.debug("setStringAttribute failed for key '{s}': {}", .{ key, err });
+            log.debug("setStringAttribute failed for key '{s}': {}", .{ key, err });
         };
     }
 
@@ -235,7 +237,7 @@ pub const Span = struct {
     /// TigerStyle: logs on failure rather than swallowing errors.
     pub fn setIntAttribute(self: *Self, key: []const u8, value: i64) void {
         self.setAttribute(key, AttributeValue.fromInt(value)) catch |err| {
-            std.log.debug("setIntAttribute failed for key '{s}': {}", .{ key, err });
+            log.debug("setIntAttribute failed for key '{s}': {}", .{ key, err });
         };
     }
 
@@ -243,7 +245,7 @@ pub const Span = struct {
     /// TigerStyle: logs on failure rather than swallowing errors.
     pub fn setBoolAttribute(self: *Self, key: []const u8, value: bool) void {
         self.setAttribute(key, AttributeValue.fromBool(value)) catch |err| {
-            std.log.debug("setBoolAttribute failed for key '{s}': {}", .{ key, err });
+            log.debug("setBoolAttribute failed for key '{s}': {}", .{ key, err });
         };
     }
 
@@ -251,7 +253,7 @@ pub const Span = struct {
     /// TigerStyle: logs on failure rather than swallowing errors.
     pub fn setDoubleAttribute(self: *Self, key: []const u8, value: f64) void {
         self.setAttribute(key, AttributeValue.fromDouble(value)) catch |err| {
-            std.log.debug("setDoubleAttribute failed for key '{s}': {}", .{ key, err });
+            log.debug("setDoubleAttribute failed for key '{s}': {}", .{ key, err });
         };
     }
 

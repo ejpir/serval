@@ -198,6 +198,7 @@
 //!   --version                    Show version
 
 const std = @import("std");
+const assert = std.debug.assert;
 const serval = @import("serval");
 const serval_lb = @import("serval-lb");
 const serval_net = @import("serval-net");
@@ -387,7 +388,7 @@ pub fn main() !void {
     if (args.extra.stats) {
         stats_display_instance = StatsDisplay.init(&metrics, &pool, upstreams);
         try stats_display_instance.?.start();
-        std.debug.assert(stats_display_instance.?.running.load(.acquire));
+        assert(stats_display_instance.?.running.load(.acquire));
     }
     defer if (stats_display_instance) |*sd| sd.stop();
 

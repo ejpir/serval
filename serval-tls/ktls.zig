@@ -18,6 +18,7 @@
 //! - RFC 5246 (TLS 1.2 key derivation)
 
 const std = @import("std");
+const log = @import("serval-core").log.scoped(.tls);
 const builtin = @import("builtin");
 const posix = std.posix;
 const assert = std.debug.assert;
@@ -194,7 +195,7 @@ fn attachTlsULP(fd: i32) bool {
 
     // kTLS is Linux-only
     if (builtin.os.tag != .linux) {
-        std.log.debug("attachTlsULP: kTLS not available (non-Linux platform)", .{});
+        log.debug("attachTlsULP: kTLS not available (non-Linux platform)", .{});
         return false;
     }
 
@@ -214,9 +215,9 @@ fn attachTlsULP(fd: i32) bool {
     if (err != .SUCCESS) {
         if (err == .NOPROTOOPT or err == .NOENT) {
             // kTLS module not loaded or TLS ULP not available
-            std.log.debug("attachTlsULP: kTLS not available ({s})", .{@tagName(err)});
+            log.debug("attachTlsULP: kTLS not available ({s})", .{@tagName(err)});
         } else {
-            std.log.debug("attachTlsULP failed on fd {d}: {s}", .{ fd, @tagName(err) });
+            log.debug("attachTlsULP failed on fd {d}: {s}", .{ fd, @tagName(err) });
         }
         return false;
     }
@@ -236,7 +237,7 @@ fn setKtlsDirection(fd: i32, direction: u32, crypto_info: []const u8) bool {
 
     // kTLS is Linux-only
     if (builtin.os.tag != .linux) {
-        std.log.debug("setKtlsDirection: kTLS not available (non-Linux platform)", .{});
+        log.debug("setKtlsDirection: kTLS not available (non-Linux platform)", .{});
         return false;
     }
 
@@ -254,9 +255,9 @@ fn setKtlsDirection(fd: i32, direction: u32, crypto_info: []const u8) bool {
     const err = posix.errno(rc);
     if (err != .SUCCESS) {
         if (err == .NOPROTOOPT) {
-            std.log.debug("setKtls{s}: kTLS not available (ENOPROTOOPT)", .{direction_name});
+            log.debug("setKtls{s}: kTLS not available (ENOPROTOOPT)", .{direction_name});
         } else {
-            std.log.debug("setKtls{s} failed on fd {d}: {s}", .{ direction_name, fd, @tagName(err) });
+            log.debug("setKtls{s} failed on fd {d}: {s}", .{ direction_name, fd, @tagName(err) });
         }
         return false;
     }
@@ -340,7 +341,7 @@ fn extractKeyMaterial(
         0, // no context
     );
     if (key_result != 1) {
-        std.log.debug("kTLS: Failed to export {s} key material", .{if (is_tx) "TX" else "RX"});
+        log.debug("kTLS: Failed to export {s} key material", .{if (is_tx) "TX" else "RX"});
         return false;
     }
 
@@ -356,7 +357,7 @@ fn extractKeyMaterial(
         0,
     );
     if (iv_result != 1) {
-        std.log.debug("kTLS: Failed to export {s} IV material", .{if (is_tx) "TX" else "RX"});
+        log.debug("kTLS: Failed to export {s} IV material", .{if (is_tx) "TX" else "RX"});
         return false;
     }
 
@@ -537,21 +538,21 @@ pub fn tryEnableKtls(
 
     // Step 1: Check if running on Linux - kTLS is Linux-only
     if (builtin.os.tag != .linux) {
-        std.log.debug("kTLS: Not on Linux, using userspace fallback", .{});
+        log.debug("kTLS: Not on Linux, using userspace fallback", .{});
         return .userspace_fallback;
     }
 
     // Step 2: Get TLS version - must be TLS 1.2 or 1.3
     const tls_version_int: c_int = ssl.SSL_version(ssl_ptr);
     if (tls_version_int != ssl.TLS1_2_VERSION and tls_version_int != ssl.TLS1_3_VERSION) {
-        std.log.debug("kTLS: Unsupported TLS version 0x{x}", .{tls_version_int});
+        log.debug("kTLS: Unsupported TLS version 0x{x}", .{tls_version_int});
         return .userspace_fallback;
     }
     const ktls_version: u16 = @intCast(tls_version_int);
 
     // Step 3: Get current cipher
     const cipher = ssl.SSL_get_current_cipher(ssl_ptr) orelse {
-        std.log.debug("kTLS: No cipher negotiated", .{});
+        log.debug("kTLS: No cipher negotiated", .{});
         return .userspace_fallback;
     };
 
@@ -559,32 +560,32 @@ pub fn tryEnableKtls(
     const cipher_id: u16 = ssl.SSL_CIPHER_get_protocol_id(cipher);
     const ktls_cipher = mapCipherToKtls(cipher_id);
     if (ktls_cipher == .unsupported) {
-        std.log.debug("kTLS: Cipher 0x{x} not supported by kTLS", .{cipher_id});
+        log.debug("kTLS: Cipher 0x{x} not supported by kTLS", .{cipher_id});
         return .userspace_fallback;
     }
 
     // Step 5: Attach TLS ULP (Upper Layer Protocol) to socket
     if (!attachTlsULP(fd)) {
-        std.log.debug("kTLS: Failed to attach TLS ULP (kernel module not loaded?)", .{});
+        log.debug("kTLS: Failed to attach TLS ULP (kernel module not loaded?)", .{});
         return .userspace_fallback;
     }
 
     // Step 6: Configure TX (transmit) crypto
     if (!configureKtlsForDirection(fd, ssl_ptr, ktls_version, ktls_cipher, true)) {
-        std.log.debug("kTLS: Failed to configure TX crypto", .{});
+        log.debug("kTLS: Failed to configure TX crypto", .{});
         return .userspace_fallback;
     }
 
     // Step 7: Configure RX (receive) crypto
     if (!configureKtlsForDirection(fd, ssl_ptr, ktls_version, ktls_cipher, false)) {
-        std.log.debug("kTLS: Failed to configure RX crypto (TX may be enabled)", .{});
+        log.debug("kTLS: Failed to configure RX crypto (TX may be enabled)", .{});
         // Note: TX is already enabled, but RX failed. For simplicity, we fall back
         // to userspace. Production code might want to handle TX-only kTLS mode.
         return .userspace_fallback;
     }
 
     // Step 8: Success - kTLS enabled for both directions
-    std.log.debug("kTLS: Successfully enabled for cipher 0x{x}", .{cipher_id});
+    log.debug("kTLS: Successfully enabled for cipher 0x{x}", .{cipher_id});
     return .ktls_enabled;
 }
 

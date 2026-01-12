@@ -6,6 +6,7 @@
 //! TigerStyle: Fixed-size, no allocation, W3C compliant.
 
 const std = @import("std");
+const assert = std.debug.assert;
 
 /// Lightweight reference to a span.
 /// Uses byte arrays to match W3C Trace Context and OTLP wire format.
@@ -37,7 +38,7 @@ pub const SpanHandle = struct {
             buf[i * 2 + 1] = charset[byte & 0x0f];
         }
         const result = buf[0..32];
-        std.debug.assert(result.len == 32); // Postcondition: always 32 hex chars
+        assert(result.len == 32); // Postcondition: always 32 hex chars
         return result;
     }
 
@@ -49,7 +50,7 @@ pub const SpanHandle = struct {
             buf[i * 2 + 1] = charset[byte & 0x0f];
         }
         const result = buf[0..16];
-        std.debug.assert(result.len == 16); // Postcondition: always 16 hex chars
+        assert(result.len == 16); // Postcondition: always 16 hex chars
         return result;
     }
 };

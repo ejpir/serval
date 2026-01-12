@@ -1,4 +1,5 @@
 const std = @import("std");
+const log = @import("serval-core").log.scoped(.tls_experiment);
 const ssl = @import("ssl.zig");
 const posix = std.posix;
 
@@ -10,8 +11,8 @@ pub fn main() !void {
     const host = "www.google.com";
     const port: u16 = 443;
 
-    std.log.info("=== BoringSSL TLS POC ===", .{});
-    std.log.info("Connecting to {s}:{d}...", .{ host, port });
+    log.info("=== BoringSSL TLS POC ===", .{});
+    log.info("Connecting to {s}:{d}...", .{ host, port });
 
     // Create Io instance
     var threaded = std.Io.Threaded.init(allocator, .{});
@@ -24,7 +25,7 @@ pub fn main() !void {
     // 2. Create SSL_CTX
     const ctx = try ssl.createClientCtx();
     defer ssl.SSL_CTX_free(ctx);
-    std.log.info("SSL_CTX created", .{});
+    log.info("SSL_CTX created", .{});
 
     // 3. Connect using HostName.connect (handles DNS + connect)
     const hostname = try std.Io.net.HostName.init(host);
@@ -32,7 +33,7 @@ pub fn main() !void {
     defer stream.close(io);
 
     const sock: c_int = @intCast(stream.socket.handle);
-    std.log.info("TCP connected, fd={d}", .{sock});
+    log.info("TCP connected, fd={d}", .{sock});
 
     // 6. Create SSL object
     const ssl_conn = try ssl.createSsl(ctx);
@@ -40,7 +41,7 @@ pub fn main() !void {
 
     // 7. Set socket fd
     if (ssl.SSL_set_fd(ssl_conn, sock) != 1) {
-        std.log.err("SSL_set_fd failed", .{});
+        log.err("SSL_set_fd failed", .{});
         return error.SslSetFd;
     }
 
@@ -48,33 +49,33 @@ pub fn main() !void {
     const host_z = try allocator.dupeZ(u8, host);
     defer allocator.free(host_z);
     if (ssl.SSL_set_tlsext_host_name(ssl_conn, host_z) != 1) {
-        std.log.err("SSL_set_tlsext_host_name failed", .{});
+        log.err("SSL_set_tlsext_host_name failed", .{});
         return error.SslSetHostname;
     }
 
     // 9. Set client mode
     ssl.SSL_set_connect_state(ssl_conn);
 
-    std.log.info("Starting TLS handshake...", .{});
+    log.info("Starting TLS handshake...", .{});
 
     // 10. Do handshake
     const ret = ssl.SSL_connect(ssl_conn);
     if (ret != 1) {
         const err = ssl.SSL_get_error(ssl_conn, ret);
-        std.log.err("SSL_connect failed: {d}", .{err});
+        log.err("SSL_connect failed: {d}", .{err});
         ssl.printErrors();
         return error.SslConnect;
     }
 
-    std.log.info("TLS handshake complete!", .{});
+    log.info("TLS handshake complete!", .{});
 
     // Print connection info
     if (ssl.SSL_get_version(ssl_conn)) |v| {
-        std.log.info("TLS version: {s}", .{std.mem.span(v)});
+        log.info("TLS version: {s}", .{std.mem.span(v)});
     }
     if (ssl.SSL_get_current_cipher(ssl_conn)) |cipher| {
         if (ssl.SSL_CIPHER_get_name(cipher)) |cn| {
-            std.log.info("Cipher: {s}", .{std.mem.span(cn)});
+            log.info("Cipher: {s}", .{std.mem.span(cn)});
         }
     }
 
@@ -82,10 +83,10 @@ pub fn main() !void {
     const request = "GET / HTTP/1.1\r\nHost: www.google.com\r\nConnection: close\r\n\r\n";
     const written = ssl.SSL_write(ssl_conn, request.ptr, @intCast(request.len));
     if (written <= 0) {
-        std.log.err("SSL_write failed", .{});
+        log.err("SSL_write failed", .{});
         return error.SslWrite;
     }
-    std.log.info("Sent {d} bytes", .{written});
+    log.info("Sent {d} bytes", .{written});
 
     // 12. Read response
     var buf: [4096]u8 = undefined;
@@ -96,10 +97,10 @@ pub fn main() !void {
         if (n <= 0) {
             const err = ssl.SSL_get_error(ssl_conn, n);
             if (err == ssl.SSL_ERROR_ZERO_RETURN) {
-                std.log.info("Connection closed cleanly", .{});
+                log.info("Connection closed cleanly", .{});
                 break;
             }
-            std.log.info("SSL_read returned {d}, error {d}", .{ n, err });
+            log.info("SSL_read returned {d}, error {d}", .{ n, err });
             break;
         }
         total += @intCast(n);
@@ -111,9 +112,9 @@ pub fn main() !void {
         }
     }
 
-    std.log.info("\nReceived {d} bytes total", .{total});
+    log.info("\nReceived {d} bytes total", .{total});
 
     // 13. Shutdown
     _ = ssl.SSL_shutdown(ssl_conn);
-    std.log.info("Done!", .{});
+    log.info("Done!", .{});
 }

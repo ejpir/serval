@@ -13,6 +13,8 @@
 //! - close: Graceful TLS shutdown
 
 const std = @import("std");
+const log = @import("serval-core").log.scoped(.tls);
+const assert = std.debug.assert;
 const posix = std.posix;
 const ssl = @import("ssl.zig");
 const ktls = @import("ktls.zig");
@@ -36,7 +38,7 @@ pub const Mode = union(enum) {
 /// TigerStyle: Local helper to avoid serval-core dependency (layer isolation).
 fn monotonicNanos() u64 {
     const ts = posix.clock_gettime(.MONOTONIC) catch return 0;
-    std.debug.assert(ts.sec >= 0);
+    assert(ts.sec >= 0);
     const sec_ns: u64 = @as(u64, @intCast(ts.sec)) *% std.time.ns_per_s;
     const nsec: u64 = @intCast(ts.nsec);
     return sec_ns +% nsec;
@@ -115,7 +117,7 @@ pub const TLSStream = struct {
     fn logKtlsStatus(info: *const HandshakeInfo, is_server: bool) void {
         const role = if (is_server) "server" else "client";
         const ktls_status = if (info.ktls_enabled) "enabled" else "disabled";
-        std.log.info("TLS handshake ({s}): ktls={s}, cipher={s}", .{ role, ktls_status, info.cipher() });
+        log.info("TLS handshake ({s}): ktls={s}, cipher={s}", .{ role, ktls_status, info.cipher() });
     }
 
     /// Server-side TLS handshake (client termination).
@@ -126,8 +128,8 @@ pub const TLSStream = struct {
         allocator: Allocator,
     ) !TLSStream {
         // S1: preconditions
-        std.debug.assert(@intFromPtr(ctx) != 0); // S1: precondition - ctx is valid pointer
-        std.debug.assert(fd > 0); // S1: precondition
+        assert(@intFromPtr(ctx) != 0); // S1: precondition - ctx is valid pointer
+        assert(fd > 0); // S1: precondition
 
         const ssl_conn = ssl.SSL_new(ctx) orelse return error.SslNew;
         errdefer ssl.SSL_free(ssl_conn);
@@ -151,9 +153,9 @@ pub const TLSStream = struct {
         }
 
         const end_ns: u64 = monotonicNanos();
-        std.debug.assert(end_ns >= start_ns); // S1: monotonic clock invariant
+        assert(end_ns >= start_ns); // S1: monotonic clock invariant
 
-        std.debug.assert(ssl.SSL_is_init_finished(ssl_conn) == 1); // S1: postcondition
+        assert(ssl.SSL_is_init_finished(ssl_conn) == 1); // S1: postcondition
 
         // Populate handshake info
         var info = HandshakeInfo{};
@@ -184,8 +186,8 @@ pub const TLSStream = struct {
         enable_ktls: bool,
     ) !TLSStream {
         // S1: preconditions
-        std.debug.assert(@intFromPtr(ctx) != 0); // S1: precondition - ctx is valid pointer
-        std.debug.assert(fd > 0); // S1: precondition
+        assert(@intFromPtr(ctx) != 0); // S1: precondition - ctx is valid pointer
+        assert(fd > 0); // S1: precondition
 
         const ssl_conn = ssl.SSL_new(ctx) orelse return error.SslNew;
         errdefer ssl.SSL_free(ssl_conn);
@@ -213,9 +215,9 @@ pub const TLSStream = struct {
         }
 
         const end_ns: u64 = monotonicNanos();
-        std.debug.assert(end_ns >= start_ns); // S1: monotonic clock invariant
+        assert(end_ns >= start_ns); // S1: monotonic clock invariant
 
-        std.debug.assert(ssl.SSL_is_init_finished(ssl_conn) == 1); // S1: postcondition
+        assert(ssl.SSL_is_init_finished(ssl_conn) == 1); // S1: postcondition
 
         // Populate handshake info
         var info = HandshakeInfo{};
@@ -242,8 +244,8 @@ pub const TLSStream = struct {
     /// Returns number of bytes read, or 0 on clean shutdown.
     /// TigerStyle: Explicit switch on mode (no default case).
     pub fn read(self: *TLSStream, buf: []u8) !u32 {
-        std.debug.assert(buf.len > 0); // S1: precondition
-        std.debug.assert(self.fd > 0); // S1: precondition - fd is valid
+        assert(buf.len > 0); // S1: precondition
+        assert(self.fd > 0); // S1: precondition - fd is valid
 
         switch (self.mode) {
             .ktls => {
@@ -259,7 +261,7 @@ pub const TLSStream = struct {
                 };
                 if (n == 0) return 0; // Clean shutdown (EOF)
                 const bytes_read: u32 = @intCast(n);
-                std.debug.assert(bytes_read <= buf.len); // S1: postcondition
+                assert(bytes_read <= buf.len); // S1: postcondition
                 return bytes_read;
             },
             .userspace => |ssl_conn| {
@@ -272,7 +274,7 @@ pub const TLSStream = struct {
                     return error.SslRead;
                 }
                 const bytes_read: u32 = @intCast(n);
-                std.debug.assert(bytes_read <= buf.len); // S1: postcondition
+                assert(bytes_read <= buf.len); // S1: postcondition
                 return bytes_read;
             },
         }
@@ -282,8 +284,8 @@ pub const TLSStream = struct {
     /// Returns number of bytes written.
     /// TigerStyle: Explicit switch on mode (no default case).
     pub fn write(self: *TLSStream, data: []const u8) !u32 {
-        std.debug.assert(data.len > 0); // S1: precondition
-        std.debug.assert(self.fd > 0); // S1: precondition - fd is valid
+        assert(data.len > 0); // S1: precondition
+        assert(self.fd > 0); // S1: precondition - fd is valid
 
         switch (self.mode) {
             .ktls => {
@@ -298,7 +300,7 @@ pub const TLSStream = struct {
                     };
                 };
                 const bytes_written: u32 = @intCast(n);
-                std.debug.assert(bytes_written <= data.len); // S1: postcondition
+                assert(bytes_written <= data.len); // S1: postcondition
                 return bytes_written;
             },
             .userspace => |ssl_conn| {
@@ -307,7 +309,7 @@ pub const TLSStream = struct {
                 if (n <= 0) return error.SslWrite;
 
                 const bytes_written: u32 = @intCast(n);
-                std.debug.assert(bytes_written <= data.len); // S1: postcondition
+                assert(bytes_written <= data.len); // S1: postcondition
                 return bytes_written;
             },
         }
@@ -336,8 +338,8 @@ pub const TLSStream = struct {
 /// Populates version, cipher, resumed, ALPN, and peer certificate info.
 fn populateHandshakeInfo(ssl_conn: *ssl.SSL, info: *HandshakeInfo) void {
     // S1: preconditions
-    std.debug.assert(@intFromPtr(ssl_conn) != 0);
-    std.debug.assert(ssl.SSL_is_init_finished(ssl_conn) == 1);
+    assert(@intFromPtr(ssl_conn) != 0);
+    assert(ssl.SSL_is_init_finished(ssl_conn) == 1);
 
     // TLS version (e.g., "TLSv1.3")
     if (ssl.SSL_get_version(ssl_conn)) |version_ptr| {

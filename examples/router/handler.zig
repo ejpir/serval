@@ -7,6 +7,7 @@
 //! TigerStyle: Wrapper pattern avoids modifying server internals.
 
 const std = @import("std");
+const log = serval.core.log.scoped(.router_example);
 const serval = @import("serval");
 const serval_router = @import("serval-router");
 const config_storage = @import("config_storage.zig");
@@ -25,10 +26,10 @@ pub const RouterHandler = struct {
     /// Returns 503 if no router is available (shouldn't happen in normal operation).
     pub fn selectUpstream(_: *RouterHandler, ctx: *Context, request: *const Request) Router.Action {
         const router = config_storage.getActiveRouter() orelse {
-            std.log.err("RouterHandler: no router available", .{});
+            log.err("RouterHandler: no router available", .{});
             return .{ .reject = .{ .status = 503, .body = "Service Unavailable" } };
         };
-        std.log.debug("RouterHandler: loaded router with {d} routes, {d} allowed_hosts", .{
+        log.debug("RouterHandler: loaded router with {d} routes, {d} allowed_hosts", .{
             router.routes.len,
             router.allowed_hosts.len,
         });

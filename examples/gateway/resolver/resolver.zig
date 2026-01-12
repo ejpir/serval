@@ -7,6 +7,7 @@
 //! TigerStyle: Bounded storage, explicit errors, no allocation after init.
 
 const std = @import("std");
+const log = @import("serval-core").log.scoped(.gateway_resolver);
 const assert = std.debug.assert;
 const gateway = @import("serval-k8s-gateway");
 const gw_config = gateway.config;
@@ -112,7 +113,7 @@ pub const Resolver = struct {
         assert(svc_namespace.len > 0);
         assert(endpoints_json.len > 0);
 
-        std.log.debug("resolver: updateService {s}/{s} json_len={d}", .{ svc_namespace, svc_name, endpoints_json.len });
+        log.debug("resolver: updateService {s}/{s} json_len={d}", .{ svc_namespace, svc_name, endpoints_json.len });
 
         if (svc_name.len > MAX_NAME_LEN) return error.NameTooLong;
         if (svc_namespace.len > MAX_NAME_LEN) return error.NameTooLong;
@@ -145,11 +146,11 @@ pub const Resolver = struct {
         var endpoints_buf: [MAX_ENDPOINTS_PER_SERVICE]StoredEndpoint = undefined;
 
         parseEndpointsJson(endpoints_json, &endpoints_buf, &endpoints_count) catch |err| {
-            std.log.err("resolver: parseEndpointsJson failed: {s}", .{@errorName(err)});
+            log.err("resolver: parseEndpointsJson failed: {s}", .{@errorName(err)});
             return err;
         };
 
-        std.log.debug("resolver: parsed {d} endpoints for {s}/{s}", .{ endpoints_count, svc_namespace, svc_name });
+        log.debug("resolver: parsed {d} endpoints for {s}/{s}", .{ endpoints_count, svc_namespace, svc_name });
 
         // Update slot atomically (copy all fields)
         @memcpy(target.name_storage[0..svc_name.len], svc_name);
@@ -344,7 +345,7 @@ pub const Resolver = struct {
         assert(backend_ref.name.len > 0);
         assert(backend_ref.namespace.len > 0);
 
-        std.log.debug("resolver: resolveBackendRef {s}/{s} port={d}", .{
+        log.debug("resolver: resolveBackendRef {s}/{s} port={d}", .{
             backend_ref.namespace,
             backend_ref.name,
             backend_ref.port,
@@ -353,7 +354,7 @@ pub const Resolver = struct {
         for (&self.services) |*svc| {
             if (svc.matches(backend_ref.name, backend_ref.namespace)) {
                 const count = @min(svc.endpoints_count, @as(u8, @intCast(out_upstreams.len)));
-                std.log.debug("resolver: found service with {d} endpoints", .{count});
+                log.debug("resolver: found service with {d} endpoints", .{count});
                 for (0..count) |i| {
                     const stored_ep = &svc.endpoints[i];
                     // Use backend_ref.port as the target port (service port mapping)
@@ -365,7 +366,7 @@ pub const Resolver = struct {
                 return count;
             }
         }
-        std.log.debug("resolver: service not found", .{});
+        log.debug("resolver: service not found", .{});
         return 0;
     }
 
@@ -416,7 +417,7 @@ pub const Resolver = struct {
         assert(name.len <= gw_config.MAX_NAME_LEN);
         assert(namespace.len <= gw_config.MAX_NAME_LEN);
 
-        std.log.debug("resolveBackend: looking for {s}/{s}, have {d} services", .{
+        log.debug("resolveBackend: looking for {s}/{s}, have {d} services", .{
             namespace,
             name,
             self.serviceCount(),
@@ -425,7 +426,7 @@ pub const Resolver = struct {
         // Debug: list all services we have
         for (&self.services, 0..) |*svc, i| {
             if (svc.active) {
-                std.log.debug("resolveBackend: service[{d}] = {s}/{s} ({d} endpoints)", .{
+                log.debug("resolveBackend: service[{d}] = {s}/{s} ({d} endpoints)", .{
                     i,
                     svc.namespace(),
                     svc.name(),
@@ -436,7 +437,7 @@ pub const Resolver = struct {
 
         // Find service in our registry
         const service_idx = self.findService(name, namespace) orelse {
-            std.log.debug("resolveBackend: service {s}/{s} not found in registry", .{ namespace, name });
+            log.debug("resolveBackend: service {s}/{s} not found in registry", .{ namespace, name });
             return error.ServiceNotFound;
         };
 
@@ -464,7 +465,11 @@ pub const Resolver = struct {
         }
         out.endpoint_count = ep_count;
 
-        assert(out.endpoint_count > 0); // S1: postcondition - found at least one endpoint
+        // Service exists but has no ready endpoints (pods may be starting)
+        if (out.endpoint_count == 0) {
+            log.debug("resolveBackend: service {s}/{s} has no ready endpoints", .{ namespace, name });
+            return error.NoEndpoints;
+        }
     }
 };
 

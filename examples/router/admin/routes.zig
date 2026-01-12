@@ -5,6 +5,7 @@
 //! TigerStyle: Bounded buffers, explicit error handling, validates all input.
 
 const std = @import("std");
+const log = serval.core.log.scoped(.router_example);
 const assert = std.debug.assert;
 
 const serval = @import("serval");
@@ -43,7 +44,7 @@ pub fn handleRouteUpdate(body: ?[]const u8, response_buf: []u8) RouteUpdateResul
 
     // Parse JSON
     const parsed = std.json.parseFromSlice(ConfigJson, std.heap.page_allocator, request_body, .{}) catch |err| {
-        std.log.err("Admin: JSON parse error: {s}", .{@errorName(err)});
+        log.err("Admin: JSON parse error: {s}", .{@errorName(err)});
         return .{ .status = 400, .body = response.errors.json_parse };
     };
     defer parsed.deinit();
@@ -81,7 +82,7 @@ pub fn handleRouteUpdate(body: ?[]const u8, response_buf: []u8) RouteUpdateResul
     const allowed_hosts_slice: []const []const u8 = allowed_hosts[0..allowed_hosts_count];
 
     // Convert routes
-    std.log.debug("handleRouteUpdate: converting {d} routes", .{json_config.routes.len});
+    log.debug("handleRouteUpdate: converting {d} routes", .{json_config.routes.len});
     for (json_config.routes, 0..) |route_json, i| {
         if (route_json.pool_idx >= json_config.pools.len) {
             return .{ .status = 400, .body = response.errors.invalid_pool_idx };
@@ -97,7 +98,7 @@ pub fn handleRouteUpdate(body: ?[]const u8, response_buf: []u8) RouteUpdateResul
             return .{ .status = 400, .body = response.errors.route_needs_path };
         };
 
-        std.log.debug("handleRouteUpdate: route[{d}] name={s} host={s} path={s} pool_idx={d}", .{
+        log.debug("handleRouteUpdate: route[{d}] name={s} host={s} path={s} pool_idx={d}", .{
             i,
             route_json.name,
             route_json.host orelse "(null)",
@@ -118,7 +119,7 @@ pub fn handleRouteUpdate(body: ?[]const u8, response_buf: []u8) RouteUpdateResul
     const routes: []const Route = route_storage[0..json_config.routes.len];
 
     // Convert pools
-    std.log.debug("handleRouteUpdate: converting {d} pools", .{json_config.pools.len});
+    log.debug("handleRouteUpdate: converting {d} pools", .{json_config.pools.len});
     for (json_config.pools, 0..) |pool_json, i| {
         if (pool_json.upstreams.len == 0) {
             return .{ .status = 400, .body = response.errors.pool_no_upstreams };
@@ -128,7 +129,7 @@ pub fn handleRouteUpdate(body: ?[]const u8, response_buf: []u8) RouteUpdateResul
             return .{ .status = 400, .body = response.errors.pool_too_many_upstreams };
         }
 
-        std.log.debug("handleRouteUpdate: pool[{d}] name={s} upstreams={d}", .{
+        log.debug("handleRouteUpdate: pool[{d}] name={s} upstreams={d}", .{
             i,
             pool_json.name,
             pool_json.upstreams.len,
@@ -141,7 +142,7 @@ pub fn handleRouteUpdate(body: ?[]const u8, response_buf: []u8) RouteUpdateResul
                 return .{ .status = 400, .body = response.errors.upstream_idx_max };
             }
 
-            std.log.debug("handleRouteUpdate: pool[{d}] upstream[{d}] host={s} port={d}", .{
+            log.debug("handleRouteUpdate: pool[{d}] upstream[{d}] host={s} port={d}", .{
                 i,
                 j,
                 upstream_json.host,
@@ -171,7 +172,7 @@ pub fn handleRouteUpdate(body: ?[]const u8, response_buf: []u8) RouteUpdateResul
     }
     const pools: []const PoolConfig = pool_storage[0..json_config.pools.len];
 
-    std.log.debug("handleRouteUpdate: calling swapRouter with {d} routes, {d} pools, {d} allowed_hosts", .{
+    log.debug("handleRouteUpdate: calling swapRouter with {d} routes, {d} pools, {d} allowed_hosts", .{
         routes.len,
         pools.len,
         allowed_hosts_slice.len,
@@ -179,19 +180,19 @@ pub fn handleRouteUpdate(body: ?[]const u8, response_buf: []u8) RouteUpdateResul
 
     // Call swapRouter to atomically update configuration
     config_storage.swapRouter(routes, pools, allowed_hosts_slice, null) catch |err| {
-        std.log.err("Admin: swapRouter failed: {s}", .{@errorName(err)});
+        log.err("Admin: swapRouter failed: {s}", .{@errorName(err)});
         return .{ .status = 500, .body = response.errors.swap_failed };
     };
 
     // Verify the swap worked by loading the new router
     const new_router = config_storage.getActiveRouter();
     if (new_router) |r| {
-        std.log.info("handleRouteUpdate: config swap successful - new router has {d} routes, {d} allowed_hosts", .{
+        log.info("handleRouteUpdate: config swap successful - new router has {d} routes, {d} allowed_hosts", .{
             r.routes.len,
             r.allowed_hosts.len,
         });
     } else {
-        std.log.err("handleRouteUpdate: swap succeeded but current_router is null!", .{});
+        log.err("handleRouteUpdate: swap succeeded but current_router is null!", .{});
     }
 
     const generation = config_storage.getRouterGeneration();
@@ -217,7 +218,7 @@ pub fn handleRoutesAdd(body: ?[]const u8, response_buf: []u8) RouteUpdateResult 
 
     // Parse JSON
     const parsed = std.json.parseFromSlice(AddRouteJson, std.heap.page_allocator, request_body, .{}) catch |err| {
-        std.log.err("Admin: JSON parse error: {s}", .{@errorName(err)});
+        log.err("Admin: JSON parse error: {s}", .{@errorName(err)});
         return .{ .status = 400, .body = response.errors.json_parse };
     };
     defer parsed.deinit();
@@ -289,7 +290,7 @@ pub fn handleRoutesAdd(body: ?[]const u8, response_buf: []u8) RouteUpdateResult 
 
     // Swap to new config (preserve existing allowed_hosts from current router)
     config_storage.swapRouter(new_routes, pools, router.allowed_hosts, null) catch |err| {
-        std.log.err("Admin: swapRouter failed: {s}", .{@errorName(err)});
+        log.err("Admin: swapRouter failed: {s}", .{@errorName(err)});
         return .{ .status = 500, .body = response.errors.swap_failed };
     };
 
@@ -316,7 +317,7 @@ pub fn handleRoutesRemove(body: ?[]const u8, response_buf: []u8) RouteUpdateResu
 
     // Parse JSON
     const parsed = std.json.parseFromSlice(RemoveRouteJson, std.heap.page_allocator, request_body, .{}) catch |err| {
-        std.log.err("Admin: JSON parse error: {s}", .{@errorName(err)});
+        log.err("Admin: JSON parse error: {s}", .{@errorName(err)});
         return .{ .status = 400, .body = response.errors.json_parse };
     };
     defer parsed.deinit();
@@ -368,7 +369,7 @@ pub fn handleRoutesRemove(body: ?[]const u8, response_buf: []u8) RouteUpdateResu
 
     // Swap to new config (preserve existing allowed_hosts from current router)
     config_storage.swapRouter(new_routes, pools, router.allowed_hosts, null) catch |err| {
-        std.log.err("Admin: swapRouter failed: {s}", .{@errorName(err)});
+        log.err("Admin: swapRouter failed: {s}", .{@errorName(err)});
         return .{ .status = 500, .body = response.errors.swap_failed };
     };
 

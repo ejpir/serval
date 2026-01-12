@@ -11,6 +11,7 @@ const assert = std.debug.assert;
 
 const serval_client = @import("serval-client");
 const serval_core = @import("serval-core");
+const log = serval_core.log.scoped(.gateway_controller);
 const time = serval_core.time;
 const serval_net = @import("serval-net");
 const gateway = @import("serval-k8s-gateway");
@@ -158,7 +159,7 @@ pub const RouterClient = struct {
         assert(namespace.len > 0);
         assert(service_name.len > 0);
 
-        std.log.debug("router_client: refreshEndpoints for {s}/{s}", .{ namespace, service_name });
+        log.debug("router_client: refreshEndpoints for {s}/{s}", .{ namespace, service_name });
 
         const endpoints = k8s_client_mod.discoverRouterEndpoints(
             k8s,
@@ -167,7 +168,7 @@ pub const RouterClient = struct {
             self.admin_port,
             io,
         ) catch |err| {
-            std.log.warn("router_client: endpoint discovery failed: {s}", .{@errorName(err)});
+            log.warn("router_client: endpoint discovery failed: {s}", .{@errorName(err)});
             // Fall back to single-instance mode
             self.multi_endpoint_mode = false;
             return RouterClientError.EndpointDiscoveryFailed;
@@ -179,7 +180,7 @@ pub const RouterClient = struct {
         self.multi_endpoint_mode = true;
         if (pods_changed) {
             self.endpoints_refreshed = true;
-            std.log.info("router_client: router pods changed, will push config", .{});
+            log.info("router_client: router pods changed, will push config", .{});
         }
 
         // S1: Postcondition
@@ -221,26 +222,26 @@ pub const RouterClient = struct {
         // S1: precondition - config has content
         assert(config_ptr.http_routes.len > 0 or config_ptr.gateways.len > 0);
 
-        std.log.debug("router_client: pushConfig routes={d} gateways={d}", .{
+        log.debug("router_client: pushConfig routes={d} gateways={d}", .{
             config_ptr.http_routes.len,
             config_ptr.gateways.len,
         });
 
         // Count expected backends from config
         const expected_backends = countExpectedBackends(config_ptr);
-        std.log.debug("router_client: expecting {d} backends", .{expected_backends});
+        log.debug("router_client: expecting {d} backends", .{expected_backends});
 
         // Step 1: Resolve backends to IPs
         const resolved_count = self.resolveBackends(config_ptr, resolver) catch |err| {
-            std.log.err("router_client: resolveBackends failed: {s}", .{@errorName(err)});
+            log.err("router_client: resolveBackends failed: {s}", .{@errorName(err)});
             return err;
         };
-        std.log.debug("router_client: resolved {d} backends", .{resolved_count});
+        log.debug("router_client: resolved {d} backends", .{resolved_count});
 
         // Check if all expected backends were resolved
         // Don't push config with unresolved backends - wait for endpoints to arrive
         if (expected_backends > 0 and resolved_count < expected_backends) {
-            std.log.info("router_client: waiting for backends ({d}/{d} resolved)", .{
+            log.info("router_client: waiting for backends ({d}/{d} resolved)", .{
                 resolved_count,
                 expected_backends,
             });
@@ -253,7 +254,7 @@ pub const RouterClient = struct {
             self.resolved_backends[0..resolved_count],
             &self.json_buffer,
         ) catch |err| {
-            std.log.err("router_client: translateToJson failed: {s}", .{@errorName(err)});
+            log.err("router_client: translateToJson failed: {s}", .{@errorName(err)});
             return RouterClientError.TranslationFailed;
         };
 
@@ -263,19 +264,19 @@ pub const RouterClient = struct {
         // Step 3: Check if config changed (skip redundant pushes)
         const config_hash = std.hash.Wyhash.hash(0, self.json_buffer[0..json_len]);
         if (config_hash == self.last_config_hash) {
-            std.log.debug("router_client: config unchanged (hash={x}), skipping push", .{config_hash});
+            log.debug("router_client: config unchanged (hash={x}), skipping push", .{config_hash});
             return;
         }
 
-        std.log.debug("router_client: generated JSON len={d}", .{json_len});
-        std.log.debug("router_client: JSON preview: {s}", .{self.json_buffer[0..@min(500, json_len)]});
+        log.debug("router_client: generated JSON len={d}", .{json_len});
+        log.debug("router_client: JSON preview: {s}", .{self.json_buffer[0..@min(500, json_len)]});
 
         // Step 4: Push to router using serval-client
         try self.sendConfigRequest(self.json_buffer[0..json_len], io);
 
         // Step 5: Update hash after successful push
         self.last_config_hash = config_hash;
-        std.log.info("router_client: config pushed successfully (hash={x})", .{config_hash});
+        log.info("router_client: config pushed successfully (hash={x})", .{config_hash});
     }
 
     /// Push configuration with retry logic.
@@ -348,7 +349,7 @@ pub const RouterClient = struct {
         // S1: precondition - config is valid
         assert(config_ptr.http_routes.len <= gateway.config.MAX_HTTP_ROUTES);
 
-        std.log.debug("resolveBackends: resolver has {d} services", .{resolver.serviceCount()});
+        log.debug("resolveBackends: resolver has {d} services", .{resolver.serviceCount()});
 
         var count: u16 = 0;
 
@@ -356,19 +357,19 @@ pub const RouterClient = struct {
         for (config_ptr.http_routes, 0..) |http_route, route_i| {
             if (route_i >= gateway.config.MAX_HTTP_ROUTES) break;
 
-            std.log.debug("resolveBackends: route[{d}] has {d} rules", .{ route_i, http_route.rules.len });
+            log.debug("resolveBackends: route[{d}] has {d} rules", .{ route_i, http_route.rules.len });
 
             // S3: bounded loop - limited by MAX_RULES
             for (http_route.rules, 0..) |rule, rule_i| {
                 if (rule_i >= gateway.config.MAX_RULES) break;
 
-                std.log.debug("resolveBackends: rule[{d}] has {d} backend_refs", .{ rule_i, rule.backend_refs.len });
+                log.debug("resolveBackends: rule[{d}] has {d} backend_refs", .{ rule_i, rule.backend_refs.len });
 
                 // S3: bounded loop - limited by MAX_BACKEND_REFS
                 for (rule.backend_refs, 0..) |backend_ref, ref_i| {
                     if (ref_i >= gateway.config.MAX_BACKEND_REFS) break;
 
-                    std.log.debug("resolveBackends: trying to resolve backend_ref[{d}]: {s}/{s}:{d}", .{
+                    log.debug("resolveBackends: trying to resolve backend_ref[{d}]: {s}/{s}:{d}", .{
                         ref_i,
                         backend_ref.namespace,
                         backend_ref.name,
@@ -386,7 +387,7 @@ pub const RouterClient = struct {
                         &self.resolved_backends[count],
                     ) catch |err| {
                         // Skip backends that can't be resolved (service not found)
-                        std.log.debug("resolveBackends: failed to resolve {s}/{s}: {s}", .{
+                        log.debug("resolveBackends: failed to resolve {s}/{s}: {s}", .{
                             backend_ref.namespace,
                             backend_ref.name,
                             @errorName(err),
@@ -394,7 +395,7 @@ pub const RouterClient = struct {
                         continue;
                     };
 
-                    std.log.debug("resolveBackends: resolved {s}/{s} with {d} endpoints", .{
+                    log.debug("resolveBackends: resolved {s}/{s} with {d} endpoints", .{
                         backend_ref.namespace,
                         backend_ref.name,
                         self.resolved_backends[count].endpoint_count,
@@ -480,7 +481,7 @@ pub const RouterClient = struct {
             &connect_result.conn,
             &self.response_header_buffer,
         ) catch |err| {
-            std.log.err("router_client: failed to read response from {s}:{d}: {s}", .{
+            log.err("router_client: failed to read response from {s}:{d}: {s}", .{
                 host,
                 port,
                 @errorName(err),
@@ -488,10 +489,10 @@ pub const RouterClient = struct {
             return RouterClientError.ReceiveFailed;
         };
 
-        std.log.debug("router_client: response status={d}", .{response.status});
+        log.debug("router_client: response status={d}", .{response.status});
 
         if (response.status < 200 or response.status >= 300) {
-            std.log.err("router_client: {s}:{d} rejected with status {d}", .{
+            log.err("router_client: {s}:{d} rejected with status {d}", .{
                 host,
                 port,
                 response.status,
@@ -531,7 +532,7 @@ pub const RouterClient = struct {
         if (!self.multi_endpoint_mode or self.router_endpoints.count == 0) {
             result.total = 1;
             self.sendConfigRequest(json_body, io) catch |err| {
-                std.log.err("router_client: push to {s}:{d} failed: {s}", .{
+                log.err("router_client: push to {s}:{d} failed: {s}", .{
                     self.admin_host,
                     self.admin_port,
                     @errorName(err),
@@ -540,7 +541,7 @@ pub const RouterClient = struct {
                 return result;
             };
             result.success_count = 1;
-            std.log.info("router_client: pushed to {s}:{d}", .{ self.admin_host, self.admin_port });
+            log.info("router_client: pushed to {s}:{d}", .{ self.admin_host, self.admin_port });
             return result;
         }
 
@@ -567,7 +568,7 @@ pub const RouterClient = struct {
             endpoints_to_push += 1;
             const ip = endpoint.getIp();
             self.sendConfigToEndpoint(ip, endpoint.port, json_body, io) catch |err| {
-                std.log.warn("router_client: push to {s}:{d} failed: {s}", .{
+                log.warn("router_client: push to {s}:{d} failed: {s}", .{
                     ip,
                     endpoint.port,
                     @errorName(err),
@@ -579,21 +580,21 @@ pub const RouterClient = struct {
             // Record this endpoint as synced (by pod name)
             self.addSyncedEndpoint(endpoint.getPodName());
             result.success_count += 1;
-            std.log.info("router_client: pushed to {s}:{d} (pod={s})", .{ ip, endpoint.port, endpoint.getPodName() });
+            log.info("router_client: pushed to {s}:{d} (pod={s})", .{ ip, endpoint.port, endpoint.getPodName() });
         }
 
         result.total = endpoints_to_push;
 
         // Log summary
         if (result.total == 0) {
-            std.log.debug("router_client: no endpoints to push (all already synced)", .{});
+            log.debug("router_client: no endpoints to push (all already synced)", .{});
         } else if (result.failure_count > 0) {
-            std.log.warn("router_client: config push: {d}/{d} succeeded", .{
+            log.warn("router_client: config push: {d}/{d} succeeded", .{
                 result.success_count,
                 result.total,
             });
         } else if (result.success_count > 0) {
-            std.log.info("router_client: config pushed to {d} routers", .{result.success_count});
+            log.info("router_client: config pushed to {d} routers", .{result.success_count});
         }
 
         // S2: postcondition - counts are consistent
@@ -617,25 +618,25 @@ pub const RouterClient = struct {
         // S1: precondition - config has content
         assert(config_ptr.http_routes.len > 0 or config_ptr.gateways.len > 0);
 
-        std.log.debug("router_client: pushConfigToAll routes={d} gateways={d}", .{
+        log.debug("router_client: pushConfigToAll routes={d} gateways={d}", .{
             config_ptr.http_routes.len,
             config_ptr.gateways.len,
         });
 
         // Count expected backends from config
         const expected_backends = countExpectedBackends(config_ptr);
-        std.log.debug("router_client: expecting {d} backends", .{expected_backends});
+        log.debug("router_client: expecting {d} backends", .{expected_backends});
 
         // Step 1: Resolve backends to IPs
         const resolved_count = self.resolveBackends(config_ptr, resolver) catch |err| {
-            std.log.err("router_client: resolveBackends failed: {s}", .{@errorName(err)});
+            log.err("router_client: resolveBackends failed: {s}", .{@errorName(err)});
             return err;
         };
-        std.log.debug("router_client: resolved {d} backends", .{resolved_count});
+        log.debug("router_client: resolved {d} backends", .{resolved_count});
 
         // Check if all expected backends were resolved
         if (expected_backends > 0 and resolved_count < expected_backends) {
-            std.log.info("router_client: waiting for backends ({d}/{d} resolved)", .{
+            log.info("router_client: waiting for backends ({d}/{d} resolved)", .{
                 resolved_count,
                 expected_backends,
             });
@@ -648,7 +649,7 @@ pub const RouterClient = struct {
             self.resolved_backends[0..resolved_count],
             &self.json_buffer,
         ) catch |err| {
-            std.log.err("router_client: translateToJson failed: {s}", .{@errorName(err)});
+            log.err("router_client: translateToJson failed: {s}", .{@errorName(err)});
             return RouterClientError.TranslationFailed;
         };
 
@@ -660,7 +661,7 @@ pub const RouterClient = struct {
         const config_changed = config_hash != self.last_config_hash;
 
         if (!config_changed and !self.endpoints_refreshed) {
-            std.log.debug("router_client: config unchanged (hash={x}), skipping push", .{config_hash});
+            log.debug("router_client: config unchanged (hash={x}), skipping push", .{config_hash});
             // Return success with 0 endpoints pushed (config unchanged)
             return PushResult{
                 .success_count = 0,
@@ -669,7 +670,7 @@ pub const RouterClient = struct {
             };
         }
 
-        std.log.debug("router_client: generated JSON len={d}", .{json_len});
+        log.debug("router_client: generated JSON len={d}", .{json_len});
 
         // Step 4: Push config
         // - If config changed: clear synced list and push to ALL endpoints (full update)
@@ -677,11 +678,11 @@ pub const RouterClient = struct {
         var result: PushResult = undefined;
 
         if (config_changed) {
-            std.log.info("router_client: config changed, pushing to all endpoints", .{});
+            log.info("router_client: config changed, pushing to all endpoints", .{});
             result = try self.pushToAll(self.json_buffer[0..json_len], io, true);
         } else {
             // Only endpoints refreshed - push incrementally to new endpoints only
-            std.log.info("router_client: endpoints refreshed, pushing to new endpoints only", .{});
+            log.info("router_client: endpoints refreshed, pushing to new endpoints only", .{});
             self.pruneStaleSyncedEndpoints();
             result = try self.pushToAll(self.json_buffer[0..json_len], io, false);
         }
@@ -690,7 +691,7 @@ pub const RouterClient = struct {
         if (result.success_count > 0) {
             self.last_config_hash = config_hash;
             if (config_changed) {
-                std.log.info("router_client: config updated (hash={x})", .{config_hash});
+                log.info("router_client: config updated (hash={x})", .{config_hash});
             }
         }
 
@@ -735,13 +736,13 @@ pub const RouterClient = struct {
 
         // Skip if no config has been pushed yet
         if (self.last_config_hash == 0) {
-            std.log.info("router_client: syncNewEndpoints skipped - no config pushed yet", .{});
+            log.info("router_client: syncNewEndpoints skipped - no config pushed yet", .{});
             return 0;
         }
 
         // Refresh endpoints from K8s
         _ = self.refreshEndpoints(k8s, namespace, service_name, io) catch |err| {
-            std.log.warn("router_client: syncNewEndpoints discovery failed: {s}", .{@errorName(err)});
+            log.warn("router_client: syncNewEndpoints discovery failed: {s}", .{@errorName(err)});
             return err;
         };
 
@@ -763,25 +764,25 @@ pub const RouterClient = struct {
                 if (new_count < MAX_ROUTER_ENDPOINTS) {
                     new_endpoints[new_count] = ep.*;
                     new_count += 1;
-                    std.log.info("router_client: found new endpoint {s}:{d} (pod={s})", .{ ep.getIp(), ep.port, pod_name });
+                    log.info("router_client: found new endpoint {s}:{d} (pod={s})", .{ ep.getIp(), ep.port, pod_name });
                 }
             }
         }
 
         if (new_count == 0) {
-            std.log.info("router_client: no new endpoints to sync (synced={d}, current={d})", .{
+            log.info("router_client: no new endpoints to sync (synced={d}, current={d})", .{
                 self.synced_endpoint_count,
                 self.router_endpoints.count,
             });
             return 0;
         }
 
-        std.log.info("router_client: syncing config to {d} new endpoints", .{new_count});
+        log.info("router_client: syncing config to {d} new endpoints", .{new_count});
 
         // Resolve backends (reuse existing resolution if valid)
         const expected_backends = countExpectedBackends(config_ptr);
         const resolved_count = self.resolveBackends(config_ptr, resolver) catch |err| {
-            std.log.err("router_client: syncNewEndpoints resolveBackends failed: {s}", .{@errorName(err)});
+            log.err("router_client: syncNewEndpoints resolveBackends failed: {s}", .{@errorName(err)});
             return err;
         };
 
@@ -795,7 +796,7 @@ pub const RouterClient = struct {
             self.resolved_backends[0..resolved_count],
             &self.json_buffer,
         ) catch |err| {
-            std.log.err("router_client: syncNewEndpoints translateToJson failed: {s}", .{@errorName(err)});
+            log.err("router_client: syncNewEndpoints translateToJson failed: {s}", .{@errorName(err)});
             return RouterClientError.TranslationFailed;
         };
 
@@ -807,14 +808,14 @@ pub const RouterClient = struct {
             const ip = ep.getIp();
 
             self.sendConfigToEndpoint(ip, ep.port, self.json_buffer[0..json_len], io) catch |err| {
-                std.log.warn("router_client: push to {s}:{d} failed: {s}", .{ ip, ep.port, @errorName(err) });
+                log.warn("router_client: push to {s}:{d} failed: {s}", .{ ip, ep.port, @errorName(err) });
                 continue;
             };
 
             // Record successful sync (by pod name)
             self.addSyncedEndpoint(ep.getPodName());
             success_count += 1;
-            std.log.info("router_client: synced config to {s}:{d} (pod={s})", .{ ip, ep.port, ep.getPodName() });
+            log.info("router_client: synced config to {s}:{d} (pod={s})", .{ ip, ep.port, ep.getPodName() });
         }
 
         // S1: Postcondition

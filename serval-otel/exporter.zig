@@ -9,6 +9,7 @@ const Io = std.Io;
 const assert = std.debug.assert;
 
 const core = @import("serval-core");
+const log = core.log.scoped(.otel);
 const core_config = core.config;
 const core_types = core.types;
 const debugLog = core.debugLog;
@@ -252,14 +253,14 @@ pub const OTLPExporter = struct {
 
         // Parse endpoint URL
         const parsed = parseEndpoint(cfg.endpoint) catch {
-            std.log.err("OTLP: invalid endpoint URL: {s}", .{cfg.endpoint});
+            log.err("OTLP: invalid endpoint URL: {s}", .{cfg.endpoint});
             return error.InvalidEndpoint;
         };
 
         // Create TLS context if needed
         const tls_ctx: ?*ssl.SSL_CTX = if (parsed.tls) blk: {
             break :blk ssl.createClientCtx() catch {
-                std.log.err("OTLP: failed to create TLS context", .{});
+                log.err("OTLP: failed to create TLS context", .{});
                 return error.TlsInitFailed;
             };
         } else null;
@@ -444,7 +445,7 @@ pub const OTLPExporter = struct {
 
         // Connect to upstream
         var connect_result = self.http_client.connect(upstream, io) catch |err| {
-            std.log.err("OTLP: connection failed: {s}", .{@errorName(err)});
+            log.err("OTLP: connection failed: {s}", .{@errorName(err)});
             return error.ConnectionFailed;
         };
         defer connect_result.conn.close();
@@ -460,14 +461,14 @@ pub const OTLPExporter = struct {
 
         // Read response
         const response = client_mod.readResponseHeaders(&connect_result.conn.socket, self.response_buf) catch |err| {
-            std.log.err("OTLP: failed to read response: {s}", .{@errorName(err)});
+            log.err("OTLP: failed to read response: {s}", .{@errorName(err)});
             return error.ExportFailed;
         };
 
         debugLog("OTLP: response status={d}", .{response.status});
 
         if (response.status != 200 and response.status != 202) {
-            std.log.err("OTLP: collector returned status {d}", .{response.status});
+            log.err("OTLP: collector returned status {d}", .{response.status});
             return error.ExportFailed;
         }
 

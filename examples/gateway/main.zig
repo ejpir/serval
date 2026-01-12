@@ -23,6 +23,8 @@
 //! TigerStyle Y1: Functions under 70 lines, extracted helpers.
 
 const std = @import("std");
+const log = @import("serval-core").log.scoped(.gateway);
+const assert = std.debug.assert;
 const Io = std.Io;
 const time = @import("serval-core").time;
 const gateway = @import("serval-k8s-gateway");
@@ -76,8 +78,8 @@ const MAX_CLI_ARGS: u32 = 32;
 fn parseArgs() CliConfig {
     var config = CliConfig{};
     var args = std.process.args();
-    std.debug.assert(config.admin_port > 0); // S1: postcondition - valid default port
-    std.debug.assert(config.data_plane_port > 0); // S1: postcondition - valid default port
+    assert(config.admin_port > 0); // S1: postcondition - valid default port
+    assert(config.data_plane_port > 0); // S1: postcondition - valid default port
 
     // Skip program name
     _ = args.skip();
@@ -126,8 +128,8 @@ fn parseArgs() CliConfig {
         }
     }
 
-    std.debug.assert(config.admin_port > 0); // S1: postcondition - valid port after parsing
-    std.debug.assert(config.namespace.len > 0); // S1: postcondition - namespace always set
+    assert(config.admin_port > 0); // S1: postcondition - valid port after parsing
+    assert(config.namespace.len > 0); // S1: postcondition - namespace always set
     return config;
 }
 
@@ -170,7 +172,7 @@ fn printUsage() void {
 /// Main entry point.
 /// TigerStyle Y1: Under 70 lines with extracted helpers.
 pub fn main() !void {
-    std.log.info("=== MAIN STARTING ===", .{});
+    log.info("=== MAIN STARTING ===", .{});
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -191,9 +193,9 @@ const ShutdownContext = struct {
 
     /// Wait for shutdown and stop admin server.
     fn shutdownAdmin(self: *const ShutdownContext) void {
-        std.debug.assert(@intFromPtr(self.ctrl) != 0); // S1: precondition
+        assert(@intFromPtr(self.ctrl) != 0); // S1: precondition
         waitForShutdown(self.ctrl);
-        std.log.info("shutdown requested, stopping admin server...", .{});
+        log.info("shutdown requested, stopping admin server...", .{});
         self.admin_shutdown.store(true, .release);
         self.admin_thread.join();
     }
@@ -208,19 +210,19 @@ const WatcherResult = struct {
 /// Run the gateway controller.
 /// TigerStyle Y1: Under 70 lines with extracted helpers.
 fn run(allocator: std.mem.Allocator, config: CliConfig) !void {
-    std.debug.assert(config.admin_port > 0); // S1: precondition - valid port
-    std.debug.assert(config.data_plane_port > 0); // S1: precondition - valid port
+    assert(config.admin_port > 0); // S1: precondition - valid port
+    assert(config.data_plane_port > 0); // S1: precondition - valid port
 
     logStartupBanner(config);
 
     // Initialize K8s client first (needed for Controller's StatusManager)
     const k8s_client = initK8sClient(allocator, config) catch |err| {
-        std.log.err("failed to initialize K8s client: {s}", .{@errorName(err)});
-        std.log.info("hint: run inside a K8s pod or provide --api-server and --token", .{});
+        log.err("failed to initialize K8s client: {s}", .{@errorName(err)});
+        log.info("hint: run inside a K8s pod or provide --api-server and --token", .{});
         return;
     };
     defer k8s_client.deinit();
-    std.log.info("K8s client initialized: {s}:{d}", .{ k8s_client.getApiServer(), k8s_client.api_port });
+    log.info("K8s client initialized: {s}:{d}", .{ k8s_client.getApiServer(), k8s_client.api_port });
 
     // Initialize controller (heap-allocated due to ~2.5MB size)
     // Controller now takes K8s client for status updates
@@ -238,16 +240,16 @@ fn run(allocator: std.mem.Allocator, config: CliConfig) !void {
     // This discovers all router pod IPs via EndpointSlice and pushes to all
     if (config.router_service) |service| {
         ctrl.enableMultiEndpoint(config.router_namespace, service);
-        std.log.info("multi-endpoint mode enabled: {s}/{s}", .{ config.router_namespace, service });
+        log.info("multi-endpoint mode enabled: {s}/{s}", .{ config.router_namespace, service });
     }
 
     // Start admin server thread for K8s health probes
     var admin_shutdown = std.atomic.Value(bool).init(false);
     const admin_thread = startAdminServer(ctrl.getAdminHandler(), config.admin_port, &admin_shutdown) catch |err| {
-        std.log.err("failed to start admin server: {s}", .{@errorName(err)});
+        log.err("failed to start admin server: {s}", .{@errorName(err)});
         return err;
     };
-    std.log.info("admin server started on port {d}", .{config.admin_port});
+    log.info("admin server started on port {d}", .{config.admin_port});
 
     const shutdown_ctx = ShutdownContext{
         .ctrl = ctrl,
@@ -265,38 +267,38 @@ fn run(allocator: std.mem.Allocator, config: CliConfig) !void {
     if (ctrl.isMultiEndpointEnabled()) {
         if (std.Thread.spawn(.{}, runEndpointSyncLoop, .{ allocator, ctrl })) |t| {
             sync_thread = t;
-            std.log.info("endpoint sync thread started (interval: 5s)", .{});
+            log.info("endpoint sync thread started (interval: 5s)", .{});
         } else |err| {
-            std.log.warn("failed to start endpoint sync thread: {s}", .{@errorName(err)});
+            log.warn("failed to start endpoint sync thread: {s}", .{@errorName(err)});
         }
     }
 
     // Mark ready and run until shutdown
     ctrl.setReady(true);
-    std.log.info("controller ready, watching for Gateway API resources...", .{});
+    log.info("controller ready, watching for Gateway API resources...", .{});
     waitForShutdown(ctrl);
 
     // Graceful shutdown: stop all threads
-    std.log.info("shutdown requested, stopping services...", .{});
+    log.info("shutdown requested, stopping services...", .{});
     watcher_result.watcher.stop(); // stop() internally joins all watch threads
     if (sync_thread) |t| t.join();
     admin_shutdown.store(true, .release);
     admin_thread.join();
-    std.log.info("gateway controller stopped", .{});
+    log.info("gateway controller stopped", .{});
 }
 
 /// Log startup banner with config info.
 /// TigerStyle Y1: Extracted helper for function length compliance.
 fn logStartupBanner(config: CliConfig) void {
-    std.debug.assert(config.admin_port > 0); // S1: precondition
-    std.debug.assert(config.namespace.len > 0); // S1: precondition
-    std.log.info("=== serval-k8s-gateway v{s} ===", .{VERSION});
-    std.log.info("Admin API: http://localhost:{d}", .{config.admin_port});
-    std.log.info("Data plane: {s}:{d}", .{ config.data_plane_host, config.data_plane_port });
+    assert(config.admin_port > 0); // S1: precondition
+    assert(config.namespace.len > 0); // S1: precondition
+    log.info("=== serval-k8s-gateway v{s} ===", .{VERSION});
+    log.info("Admin API: http://localhost:{d}", .{config.admin_port});
+    log.info("Data plane: {s}:{d}", .{ config.data_plane_host, config.data_plane_port });
     if (config.router_service) |service| {
-        std.log.info("Multi-endpoint mode: {s}/{s} (HA)", .{ config.router_namespace, service });
+        log.info("Multi-endpoint mode: {s}/{s} (HA)", .{ config.router_namespace, service });
     } else {
-        std.log.info("Single-endpoint mode (use --router-service for HA)", .{});
+        log.info("Single-endpoint mode (use --router-service for HA)", .{});
     }
 }
 
@@ -309,19 +311,19 @@ fn initAndStartWatcher(
     shutdown_ctx: *const ShutdownContext,
     controller_name: []const u8,
 ) ?WatcherResult {
-    std.debug.assert(@intFromPtr(k8s_client) != 0); // S1: precondition
-    std.debug.assert(@intFromPtr(ctrl) != 0); // S1: precondition
-    std.debug.assert(controller_name.len > 0); // S1: precondition
+    assert(@intFromPtr(k8s_client) != 0); // S1: precondition
+    assert(@intFromPtr(ctrl) != 0); // S1: precondition
+    assert(controller_name.len > 0); // S1: precondition
 
-    std.log.info("watching namespace: {s}", .{k8s_client.getNamespace()});
-    std.log.info("controller name: {s}", .{controller_name});
+    log.info("watching namespace: {s}", .{k8s_client.getNamespace()});
+    log.info("controller name: {s}", .{controller_name});
 
     // Get resolver from controller for endpoint data updates.
     // Watcher updates resolver when it receives Endpoints events.
     const resolver = ctrl.getResolver();
 
     const watcher = Watcher.init(allocator, k8s_client, onConfigChange, ctrl, resolver, controller_name) catch |err| {
-        std.log.err("failed to initialize watcher: {s}", .{@errorName(err)});
+        log.err("failed to initialize watcher: {s}", .{@errorName(err)});
         shutdown_ctx.shutdownAdmin();
         return null;
     };
@@ -329,7 +331,7 @@ fn initAndStartWatcher(
     // Start spawns parallel watch threads for each resource type.
     // Threads are managed internally; stop() will join all of them.
     watcher.start() catch |err| {
-        std.log.err("failed to start watcher threads: {s}", .{@errorName(err)});
+        log.err("failed to start watcher threads: {s}", .{@errorName(err)});
         watcher.deinit();
         shutdown_ctx.shutdownAdmin();
         return null;
@@ -342,25 +344,25 @@ fn initAndStartWatcher(
 /// TigerStyle: Explicit error handling, logs failures.
 /// Receives Io from watcher thread for async operations (status updates).
 fn onConfigChange(ctx: ?*anyopaque, config_ptr: *gw_config.GatewayConfig, io: Io) void {
-    std.debug.assert(ctx != null); // S1: precondition - context required
-    std.debug.assert(@intFromPtr(config_ptr) != 0); // S1: precondition - valid config pointer
+    assert(ctx != null); // S1: precondition - context required
+    assert(@intFromPtr(config_ptr) != 0); // S1: precondition - valid config pointer
 
     const ctrl: *Controller = @ptrCast(@alignCast(ctx.?));
     ctrl.updateConfig(config_ptr, io) catch |err| {
-        std.log.err("config update failed: {s}", .{@errorName(err)});
+        log.err("config update failed: {s}", .{@errorName(err)});
     };
 }
 
 /// Initialize K8s client based on CLI config or in-cluster defaults.
 /// TigerStyle Y1: Extracted helper for function length compliance.
 fn initK8sClient(allocator: std.mem.Allocator, config: CliConfig) k8s_client_mod.ClientError!*K8sClient {
-    std.debug.assert(config.namespace.len > 0); // S1: precondition - namespace required
-    std.debug.assert(config.api_port > 0); // S1: precondition - valid API port
+    assert(config.namespace.len > 0); // S1: precondition - namespace required
+    assert(config.api_port > 0); // S1: precondition - valid API port
 
     if (config.api_server) |server| {
         // Out-of-cluster: use provided config
         const token = config.token orelse {
-            std.log.err("--token required when using --api-server", .{});
+            log.err("--token required when using --api-server", .{});
             return k8s_client_mod.ClientError.TokenNotFound;
         };
         return K8sClient.initWithConfig(
@@ -379,7 +381,7 @@ fn initK8sClient(allocator: std.mem.Allocator, config: CliConfig) k8s_client_mod
 /// Wait for shutdown signal (Ctrl+C or controller shutdown).
 /// TigerStyle: Bounded sleep loop with explicit exit condition.
 fn waitForShutdown(ctrl: *Controller) void {
-    std.debug.assert(@intFromPtr(ctrl) != 0); // S1: precondition - valid controller pointer
+    assert(@intFromPtr(ctrl) != 0); // S1: precondition - valid controller pointer
 
     const sleep_interval_ns: u64 = 100_000_000; // 100ms
     const max_iterations: u32 = 1_000_000_000; // ~27 hours max (effectively unbounded for practical use)
@@ -400,7 +402,7 @@ fn startAdminServer(
     port: u16,
     shutdown: *std.atomic.Value(bool),
 ) !std.Thread {
-    std.debug.assert(port > 0); // S1: precondition - valid port
+    assert(port > 0); // S1: precondition - valid port
 
     return std.Thread.spawn(.{}, adminServerLoop, .{ handler, port, shutdown });
 }
@@ -414,9 +416,9 @@ fn adminServerLoop(
     port: u16,
     shutdown: *std.atomic.Value(bool),
 ) void {
-    std.debug.assert(port > 0); // S1: precondition - valid port
-    std.debug.assert(@intFromPtr(handler) != 0); // S1: precondition - valid handler pointer
-    std.debug.assert(@intFromPtr(shutdown) != 0); // S1: precondition - valid shutdown flag pointer
+    assert(port > 0); // S1: precondition - valid port
+    assert(@intFromPtr(handler) != 0); // S1: precondition - valid handler pointer
+    assert(@intFromPtr(shutdown) != 0); // S1: precondition - valid shutdown flag pointer
 
     // Initialize async I/O runtime for this thread
     var threaded: Io.Threaded = .init(std.heap.page_allocator, .{});
@@ -442,7 +444,7 @@ fn adminServerLoop(
 
     // Run server until shutdown
     server.run(io, shutdown) catch |err| {
-        std.log.err("admin server error: {s}", .{@errorName(err)});
+        log.err("admin server error: {s}", .{@errorName(err)});
     };
 }
 
@@ -451,7 +453,7 @@ fn adminServerLoop(
 ///
 /// TigerStyle S3: Bounded loop with explicit iteration limit.
 fn runEndpointSyncLoop(allocator: std.mem.Allocator, ctrl: *Controller) void {
-    std.debug.assert(@intFromPtr(ctrl) != 0); // S1: precondition - valid controller pointer
+    assert(@intFromPtr(ctrl) != 0); // S1: precondition - valid controller pointer
 
     // Initialize async I/O runtime for this thread
     var threaded: Io.Threaded = .init(allocator, .{});
@@ -463,7 +465,7 @@ fn runEndpointSyncLoop(allocator: std.mem.Allocator, ctrl: *Controller) void {
     const max_iterations: u32 = 1_000_000_000; // Effectively unbounded
     var iteration: u32 = 0;
 
-    std.log.debug("endpoint sync loop started", .{});
+    log.debug("endpoint sync loop started", .{});
 
     while (iteration < max_iterations) : (iteration += 1) {
         if (ctrl.isShutdown()) break;
@@ -476,11 +478,11 @@ fn runEndpointSyncLoop(allocator: std.mem.Allocator, ctrl: *Controller) void {
         // Sync config to any new router endpoints
         const synced = ctrl.syncRouterEndpoints(io);
         if (synced > 0) {
-            std.log.info("endpoint sync: pushed config to {d} new router(s)", .{synced});
+            log.info("endpoint sync: pushed config to {d} new router(s)", .{synced});
         }
     }
 
-    std.log.debug("endpoint sync loop stopped", .{});
+    log.debug("endpoint sync loop stopped", .{});
 }
 
 test "main module compiles" {

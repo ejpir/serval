@@ -5,6 +5,7 @@
 //! TigerStyle: Single source of truth for time operations.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const posix = std.posix;
 
 // =============================================================================
@@ -73,7 +74,7 @@ pub fn sleep(duration_ns: u64) void {
 pub fn realtimeNanos() i128 {
     const ts = posix.clock_gettime(.REALTIME) catch return 0;
     // TigerStyle: Assert precondition - REALTIME clock should represent valid Unix time.
-    std.debug.assert(ts.sec >= 0);
+    assert(ts.sec >= 0);
     return @as(i128, ts.sec) * ns_per_s + ts.nsec;
 }
 
@@ -88,7 +89,7 @@ pub fn realtimeNanos() i128 {
 pub fn monotonicNanos() u64 {
     const ts = posix.clock_gettime(.MONOTONIC) catch return 0;
     // TigerStyle: Assert precondition - MONOTONIC clock starts at boot, always positive.
-    std.debug.assert(ts.sec >= 0);
+    assert(ts.sec >= 0);
     const sec_ns: u64 = @as(u64, @intCast(ts.sec)) *% ns_per_s;
     const nsec: u64 = @intCast(ts.nsec);
     return sec_ns +% nsec;

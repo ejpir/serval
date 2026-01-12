@@ -5,6 +5,7 @@
 //! TigerStyle: Bounded loops, explicit tracking, ~2 assertions per function.
 
 const std = @import("std");
+const log = @import("serval-core").log.scoped(.gateway_controller);
 const Io = std.Io;
 const assert = std.debug.assert;
 
@@ -97,7 +98,7 @@ pub fn addSyncedEndpoint(
     assert(pod_name.len <= MAX_POD_NAME_LEN); // S1: precondition
 
     if (synced_endpoint_count.* >= MAX_ROUTER_ENDPOINTS) {
-        std.log.warn("router_client: synced endpoint list full, cannot add {s}", .{pod_name});
+        log.warn("router_client: synced endpoint list full, cannot add {s}", .{pod_name});
         return;
     }
 
@@ -165,7 +166,7 @@ pub fn pruneStaleSyncedEndpoints(
     // Replace synced list with pruned version
     const pruned = synced_endpoint_count.* - new_count;
     if (pruned > 0) {
-        std.log.debug("router_client: pruned {d} stale endpoints from synced list", .{pruned});
+        log.debug("router_client: pruned {d} stale endpoints from synced list", .{pruned});
     }
 
     synced_pod_names.* = new_synced_names;

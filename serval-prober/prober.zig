@@ -11,6 +11,7 @@ const posix = std.posix;
 const Io = std.Io;
 
 const core = @import("serval-core");
+const log = core.log.scoped(.prober);
 const net = @import("serval-net");
 const health_mod = @import("serval-health");
 const ssl = @import("serval-tls").ssl;
@@ -114,7 +115,7 @@ fn probeBackend(
     var header_buf: [1024]u8 = std.mem.zeroes([1024]u8);
 
     var result = client.request(upstream, &request, &header_buf, io) catch |err| {
-        std.log.debug("prober: request failed for {s}:{d}: {s}", .{
+        log.debug("prober: request failed for {s}:{d}: {s}", .{
             upstream.host,
             upstream.port,
             @errorName(err),
@@ -128,7 +129,7 @@ fn probeBackend(
     const success = status >= 200 and status < 300;
 
     if (!success) {
-        std.log.debug("prober: non-2xx status {d} for {s}:{d}{s}", .{
+        log.debug("prober: non-2xx status {d} for {s}:{d}{s}", .{
             status,
             upstream.host,
             upstream.port,
@@ -141,7 +142,7 @@ fn probeBackend(
 
 /// Log header setup failure and return false.
 fn logHeaderError(upstream: Upstream) bool {
-    std.log.debug("prober: failed to add header for {s}:{d}", .{ upstream.host, upstream.port });
+    log.debug("prober: failed to add header for {s}:{d}", .{ upstream.host, upstream.port });
     return false;
 }
 

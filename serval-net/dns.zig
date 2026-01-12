@@ -16,6 +16,7 @@ const Io = std.Io;
 const assert = std.debug.assert;
 
 const serval_core = @import("serval-core");
+const log = serval_core.log.scoped(.net);
 const config = serval_core.config;
 const time = serval_core.time;
 const debugLog = serval_core.debugLog;
@@ -430,7 +431,7 @@ pub const DnsResolver = struct {
         debugLog("DNS: starting lookup for '{s}' port={d}", .{ hostname, port });
 
         const host = Io.net.HostName.init(hostname) catch |err| {
-            std.log.err("DNS: HostName.init failed for '{s}': {s}", .{ hostname, @errorName(err) });
+            log.err("DNS: HostName.init failed for '{s}': {s}", .{ hostname, @errorName(err) });
             return err;
         };
 
@@ -489,7 +490,7 @@ pub const DnsResolver = struct {
             error.Canceled => return error.Canceled,
             error.Closed => {
                 lookup_future.await(io) catch |lookup_err| {
-                    std.log.err("DNS: lookup_future.await returned error: {s}", .{@errorName(lookup_err)});
+                    log.err("DNS: lookup_future.await returned error: {s}", .{@errorName(lookup_err)});
                     return lookup_err;
                 };
                 return error.UnknownHostName;
@@ -558,7 +559,7 @@ pub const DnsResolver = struct {
         debugLog("DNS: starting resolveAll lookup for '{s}' port={d}", .{ hostname, port });
 
         const host = Io.net.HostName.init(hostname) catch |err| {
-            std.log.err("DNS: HostName.init failed for '{s}': {s}", .{ hostname, @errorName(err) });
+            log.err("DNS: HostName.init failed for '{s}': {s}", .{ hostname, @errorName(err) });
             return err;
         };
 
@@ -582,7 +583,7 @@ pub const DnsResolver = struct {
 
         if (out.count == 0) {
             lookup_future.await(io) catch |lookup_err| {
-                std.log.err("DNS: lookup_future.await returned error: {s}", .{@errorName(lookup_err)});
+                log.err("DNS: lookup_future.await returned error: {s}", .{@errorName(lookup_err)});
                 return lookup_err;
             };
             return error.UnknownHostName;
@@ -655,14 +656,14 @@ pub const DnsResolver = struct {
     fn logResolvConf(io: Io) void {
         _ = io;
         const fd = std.posix.open("/etc/resolv.conf", .{}, 0) catch |err| {
-            std.log.warn("DNS debug: cannot open /etc/resolv.conf: {s}", .{@errorName(err)});
+            log.warn("DNS debug: cannot open /etc/resolv.conf: {s}", .{@errorName(err)});
             return;
         };
         defer std.posix.close(fd);
 
         var buf: [1024]u8 = undefined;
         const bytes_read = std.posix.read(fd, &buf) catch |err| {
-            std.log.warn("DNS debug: cannot read /etc/resolv.conf: {s}", .{@errorName(err)});
+            log.warn("DNS debug: cannot read /etc/resolv.conf: {s}", .{@errorName(err)});
             return;
         };
 

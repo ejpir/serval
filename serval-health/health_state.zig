@@ -5,6 +5,7 @@
 //! TigerStyle: Cache-line aligned, no allocation, bounded loops.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const config = @import("serval-core").config;
 
 pub const MAX_UPSTREAMS: u8 = config.MAX_UPSTREAMS;
@@ -36,14 +37,14 @@ pub const HealthState = struct {
 
     // Compile-time verification
     comptime {
-        std.debug.assert(@alignOf(HealthState) == CACHE_LINE_BYTES);
-        std.debug.assert(MAX_UPSTREAMS <= 64); // Bitmap is u64
+        assert(@alignOf(HealthState) == CACHE_LINE_BYTES);
+        assert(MAX_UPSTREAMS <= 64); // Bitmap is u64
     }
 
     /// Compute bitmask for first `count` backends.
     /// Returns mask where bits 0..(count-1) are set.
     fn backendMask(count: u8) u64 {
-        std.debug.assert(count <= MAX_UPSTREAMS);
+        assert(count <= MAX_UPSTREAMS);
         if (count == 0) return 0;
         if (count >= 64) return std.math.maxInt(u64);
         return (@as(u64, 1) << @as(u6, @intCast(count))) - 1;
@@ -52,9 +53,9 @@ pub const HealthState = struct {
     /// Initialize with backend count and thresholds.
     /// Only first backend_count backends start healthy.
     pub fn init(backend_count: u8, unhealthy_threshold: u8, healthy_threshold: u8) HealthState {
-        std.debug.assert(backend_count <= MAX_UPSTREAMS);
-        std.debug.assert(unhealthy_threshold > 0);
-        std.debug.assert(healthy_threshold > 0);
+        assert(backend_count <= MAX_UPSTREAMS);
+        assert(unhealthy_threshold > 0);
+        assert(healthy_threshold > 0);
 
         return HealthState{
             .health_bitmap = std.atomic.Value(u64).init(backendMask(backend_count)),
@@ -70,7 +71,7 @@ pub const HealthState = struct {
     /// Resets failure counter; increments success counter if unhealthy.
     /// Transitions to healthy when success threshold is reached.
     pub inline fn recordSuccess(self: *HealthState, idx: UpstreamIndex) void {
-        std.debug.assert(idx < self.backend_count);
+        assert(idx < self.backend_count);
 
         // Reset failure counter on any success
         self.failure_counts[idx] = 0;
@@ -93,7 +94,7 @@ pub const HealthState = struct {
     /// Resets success counter; increments failure counter if healthy.
     /// Transitions to unhealthy when failure threshold is reached.
     pub inline fn recordFailure(self: *HealthState, idx: UpstreamIndex) void {
-        std.debug.assert(idx < self.backend_count);
+        assert(idx < self.backend_count);
 
         // Reset success counter on any failure
         self.success_counts[idx] = 0;
@@ -114,7 +115,7 @@ pub const HealthState = struct {
 
     /// Check if backend is healthy (atomic read).
     pub inline fn isHealthy(self: *const HealthState, idx: UpstreamIndex) bool {
-        std.debug.assert(idx < self.backend_count);
+        assert(idx < self.backend_count);
         const bitmap = self.health_bitmap.load(.acquire);
         const mask: u64 = @as(u64, 1) << idx;
         return (bitmap & mask) != 0;
@@ -141,14 +142,14 @@ pub const HealthState = struct {
         while (bitmap != 0 and iterations < MAX_UPSTREAMS) : (iterations += 1) {
             const lowest_bit_pos: u7 = @ctz(bitmap);
             if (remaining == 0) {
-                std.debug.assert(lowest_bit_pos < 64);
+                assert(lowest_bit_pos < 64);
                 return @intCast(lowest_bit_pos);
             }
             bitmap &= bitmap - 1;
             remaining -= 1;
         }
 
-        std.debug.assert(false);
+        assert(false);
         return null;
     }
 
@@ -158,27 +159,27 @@ pub const HealthState = struct {
         var bitmap = self.health_bitmap.load(.acquire) & backendMask(self.backend_count);
 
         if (exclude_idx) |idx| {
-            std.debug.assert(idx < self.backend_count);
+            assert(idx < self.backend_count);
             bitmap &= ~(@as(u64, 1) << idx);
         }
 
         if (bitmap == 0) return null;
 
         const first: u7 = @ctz(bitmap);
-        std.debug.assert(first < 64);
+        assert(first < 64);
         return @intCast(first);
     }
 
     /// Mark backend as healthy (atomic set bit).
     fn markHealthy(self: *HealthState, idx: UpstreamIndex) void {
-        std.debug.assert(idx < self.backend_count);
+        assert(idx < self.backend_count);
         const mask: u64 = @as(u64, 1) << idx;
         _ = self.health_bitmap.fetchOr(mask, .release);
     }
 
     /// Mark backend as unhealthy (atomic clear bit).
     fn markUnhealthy(self: *HealthState, idx: UpstreamIndex) void {
-        std.debug.assert(idx < self.backend_count);
+        assert(idx < self.backend_count);
         const mask: u64 = @as(u64, 1) << idx;
         _ = self.health_bitmap.fetchAnd(~mask, .release);
     }

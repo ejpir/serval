@@ -88,6 +88,7 @@ pub const ConfigStorage = struct {
                 .path = switch (route.matcher.path) {
                     .prefix => |p| .{ .prefix = try self.copyString(p) },
                     .exact => |e| .{ .exact = try self.copyString(e) },
+                    .exactPath => |e| .{ .exactPath = try self.copyString(e) },
                 },
             },
             .pool_idx = route.pool_idx,

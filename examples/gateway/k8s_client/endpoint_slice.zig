@@ -7,6 +7,7 @@
 //! TigerStyle: Bounded arrays, explicit errors, no allocation after init.
 
 const std = @import("std");
+const log = @import("serval-core").log.scoped(.gateway_k8s_client);
 const assert = std.debug.assert;
 const Io = std.Io;
 
@@ -223,23 +224,23 @@ pub fn discoverRouterEndpoints(
         return EndpointSliceError.UrlTooLarge;
     };
 
-    std.log.debug("endpoint_slice: GET {s}", .{url});
+    log.debug("endpoint_slice: GET {s}", .{url});
 
     // Make K8s API request
     const response_json = k8s.get(url, io) catch |err| {
-        std.log.err("endpoint_slice: K8s API request failed: {s}", .{@errorName(err)});
+        log.err("endpoint_slice: K8s API request failed: {s}", .{@errorName(err)});
         return EndpointSliceError.RequestFailed;
     };
 
-    std.log.debug("endpoint_slice: got response len={d}", .{response_json.len});
+    log.debug("endpoint_slice: got response len={d}", .{response_json.len});
 
     // Parse EndpointSlice list response
     const endpoints = parseEndpointSliceList(response_json, admin_port) catch |err| {
-        std.log.err("endpoint_slice: parse failed: {s}", .{@errorName(err)});
+        log.err("endpoint_slice: parse failed: {s}", .{@errorName(err)});
         return err;
     };
 
-    std.log.info("endpoint_slice: discovered {d} endpoints", .{endpoints.count});
+    log.info("endpoint_slice: discovered {d} endpoints", .{endpoints.count});
     return endpoints;
 }
 
@@ -272,7 +273,7 @@ fn parseEndpointSliceList(
 
     // Parse JSON
     const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, json_data, .{}) catch {
-        std.log.err("endpoint_slice: JSON parse failed", .{});
+        log.err("endpoint_slice: JSON parse failed", .{});
         return EndpointSliceError.ParseFailed;
     };
     defer parsed.deinit();
@@ -281,12 +282,12 @@ fn parseEndpointSliceList(
 
     // Get items array
     const items = root.object.get("items") orelse {
-        std.log.debug("endpoint_slice: no 'items' field in response", .{});
+        log.debug("endpoint_slice: no 'items' field in response", .{});
         return EndpointSliceError.NoEndpointsFound;
     };
 
     if (items != .array) {
-        std.log.debug("endpoint_slice: 'items' is not an array", .{});
+        log.debug("endpoint_slice: 'items' is not an array", .{});
         return EndpointSliceError.ParseFailed;
     }
 
@@ -305,7 +306,7 @@ fn parseEndpointSliceList(
 
         // Parse endpoints from this slice
         parseEndpointsFromSlice(slice_item.object, target_port, &result) catch |err| {
-            std.log.debug("endpoint_slice: parseEndpointsFromSlice failed: {s}", .{@errorName(err)});
+            log.debug("endpoint_slice: parseEndpointsFromSlice failed: {s}", .{@errorName(err)});
             continue;
         };
     }
@@ -313,7 +314,7 @@ fn parseEndpointSliceList(
     // S1: Postcondition
     assert(result.count <= MAX_ROUTER_ENDPOINTS);
 
-    std.log.info("endpoint_slice: discovered {d} router endpoints", .{result.count});
+    log.info("endpoint_slice: discovered {d} router endpoints", .{result.count});
 
     if (result.count == 0) {
         return EndpointSliceError.NoEndpointsFound;
@@ -402,7 +403,7 @@ fn parseEndpointsFromSlice(
             const ip_str = addr_item.string;
 
             if (ip_str.len > MAX_IP_LEN) {
-                std.log.warn("endpoint_slice: IP too long: {d} chars", .{ip_str.len});
+                log.warn("endpoint_slice: IP too long: {d} chars", .{ip_str.len});
                 continue;
             }
 
@@ -416,7 +417,7 @@ fn parseEndpointsFromSlice(
             endpoint.ready = ready;
             result.count += 1;
 
-            std.log.debug("endpoint_slice: found endpoint {s}:{d} pod={s} ready={}", .{
+            log.debug("endpoint_slice: found endpoint {s}:{d} pod={s} ready={}", .{
                 ip_str,
                 target_port,
                 if (pod_name) |n| n else "<unknown>",
@@ -437,7 +438,7 @@ fn getPodName(endpoint_obj: std.json.ObjectMap) ?[]const u8 {
     if (name != .string) return null;
 
     if (name.string.len > MAX_POD_NAME_LEN) {
-        std.log.warn("endpoint_slice: pod name too long: {d} chars", .{name.string.len});
+        log.warn("endpoint_slice: pod name too long: {d} chars", .{name.string.len});
         return null;
     }
 

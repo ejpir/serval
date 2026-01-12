@@ -9,6 +9,7 @@
 //! is watched in a separate thread to avoid blocking on long-running watch streams.
 
 const std = @import("std");
+const log = @import("serval-core").log.scoped(.gateway_watcher);
 const assert = std.debug.assert;
 const posix = std.posix;
 const Io = std.Io;
@@ -320,7 +321,7 @@ pub const Watcher = struct {
 
         self.running.store(true, .release);
 
-        std.log.debug("watcher: starting {d} watch threads", .{RESOURCE_TYPE_COUNT});
+        log.debug("watcher: starting {d} watch threads", .{RESOURCE_TYPE_COUNT});
 
         // Spawn a thread for each resource type.
         // TigerStyle: Bounded loop, explicit iteration.
@@ -350,14 +351,14 @@ pub const Watcher = struct {
             const resource_type = resource_types[spawned_count];
             const thread_idx = spawned_count;
 
-            std.log.debug("watcher: spawning thread for {s}", .{resource_type.getName()});
+            log.debug("watcher: spawning thread for {s}", .{resource_type.getName()});
 
             self.watch_threads[thread_idx] = std.Thread.spawn(
                 .{},
                 watchThreadLoop,
                 .{ self, resource_type, thread_idx },
             ) catch |err| {
-                std.log.err("watcher: failed to spawn thread for {s}: {s}", .{
+                log.err("watcher: failed to spawn thread for {s}: {s}", .{
                     resource_type.getName(),
                     @errorName(err),
                 });
@@ -365,19 +366,19 @@ pub const Watcher = struct {
             };
 
             _ = self.active_thread_count.fetchAdd(1, .acq_rel);
-            std.log.info("watcher: thread {d} spawned for {s}", .{ thread_idx, resource_type.getName() });
+            log.info("watcher: thread {d} spawned for {s}", .{ thread_idx, resource_type.getName() });
         }
 
         // S1: Postconditions
         assert(self.running.load(.acquire)); // running flag set
         assert(self.active_thread_count.load(.acquire) == RESOURCE_TYPE_COUNT); // all threads spawned
-        std.log.debug("watcher: all {d} watch threads started", .{RESOURCE_TYPE_COUNT});
+        log.debug("watcher: all {d} watch threads started", .{RESOURCE_TYPE_COUNT});
     }
 
     /// Stop watching gracefully and wait for all threads to finish.
     /// TigerStyle: Explicit cleanup, bounded wait for threads.
     pub fn stop(self: *Self) void {
-        std.log.debug("watcher: stopping, signaling threads to exit", .{});
+        log.debug("watcher: stopping, signaling threads to exit", .{});
         self.running.store(false, .release);
 
         // Wait for all watch threads to finish.
@@ -385,7 +386,7 @@ pub const Watcher = struct {
         var thread_idx: u8 = 0;
         while (thread_idx < RESOURCE_TYPE_COUNT) : (thread_idx += 1) {
             if (self.watch_threads[thread_idx]) |thread| {
-                std.log.debug("watcher: joining thread {d}", .{thread_idx});
+                log.debug("watcher: joining thread {d}", .{thread_idx});
                 thread.join();
                 self.watch_threads[thread_idx] = null;
                 _ = self.active_thread_count.fetchSub(1, .acq_rel);
@@ -395,7 +396,7 @@ pub const Watcher = struct {
         // S1: Postconditions
         assert(!self.running.load(.acquire)); // running flag cleared
         assert(self.active_thread_count.load(.acquire) == 0); // all threads stopped
-        std.log.debug("watcher: all threads stopped", .{});
+        log.debug("watcher: all threads stopped", .{});
     }
 
     /// Per-thread watch loop for a single resource type.
@@ -406,22 +407,22 @@ pub const Watcher = struct {
         assert(self.running.load(.acquire)); // S1: precondition - watcher is running
 
         const resource_name = resource_type.getName();
-        std.log.info("watcher: thread {d} STARTING for {s}", .{ thread_idx, resource_name });
+        log.info("watcher: thread {d} STARTING for {s}", .{ thread_idx, resource_name });
 
         // Initialize Io runtime for this thread's HTTP client operations.
         // TigerStyle: One-time initialization at thread start.
-        std.log.info("watcher: thread {d} initializing Io runtime...", .{thread_idx});
+        log.info("watcher: thread {d} initializing Io runtime...", .{thread_idx});
         var io_runtime = Io.Threaded.init(self.allocator, .{});
         defer io_runtime.deinit();
         const io = io_runtime.io();
-        std.log.info("watcher: thread {d} Io runtime ready", .{thread_idx});
+        log.info("watcher: thread {d} Io runtime ready", .{thread_idx});
 
         var reconnect_attempts: u32 = 0;
 
         // Watch loop with reconnection.
         // TigerStyle: Bounded reconnect attempts, explicit backoff.
         while (self.running.load(.acquire) and reconnect_attempts < MAX_RECONNECT_ATTEMPTS) {
-            std.log.debug("watcher: thread {d} watch iteration, attempt={d}", .{ thread_idx, reconnect_attempts });
+            log.debug("watcher: thread {d} watch iteration, attempt={d}", .{ thread_idx, reconnect_attempts });
 
             const watch_success = self.watchResourceType(resource_type, thread_idx, io);
 
@@ -437,14 +438,14 @@ pub const Watcher = struct {
         }
 
         if (reconnect_attempts >= MAX_RECONNECT_ATTEMPTS) {
-            std.log.err("watcher: thread {d} ({s}) max reconnection attempts ({d}) exceeded", .{
+            log.err("watcher: thread {d} ({s}) max reconnection attempts ({d}) exceeded", .{
                 thread_idx,
                 resource_name,
                 MAX_RECONNECT_ATTEMPTS,
             });
         }
 
-        std.log.debug("watcher: thread {d} ({s}) exiting", .{ thread_idx, resource_name });
+        log.debug("watcher: thread {d} ({s}) exiting", .{ thread_idx, resource_name });
     }
 
     /// Watch a single resource type using its dedicated thread buffer.
@@ -472,7 +473,7 @@ pub const Watcher = struct {
             .secret => self.secrets.getLatestResourceVersion(),
         };
 
-        std.log.debug("watcher: thread {d} watchResourceType {s} rv={s}", .{
+        log.debug("watcher: thread {d} watchResourceType {s} rv={s}", .{
             thread_idx,
             resource_name,
             if (rv.len > 0) rv else "(none)",
@@ -480,32 +481,32 @@ pub const Watcher = struct {
 
         const watch_url = if (rv.len > 0)
             std.fmt.bufPrint(&url_buffer, "{s}?watch=true&resourceVersion={s}", .{ path, rv }) catch {
-                std.log.err("watcher: URL buffer overflow for {s}", .{path});
+                log.err("watcher: URL buffer overflow for {s}", .{path});
                 return false;
             }
         else
             std.fmt.bufPrint(&url_buffer, "{s}?watch=true", .{path}) catch {
-                std.log.err("watcher: URL buffer overflow for {s}", .{path});
+                log.err("watcher: URL buffer overflow for {s}", .{path});
                 return false;
             };
 
-        std.log.debug("watcher: thread {d} starting watch stream URL={s}", .{ thread_idx, watch_url });
+        log.debug("watcher: thread {d} starting watch stream URL={s}", .{ thread_idx, watch_url });
 
         // Start watch stream.
         var stream = self.client.watch(watch_url);
         defer stream.close(); // TigerStyle: Explicit cleanup paired with creation.
 
-        std.log.debug("watcher: thread {d} watch stream created, reading events...", .{thread_idx});
+        log.debug("watcher: thread {d} watch stream created, reading events...", .{thread_idx});
 
         // Process events until stream ends or error.
         // TigerStyle: Bounded loop with explicit iteration limit.
         var events_processed: u32 = 0;
         while (events_processed < MAX_EVENTS_PER_ITERATION and self.running.load(.acquire)) {
-            std.log.debug("watcher: thread {d} iteration {d}, calling readEvent...", .{ thread_idx, events_processed });
+            log.debug("watcher: thread {d} iteration {d}, calling readEvent...", .{ thread_idx, events_processed });
 
             // Read next event line using thread-specific buffer.
             const event_data = stream.readEvent(line_buffer, io) catch |err| {
-                std.log.debug("watcher: thread {d} read error for {s}: {s}", .{
+                log.debug("watcher: thread {d} read error for {s}: {s}", .{
                     thread_idx,
                     resource_name,
                     @errorName(err),
@@ -514,10 +515,10 @@ pub const Watcher = struct {
             };
 
             if (event_data) |data| {
-                std.log.debug("watcher: thread {d} received event data len={d}", .{ thread_idx, data.len });
+                log.debug("watcher: thread {d} received event data len={d}", .{ thread_idx, data.len });
                 // Parse and handle event (with mutex protection for shared state).
                 self.handleEvent(data, resource_type, io) catch |err| {
-                    std.log.debug("watcher: thread {d} event handling error: {s}", .{
+                    log.debug("watcher: thread {d} event handling error: {s}", .{
                         thread_idx,
                         @errorName(err),
                     });
@@ -526,7 +527,7 @@ pub const Watcher = struct {
                 events_processed += 1;
             } else {
                 // Stream ended normally (server closed connection).
-                std.log.debug("watcher: thread {d} stream ended normally for {s}, events={d}", .{
+                log.debug("watcher: thread {d} stream ended normally for {s}, events={d}", .{
                     thread_idx,
                     resource_name,
                     events_processed,
@@ -535,7 +536,7 @@ pub const Watcher = struct {
             }
         }
 
-        std.log.debug("watcher: thread {d} watchResourceType done, processed {d} events", .{
+        log.debug("watcher: thread {d} watchResourceType done, processed {d} events", .{
             thread_idx,
             events_processed,
         });
@@ -549,7 +550,7 @@ pub const Watcher = struct {
 
         const event = try parsing.parseEvent(data);
 
-        std.log.debug("watcher: handleEvent type={s} resource={s}", .{ @tagName(event.event_type), @tagName(resource_type) });
+        log.debug("watcher: handleEvent type={s} resource={s}", .{ @tagName(event.event_type), @tagName(resource_type) });
 
         // Acquire mutex for thread-safe access to shared ResourceStores.
         // TigerStyle: Explicit synchronization, mutex held during store modification.
@@ -559,37 +560,37 @@ pub const Watcher = struct {
         // Handle based on event type.
         switch (event.event_type) {
             .ADDED, .MODIFIED => {
-                std.log.debug("watcher: extracting meta from raw_object len={d}", .{event.raw_object.len});
+                log.debug("watcher: extracting meta from raw_object len={d}", .{event.raw_object.len});
                 const meta = parsing.extractResourceMeta(event.raw_object) catch |err| {
-                    std.log.err("watcher: extractResourceMeta failed: {s}", .{@errorName(err)});
+                    log.err("watcher: extractResourceMeta failed: {s}", .{@errorName(err)});
                     return err;
                 };
-                std.log.debug("watcher: {s} {s}/{s}", .{ @tagName(event.event_type), meta.namespace, meta.name });
+                log.debug("watcher: {s} {s}/{s}", .{ @tagName(event.event_type), meta.namespace, meta.name });
                 switch (resource_type) {
                     .gateway_class => try self.gateway_classes.upsert(meta, event.raw_object),
                     .gateway => try self.gateways.upsert(meta, event.raw_object),
                     .http_route => try self.http_routes.upsert(meta, event.raw_object),
                     .service => try self.services.upsert(meta, event.raw_object),
                     .endpoints => {
-                        std.log.debug("watcher: upserting endpoints for {s}/{s}", .{ meta.namespace, meta.name });
+                        log.debug("watcher: upserting endpoints for {s}/{s}", .{ meta.namespace, meta.name });
                         try self.endpoints.upsert(meta, event.raw_object);
                         // Update resolver with endpoint data for backend resolution.
                         // TigerStyle: Resolver.updateService parses the JSON internally.
-                        std.log.debug("watcher: calling resolver.updateService for {s}/{s}", .{ meta.namespace, meta.name });
+                        log.debug("watcher: calling resolver.updateService for {s}/{s}", .{ meta.namespace, meta.name });
                         self.resolver.updateService(meta.name, meta.namespace, event.raw_object) catch |err| {
-                            std.log.warn("watcher: failed to update resolver for {s}/{s}: {s}", .{
+                            log.warn("watcher: failed to update resolver for {s}/{s}: {s}", .{
                                 meta.namespace,
                                 meta.name,
                                 @errorName(err),
                             });
                             // Continue - store update succeeded, resolver update is best-effort.
                         };
-                        std.log.debug("watcher: resolver now has {d} services", .{self.resolver.serviceCount()});
+                        log.debug("watcher: resolver now has {d} services", .{self.resolver.serviceCount()});
                     },
                     .secret => try self.secrets.upsert(meta, event.raw_object),
                 }
                 // Trigger reconciliation (still under mutex lock).
-                std.log.debug("watcher: triggering reconciliation", .{});
+                log.debug("watcher: triggering reconciliation", .{});
                 self.triggerReconciliationLocked(io);
             },
             .DELETED => {
@@ -627,7 +628,7 @@ pub const Watcher = struct {
                 // ERROR events indicate watch needs restart.
                 // Most commonly caused by expired resourceVersion (410 Gone).
                 // Reset resourceVersion to empty so next watch starts fresh with a LIST.
-                std.log.warn("watcher: received ERROR event, resetting resourceVersion", .{});
+                log.warn("watcher: received ERROR event, resetting resourceVersion", .{});
                 switch (resource_type) {
                     .gateway_class => self.gateway_classes.resetResourceVersion(),
                     .gateway => self.gateways.resetResourceVersion(),
@@ -647,25 +648,25 @@ pub const Watcher = struct {
     fn triggerReconciliationLocked(self: *Self, io: Io) void {
         assert(@intFromPtr(self.on_config_change) != 0); // S1: precondition - callback set
 
-        std.log.debug("watcher: triggerReconciliation starting", .{});
+        log.debug("watcher: triggerReconciliation starting", .{});
 
         // Build GatewayConfig from stored resources.
         // TigerStyle: Store in self.current_config so pointer remains valid after this function returns.
         self.current_config = self.reconcile() catch |err| {
-            std.log.err("watcher: reconciliation failed: {s}", .{@errorName(err)});
+            log.err("watcher: reconciliation failed: {s}", .{@errorName(err)});
             return;
         };
 
-        std.log.debug("watcher: reconcile complete, gateways={d} routes={d}", .{
+        log.debug("watcher: reconcile complete, gateways={d} routes={d}", .{
             self.current_config.gateways.len,
             self.current_config.http_routes.len,
         });
 
         // Invoke callback with context, new config, and Io for async operations.
         // TigerStyle: Pass pointer to self-owned config, valid until next reconcile().
-        std.log.debug("watcher: invoking on_config_change callback", .{});
+        log.debug("watcher: invoking on_config_change callback", .{});
         self.on_config_change(self.callback_context, &self.current_config, io);
-        std.log.debug("watcher: on_config_change callback returned", .{});
+        log.debug("watcher: on_config_change callback returned", .{});
     }
 
     /// Reconcile stored resources into a GatewayConfig.
@@ -678,7 +679,7 @@ pub const Watcher = struct {
     /// - S3: All loops bounded by MAX_* constants
     /// - No allocation after init (uses pre-allocated storage arrays)
     pub fn reconcile(self: *Self) WatcherError!gw_config.GatewayConfig {
-        std.log.debug("watcher: reconcile starting", .{});
+        log.debug("watcher: reconcile starting", .{});
 
         // Reset parsed counts.
         self.parsed_gateway_classes_count = 0;
@@ -687,26 +688,26 @@ pub const Watcher = struct {
 
         // Phase 1: Parse GatewayClasses first (needed for filtering).
         try self.parseStoredGatewayClasses();
-        std.log.debug("watcher: parsed {d} GatewayClasses", .{self.parsed_gateway_classes_count});
+        log.debug("watcher: parsed {d} GatewayClasses", .{self.parsed_gateway_classes_count});
 
         // Phase 2: Find GatewayClass names that match our controller_name.
         var matching_class_names: [MAX_GATEWAY_CLASSES][]const u8 = undefined;
         const matching_count = self.findMatchingGatewayClasses(&matching_class_names);
-        std.log.debug("watcher: {d} GatewayClasses match our controller", .{matching_count});
+        log.debug("watcher: {d} GatewayClasses match our controller", .{matching_count});
 
         // Phase 3: Parse Gateways and filter by matching GatewayClasses.
-        std.log.debug("watcher: parsing Gateways...", .{});
+        log.debug("watcher: parsing Gateways...", .{});
         self.parseStoredGatewaysFiltered(matching_class_names[0..matching_count]) catch |err| {
-            std.log.err("watcher: parseStoredGatewaysFiltered failed: {s}", .{@errorName(err)});
+            log.err("watcher: parseStoredGatewaysFiltered failed: {s}", .{@errorName(err)});
             return err;
         };
-        std.log.debug("watcher: parsed {d} Gateways after filtering", .{self.parsed_gateways_count});
-        std.log.debug("watcher: parsing HTTPRoutes...", .{});
+        log.debug("watcher: parsed {d} Gateways after filtering", .{self.parsed_gateways_count});
+        log.debug("watcher: parsing HTTPRoutes...", .{});
         self.parseStoredHTTPRoutes() catch |err| {
-            std.log.err("watcher: parseStoredHTTPRoutes failed: {s}", .{@errorName(err)});
+            log.err("watcher: parseStoredHTTPRoutes failed: {s}", .{@errorName(err)});
             return err;
         };
-        std.log.debug("watcher: parsed {d} HTTPRoutes", .{self.parsed_http_routes_count});
+        log.debug("watcher: parsed {d} HTTPRoutes", .{self.parsed_http_routes_count});
 
         // Phase 4: Build config slices from parsed storage.
         self.buildGatewayConfigs();
@@ -717,7 +718,7 @@ pub const Watcher = struct {
         assert(self.parsed_gateways_count <= MAX_GATEWAYS);
         assert(self.parsed_http_routes_count <= MAX_HTTP_ROUTES);
 
-        std.log.debug("watcher: reconcile done", .{});
+        log.debug("watcher: reconcile done", .{});
         return gw_config.GatewayConfig{
             .gateways = self.temp_gateways[0..self.parsed_gateways_count],
             .http_routes = self.temp_http_routes[0..self.parsed_http_routes_count],
@@ -756,7 +757,7 @@ pub const Watcher = struct {
     fn findMatchingGatewayClasses(self: *Self, out_names: *[MAX_GATEWAY_CLASSES][]const u8) u8 {
         assert(self.controller_name.len > 0); // S1: precondition - controller name set
 
-        std.log.debug("watcher: findMatchingGatewayClasses, our_controller={s}", .{self.controller_name.slice()});
+        log.debug("watcher: findMatchingGatewayClasses, our_controller={s}", .{self.controller_name.slice()});
 
         var match_count: u8 = 0;
         var idx: u8 = 0;
@@ -765,20 +766,20 @@ pub const Watcher = struct {
             const gc = &self.parsed_gateway_classes[idx];
             if (!gc.active) continue;
 
-            std.log.debug("watcher: checking GatewayClass name={s} controllerName={s}", .{
+            log.debug("watcher: checking GatewayClass name={s} controllerName={s}", .{
                 gc.name.slice(),
                 gc.controller_name.slice(),
             });
 
             // Check if controllerName matches our controller_name.
             if (std.mem.eql(u8, gc.controller_name.slice(), self.controller_name.slice())) {
-                std.log.debug("watcher: GatewayClass {s} MATCHES", .{gc.name.slice()});
+                log.debug("watcher: GatewayClass {s} MATCHES", .{gc.name.slice()});
                 if (match_count < MAX_GATEWAY_CLASSES) {
                     out_names[match_count] = gc.name.slice();
                     match_count += 1;
                 }
             } else {
-                std.log.debug("watcher: GatewayClass {s} does not match", .{gc.name.slice()});
+                log.debug("watcher: GatewayClass {s} does not match", .{gc.name.slice()});
             }
         }
 
@@ -807,7 +808,7 @@ pub const Watcher = struct {
         var iteration: u32 = 0;
         const items = self.gateways.items;
 
-        std.log.debug("watcher: parseStoredGatewaysFiltered checking {d} slots", .{MAX_GATEWAYS});
+        log.debug("watcher: parseStoredGatewaysFiltered checking {d} slots", .{MAX_GATEWAYS});
 
         while (iteration < MAX_GATEWAYS) : (iteration += 1) {
             if (!items[iteration].active) continue;
@@ -815,7 +816,7 @@ pub const Watcher = struct {
             const raw_json = items[iteration].rawJson();
             if (raw_json.len == 0) continue;
 
-            std.log.debug("watcher: parsing Gateway slot {d}, json_len={d}", .{ iteration, raw_json.len });
+            log.debug("watcher: parsing Gateway slot {d}, json_len={d}", .{ iteration, raw_json.len });
 
             if (self.parsed_gateways_count >= MAX_GATEWAYS) {
                 return WatcherError.BufferOverflow;
@@ -824,8 +825,8 @@ pub const Watcher = struct {
             // Parse into temporary storage first.
             var temp_gateway = StoredGateway.init();
             parsing.parseGatewayJson(raw_json, &temp_gateway) catch |err| {
-                std.log.err("watcher: parseGatewayJson failed for slot {d}: {s}", .{ iteration, @errorName(err) });
-                std.log.err("watcher: raw_json preview: {s}", .{raw_json[0..@min(200, raw_json.len)]});
+                log.err("watcher: parseGatewayJson failed for slot {d}: {s}", .{ iteration, @errorName(err) });
+                log.err("watcher: raw_json preview: {s}", .{raw_json[0..@min(200, raw_json.len)]});
                 return err;
             };
 

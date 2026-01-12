@@ -63,6 +63,10 @@ fn writeRoute(w: *std.json.Stringify, route: Route) !void {
             try w.objectField("path_exact");
             try w.write(e);
         },
+        .exactPath => |e| {
+            try w.objectField("path_exact_path");
+            try w.write(e);
+        },
     }
 
     try w.objectField("pool_idx");

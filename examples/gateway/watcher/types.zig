@@ -6,6 +6,7 @@
 //! TigerStyle: Explicit types, bounded storage, no allocation after init.
 
 const std = @import("std");
+const log = @import("serval-core").log.scoped(.gateway_watcher);
 const assert = std.debug.assert;
 
 const gateway = @import("serval-k8s-gateway");
@@ -288,7 +289,7 @@ pub fn ResourceStore(comptime capacity: u32, comptime buffer_size: u32) type {
             assert(meta.name.len > 0); // S1: precondition
             assert(meta.namespace.len > 0); // S1: precondition
 
-            std.log.debug("ResourceStore.upsert: name={s} namespace={s} current_count={d}", .{
+            log.debug("ResourceStore.upsert: name={s} namespace={s} current_count={d}", .{
                 meta.name,
                 meta.namespace,
                 self.count,
@@ -311,7 +312,7 @@ pub fn ResourceStore(comptime capacity: u32, comptime buffer_size: u32) type {
 
             if (found_idx) |idx| {
                 // Update existing entry.
-                std.log.debug("ResourceStore.upsert: updating existing at idx={d}", .{idx});
+                log.debug("ResourceStore.upsert: updating existing at idx={d}", .{idx});
                 self.items[idx].setMeta(meta);
                 self.items[idx].setRawJson(raw_json);
             } else {
@@ -326,12 +327,12 @@ pub fn ResourceStore(comptime capacity: u32, comptime buffer_size: u32) type {
                 }
 
                 if (slot_idx) |idx| {
-                    std.log.debug("ResourceStore.upsert: adding new at idx={d}", .{idx});
+                    log.debug("ResourceStore.upsert: adding new at idx={d}", .{idx});
                     self.items[idx].setMeta(meta);
                     self.items[idx].setRawJson(raw_json);
                     self.items[idx].active = true;
                     self.count += 1;
-                    std.log.debug("ResourceStore.upsert: new count={d}", .{self.count});
+                    log.debug("ResourceStore.upsert: new count={d}", .{self.count});
                     assert(self.count <= capacity); // S1: postcondition - count within bounds
                 } else {
                     return WatcherError.BufferOverflow;

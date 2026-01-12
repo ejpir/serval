@@ -6,7 +6,9 @@
 //! TigerStyle: Fixed-size span pool, no allocation after init.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const core = @import("serval-core");
+const log = core.log.scoped(.otel);
 const config = core.config;
 const tracing = @import("serval-tracing");
 const SpanHandle = tracing.SpanHandle;
@@ -80,8 +82,8 @@ pub const OtelTracer = struct {
         scope_version: []const u8,
     ) !*Self {
         // TigerStyle: assertions on inputs
-        std.debug.assert(scope_name.len <= 64);
-        std.debug.assert(scope_version.len <= 32);
+        assert(scope_name.len <= 64);
+        assert(scope_version.len <= 32);
 
         const self = try allocator.create(Self);
         errdefer allocator.destroy(self);
@@ -119,7 +121,7 @@ pub const OtelTracer = struct {
         // Find a free slot
         const slot_index = self.findFreeSlot() orelse {
             // Pool exhausted - return invalid handle (span will be dropped)
-            std.log.warn("OtelTracer: span pool exhausted, dropping span '{s}'", .{name});
+            log.warn("OtelTracer: span pool exhausted, dropping span '{s}'", .{name});
             return .{};
         };
 
@@ -179,7 +181,7 @@ pub const OtelTracer = struct {
         self.spans[slot_index].in_use = false;
 
         // TigerStyle: assertion guards against underflow from double-end bugs
-        std.debug.assert(self.active_count > 0);
+        assert(self.active_count > 0);
         self.active_count -= 1;
 
         // Set error status if provided
@@ -226,7 +228,7 @@ pub const OtelTracer = struct {
 
         if (self.findSpanBySpanId(handle.span_id)) |slot_index| {
             self.spans[slot_index].span.addEvent(name) catch |err| {
-                std.log.debug("addEvent failed for span: {}", .{err});
+                log.debug("addEvent failed for span: {}", .{err});
             };
         }
     }

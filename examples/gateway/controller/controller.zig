@@ -13,6 +13,7 @@ const assert = std.debug.assert;
 const Io = std.Io;
 
 const serval_core = @import("serval-core");
+const log = serval_core.log.scoped(.gateway_controller);
 const gateway = @import("serval-k8s-gateway");
 const GatewayConfig = gateway.GatewayConfig;
 const Gateway = gateway.Gateway;
@@ -189,7 +190,7 @@ pub const Controller = struct {
 
         self.multi_endpoint_enabled = true;
 
-        std.log.info("controller: multi-endpoint mode enabled for {s}/{s}", .{
+        log.info("controller: multi-endpoint mode enabled for {s}/{s}", .{
             namespace,
             service_name,
         });
@@ -312,10 +313,10 @@ pub const Controller = struct {
                     // BackendsNotReady is not a failure - endpoints haven't arrived yet.
                     // The next reconciliation (when endpoints arrive) will push the config.
                     if (err == RouterClientError.BackendsNotReady) {
-                        std.log.info("config push deferred: waiting for endpoint data", .{});
+                        log.info("config push deferred: waiting for endpoint data", .{});
                         // Continue to update status - don't return error
                     } else {
-                        std.log.err("failed to push config to router: {s}", .{@errorName(err)});
+                        log.err("failed to push config to router: {s}", .{@errorName(err)});
                         return error.DataPlanePushFailed;
                     }
                 };
@@ -354,7 +355,7 @@ pub const Controller = struct {
             );
         }
 
-        std.log.info("config updated ({d} gateways, {d} routes)", .{
+        log.info("config updated ({d} gateways, {d} routes)", .{
             config_ptr.gateways.len,
             config_ptr.http_routes.len,
         });
@@ -410,7 +411,7 @@ pub const Controller = struct {
             io,
         ) catch |err| {
             // Endpoint discovery failed - fall back to single endpoint
-            std.log.warn("controller: endpoint discovery failed ({s}), using single endpoint", .{
+            log.warn("controller: endpoint discovery failed ({s}), using single endpoint", .{
                 @errorName(err),
             });
             // Try single-endpoint push as fallback
@@ -420,16 +421,16 @@ pub const Controller = struct {
                 io,
             ) catch |push_err| {
                 if (push_err == RouterClientError.BackendsNotReady) {
-                    std.log.info("config push deferred: waiting for endpoint data", .{});
+                    log.info("config push deferred: waiting for endpoint data", .{});
                     return;
                 }
-                std.log.err("failed to push config (fallback): {s}", .{@errorName(push_err)});
+                log.err("failed to push config (fallback): {s}", .{@errorName(push_err)});
                 return error.DataPlanePushFailed;
             };
             return;
         };
 
-        std.log.info("controller: discovered {d} router endpoints", .{endpoint_count});
+        log.info("controller: discovered {d} router endpoints", .{endpoint_count});
 
         // Push config to all discovered endpoints
         const result = self.router_client.pushConfigToAll(
@@ -438,24 +439,24 @@ pub const Controller = struct {
             io,
         ) catch |err| {
             if (err == RouterClientError.BackendsNotReady) {
-                std.log.info("config push deferred: waiting for backend endpoint data", .{});
+                log.info("config push deferred: waiting for backend endpoint data", .{});
                 return;
             }
             if (err == RouterClientError.AllPushesFailed) {
-                std.log.err("config push failed: all {d} router endpoints failed", .{endpoint_count});
+                log.err("config push failed: all {d} router endpoints failed", .{endpoint_count});
                 return error.DataPlanePushFailed;
             }
-            std.log.err("failed to push config to routers: {s}", .{@errorName(err)});
+            log.err("failed to push config to routers: {s}", .{@errorName(err)});
             return error.DataPlanePushFailed;
         };
 
         // Log push results
         if (result.total == 0) {
-            std.log.debug("controller: config unchanged, no push needed", .{});
+            log.debug("controller: config unchanged, no push needed", .{});
         } else if (result.isFullSuccess()) {
-            std.log.info("controller: config pushed to all {d} routers", .{result.success_count});
+            log.info("controller: config pushed to all {d} routers", .{result.success_count});
         } else if (result.hasAnySuccess()) {
-            std.log.warn("controller: config push partial: {d}/{d} succeeded", .{
+            log.warn("controller: config push partial: {d}/{d} succeeded", .{
                 result.success_count,
                 result.total,
             });
@@ -483,7 +484,7 @@ pub const Controller = struct {
 
         // Skip if no config has been set yet
         const config_ptr = self.gateway_config orelse {
-            std.log.debug("controller: syncRouterEndpoints skipped - no config yet", .{});
+            log.debug("controller: syncRouterEndpoints skipped - no config yet", .{});
             return 0;
         };
 
@@ -498,12 +499,12 @@ pub const Controller = struct {
             self.resolver,
             io,
         ) catch |err| {
-            std.log.warn("controller: syncRouterEndpoints failed: {s}", .{@errorName(err)});
+            log.warn("controller: syncRouterEndpoints failed: {s}", .{@errorName(err)});
             return 0;
         };
 
         if (synced > 0) {
-            std.log.info("controller: synced config to {d} new router endpoints", .{synced});
+            log.info("controller: synced config to {d} new router endpoints", .{synced});
         }
 
         return synced;

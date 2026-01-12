@@ -20,6 +20,7 @@
 //! TigerStyle: Demonstrates direct response capability without forwarding.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const serval = @import("serval");
 const serval_net = @import("serval-net");
 const cli = @import("serval-cli");
@@ -55,8 +56,8 @@ const EchoHandler = struct {
 
     pub fn init(id: []const u8, port: u16, debug: bool, chunked: bool) EchoHandler {
         // Preconditions
-        std.debug.assert(id.len > 0);
-        std.debug.assert(port > 0);
+        assert(id.len > 0);
+        assert(port > 0);
 
         var self = EchoHandler{
             .id = id,
@@ -74,8 +75,8 @@ const EchoHandler = struct {
         self.extra_headers_len = @intCast(formatted.len);
 
         // Postcondition: handler state is consistent
-        std.debug.assert(self.id.len > 0);
-        std.debug.assert(self.port > 0);
+        assert(self.id.len > 0);
+        assert(self.port > 0);
 
         return self;
     }
@@ -86,7 +87,7 @@ const EchoHandler = struct {
         _ = ctx;
         _ = request;
         // TigerStyle: Explicit sentinel - this should never be reached.
-        std.debug.assert(false);
+        assert(false);
         return .{ .host = "0.0.0.0", .port = 0, .idx = 0 };
     }
 
@@ -100,7 +101,7 @@ const EchoHandler = struct {
     ) serval.Action {
         _ = ctx;
         // Precondition: response buffer must be provided
-        std.debug.assert(response_buf.len > 0);
+        assert(response_buf.len > 0);
 
         // Format echo response into server-provided buffer
         const body_len = formatEchoBody(response_buf, request, self.id, self.port);
@@ -133,8 +134,8 @@ fn formatEchoBody(
     port: u16,
 ) usize {
     // Preconditions
-    std.debug.assert(buf.len > 0);
-    std.debug.assert(id.len > 0);
+    assert(buf.len > 0);
+    assert(id.len > 0);
 
     var position: usize = 0;
 
@@ -191,7 +192,7 @@ fn formatEchoBody(
     }
 
     // Postcondition: returned length is within buffer bounds.
-    std.debug.assert(position <= buf.len);
+    assert(position <= buf.len);
 
     return position;
 }

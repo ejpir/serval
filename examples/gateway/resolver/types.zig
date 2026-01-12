@@ -75,6 +75,8 @@ pub const ResolverError = error{
     BufferTooSmall,
     /// Service not found in resolver registry.
     ServiceNotFound,
+    /// Service exists but has no ready endpoints.
+    NoEndpoints,
 };
 
 // ============================================================================

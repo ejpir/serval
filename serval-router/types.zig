@@ -7,6 +7,7 @@
 //! TigerStyle: Fixed-size types, no allocation, explicit defaults.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const core = @import("serval-core");
 const lb = @import("serval-lb");
 
@@ -24,7 +25,13 @@ pub const Upstream = core.Upstream;
 pub const PathMatch = union(enum) {
     /// Exact path match: "/api/v1/users" matches only "/api/v1/users".
     /// Does not match "/api/v1/users/" or "/api/v1/users/123".
+    /// Does not match "/api/v1/users?foo=bar" (use exactPath for that).
     exact: []const u8,
+
+    /// Exact path match ignoring query string: "/healthz" matches both
+    /// "/healthz" and "/healthz?verbose=true".
+    /// Does not match "/healthz/" or "/healthzfoo".
+    exactPath: []const u8,
 
     /// Prefix match: "/api/" matches "/api/users", "/api/v1/health", etc.
     /// The prefix must match the start of the request path.
@@ -35,8 +42,28 @@ pub const PathMatch = union(enum) {
     pub fn matches(self: PathMatch, request_path: []const u8) bool {
         return switch (self) {
             .exact => |pattern| std.mem.eql(u8, request_path, pattern),
+            .exactPath => |pattern| matchExactPath(pattern, request_path),
             .prefix => |pattern| std.mem.startsWith(u8, request_path, pattern),
         };
+    }
+
+    /// Match path exactly, ignoring query string.
+    /// TigerStyle: Pure function, bounded comparison.
+    fn matchExactPath(pattern: []const u8, request_path: []const u8) bool {
+        // S1: Preconditions - pattern from route config, path from request
+        assert(pattern.len > 0); // Route config validation ensures non-empty
+        assert(request_path.len > 0); // HTTP request path always starts with /
+
+        // Exact match (no query string)
+        if (std.mem.eql(u8, request_path, pattern)) return true;
+
+        // Match with query string: pattern + "?" + query
+        if (request_path.len > pattern.len) {
+            if (std.mem.startsWith(u8, request_path, pattern)) {
+                return request_path[pattern.len] == '?';
+            }
+        }
+        return false;
     }
 
     /// Get the pattern string for logging/debugging.
@@ -92,8 +119,8 @@ pub const RouteMatcher = struct {
     /// TigerStyle: Pure function, no allocation, bounded iteration.
     fn matchHost(pattern: []const u8, hostname: []const u8) bool {
         // Preconditions: pattern comes from route config, hostname from request
-        std.debug.assert(pattern.len > 0); // Route config validation ensures non-empty
-        std.debug.assert(hostname.len > 0); // Caller strips port, empty hostname rejected earlier
+        assert(pattern.len > 0); // Route config validation ensures non-empty
+        assert(hostname.len > 0); // Caller strips port, empty hostname rejected earlier
 
         // Check for wildcard pattern: must start with "*."
         if (std.mem.startsWith(u8, pattern, "*.")) {
@@ -228,11 +255,56 @@ test "PathMatch prefix matches" {
     try std.testing.expect(!pattern.matches("/ap"));
 }
 
+test "PathMatch exactPath matches" {
+    const pattern = PathMatch{ .exactPath = "/healthz" };
+
+    // Exact match succeeds
+    try std.testing.expect(pattern.matches("/healthz"));
+
+    // With query string succeeds
+    try std.testing.expect(pattern.matches("/healthz?"));
+    try std.testing.expect(pattern.matches("/healthz?verbose=true"));
+    try std.testing.expect(pattern.matches("/healthz?foo=bar&baz=qux"));
+
+    // Trailing slash fails
+    try std.testing.expect(!pattern.matches("/healthz/"));
+
+    // Subpath fails
+    try std.testing.expect(!pattern.matches("/healthz/deep"));
+
+    // Similar prefix fails (no query string separator)
+    try std.testing.expect(!pattern.matches("/healthzfoo"));
+    try std.testing.expect(!pattern.matches("/healthz-extended"));
+
+    // Different path fails
+    try std.testing.expect(!pattern.matches("/readyz"));
+
+    // Prefix of pattern fails
+    try std.testing.expect(!pattern.matches("/health"));
+}
+
+test "PathMatch exactPath edge cases" {
+    // Root path
+    const root = PathMatch{ .exactPath = "/" };
+    try std.testing.expect(root.matches("/"));
+    try std.testing.expect(root.matches("/?foo=bar"));
+    try std.testing.expect(!root.matches("/api"));
+
+    // Path with existing query-like chars
+    const config = PathMatch{ .exactPath = "/config" };
+    try std.testing.expect(config.matches("/config"));
+    try std.testing.expect(config.matches("/config?format=json"));
+    try std.testing.expect(!config.matches("/config/"));
+    try std.testing.expect(!config.matches("/configuration"));
+}
+
 test "PathMatch getPattern" {
     const exact = PathMatch{ .exact = "/health" };
+    const exact_path = PathMatch{ .exactPath = "/healthz" };
     const prefix = PathMatch{ .prefix = "/api/" };
 
     try std.testing.expectEqualStrings("/health", exact.getPattern());
+    try std.testing.expectEqualStrings("/healthz", exact_path.getPattern());
     try std.testing.expectEqualStrings("/api/", prefix.getPattern());
 }
 

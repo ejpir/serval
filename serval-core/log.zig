@@ -1,10 +1,17 @@
 // lib/serval-core/log.zig
 //! Logging Utilities
 //!
-//! Comptime-conditional debug logging and LogEntry for request lifecycle.
-//! TigerStyle: Zero overhead in release builds.
+//! Scoped logging with comptime-conditional debug level.
+//! TigerStyle: Zero overhead for debug logs in release builds.
+//!
+//! Usage:
+//!   const log = @import("serval-core").log.scoped(.my_module);
+//!   log.debug("...", .{});  // conditional on DEBUG_LOGGING
+//!   log.info("...", .{});   // always on
+//!   log.err("...", .{});    // always on
 
 const std = @import("std");
+const assert = std.debug.assert;
 const config = @import("config.zig");
 const types = @import("types.zig");
 const errors = @import("errors.zig");
@@ -12,10 +19,56 @@ const errors = @import("errors.zig");
 const Method = types.Method;
 const Upstream = types.Upstream;
 
+// =============================================================================
+// Scoped Logging
+// =============================================================================
+
+/// Returns a scoped logger with conditional debug level.
+///
+/// Debug logs are compiled out when DEBUG_LOGGING is false (zero overhead).
+/// Info, warn, and err logs are always active.
+///
+/// Example:
+///   const log = @import("serval-core").log.scoped(.router);
+///   log.debug("routing request to {s}", .{upstream.host});
+///   log.err("connection failed: {s}", .{@errorName(err)});
+pub fn scoped(comptime scope: @TypeOf(.enum_literal)) type {
+    const std_log = std.log.scoped(scope);
+    return struct {
+        /// Debug logging - conditional on DEBUG_LOGGING.
+        /// TigerStyle: Zero overhead in release builds via dead code elimination.
+        pub fn debug(comptime fmt: []const u8, args: anytype) void {
+            if (comptime config.DEBUG_LOGGING) {
+                std_log.debug(fmt, args);
+            }
+        }
+
+        /// Info logging - always active.
+        pub fn info(comptime fmt: []const u8, args: anytype) void {
+            std_log.info(fmt, args);
+        }
+
+        /// Warning logging - always active.
+        pub fn warn(comptime fmt: []const u8, args: anytype) void {
+            std_log.warn(fmt, args);
+        }
+
+        /// Error logging - always active.
+        pub fn err(comptime fmt: []const u8, args: anytype) void {
+            std_log.err(fmt, args);
+        }
+    };
+}
+
+// =============================================================================
+// Legacy Debug Logging (deprecated - use scoped().debug instead)
+// =============================================================================
+
 /// Comptime-conditional debug logging.
 /// TigerStyle: Zero overhead in release builds via dead code elimination.
+/// @deprecated Use `scoped(.module).debug()` instead for scoped output.
 pub fn debugLog(comptime fmt: []const u8, args: anytype) void {
-    comptime std.debug.assert(fmt.len > 0); // Precondition: non-empty format
+    comptime assert(fmt.len > 0); // Precondition: non-empty format
     if (comptime config.DEBUG_LOGGING) {
         std.log.debug(fmt, args);
     }
@@ -80,4 +133,12 @@ pub const LogEntry = struct {
 
 test "debugLog compiles in both modes" {
     debugLog("test message {d}", .{42});
+}
+
+test "scoped logging compiles" {
+    const log = scoped(.test_module);
+    log.debug("debug message {d}", .{42});
+    log.info("info message {d}", .{42});
+    log.warn("warn message {d}", .{42});
+    log.err("err message {d}", .{42});
 }

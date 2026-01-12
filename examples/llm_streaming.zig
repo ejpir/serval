@@ -23,6 +23,7 @@
 //! TigerStyle: Demonstrates Action.stream and nextChunk() interface.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const serval = @import("serval");
 const time = serval.time;
 const serval_net = @import("serval-net");
@@ -83,7 +84,7 @@ const LlmHandler = struct {
 
     pub fn init(port: u16, debug: bool) LlmHandler {
         // S1: Preconditions
-        std.debug.assert(port > 0);
+        assert(port > 0);
 
         const self = LlmHandler{
             .port = port,
@@ -92,7 +93,7 @@ const LlmHandler = struct {
         };
 
         // S2: Postcondition - handler initialized
-        std.debug.assert(self.port > 0);
+        assert(self.port > 0);
 
         return self;
     }
@@ -103,7 +104,7 @@ const LlmHandler = struct {
         _ = ctx;
         _ = request;
         // TigerStyle: Explicit sentinel - this should never be reached.
-        std.debug.assert(false);
+        assert(false);
         return .{ .host = "0.0.0.0", .port = 0, .idx = 0 };
     }
 
@@ -117,7 +118,7 @@ const LlmHandler = struct {
     ) serval.Action {
         _ = ctx;
         // S1: Precondition - response buffer must be provided
-        std.debug.assert(response_buf.len > 0);
+        assert(response_buf.len > 0);
 
         if (self.debug) {
             std.debug.print("[llm] {s} {s}\n", .{
@@ -141,7 +142,7 @@ const LlmHandler = struct {
     fn handleHealth(self: *@This(), response_buf: []u8) serval.Action {
         _ = self;
         // S1: Precondition
-        std.debug.assert(response_buf.len > 0);
+        assert(response_buf.len > 0);
 
         const body = "OK";
         @memcpy(response_buf[0..body.len], body);
@@ -179,7 +180,7 @@ const LlmHandler = struct {
     fn handleNotFound(self: *@This(), response_buf: []u8) serval.Action {
         _ = self;
         // S1: Precondition
-        std.debug.assert(response_buf.len > 0);
+        assert(response_buf.len > 0);
 
         const body = "Not Found";
         @memcpy(response_buf[0..body.len], body);
@@ -202,7 +203,7 @@ const LlmHandler = struct {
     ) !?usize {
         _ = ctx;
         // S1: Preconditions
-        std.debug.assert(response_buf.len > 0);
+        assert(response_buf.len > 0);
 
         // S3: Bounded check - have we exceeded max tokens?
         if (self.token_idx > RESPONSE_TOKENS.len + 1) {
@@ -257,7 +258,7 @@ const LlmHandler = struct {
         self.token_idx += 1;
 
         // S2: Postcondition - returned length matches written data
-        std.debug.assert(total_len <= response_buf.len);
+        assert(total_len <= response_buf.len);
 
         if (self.debug) {
             std.debug.print("[llm] streaming token {d}/{d}: {s}\n", .{

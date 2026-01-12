@@ -29,6 +29,7 @@
 //!   --version                    Show version
 
 const std = @import("std");
+const log = serval.core.log.scoped(.router_example);
 const serval = @import("serval");
 const serval_router = @import("serval-router");
 const serval_net = @import("serval-net");
@@ -74,7 +75,7 @@ fn runAdminServer(
     shutdown: *std.atomic.Value(bool),
 ) void {
     admin_server.run(io, shutdown) catch |err| {
-        std.log.err("Admin server error: {}", .{err});
+        log.err("Admin server error: {}", .{err});
     };
 }
 

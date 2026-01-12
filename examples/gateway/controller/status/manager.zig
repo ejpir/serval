@@ -13,6 +13,7 @@ const assert = std.debug.assert;
 const Io = std.Io;
 
 const serval_core = @import("serval-core");
+const log = serval_core.log.scoped(.gateway_controller);
 const core_time = serval_core.time;
 
 const k8s_client_mod = @import("../../k8s_client/mod.zig");
@@ -151,7 +152,7 @@ pub const StatusManager = struct {
         assert(gateway_name.len > 0); // gateway_name must be non-empty
         assert(namespace.len > 0); // namespace must be non-empty
 
-        std.log.debug("status: updateGatewayStatus {s}/{s} accepted={} programmed={}", .{
+        log.debug("status: updateGatewayStatus {s}/{s} accepted={} programmed={}", .{
             namespace,
             gateway_name,
             result.accepted,
@@ -159,14 +160,14 @@ pub const StatusManager = struct {
         });
 
         self.updateGatewayStatusImpl(gateway_name, namespace, result, io) catch |err| {
-            std.log.warn("failed to update Gateway status {s}/{s}: {s}", .{
+            log.warn("failed to update Gateway status {s}/{s}: {s}", .{
                 namespace,
                 gateway_name,
                 @errorName(err),
             });
         };
 
-        std.log.debug("status: updateGatewayStatus {s}/{s} complete", .{ namespace, gateway_name });
+        log.debug("status: updateGatewayStatus {s}/{s} complete", .{ namespace, gateway_name });
     }
 
     /// Update status for a GatewayClass resource.
@@ -183,7 +184,7 @@ pub const StatusManager = struct {
         assert(gateway_class_name.len > 0); // gateway_class_name must be non-empty
 
         self.updateGatewayClassStatusImpl(gateway_class_name, io) catch |err| {
-            std.log.warn("failed to update GatewayClass status {s}: {s}", .{
+            log.warn("failed to update GatewayClass status {s}: {s}", .{
                 gateway_class_name,
                 @errorName(err),
             });
@@ -237,7 +238,7 @@ pub const StatusManager = struct {
             self.gateway_conditions[0..2],
             result.observed_generation,
         ) catch {
-            std.log.err("failed to build Gateway status JSON", .{});
+            log.err("failed to build Gateway status JSON", .{});
             return error.JsonSerializationFailed;
         };
 
@@ -246,24 +247,24 @@ pub const StatusManager = struct {
 
         // Build API path
         const path = self.buildGatewayPath(namespace, gateway_name) catch |err| {
-            std.log.err("failed to build Gateway path: {s}", .{@errorName(err)});
+            log.err("failed to build Gateway path: {s}", .{@errorName(err)});
             return error.PathTooLong;
         };
 
-        std.log.debug("status: PATCH path={s}", .{path});
-        std.log.debug("status: PATCH json_len={d}", .{json_len});
+        log.debug("status: PATCH path={s}", .{path});
+        log.debug("status: PATCH json_len={d}", .{json_len});
 
         // PATCH status to K8s API
         self.k8s_client.patchStatus(path, self.json_buffer[0..json_len], io) catch |err| {
-            std.log.debug("status: patchStatus returned error={s}", .{@errorName(err)});
+            log.debug("status: patchStatus returned error={s}", .{@errorName(err)});
             if (err == ClientError.ConflictRetryable) {
                 // HTTP 409 - resource version mismatch, log and continue
-                std.log.debug("Gateway status update conflict (will retry on next reconcile)", .{});
+                log.debug("Gateway status update conflict (will retry on next reconcile)", .{});
             }
             return err;
         };
 
-        std.log.info("updated Gateway status {s}/{s}", .{ namespace, gateway_name });
+        log.info("updated Gateway status {s}/{s}", .{ namespace, gateway_name });
     }
 
     /// Internal implementation of GatewayClass status update.
@@ -292,7 +293,7 @@ pub const StatusManager = struct {
         const json_len = self.buildGatewayClassStatusJson(
             self.gateway_class_conditions[0..1],
         ) catch {
-            std.log.err("failed to build GatewayClass status JSON", .{});
+            log.err("failed to build GatewayClass status JSON", .{});
             return error.JsonSerializationFailed;
         };
 
@@ -301,19 +302,19 @@ pub const StatusManager = struct {
 
         // Build API path (GatewayClass is cluster-scoped, no namespace)
         const path = self.buildGatewayClassPath(gateway_class_name) catch |err| {
-            std.log.err("failed to build GatewayClass path: {s}", .{@errorName(err)});
+            log.err("failed to build GatewayClass path: {s}", .{@errorName(err)});
             return error.PathTooLong;
         };
 
         // PATCH status to K8s API
         self.k8s_client.patchStatus(path, self.json_buffer[0..json_len], io) catch |err| {
             if (err == ClientError.ConflictRetryable) {
-                std.log.debug("GatewayClass status update conflict (will retry on next reconcile)", .{});
+                log.debug("GatewayClass status update conflict (will retry on next reconcile)", .{});
             }
             return err;
         };
 
-        std.log.debug("updated GatewayClass status {s}", .{gateway_class_name});
+        log.debug("updated GatewayClass status {s}", .{gateway_class_name});
     }
 
     /// Build listener status entries from reconcile result.

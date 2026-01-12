@@ -5,6 +5,7 @@
 //! TigerStyle: Small focused functions, explicit error handling.
 
 const std = @import("std");
+const log = @import("serval-core").log.scoped(.net);
 const builtin = @import("builtin");
 const assert = std.debug.assert;
 const posix = std.posix;
@@ -38,7 +39,7 @@ pub fn setTcpNoDelay(fd: i32) bool {
     posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, value_bytes) catch |err| {
         // Log at debug level - this is an optimization, not critical
         // TigerStyle: Explicit error handling instead of catch {}
-        std.log.debug("setTcpNoDelay failed on fd {d}: {s}", .{ fd, @errorName(err) });
+        log.debug("setTcpNoDelay failed on fd {d}: {s}", .{ fd, @errorName(err) });
         return false;
     };
 
@@ -65,7 +66,7 @@ pub fn setTcpKeepAlive(
     // Enable keepalive
     const enabled: u32 = 1;
     posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.KEEPALIVE, std.mem.asBytes(&enabled)) catch |err| {
-        std.log.debug("setTcpKeepAlive SO_KEEPALIVE failed on fd {d}: {s}", .{ fd, @errorName(err) });
+        log.debug("setTcpKeepAlive SO_KEEPALIVE failed on fd {d}: {s}", .{ fd, @errorName(err) });
         return false;
     };
 
@@ -73,19 +74,19 @@ pub fn setTcpKeepAlive(
     if (@import("builtin").os.tag == .linux) {
         // TCP_KEEPIDLE: idle time before first probe
         posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.KEEPIDLE, std.mem.asBytes(&idle_secs)) catch |err| {
-            std.log.debug("setTcpKeepAlive KEEPIDLE failed on fd {d}: {s}", .{ fd, @errorName(err) });
+            log.debug("setTcpKeepAlive KEEPIDLE failed on fd {d}: {s}", .{ fd, @errorName(err) });
             return false;
         };
 
         // TCP_KEEPINTVL: interval between probes
         posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.KEEPINTVL, std.mem.asBytes(&interval_secs)) catch |err| {
-            std.log.debug("setTcpKeepAlive KEEPINTVL failed on fd {d}: {s}", .{ fd, @errorName(err) });
+            log.debug("setTcpKeepAlive KEEPINTVL failed on fd {d}: {s}", .{ fd, @errorName(err) });
             return false;
         };
 
         // TCP_KEEPCNT: probe count before declaring dead
         posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.KEEPCNT, std.mem.asBytes(&count)) catch |err| {
-            std.log.debug("setTcpKeepAlive KEEPCNT failed on fd {d}: {s}", .{ fd, @errorName(err) });
+            log.debug("setTcpKeepAlive KEEPCNT failed on fd {d}: {s}", .{ fd, @errorName(err) });
             return false;
         };
     }
@@ -106,7 +107,7 @@ pub fn setTcpQuickAck(fd: i32) bool {
 
     const enabled: u32 = 1;
     posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.QUICKACK, std.mem.asBytes(&enabled)) catch |err| {
-        std.log.debug("setTcpQuickAck failed on fd {d}: {s}", .{ fd, @errorName(err) });
+        log.debug("setTcpQuickAck failed on fd {d}: {s}", .{ fd, @errorName(err) });
         return false;
     };
     return true;
@@ -126,7 +127,7 @@ pub fn setSoLinger(fd: i32, timeout_secs: u16) bool {
         .linger = @intCast(timeout_secs),
     };
     posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.LINGER, std.mem.asBytes(&linger_val)) catch |err| {
-        std.log.debug("setSoLinger failed on fd {d}: {s}", .{ fd, @errorName(err) });
+        log.debug("setSoLinger failed on fd {d}: {s}", .{ fd, @errorName(err) });
         return false;
     };
     return true;
@@ -143,7 +144,7 @@ pub fn attachTlsULP(fd: i32) bool {
 
     // kTLS is Linux-only
     if (builtin.os.tag != .linux) {
-        std.log.debug("attachTlsULP: kTLS not available (non-Linux platform)", .{});
+        log.debug("attachTlsULP: kTLS not available (non-Linux platform)", .{});
         return false;
     }
 
@@ -164,9 +165,9 @@ pub fn attachTlsULP(fd: i32) bool {
     if (err != .SUCCESS) {
         if (err == .NOPROTOOPT or err == .NOENT) {
             // kTLS module not loaded or TLS ULP not available
-            std.log.debug("attachTlsULP: kTLS not available ({s})", .{@tagName(err)});
+            log.debug("attachTlsULP: kTLS not available ({s})", .{@tagName(err)});
         } else {
-            std.log.debug("attachTlsULP failed on fd {d}: {s}", .{ fd, @tagName(err) });
+            log.debug("attachTlsULP failed on fd {d}: {s}", .{ fd, @tagName(err) });
         }
         return false;
     }
@@ -201,7 +202,7 @@ fn setKtlsDirection(fd: i32, crypto_info: []const u8, direction: u32, direction_
 
     // kTLS is Linux-only
     if (builtin.os.tag != .linux) {
-        std.log.debug("setKtls{s}: kTLS not available (non-Linux platform)", .{direction_name});
+        log.debug("setKtls{s}: kTLS not available (non-Linux platform)", .{direction_name});
         return false;
     }
 
@@ -217,9 +218,9 @@ fn setKtlsDirection(fd: i32, crypto_info: []const u8, direction: u32, direction_
     const err = posix.errno(rc);
     if (err != .SUCCESS) {
         if (err == .NOPROTOOPT) {
-            std.log.debug("setKtls{s}: kTLS not available (ENOPROTOOPT)", .{direction_name});
+            log.debug("setKtls{s}: kTLS not available (ENOPROTOOPT)", .{direction_name});
         } else {
-            std.log.debug("setKtls{s} failed on fd {d}: {s}", .{ direction_name, fd, @tagName(err) });
+            log.debug("setKtls{s} failed on fd {d}: {s}", .{ direction_name, fd, @tagName(err) });
         }
         return false;
     }

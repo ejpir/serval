@@ -9,13 +9,12 @@ const assert = std.debug.assert;
 const Io = std.Io;
 
 const serval_core = @import("serval-core");
+const log = serval_core.log.scoped(.server);
 const types = serval_core.types;
 const context = serval_core.context;
 const config = serval_core.config;
 const errors = serval_core.errors;
-const log = serval_core.log;
 const hooks = serval_core.hooks;
-const debugLog = serval_core.debugLog;
 
 const serval_net = @import("serval-net");
 const setTcpNoDelay = serval_net.setTcpNoDelay;
@@ -189,13 +188,13 @@ pub fn Server(
                 const accept_start_ns = realtimeNanos();
                 const stream = tcp_server.accept(io) catch |err| {
                     if (shutdown.load(.acquire)) break;
-                    std.log.err("Accept failed: {s}", .{@errorName(err)});
+                    log.err("Accept failed: {s}", .{@errorName(err)});
                     continue;
                 };
                 const accept_elapsed_ns = realtimeNanos() - accept_start_ns;
                 const accept_us: u64 = if (accept_elapsed_ns >= 0) @intCast(@divFloor(accept_elapsed_ns, 1000)) else 0;
                 const accept_done_ns = realtimeNanos();
-                debugLog("server: accept completed accept_us={d} timestamp={d}", .{ accept_us, @as(u64, @intCast(accept_done_ns)) });
+                log.debug("server: accept completed accept_us={d} timestamp={d}", .{ accept_us, @as(u64, @intCast(accept_done_ns)) });
 
                 group.concurrent(io, handleConnectionImpl, .{
                     self.handler,
@@ -207,7 +206,7 @@ pub fn Server(
                     io,
                     stream,
                 }) catch |err| {
-                    std.log.err("Failed to spawn handler: {s}", .{@errorName(err)});
+                    log.err("Failed to spawn handler: {s}", .{@errorName(err)});
                     stream.close(io);
                 };
             }
@@ -255,7 +254,7 @@ pub fn Server(
                 var mutable_tls = tls.*;
                 const n = mutable_tls.read(buf) catch |err| {
                     // Log TLS errors (includes client disconnect, handshake issues, etc.)
-                    debugLog("server: conn={d} TLS read error: {s}", .{ conn_id, @errorName(err) });
+                    log.debug("server: conn={d} TLS read error: {s}", .{ conn_id, @errorName(err) });
                     return null;
                 };
                 return n;
@@ -268,9 +267,9 @@ pub fn Server(
                     if (err != error.EndOfStream) {
                         // Log underlying error from stream_reader.err (ReadFailed wraps the real error)
                         if (stream_reader.err) |underlying| {
-                            debugLog("server: conn={d} read error: {s} (underlying: {s})", .{ conn_id, @errorName(err), @errorName(underlying) });
+                            log.debug("server: conn={d} read error: {s} (underlying: {s})", .{ conn_id, @errorName(err), @errorName(underlying) });
                         } else {
-                            debugLog("server: conn={d} read error: {s}", .{ conn_id, @errorName(err) });
+                            log.debug("server: conn={d} read error: {s}", .{ conn_id, @errorName(err) });
                         }
                     }
                     return null;
@@ -564,7 +563,7 @@ pub fn Server(
                     allocator,
                 ) catch |err| {
                     tracer.endSpan(tls_span, @errorName(err));
-                    std.log.err("TLS handshake failed: {s}", .{@errorName(err)});
+                    log.err("TLS handshake failed: {s}", .{@errorName(err)});
                     return;
                 };
 
@@ -649,7 +648,7 @@ pub fn Server(
 
                 // Pipelining: reuse leftover data or read new data
                 const handler_start_ns = realtimeNanos();
-                debugLog("server: conn={d} waiting for request handler_start={d}", .{ connection_id, @as(u64, @intCast(handler_start_ns)) });
+                log.debug("server: conn={d} waiting for request handler_start={d}", .{ connection_id, @as(u64, @intCast(handler_start_ns)) });
                 const read_start_ns = realtimeNanos();
                 if (buffer_offset >= buffer_len) {
                     const n = connectionRead(maybe_tls_ptr, &io_mut, stream, &recv_buf, connection_id) orelse return;
@@ -661,7 +660,7 @@ pub fn Server(
                 if (!accumulateHeaders(maybe_tls_ptr, &io_mut, stream, &recv_buf, buffer_offset, &buffer_len, connection_id)) return;
                 const read_elapsed_ns = realtimeNanos() - read_start_ns;
                 const read_duration_us: u64 = if (read_elapsed_ns >= 0) @intCast(@divFloor(read_elapsed_ns, 1000)) else 0;
-                debugLog("server: conn={d} received bytes={d} read_us={d}", .{ connection_id, buffer_len - buffer_offset, read_duration_us });
+                log.debug("server: conn={d} received bytes={d} read_us={d}", .{ connection_id, buffer_len - buffer_offset, read_duration_us });
 
                 ctx.bytes_received = @intCast(buffer_len - buffer_offset);
                 metrics.requestStart();
@@ -779,7 +778,7 @@ pub fn Server(
 
                                 // 1. Send headers (chunked encoding)
                                 sendStreamHeaders(&tls_writer, stream_resp) catch |err| {
-                                    std.log.err("streaming response: failed to send headers: {s}", .{@errorName(err)});
+                                    log.err("streaming response: failed to send headers: {s}", .{@errorName(err)});
                                     const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
                                     metrics.requestEnd(500, duration_ns);
                                     tracer.endSpan(span_handle, "stream_headers_failed");
@@ -795,7 +794,7 @@ pub fn Server(
                                 while (chunk_count < max_chunk_count) : (chunk_count += 1) {
                                     const maybe_len = handler.nextChunk(&ctx, &response_buf) catch |err| {
                                         // S6: Log error before terminating stream
-                                        std.log.err("streaming response failed at chunk {d}: {s}", .{ chunk_count, @errorName(err) });
+                                        log.err("streaming response failed at chunk {d}: {s}", .{ chunk_count, @errorName(err) });
                                         sendFinalChunk(&tls_writer) catch {};
                                         stream_error = true;
                                         break;
@@ -805,7 +804,7 @@ pub fn Server(
                                         assert(len <= response_buf.len); // S1: postcondition
                                         if (len > 0) {
                                             sendChunk(&tls_writer, response_buf[0..len]) catch |err| {
-                                                std.log.err("streaming response: failed to send chunk {d}: {s}", .{ chunk_count, @errorName(err) });
+                                                log.err("streaming response: failed to send chunk {d}: {s}", .{ chunk_count, @errorName(err) });
                                                 stream_error = true;
                                                 break;
                                             };
@@ -819,7 +818,7 @@ pub fn Server(
 
                                 // TigerStyle: if we hit max_chunk_count, log and terminate cleanly
                                 if (chunk_count >= max_chunk_count) {
-                                    std.log.warn("streaming response hit max chunk count: {d}", .{max_chunk_count});
+                                    log.warn("streaming response hit max chunk count: {d}", .{max_chunk_count});
                                     sendFinalChunk(&tls_writer) catch {};
                                 }
 
@@ -867,7 +866,7 @@ pub fn Server(
 
                                 metrics.requestEnd(rej.status, duration_ns);
                                 if (comptime hooks.hasHook(Handler, "onLog")) {
-                                    const log_entry = log.LogEntry{
+                                    const log_entry = serval_core.log.LogEntry{
                                         .timestamp_s = time.nanosToSecondsI128(ctx.start_time_ns),
                                         .start_time_ns = ctx.start_time_ns,
                                         .duration_ns = duration_ns,
@@ -965,7 +964,7 @@ pub fn Server(
             }
 
             if (comptime hooks.hasHook(Handler, "onLog")) {
-                const log_entry = log.LogEntry{
+                const log_entry = serval_core.log.LogEntry{
                     .timestamp_s = time.nanosToSecondsI128(ctx.start_time_ns),
                     .start_time_ns = ctx.start_time_ns,
                     .duration_ns = duration_ns,
@@ -1036,7 +1035,7 @@ pub fn Server(
             }
 
             if (comptime hooks.hasHook(Handler, "onLog")) {
-                const log_entry = log.LogEntry{
+                const log_entry = serval_core.log.LogEntry{
                     .timestamp_s = time.nanosToSecondsI128(ctx.start_time_ns),
                     .start_time_ns = ctx.start_time_ns,
                     .duration_ns = duration_ns,

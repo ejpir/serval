@@ -6,6 +6,7 @@
 //! TigerStyle: Bounded loop, explicit cleanup, atomic control.
 
 const std = @import("std");
+const log = serval.core.log.scoped(.stats_display);
 const assert = std.debug.assert;
 const posix = std.posix;
 const serval = @import("serval");
@@ -71,7 +72,7 @@ fn writeStdout(bytes: []const u8) void {
     _ = posix.write(posix.STDOUT_FILENO, bytes) catch |err| {
         // TigerStyle: Log errors in debug builds, don't crash for terminal I/O
         if (@import("builtin").mode == .Debug) {
-            std.log.debug("stats_display: stdout write failed: {s}", .{@errorName(err)});
+            log.debug("stats_display: stdout write failed: {s}", .{@errorName(err)});
         }
     };
 }

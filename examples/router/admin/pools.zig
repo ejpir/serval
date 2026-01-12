@@ -5,6 +5,7 @@
 //! TigerStyle: Bounded buffers, explicit error handling, validates all input.
 
 const std = @import("std");
+const log = serval.core.log.scoped(.router_example);
 const assert = std.debug.assert;
 
 const serval = @import("serval");
@@ -44,7 +45,7 @@ pub fn handlePoolsAdd(body: ?[]const u8, response_buf: []u8) RouteUpdateResult {
 
     // Parse JSON
     const parsed = std.json.parseFromSlice(AddPoolJson, std.heap.page_allocator, request_body, .{}) catch |err| {
-        std.log.err("Admin: JSON parse error: {s}", .{@errorName(err)});
+        log.err("Admin: JSON parse error: {s}", .{@errorName(err)});
         return .{ .status = 400, .body = response.errors.json_parse };
     };
     defer parsed.deinit();
@@ -128,7 +129,7 @@ pub fn handlePoolsAdd(body: ?[]const u8, response_buf: []u8) RouteUpdateResult {
 
     // Swap to new config (preserve existing allowed_hosts from current router)
     config_storage.swapRouter(routes, pools, router.allowed_hosts, null) catch |err| {
-        std.log.err("Admin: swapRouter failed: {s}", .{@errorName(err)});
+        log.err("Admin: swapRouter failed: {s}", .{@errorName(err)});
         return .{ .status = 500, .body = response.errors.swap_failed };
     };
 
@@ -156,7 +157,7 @@ pub fn handlePoolsRemove(body: ?[]const u8, response_buf: []u8) RouteUpdateResul
 
     // Parse JSON
     const parsed = std.json.parseFromSlice(RemovePoolJson, std.heap.page_allocator, request_body, .{}) catch |err| {
-        std.log.err("Admin: JSON parse error: {s}", .{@errorName(err)});
+        log.err("Admin: JSON parse error: {s}", .{@errorName(err)});
         return .{ .status = 400, .body = response.errors.json_parse };
     };
     defer parsed.deinit();
@@ -225,7 +226,7 @@ pub fn handlePoolsRemove(body: ?[]const u8, response_buf: []u8) RouteUpdateResul
 
     // Swap to new config (preserve existing allowed_hosts from current router)
     config_storage.swapRouter(routes, pools, router.allowed_hosts, null) catch |err| {
-        std.log.err("Admin: swapRouter failed: {s}", .{@errorName(err)});
+        log.err("Admin: swapRouter failed: {s}", .{@errorName(err)});
         return .{ .status = 500, .body = response.errors.swap_failed };
     };
 

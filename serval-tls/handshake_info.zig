@@ -4,6 +4,7 @@
 //! All buffers are fixed-size (TigerStyle: no allocation after init).
 
 const std = @import("std");
+const assert = std.debug.assert;
 
 /// Information extracted from a completed TLS handshake.
 /// All string fields use fixed buffers with length tracking.
@@ -46,33 +47,33 @@ pub const HandshakeInfo = struct {
 
     /// Returns the negotiated TLS version string (e.g., "TLSv1.3").
     pub fn version(self: *const Self) []const u8 {
-        std.debug.assert(self.version_len <= VERSION_BUF_SIZE); // S1: postcondition
+        assert(self.version_len <= VERSION_BUF_SIZE); // S1: postcondition
         return self.version_buf[0..self.version_len];
     }
 
     /// Returns the negotiated cipher suite name (e.g., "TLS_AES_256_GCM_SHA384").
     pub fn cipher(self: *const Self) []const u8 {
-        std.debug.assert(self.cipher_len <= CIPHER_BUF_SIZE); // S1: postcondition
+        assert(self.cipher_len <= CIPHER_BUF_SIZE); // S1: postcondition
         return self.cipher_buf[0..self.cipher_len];
     }
 
     /// Returns the negotiated ALPN protocol, or null if none.
     pub fn alpn(self: *const Self) ?[]const u8 {
-        std.debug.assert(self.alpn_len <= ALPN_BUF_SIZE); // S1: postcondition
+        assert(self.alpn_len <= ALPN_BUF_SIZE); // S1: postcondition
         if (self.alpn_len == 0) return null;
         return self.alpn_buf[0..self.alpn_len];
     }
 
     /// Returns the peer certificate subject, or null if no peer cert.
     pub fn certSubject(self: *const Self) ?[]const u8 {
-        std.debug.assert(self.cert_subject_len <= CERT_NAME_BUF_SIZE); // S1: postcondition
+        assert(self.cert_subject_len <= CERT_NAME_BUF_SIZE); // S1: postcondition
         if (self.cert_subject_len == 0) return null;
         return self.cert_subject_buf[0..self.cert_subject_len];
     }
 
     /// Returns the peer certificate issuer, or null if no peer cert.
     pub fn certIssuer(self: *const Self) ?[]const u8 {
-        std.debug.assert(self.cert_issuer_len <= CERT_NAME_BUF_SIZE); // S1: postcondition
+        assert(self.cert_issuer_len <= CERT_NAME_BUF_SIZE); // S1: postcondition
         if (self.cert_issuer_len == 0) return null;
         return self.cert_issuer_buf[0..self.cert_issuer_len];
     }
