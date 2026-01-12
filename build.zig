@@ -522,6 +522,7 @@ pub fn build(b: *std.Build) void {
     gateway_example_mod.addImport("serval-server", serval_server_module);
     gateway_example_mod.addImport("serval-metrics", serval_metrics_module);
     gateway_example_mod.addImport("serval-tracing", serval_tracing_module);
+    gateway_example_mod.addImport("serval-router", serval_router_module);
     const gateway_example = b.addExecutable(.{
         .name = "gateway_example",
         .root_module = gateway_example_mod,

@@ -20,6 +20,8 @@ const DirectResponse = types.DirectResponse;
 const gateway = @import("serval-k8s-gateway");
 const GatewayConfig = gateway.GatewayConfig;
 
+const PathMatch = @import("serval-router").PathMatch;
+
 // ============================================================================
 // Admin Handler (implements serval-server Handler interface)
 // ============================================================================
@@ -85,14 +87,17 @@ pub const AdminHandler = struct {
         assert(@intFromPtr(self.ready) != 0); // S1: precondition - ready flag initialized
 
         const path = request.path;
+        const healthz = PathMatch{ .exactPath = "/healthz" };
+        const readyz = PathMatch{ .exactPath = "/readyz" };
+        const config_path = PathMatch{ .exactPath = "/config" };
 
         // GET /healthz - liveness probe
-        if (std.mem.eql(u8, path, "/healthz") or std.mem.startsWith(u8, path, "/healthz?")) {
+        if (healthz.matches(path)) {
             return self.okResponse("OK");
         }
 
         // GET /readyz - readiness probe
-        if (std.mem.eql(u8, path, "/readyz") or std.mem.startsWith(u8, path, "/readyz?")) {
+        if (readyz.matches(path)) {
             if (self.ready.load(.acquire)) {
                 return self.okResponse("OK");
             }
@@ -100,7 +105,7 @@ pub const AdminHandler = struct {
         }
 
         // GET /config - config status
-        if (std.mem.eql(u8, path, "/config") or std.mem.startsWith(u8, path, "/config?")) {
+        if (config_path.matches(path)) {
             if (self.gateway_config.* != null) {
                 return self.jsonResponse(200, "{\"status\":\"configured\"}");
             }

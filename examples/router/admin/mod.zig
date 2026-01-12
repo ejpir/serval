@@ -23,6 +23,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 const serval = @import("serval");
+const PathMatch = @import("serval-router").PathMatch;
 
 const json = @import("../json/mod.zig");
 const config_storage = @import("../config_storage.zig");
@@ -73,7 +74,10 @@ pub fn AdminHandler(comptime Tracer: type) type {
             assert(response_buf.len > 0);
 
             // Route based on path and method
-            if (std.mem.eql(u8, request.path, "/healthz")) {
+            const healthz = PathMatch{ .exactPath = "/healthz" };
+            const readyz = PathMatch{ .exactPath = "/readyz" };
+
+            if (healthz.matches(request.path)) {
                 return .{ .send_response = .{
                     .status = 200,
                     .body = "OK",
@@ -81,7 +85,7 @@ pub fn AdminHandler(comptime Tracer: type) type {
                 } };
             }
 
-            if (std.mem.eql(u8, request.path, "/readyz")) {
+            if (readyz.matches(request.path)) {
                 if (config_storage.getActiveRouter() != null) {
                     return .{ .send_response = .{
                         .status = 200,
