@@ -218,15 +218,9 @@ pub fn createServerCtx() !*SSL_CTX {
 
 pub fn createSsl(ctx: *SSL_CTX) !*SSL {
     // S1: precondition - ctx pointer must be valid (enforced by type system)
-    const ssl = SSL_new(ctx) orelse return error.SslNew;
+    const ssl_obj = SSL_new(ctx) orelse return error.SslNew;
     // S1: postcondition - ssl is non-null (verified by orelse above)
-    return ssl;
-}
-
-pub fn getErrorString(err: c_ulong) []const u8 {
-    var buf = std.mem.zeroes([256]u8); // S5: zeroed to prevent information leaks
-    ERR_error_string_n(err, &buf, buf.len);
-    return std.mem.sliceTo(&buf, 0);
+    return ssl_obj;
 }
 
 pub fn printErrors() void {

@@ -133,19 +133,25 @@ pub const Listener = struct {
         HTTP,
         HTTPS,
 
+        const string_map = [_]struct { str: []const u8, val: Protocol }{
+            .{ .str = "HTTP", .val = .HTTP },
+            .{ .str = "HTTPS", .val = .HTTPS },
+        };
+
         /// Parse protocol from string (case-insensitive).
         pub fn fromString(s: []const u8) ?Protocol {
-            if (std.ascii.eqlIgnoreCase(s, "HTTP")) return .HTTP;
-            if (std.ascii.eqlIgnoreCase(s, "HTTPS")) return .HTTPS;
+            for (string_map) |entry| {
+                if (std.ascii.eqlIgnoreCase(s, entry.str)) return entry.val;
+            }
             return null;
         }
 
         /// Convert to string for serialization.
         pub fn toString(self: Protocol) []const u8 {
-            return switch (self) {
-                .HTTP => "HTTP",
-                .HTTPS => "HTTPS",
-            };
+            for (string_map) |entry| {
+                if (entry.val == self) return entry.str;
+            }
+            unreachable;
         }
     };
 };
@@ -163,19 +169,25 @@ pub const TLSConfig = struct {
         /// Pass TLS connections through to backends unchanged.
         Passthrough,
 
+        const string_map = [_]struct { str: []const u8, val: Mode }{
+            .{ .str = "Terminate", .val = .Terminate },
+            .{ .str = "Passthrough", .val = .Passthrough },
+        };
+
         /// Parse mode from string (case-insensitive).
         pub fn fromString(s: []const u8) ?Mode {
-            if (std.ascii.eqlIgnoreCase(s, "Terminate")) return .Terminate;
-            if (std.ascii.eqlIgnoreCase(s, "Passthrough")) return .Passthrough;
+            for (string_map) |entry| {
+                if (std.ascii.eqlIgnoreCase(s, entry.str)) return entry.val;
+            }
             return null;
         }
 
         /// Convert to string for serialization.
         pub fn toString(self: Mode) []const u8 {
-            return switch (self) {
-                .Terminate => "Terminate",
-                .Passthrough => "Passthrough",
-            };
+            for (string_map) |entry| {
+                if (entry.val == self) return entry.str;
+            }
+            unreachable;
         }
     };
 };
@@ -238,19 +250,25 @@ pub const PathMatch = struct {
         /// Path prefix match (e.g., "/api/").
         PathPrefix,
 
+        const string_map = [_]struct { str: []const u8, val: Type }{
+            .{ .str = "Exact", .val = .Exact },
+            .{ .str = "PathPrefix", .val = .PathPrefix },
+        };
+
         /// Parse type from string (case-insensitive).
         pub fn fromString(s: []const u8) ?Type {
-            if (std.ascii.eqlIgnoreCase(s, "Exact")) return .Exact;
-            if (std.ascii.eqlIgnoreCase(s, "PathPrefix")) return .PathPrefix;
+            for (string_map) |entry| {
+                if (std.ascii.eqlIgnoreCase(s, entry.str)) return entry.val;
+            }
             return null;
         }
 
         /// Convert to string for serialization.
         pub fn toString(self: Type) []const u8 {
-            return switch (self) {
-                .Exact => "Exact",
-                .PathPrefix => "PathPrefix",
-            };
+            for (string_map) |entry| {
+                if (entry.val == self) return entry.str;
+            }
+            unreachable;
         }
     };
 
@@ -280,22 +298,26 @@ pub const HTTPRouteFilter = struct {
     pub const Type = enum {
         /// Rewrite the request URL.
         URLRewrite,
-        // Future extensions:
-        // RequestHeaderModifier,
-        // ResponseHeaderModifier,
-        // RequestRedirect,
+        // Future extensions: RequestHeaderModifier, ResponseHeaderModifier, RequestRedirect
+
+        const string_map = [_]struct { str: []const u8, val: Type }{
+            .{ .str = "URLRewrite", .val = .URLRewrite },
+        };
 
         /// Parse type from string (case-insensitive).
         pub fn fromString(s: []const u8) ?Type {
-            if (std.ascii.eqlIgnoreCase(s, "URLRewrite")) return .URLRewrite;
+            for (string_map) |entry| {
+                if (std.ascii.eqlIgnoreCase(s, entry.str)) return entry.val;
+            }
             return null;
         }
 
         /// Convert to string for serialization.
         pub fn toString(self: Type) []const u8 {
-            return switch (self) {
-                .URLRewrite => "URLRewrite",
-            };
+            for (string_map) |entry| {
+                if (entry.val == self) return entry.str;
+            }
+            unreachable;
         }
     };
 };
@@ -320,19 +342,25 @@ pub const PathRewrite = struct {
         /// Replace the entire path with the value.
         ReplaceFullPath,
 
+        const string_map = [_]struct { str: []const u8, val: Type }{
+            .{ .str = "ReplacePrefixMatch", .val = .ReplacePrefixMatch },
+            .{ .str = "ReplaceFullPath", .val = .ReplaceFullPath },
+        };
+
         /// Parse type from string (case-insensitive).
         pub fn fromString(s: []const u8) ?Type {
-            if (std.ascii.eqlIgnoreCase(s, "ReplacePrefixMatch")) return .ReplacePrefixMatch;
-            if (std.ascii.eqlIgnoreCase(s, "ReplaceFullPath")) return .ReplaceFullPath;
+            for (string_map) |entry| {
+                if (std.ascii.eqlIgnoreCase(s, entry.str)) return entry.val;
+            }
             return null;
         }
 
         /// Convert to string for serialization.
         pub fn toString(self: Type) []const u8 {
-            return switch (self) {
-                .ReplacePrefixMatch => "ReplacePrefixMatch",
-                .ReplaceFullPath => "ReplaceFullPath",
-            };
+            for (string_map) |entry| {
+                if (entry.val == self) return entry.str;
+            }
+            unreachable;
         }
     };
 
@@ -420,21 +448,26 @@ pub const ConditionType = enum {
     /// All backend references have been resolved.
     ResolvedRefs,
 
+    const string_map = [_]struct { str: []const u8, val: ConditionType }{
+        .{ .str = "Accepted", .val = .Accepted },
+        .{ .str = "Programmed", .val = .Programmed },
+        .{ .str = "ResolvedRefs", .val = .ResolvedRefs },
+    };
+
     /// Parse condition type from string (case-insensitive).
     pub fn fromString(s: []const u8) ?ConditionType {
-        if (std.ascii.eqlIgnoreCase(s, "Accepted")) return .Accepted;
-        if (std.ascii.eqlIgnoreCase(s, "Programmed")) return .Programmed;
-        if (std.ascii.eqlIgnoreCase(s, "ResolvedRefs")) return .ResolvedRefs;
+        for (string_map) |entry| {
+            if (std.ascii.eqlIgnoreCase(s, entry.str)) return entry.val;
+        }
         return null;
     }
 
     /// Convert to string for serialization.
     pub fn toString(self: ConditionType) []const u8 {
-        return switch (self) {
-            .Accepted => "Accepted",
-            .Programmed => "Programmed",
-            .ResolvedRefs => "ResolvedRefs",
-        };
+        for (string_map) |entry| {
+            if (entry.val == self) return entry.str;
+        }
+        unreachable;
     }
 };
 
@@ -447,21 +480,26 @@ pub const ConditionStatus = enum {
     /// Condition status is unknown.
     Unknown,
 
+    const string_map = [_]struct { str: []const u8, val: ConditionStatus }{
+        .{ .str = "True", .val = .True },
+        .{ .str = "False", .val = .False },
+        .{ .str = "Unknown", .val = .Unknown },
+    };
+
     /// Parse condition status from string (case-insensitive).
     pub fn fromString(s: []const u8) ?ConditionStatus {
-        if (std.ascii.eqlIgnoreCase(s, "True")) return .True;
-        if (std.ascii.eqlIgnoreCase(s, "False")) return .False;
-        if (std.ascii.eqlIgnoreCase(s, "Unknown")) return .Unknown;
+        for (string_map) |entry| {
+            if (std.ascii.eqlIgnoreCase(s, entry.str)) return entry.val;
+        }
         return null;
     }
 
     /// Convert to string for serialization.
     pub fn toString(self: ConditionStatus) []const u8 {
-        return switch (self) {
-            .True => "True",
-            .False => "False",
-            .Unknown => "Unknown",
-        };
+        for (string_map) |entry| {
+            if (entry.val == self) return entry.str;
+        }
+        unreachable;
     }
 };
 

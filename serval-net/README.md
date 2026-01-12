@@ -14,7 +14,7 @@ Unified socket abstraction (plain TCP + TLS) and TCP configuration helpers.
 | `SocketError` | Unified error type for socket operations |
 | `Socket.Plain.initClient(fd)` | Create plain client socket from fd |
 | `Socket.Plain.initServer(fd)` | Create plain server socket from fd |
-| `Socket.TLS.TLSSocket.initClient(fd, ctx, host)` | Create TLS client socket with SNI |
+| `Socket.TLS.TLSSocket.initClient(fd, ctx, host, enable_ktls)` | Create TLS client socket with SNI |
 | `Socket.TLS.TLSSocket.initServer(fd, ctx)` | Create TLS server socket |
 | `socket.read(buf)` | Read data into buffer |
 | `socket.write(data)` | Write data to socket |
@@ -85,7 +85,7 @@ Create plain server socket from file descriptor. Same as `initClient` for plain 
 
 **Returns:** `Socket` with `.plain` variant
 
-### Socket.TLS.TLSSocket.initClient(fd: i32, ctx: *SSL_CTX, host: []const u8) SocketError!Socket
+### Socket.TLS.TLSSocket.initClient(fd: i32, ctx: *SSL_CTX, host: []const u8, enable_ktls: bool) SocketError!Socket
 
 Create TLS client socket with Server Name Indication (SNI). Performs TLS handshake.
 
@@ -93,6 +93,7 @@ Create TLS client socket with Server Name Indication (SNI). Performs TLS handsha
 - `fd`: Socket file descriptor (must be >= 0)
 - `ctx`: OpenSSL SSL_CTX pointer (caller owns lifecycle)
 - `host`: Hostname for SNI (max 253 chars per RFC 6066)
+- `enable_ktls`: If true, attempt kernel TLS offload. If false, use userspace TLS.
 
 **Returns:** `Socket` with `.tls` variant, or `SocketError`
 
@@ -253,8 +254,8 @@ const tls = @import("serval-tls");
 const ctx = try tls.ssl.createClientContext();
 defer tls.ssl.destroyContext(ctx);
 
-// Create TLS socket with SNI
-var socket = try net.Socket.TLS.TLSSocket.initClient(upstream_fd, ctx, "api.example.com");
+// Create TLS socket with SNI (enable_ktls=true for kernel TLS offload)
+var socket = try net.Socket.TLS.TLSSocket.initClient(upstream_fd, ctx, "api.example.com", true);
 defer socket.close();
 
 // Read/write (encrypted transparently)

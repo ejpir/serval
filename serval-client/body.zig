@@ -600,8 +600,7 @@ pub const BodyReader = struct {
             };
             if (n == 0) break; // EOF
 
-            dst.writeAll(scratch[0..n]) catch |err| {
-                _ = err;
+            dst.writeAll(scratch[0..n]) catch {
                 return BodyError.WriteFailed;
             };
 

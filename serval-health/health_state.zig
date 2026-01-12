@@ -41,6 +41,14 @@ pub const HealthState = struct {
         std.debug.assert(MAX_UPSTREAMS <= 64);
     }
 
+    /// Compute bitmask for configured backends.
+    fn backendMask(count: u8) u64 {
+        std.debug.assert(count <= MAX_UPSTREAMS);
+        if (count == 0) return 0;
+        if (count >= 64) return std.math.maxInt(u64);
+        return (@as(u64, 1) << @as(u6, @intCast(count))) - 1;
+    }
+
     /// Initialize with backend count and thresholds.
     /// Only first backend_count backends start healthy.
     pub fn init(backend_count: u8, unhealthy_threshold: u8, healthy_threshold: u8) Self {
@@ -48,15 +56,8 @@ pub const HealthState = struct {
         std.debug.assert(unhealthy_threshold > 0);
         std.debug.assert(healthy_threshold > 0);
 
-        const initial_bitmap: u64 = if (backend_count == 0)
-            0
-        else if (backend_count >= MAX_UPSTREAMS)
-            std.math.maxInt(u64)
-        else
-            (@as(u64, 1) << @as(u6, @intCast(backend_count))) - 1;
-
         return Self{
-            .health_bitmap = std.atomic.Value(u64).init(initial_bitmap),
+            .health_bitmap = std.atomic.Value(u64).init(backendMask(backend_count)),
             .failure_counts = std.mem.zeroes([MAX_UPSTREAMS]u8),
             .success_counts = std.mem.zeroes([MAX_UPSTREAMS]u8),
             .backend_count = backend_count,
@@ -118,31 +119,18 @@ pub const HealthState = struct {
     /// Count healthy backends.
     pub fn countHealthy(self: *const Self) u32 {
         const bitmap = self.health_bitmap.load(.acquire);
-        // Mask to only count configured backends
-        const mask: u64 = if (self.backend_count >= 64)
-            std.math.maxInt(u64)
-        else
-            (@as(u64, 1) << @as(u6, @intCast(self.backend_count))) - 1;
-        return @popCount(bitmap & mask);
+        return @popCount(bitmap & backendMask(self.backend_count));
     }
 
     /// Find Nth healthy backend, wrapping around.
     /// Returns null only if NO healthy backends exist.
     pub fn findNthHealthy(self: *const Self, n: u32) ?UpstreamIndex {
-        var bitmap = self.health_bitmap.load(.acquire);
-
-        // Mask to only consider configured backends
-        const mask: u64 = if (self.backend_count >= 64)
-            std.math.maxInt(u64)
-        else
-            (@as(u64, 1) << @as(u6, @intCast(self.backend_count))) - 1;
-        bitmap &= mask;
+        var bitmap = self.health_bitmap.load(.acquire) & backendMask(self.backend_count);
 
         const healthy_count = @popCount(bitmap);
         if (healthy_count == 0) return null;
 
-        const target = n % healthy_count;
-        var remaining = target;
+        var remaining = n % healthy_count;
         var iterations: u8 = 0;
 
         while (bitmap != 0 and iterations < MAX_UPSTREAMS) : (iterations += 1) {
@@ -161,14 +149,7 @@ pub const HealthState = struct {
 
     /// Find first healthy backend, optionally excluding one.
     pub fn findFirstHealthy(self: *const Self, exclude_idx: ?UpstreamIndex) ?UpstreamIndex {
-        var bitmap = self.health_bitmap.load(.acquire);
-
-        // Mask to only consider configured backends
-        const mask: u64 = if (self.backend_count >= 64)
-            std.math.maxInt(u64)
-        else
-            (@as(u64, 1) << @as(u6, @intCast(self.backend_count))) - 1;
-        bitmap &= mask;
+        var bitmap = self.health_bitmap.load(.acquire) & backendMask(self.backend_count);
 
         if (exclude_idx) |idx| {
             std.debug.assert(idx < self.backend_count);
@@ -187,7 +168,6 @@ pub const HealthState = struct {
         std.debug.assert(idx < self.backend_count);
         const mask: u64 = @as(u64, 1) << idx;
         _ = self.health_bitmap.fetchOr(mask, .release);
-        self.failure_counts[idx] = 0;
     }
 
     /// Mark backend as unhealthy (internal).
@@ -195,19 +175,11 @@ pub const HealthState = struct {
         std.debug.assert(idx < self.backend_count);
         const mask: u64 = @as(u64, 1) << idx;
         _ = self.health_bitmap.fetchAnd(~mask, .release);
-        self.success_counts[idx] = 0;
     }
 
     /// Reset all backends to healthy.
     pub fn reset(self: *Self) void {
-        const initial_bitmap: u64 = if (self.backend_count == 0)
-            0
-        else if (self.backend_count >= MAX_UPSTREAMS)
-            std.math.maxInt(u64)
-        else
-            (@as(u64, 1) << @as(u6, @intCast(self.backend_count))) - 1;
-
-        self.health_bitmap.store(initial_bitmap, .release);
+        self.health_bitmap.store(backendMask(self.backend_count), .release);
         self.failure_counts = std.mem.zeroes([MAX_UPSTREAMS]u8);
         self.success_counts = std.mem.zeroes([MAX_UPSTREAMS]u8);
     }

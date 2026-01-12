@@ -140,7 +140,8 @@ pub const LbHandler = struct {
         }
 
         // Fallback: all unhealthy, use simple round-robin (graceful degradation)
-        const fallback_idx = current % @as(u32, @intCast(self.upstreams.len));
+        // Use backend_count from health state - already validated at init
+        const fallback_idx = current % @as(u32, self.health.backend_count);
         return self.upstreams[fallback_idx];
     }
 
@@ -171,7 +172,6 @@ pub const LbHandler = struct {
         assert(idx < self.upstreams.len);
         return self.health.isHealthy(idx);
     }
-
 };
 
 // =============================================================================

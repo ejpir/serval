@@ -114,14 +114,8 @@ pub const TLSStream = struct {
     /// Log kTLS status after handshake.
     fn logKtlsStatus(info: *const HandshakeInfo, is_server: bool) void {
         const role = if (is_server) "server" else "client";
-        const cipher_name = info.cipher();
-
-        // Determine kTLS type from mode for logging
-        if (info.ktls_enabled) {
-            std.log.info("TLS handshake ({s}): ktls=enabled, cipher={s}", .{ role, cipher_name });
-        } else {
-            std.log.info("TLS handshake ({s}): ktls=disabled, cipher={s}", .{ role, cipher_name });
-        }
+        const ktls_status = if (info.ktls_enabled) "enabled" else "disabled";
+        std.log.info("TLS handshake ({s}): ktls={s}, cipher={s}", .{ role, ktls_status, info.cipher() });
     }
 
     /// Server-side TLS handshake (client termination).
@@ -230,10 +224,11 @@ pub const TLSStream = struct {
         populateHandshakeInfo(ssl_conn, &info);
 
         // Setup kTLS and get appropriate mode (only if enabled)
-        const mode = if (enable_ktls) setupKtlsAfterHandshake(ssl_conn, fd, &info) else Mode{ .userspace = ssl_conn };
-        if (enable_ktls) {
+        const mode: Mode = if (enable_ktls) blk: {
+            const m = setupKtlsAfterHandshake(ssl_conn, fd, &info);
             logKtlsStatus(&info, false);
-        }
+            break :blk m;
+        } else .{ .userspace = ssl_conn };
 
         return .{
             .fd = fd,

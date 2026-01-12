@@ -273,28 +273,18 @@ pub fn translateToJson(
 }
 
 /// Check if any filter has a URL rewrite path configured.
-/// TigerStyle S1: Precondition assertion. S4: Bounded loop with explicit bounds.
 fn hasUrlRewriteFilter(filters: []const gw_config.HTTPRouteFilter) bool {
-    // S1: Precondition - filters bounded by MAX_FILTERS
-    assert(filters.len <= gw_config.MAX_FILTERS);
+    assert(filters.len <= gw_config.MAX_FILTERS); // S1: precondition
 
-    // S4: Bounded loop with explicit iteration bounds
-    for (filters, 0..) |filter, i| {
-        assert(i < gw_config.MAX_FILTERS);
-
-        if (filter.type == .URLRewrite) {
-            if (filter.url_rewrite) |rewrite| {
-                if (rewrite.path != null) {
-                    return true;
-                }
-            }
-        }
+    for (filters) |filter| {
+        if (filter.type != .URLRewrite) continue;
+        const rewrite = filter.url_rewrite orelse continue;
+        if (rewrite.path != null) return true;
     }
     return false;
 }
 
-/// Write a single route object to JSON.
-/// TigerStyle: Outputs path_exact or path_prefix based on match type.
+/// Write a single route object to JSON (outputs path_exact or path_prefix based on match type).
 fn writeRoute(
     writer: *JsonWriter,
     name: []const u8,
@@ -303,12 +293,10 @@ fn writeRoute(
     pool_idx: u8,
     strip_prefix: bool,
 ) TranslatorError!void {
-    // S1: Preconditions
-    assert(name.len > 0);
-    assert(pool_idx < MAX_POOLS);
+    assert(name.len > 0); // S1: precondition
+    assert(pool_idx < MAX_POOLS); // S1: precondition
 
-    writer.writeRaw("{") catch return error.BufferTooSmall;
-    writer.writeRaw("\"name\":\"") catch return error.BufferTooSmall;
+    writer.writeRaw("{\"name\":\"") catch return error.BufferTooSmall;
     writer.writeRaw(name) catch return error.BufferTooSmall;
     writer.writeRaw("\",") catch return error.BufferTooSmall;
 
@@ -318,16 +306,12 @@ fn writeRoute(
         writer.writeRaw("\",") catch return error.BufferTooSmall;
     }
 
-    // Output path_exact or path_prefix based on match type.
-    // TigerStyle: Explicit match type handling, defaults to prefix for "/" catch-all.
+    // Exact vs prefix path match (defaults to prefix "/" for catch-all routes)
     const path_value = if (path_match) |pm| pm.value else "/";
     const is_exact = if (path_match) |pm| pm.type == .Exact else false;
+    const path_key = if (is_exact) "\"path_exact\":\"" else "\"path_prefix\":\"";
 
-    if (is_exact) {
-        writer.writeRaw("\"path_exact\":\"") catch return error.BufferTooSmall;
-    } else {
-        writer.writeRaw("\"path_prefix\":\"") catch return error.BufferTooSmall;
-    }
+    writer.writeRaw(path_key) catch return error.BufferTooSmall;
     writer.writeRaw(path_value) catch return error.BufferTooSmall;
     writer.writeRaw("\",") catch return error.BufferTooSmall;
 
@@ -335,32 +319,25 @@ fn writeRoute(
     var idx_buf: [4]u8 = undefined;
     const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{pool_idx}) catch return error.BufferTooSmall;
     writer.writeRaw(idx_str) catch return error.BufferTooSmall;
-    writer.writeRaw(",") catch return error.BufferTooSmall;
 
-    writer.writeRaw("\"strip_prefix\":") catch return error.BufferTooSmall;
-    writer.writeRaw(if (strip_prefix) "true" else "false") catch return error.BufferTooSmall;
-
-    writer.writeRaw("}") catch return error.BufferTooSmall;
+    writer.writeRaw(",\"strip_prefix\":") catch return error.BufferTooSmall;
+    writer.writeRaw(if (strip_prefix) "true}" else "false}") catch return error.BufferTooSmall;
 }
 
 /// Find resolved backend by name and namespace.
-/// TigerStyle S4: Bounded search (resolved_backends slice is bounded by caller).
 fn findResolvedBackend(
     backends: []const gw_config.ResolvedBackend,
     name: []const u8,
     namespace: []const u8,
 ) ?*const gw_config.ResolvedBackend {
-    // S1: Preconditions
-    assert(name.len > 0);
-    assert(namespace.len > 0);
-    assert(backends.len <= gw_config.MAX_RESOLVED_BACKENDS);
+    assert(name.len > 0); // S1: precondition
+    assert(namespace.len > 0); // S1: precondition
+    assert(backends.len <= gw_config.MAX_RESOLVED_BACKENDS); // S1: precondition
 
     for (backends) |*backend| {
-        if (std.mem.eql(u8, backend.getName(), name) and
-            std.mem.eql(u8, backend.getNamespace(), namespace))
-        {
-            return backend;
-        }
+        const name_match = std.mem.eql(u8, backend.getName(), name);
+        const ns_match = std.mem.eql(u8, backend.getNamespace(), namespace);
+        if (name_match and ns_match) return backend;
     }
     return null;
 }
@@ -373,44 +350,28 @@ fn writePool(
     resolved_backends: []const gw_config.ResolvedBackend,
     pool_idx: u8,
 ) TranslatorError!void {
-    // S1: Preconditions
-    assert(name.len > 0);
-    assert(pool_idx < MAX_POOLS);
-    assert(resolved_backends.len <= gw_config.MAX_RESOLVED_BACKENDS);
+    _ = pool_idx; // Used for assertion in caller
+    assert(name.len > 0); // S1: precondition
+    assert(resolved_backends.len <= gw_config.MAX_RESOLVED_BACKENDS); // S1: precondition
 
-    writer.writeRaw("{") catch return error.BufferTooSmall;
-    writer.writeRaw("\"name\":\"") catch return error.BufferTooSmall;
+    writer.writeRaw("{\"name\":\"") catch return error.BufferTooSmall;
     writer.writeRaw(name) catch return error.BufferTooSmall;
-    writer.writeRaw("-pool\",") catch return error.BufferTooSmall;
-
-    writer.writeRaw("\"upstreams\":[") catch return error.BufferTooSmall;
+    writer.writeRaw("-pool\",\"upstreams\":[") catch return error.BufferTooSmall;
 
     var upstream_count: u8 = 0;
-    // Use local indices (0, 1, 2...) per pool, not global indices.
-    // Each pool has its own LbHandler with independent health bitmap.
 
     for (backend_refs, 0..) |backend_ref, ref_i| {
-        // S3: Bounded loop check
-        if (ref_i >= gw_config.MAX_BACKEND_REFS) break;
+        if (ref_i >= gw_config.MAX_BACKEND_REFS) break; // S3: bounded loop
 
-        // Look up resolved backend by name/namespace
         const resolved = findResolvedBackend(
             resolved_backends,
             backend_ref.name,
             backend_ref.namespace,
-        ) orelse {
-            // Skip backends without resolved endpoints
-            continue;
-        };
+        ) orelse continue; // Skip backends without resolved endpoints
 
-        // Write each endpoint as an upstream
         for (resolved.getEndpoints(), 0..) |ep, ep_i| {
-            // S3: Bounded loop check
-            if (ep_i >= gw_config.MAX_RESOLVED_ENDPOINTS) break;
-
-            if (upstream_count >= MAX_UPSTREAMS_PER_POOL) {
-                return error.TooManyUpstreams;
-            }
+            if (ep_i >= gw_config.MAX_RESOLVED_ENDPOINTS) break; // S3: bounded loop
+            if (upstream_count >= MAX_UPSTREAMS_PER_POOL) return error.TooManyUpstreams;
 
             if (upstream_count > 0) {
                 writer.writeRaw(",") catch return error.BufferTooSmall;
@@ -421,20 +382,8 @@ fn writePool(
         }
     }
 
-    writer.writeRaw("]") catch return error.BufferTooSmall;
-
-    // Add lb_config with probing disabled for now.
-    // TODO: Enable probing once router_example has a global DnsResolver.
-    // Probing requires dns_resolver != null in LbHandler.init(), but
-    // router_example's handleRouteUpdate passes null to swapRouter().
-    // To enable: add global DnsResolver to router_example and pass to swapRouter.
-    writer.writeRaw(",\"lb_config\":{") catch return error.BufferTooSmall;
-    writer.writeRaw("\"enable_probing\":false,") catch return error.BufferTooSmall;
-    writer.writeRaw("\"probe_interval_ms\":5000,") catch return error.BufferTooSmall;
-    writer.writeRaw("\"health_path\":\"/\"") catch return error.BufferTooSmall;
-    writer.writeRaw("}") catch return error.BufferTooSmall;
-
-    writer.writeRaw("}") catch return error.BufferTooSmall;
+    // Probing disabled: router_example passes null dns_resolver to swapRouter()
+    writer.writeRaw("],\"lb_config\":{\"enable_probing\":false,\"probe_interval_ms\":5000,\"health_path\":\"/\"}}") catch return error.BufferTooSmall;
 }
 
 /// Write a single upstream object to JSON.
@@ -444,62 +393,43 @@ fn writeUpstream(
     port: u16,
     idx: u8,
 ) TranslatorError!void {
-    // S1: Preconditions
-    assert(host.len > 0);
-    assert(port > 0);
+    assert(host.len > 0); // S1: precondition
+    assert(port > 0); // S1: precondition
 
-    writer.writeRaw("{") catch return error.BufferTooSmall;
-    writer.writeRaw("\"host\":\"") catch return error.BufferTooSmall;
+    writer.writeRaw("{\"host\":\"") catch return error.BufferTooSmall;
     writer.writeRaw(host) catch return error.BufferTooSmall;
-    writer.writeRaw("\",") catch return error.BufferTooSmall;
+    writer.writeRaw("\",\"port\":") catch return error.BufferTooSmall;
 
-    writer.writeRaw("\"port\":") catch return error.BufferTooSmall;
     var port_buf: [8]u8 = undefined;
     const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch return error.BufferTooSmall;
     writer.writeRaw(port_str) catch return error.BufferTooSmall;
-    writer.writeRaw(",") catch return error.BufferTooSmall;
 
-    writer.writeRaw("\"idx\":") catch return error.BufferTooSmall;
+    writer.writeRaw(",\"idx\":") catch return error.BufferTooSmall;
     var idx_buf: [4]u8 = undefined;
     const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{idx}) catch return error.BufferTooSmall;
     writer.writeRaw(idx_str) catch return error.BufferTooSmall;
-    writer.writeRaw(",") catch return error.BufferTooSmall;
 
-    writer.writeRaw("\"tls\":false") catch return error.BufferTooSmall;
-
-    writer.writeRaw("}") catch return error.BufferTooSmall;
+    writer.writeRaw(",\"tls\":false}") catch return error.BufferTooSmall;
 }
 
 // ============================================================================
 // JSON Writer Helper
 // ============================================================================
 
-/// Simple bounded JSON writer.
-/// TigerStyle: No allocation, fixed buffer, explicit error on overflow.
+/// Simple bounded JSON writer (no allocation, explicit overflow error).
 const JsonWriter = struct {
     buf: []u8,
-    /// Current write position. TigerStyle S2: u32 matches MAX_JSON_SIZE_BYTES bound.
-    pos: u32,
+    pos: u32, // Matches MAX_JSON_SIZE_BYTES bound
 
-    const Self = @This();
-
-    fn init(buf: *[MAX_JSON_SIZE_BYTES]u8) Self {
-        // S1: Precondition - buffer is valid and sized
-        assert(buf.len == MAX_JSON_SIZE_BYTES);
-
-        return Self{
-            .buf = buf,
-            .pos = 0,
-        };
+    fn init(buf: *[MAX_JSON_SIZE_BYTES]u8) JsonWriter {
+        return .{ .buf = buf, .pos = 0 };
     }
 
-    fn writeRaw(self: *Self, data: []const u8) !void {
-        // S1: Precondition - data within reasonable bounds
-        assert(data.len <= MAX_JSON_SIZE_BYTES);
+    fn writeRaw(self: *JsonWriter, data: []const u8) !void {
+        assert(data.len <= MAX_JSON_SIZE_BYTES); // S1: precondition
 
         const data_len: u32 = @intCast(data.len);
-        const buf_len: u32 = @intCast(self.buf.len);
-        if (self.pos + data_len > buf_len) {
+        if (self.pos + data_len > @as(u32, @intCast(self.buf.len))) {
             return error.BufferTooSmall;
         }
         @memcpy(self.buf[self.pos..][0..data.len], data);

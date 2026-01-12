@@ -41,44 +41,30 @@ pub const RandomIDGenerator = struct {
 
     /// Generate a new TraceID (128-bit, guaranteed non-zero)
     pub fn newTraceId(self: *Self) TraceID {
-        // TigerStyle: bounded loop (max 10 attempts, then force non-zero)
-        var attempts: u32 = 0;
-        while (attempts < 10) : (attempts += 1) {
-            var bytes: [16]u8 = undefined;
-            self.prng.random().bytes(&bytes);
-
-            const trace_id = TraceID.init(bytes);
-            if (trace_id.isValid()) {
-                return trace_id;
-            }
-        }
-
-        // Fallback: force at least one byte non-zero
-        var bytes: [16]u8 = undefined;
-        self.prng.random().bytes(&bytes);
-        bytes[0] = 1; // Force valid
-        return TraceID.init(bytes);
+        return self.newValidId(TraceID, 16);
     }
 
     /// Generate a new SpanID (64-bit, guaranteed non-zero)
     pub fn newSpanId(self: *Self) SpanID {
-        // TigerStyle: bounded loop (max 10 attempts, then force non-zero)
+        return self.newValidId(SpanID, 8);
+    }
+
+    /// Generate a valid ID of the specified type.
+    /// TigerStyle: bounded loop (max 10 attempts, then force non-zero).
+    fn newValidId(self: *Self, comptime IdType: type, comptime size: usize) IdType {
+        const max_attempts: u32 = 10;
         var attempts: u32 = 0;
-        while (attempts < 10) : (attempts += 1) {
-            var bytes: [8]u8 = undefined;
+        while (attempts < max_attempts) : (attempts += 1) {
+            var bytes: [size]u8 = undefined;
             self.prng.random().bytes(&bytes);
-
-            const span_id = SpanID.init(bytes);
-            if (span_id.isValid()) {
-                return span_id;
-            }
+            const id = IdType.init(bytes);
+            if (id.isValid()) return id;
         }
-
         // Fallback: force at least one byte non-zero
-        var bytes: [8]u8 = undefined;
+        var bytes: [size]u8 = undefined;
         self.prng.random().bytes(&bytes);
-        bytes[0] = 1; // Force valid
-        return SpanID.init(bytes);
+        bytes[0] = 1;
+        return IdType.init(bytes);
     }
 
     /// Generate both TraceID and SpanID in one call

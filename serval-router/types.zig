@@ -43,8 +43,7 @@ pub const PathMatch = union(enum) {
     /// TigerStyle: Trivial accessor, assertion-exempt.
     pub fn getPattern(self: PathMatch) []const u8 {
         return switch (self) {
-            .exact => |p| p,
-            .prefix => |p| p,
+            inline else => |p| p,
         };
     }
 };

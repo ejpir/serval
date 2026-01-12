@@ -234,7 +234,7 @@ pub const Client = struct {
                 upstream.host[0 .. upstream.host.len - 1]
             else
                 upstream.host;
-            const tls_socket = Socket.TLS.TLSSocket.initClientWithOptions(
+            const tls_socket = Socket.TLS.TLSSocket.initClient(
                 fd,
                 ctx,
                 sni_host,
@@ -375,17 +375,6 @@ fn tcpConnect(address: Io.net.IpAddress, io: Io) !i32 {
     };
 
     return stream.socket.handle;
-}
-
-/// Map DNS errors to ClientError.
-/// TigerStyle S6: Explicit error handling.
-fn mapDnsError(err: net.DnsError) ClientError {
-    return switch (err) {
-        net.DnsError.DnsResolutionFailed => ClientError.DnsResolutionFailed,
-        net.DnsError.DnsTimeout => ClientError.DnsResolutionFailed,
-        net.DnsError.InvalidHostname => ClientError.DnsResolutionFailed,
-        net.DnsError.CacheFull => ClientError.DnsResolutionFailed,
-    };
 }
 
 /// Map TCP connect errors to ClientError.
@@ -533,9 +522,3 @@ test "mapConnectError maps common errors" {
     try std.testing.expectEqual(ClientError.TcpConnectFailed, mapConnectError(error.OutOfMemory));
 }
 
-test "mapDnsError maps all variants" {
-    try std.testing.expectEqual(ClientError.DnsResolutionFailed, mapDnsError(net.DnsError.DnsResolutionFailed));
-    try std.testing.expectEqual(ClientError.DnsResolutionFailed, mapDnsError(net.DnsError.DnsTimeout));
-    try std.testing.expectEqual(ClientError.DnsResolutionFailed, mapDnsError(net.DnsError.InvalidHostname));
-    try std.testing.expectEqual(ClientError.DnsResolutionFailed, mapDnsError(net.DnsError.CacheFull));
-}

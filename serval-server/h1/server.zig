@@ -43,16 +43,10 @@ const reader = @import("reader.zig");
 const ProcessResult = connection.ProcessResult;
 const clientWantsClose = connection.clientWantsClose;
 const nextConnectionId = connection.nextConnectionId;
-const sendErrorResponse = response.sendErrorResponse;
-const sendDirectResponse = response.sendDirectResponse;
-const send100Continue = response.send100Continue;
-const send501NotImplemented = response.send501NotImplemented;
 const sendStreamHeaders = response.sendStreamHeaders;
 const sendChunk = response.sendChunk;
 const sendFinalChunk = response.sendFinalChunk;
 const StreamResponse = types.StreamResponse;
-const readRequest = reader.readRequest;
-const readMoreData = reader.readMoreData;
 const getBodyLength = reader.getBodyLength;
 
 const Request = types.Request;
@@ -60,7 +54,6 @@ const Response = types.Response;
 const Context = context.Context;
 const BodyReader = context.BodyReader;
 const Config = config.Config;
-const posix = std.posix;
 
 // Time utilities from serval-core
 const time = serval_core.time;
@@ -344,13 +337,11 @@ pub fn Server(
             recv_buf: *[REQUEST_BUFFER_SIZE_BYTES]u8,
             buffer_offset: usize,
             buffer_len: *usize,
-            cfg: Config,
             conn_id: u64,
         ) bool {
             // TigerStyle: Bounded loop - max 16 iterations to receive complete headers
             const max_read_iterations: u32 = 16;
             var read_iterations: u32 = 0;
-            _ = cfg; // Unused after removing timeout logic
 
             while (std.mem.indexOf(u8, recv_buf[buffer_offset..buffer_len.*], "\r\n\r\n") == null) {
                 read_iterations += 1;
@@ -667,7 +658,7 @@ pub fn Server(
                 }
 
                 // Accumulate reads until complete headers received
-                if (!accumulateHeaders(maybe_tls_ptr, &io_mut, stream, &recv_buf, buffer_offset, &buffer_len, cfg, connection_id)) return;
+                if (!accumulateHeaders(maybe_tls_ptr, &io_mut, stream, &recv_buf, buffer_offset, &buffer_len, connection_id)) return;
                 const read_elapsed_ns = realtimeNanos() - read_start_ns;
                 const read_duration_us: u64 = if (read_elapsed_ns >= 0) @intCast(@divFloor(read_elapsed_ns, 1000)) else 0;
                 debugLog("server: conn={d} received bytes={d} read_us={d}", .{ connection_id, buffer_len - buffer_offset, read_duration_us });

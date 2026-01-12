@@ -3,7 +3,7 @@
 //!
 //! Probes unhealthy backends for recovery using HTTP GET requests.
 //! Uses serval-client for HTTP communication, supporting both plain TCP and TLS.
-//! TigerStyle: Blocking sockets with explicit timeouts, bounded operations.
+//! Blocking I/O is intentional - runs in background thread, not on hot path.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -23,12 +23,7 @@ const DnsResolver = net.DnsResolver;
 const Client = serval_client.Client;
 const Request = core.types.Request;
 
-// =============================================================================
-// Prober Context
-// =============================================================================
-
 /// Context for background prober thread.
-/// TigerStyle: Explicit parameters, no implicit state.
 pub const ProberContext = struct {
     upstreams: []const Upstream,
     health: *HealthState,
@@ -36,44 +31,36 @@ pub const ProberContext = struct {
     probe_interval_ms: u32,
     probe_timeout_ms: u32,
     health_path: []const u8,
-    /// Caller-provided SSL context for TLS probes.
-    /// TigerStyle: Explicit dependency injection, caller owns lifetime.
-    /// Set to null if no TLS upstreams need probing (plain HTTP only).
-    /// Verification settings are configured in the SSL_CTX by the caller.
+    /// Caller-provided SSL context for TLS probes (null = plain HTTP only).
+    /// Caller owns lifetime: create before starting prober, free after stopping.
     client_ctx: ?*ssl.SSL_CTX,
-    /// DNS resolver for hostname resolution.
-    /// TigerStyle: Shared resolver with TTL caching, caller owns lifetime.
-    /// Required for hostname-based upstreams.
+    /// DNS resolver for hostname resolution (caller owns lifetime).
     dns_resolver: *DnsResolver,
-    /// Allocator for Io runtime.
-    /// TigerStyle: Explicit dependency, caller owns lifetime.
+    /// Allocator for Io runtime (caller owns lifetime).
     allocator: std.mem.Allocator = std.heap.page_allocator,
 };
 
 /// Background probe loop - probes unhealthy backends for recovery.
 /// Runs until probe_running is set to false.
-/// TigerStyle: Creates Io runtime for HTTP client, single-threaded blocking I/O.
 pub fn probeLoop(ctx: ProberContext) void {
-    assert(ctx.probe_interval_ms > 0); // S1: precondition
-    assert(ctx.probe_timeout_ms > 0); // S1: precondition
+    assert(ctx.probe_interval_ms > 0);
+    assert(ctx.probe_timeout_ms > 0);
 
     const interval_s: u64 = ctx.probe_interval_ms / 1000;
     const interval_ns: u64 = (@as(u64, ctx.probe_interval_ms) % 1000) * 1_000_000;
 
-    // Initialize Io runtime for HTTP client.
-    // TigerStyle: One-time initialization at thread start, no allocation in probe loop.
+    // One-time init at thread start, no allocation in probe loop.
     var io_runtime = Io.Threaded.init(ctx.allocator, .{});
     defer io_runtime.deinit();
 
     const io = io_runtime.io();
 
-    // Create HTTP client for probing.
-    // TigerStyle: Shared client instance for all probes, no per-probe allocation.
+    // Shared client instance for all probes.
     var client = Client.init(
         ctx.allocator,
         ctx.dns_resolver,
         ctx.client_ctx,
-        false, // verify_tls: prober typically doesn't verify (internal backends)
+        false, // prober typically doesn't verify TLS (internal backends)
     );
     defer client.deinit();
 
@@ -84,39 +71,34 @@ pub fn probeLoop(ctx: ProberContext) void {
 }
 
 /// Probe all unhealthy backends.
-/// TigerStyle: Uses serval-client for HTTP requests.
 fn probeUnhealthyBackends(ctx: ProberContext, client: *Client, io: Io) void {
-    assert(ctx.upstreams.len > 0); // S1: precondition
+    assert(ctx.upstreams.len > 0);
 
-    // TigerStyle: Bounded loop over upstreams
     for (ctx.upstreams, 0..) |upstream, i| {
         const idx: UpstreamIndex = @intCast(i);
 
-        // Only probe unhealthy backends (healthy ones get passive checks via traffic)
+        // Healthy backends get passive checks via traffic, only probe unhealthy ones.
         if (ctx.health.isHealthy(idx)) continue;
 
         const success = probeBackend(client, upstream, ctx.health_path, io);
         if (success) {
             ctx.health.recordSuccess(idx);
         }
-        // Don't record failure - backend is already unhealthy
+        // Don't record failure - backend is already unhealthy.
     }
 }
 
 /// Probe a single backend using serval-client HTTP request.
 /// Returns true if probe succeeds (2xx response).
-/// TigerStyle: Uses serval-client for DNS, TCP, TLS, and HTTP.
 fn probeBackend(
     client: *Client,
     upstream: Upstream,
     health_path: []const u8,
     io: Io,
 ) bool {
-    assert(upstream.host.len > 0); // S1: precondition
-    assert(health_path.len > 0); // S1: precondition
+    assert(upstream.host.len > 0);
+    assert(health_path.len > 0);
 
-    // Build health check request.
-    // TigerStyle: Stack-allocated request with minimal headers.
     var request = Request{
         .method = .GET,
         .path = health_path,
@@ -124,29 +106,15 @@ fn probeBackend(
         .headers = .{},
     };
 
-    // Add required headers.
-    // TigerStyle: Connection: close for one-shot probe.
-    request.headers.put("Host", upstream.host) catch {
-        std.log.debug("prober: failed to add Host header for {s}:{d}", .{ upstream.host, upstream.port });
-        return false;
-    };
-    request.headers.put("Connection", "close") catch {
-        std.log.debug("prober: failed to add Connection header for {s}:{d}", .{ upstream.host, upstream.port });
-        return false;
-    };
-    request.headers.put("User-Agent", "serval-prober/1.0") catch {
-        std.log.debug("prober: failed to add User-Agent header for {s}:{d}", .{ upstream.host, upstream.port });
-        return false;
-    };
+    // Connection: close for one-shot probe.
+    request.headers.put("Host", upstream.host) catch return logHeaderError(upstream);
+    request.headers.put("Connection", "close") catch return logHeaderError(upstream);
+    request.headers.put("User-Agent", "serval-prober/1.0") catch return logHeaderError(upstream);
 
-    // Response header buffer (small - we only need status line).
-    // TigerStyle: Stack-allocated, fixed size.
     var header_buf: [1024]u8 = std.mem.zeroes([1024]u8);
 
-    // Perform HTTP request using serval-client.
-    // TigerStyle: One-shot request, connection closed after response.
     var result = client.request(upstream, &request, &header_buf, io) catch |err| {
-        std.log.debug("prober: HTTP request failed for {s}:{d}: {s}", .{
+        std.log.debug("prober: request failed for {s}:{d}: {s}", .{
             upstream.host,
             upstream.port,
             @errorName(err),
@@ -154,12 +122,8 @@ fn probeBackend(
         return false;
     };
 
-    // Close connection immediately (Connection: close).
-    // TigerStyle: Explicit cleanup, no connection reuse for probes.
     result.conn.socket.close();
 
-    // Check for 2xx success status.
-    // TigerStyle: Simple range check, no parsing.
     const status = result.response.status;
     const success = status >= 200 and status < 300;
 
@@ -175,12 +139,13 @@ fn probeBackend(
     return success;
 }
 
-// =============================================================================
-// Tests
-// =============================================================================
+/// Log header setup failure and return false.
+fn logHeaderError(upstream: Upstream) bool {
+    std.log.debug("prober: failed to add header for {s}:{d}", .{ upstream.host, upstream.port });
+    return false;
+}
 
 test "parseHttpStatus - 2xx success codes" {
-    // Test helper that mimics status parsing logic
     const testStatus = struct {
         fn check(response: []const u8) ?u16 {
             if (!std.mem.startsWith(u8, response, "HTTP/1.")) return null;
@@ -219,17 +184,17 @@ test "isSuccessStatus - 2xx range check" {
         }
     }.check;
 
-    // Boundary: below 2xx
+    // Below 2xx
     try std.testing.expect(!isSuccess(199));
 
-    // 2xx range (success)
+    // 2xx range
     try std.testing.expect(isSuccess(200));
     try std.testing.expect(isSuccess(201));
     try std.testing.expect(isSuccess(204));
     try std.testing.expect(isSuccess(250));
     try std.testing.expect(isSuccess(299));
 
-    // Boundary: above 2xx
+    // Above 2xx
     try std.testing.expect(!isSuccess(300));
     try std.testing.expect(!isSuccess(301));
     try std.testing.expect(!isSuccess(400));
@@ -239,7 +204,6 @@ test "isSuccessStatus - 2xx range check" {
 }
 
 test "ProberContext - field validation" {
-    // ProberContext requires all fields to be set
     var dns_resolver = DnsResolver.init(.{});
     const ctx = ProberContext{
         .upstreams = &[_]Upstream{},
@@ -248,9 +212,8 @@ test "ProberContext - field validation" {
         .probe_interval_ms = 5000,
         .probe_timeout_ms = 2000,
         .health_path = "/health",
-        .client_ctx = null, // TLS context is optional (null = plain HTTP only)
+        .client_ctx = null,
         .dns_resolver = &dns_resolver,
-        // allocator defaults to page_allocator
     };
 
     try std.testing.expectEqual(@as(u32, 5000), ctx.probe_interval_ms);
@@ -260,8 +223,7 @@ test "ProberContext - field validation" {
 }
 
 test "interval calculation" {
-    // Test the interval_s and interval_ns calculation used in probeLoop
-    const testInterval = struct {
+    const calcInterval = struct {
         fn calc(interval_ms: u32) struct { s: u64, ns: u64 } {
             const interval_s: u64 = interval_ms / 1000;
             const interval_ns: u64 = (@as(u64, interval_ms) % 1000) * 1_000_000;
@@ -270,28 +232,27 @@ test "interval calculation" {
     }.calc;
 
     // 5000ms = 5s + 0ns
-    var result = testInterval(5000);
+    var result = calcInterval(5000);
     try std.testing.expectEqual(@as(u64, 5), result.s);
     try std.testing.expectEqual(@as(u64, 0), result.ns);
 
     // 5500ms = 5s + 500_000_000ns
-    result = testInterval(5500);
+    result = calcInterval(5500);
     try std.testing.expectEqual(@as(u64, 5), result.s);
     try std.testing.expectEqual(@as(u64, 500_000_000), result.ns);
 
     // 100ms = 0s + 100_000_000ns
-    result = testInterval(100);
+    result = calcInterval(100);
     try std.testing.expectEqual(@as(u64, 0), result.s);
     try std.testing.expectEqual(@as(u64, 100_000_000), result.ns);
 
     // 1ms = 0s + 1_000_000ns
-    result = testInterval(1);
+    result = calcInterval(1);
     try std.testing.expectEqual(@as(u64, 0), result.s);
     try std.testing.expectEqual(@as(u64, 1_000_000), result.ns);
 }
 
 test "Request struct creation for probe" {
-    // Test that we can create the request struct as used in probeBackend
     var request = Request{
         .method = .GET,
         .path = "/health",
@@ -307,14 +268,12 @@ test "Request struct creation for probe" {
     try std.testing.expectEqualStrings("/health", request.path);
     try std.testing.expectEqual(@as(usize, 3), request.headers.count);
 
-    // Verify headers can be retrieved
     const host = request.headers.get("Host");
     try std.testing.expect(host != null);
     try std.testing.expectEqualStrings("backend1.example.com", host.?);
 }
 
 test "Upstream struct with TLS flag" {
-    // Test upstream configuration with TLS enabled
     const upstream_tls = Upstream{
         .host = "secure.example.com",
         .port = 443,
@@ -326,7 +285,6 @@ test "Upstream struct with TLS flag" {
     try std.testing.expectEqual(@as(u16, 443), upstream_tls.port);
     try std.testing.expect(upstream_tls.tls);
 
-    // Test upstream configuration with plaintext
     const upstream_plain = Upstream{
         .host = "backend.local",
         .port = 8080,
@@ -340,10 +298,8 @@ test "Upstream struct with TLS flag" {
 }
 
 test "header buffer size is reasonable" {
-    // Verify the header buffer size used in probeBackend is adequate
-    // Response status line: "HTTP/1.1 200 OK\r\n" = ~17 bytes
-    // Minimal headers for health check response should fit in 1024 bytes
+    // Buffer must fit status line (~17 bytes) plus minimal headers.
     const header_buf_size: usize = 1024;
-    try std.testing.expect(header_buf_size >= 256); // Minimum for status + basic headers
-    try std.testing.expect(header_buf_size <= 8192); // Upper bound for stack allocation
+    try std.testing.expect(header_buf_size >= 256);
+    try std.testing.expect(header_buf_size <= 8192);
 }

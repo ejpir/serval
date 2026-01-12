@@ -75,7 +75,7 @@ pub const PrometheusMetrics = struct {
     }
 
     pub fn upstreamLatency(_: *@This(), _: u32, _: u64) void {
-        // TODO: per-upstream latency histograms
+        // Intentionally empty - per-upstream latency tracked in RealTimeMetrics.
     }
 
     // TigerStyle: Return u8 for bucket index (only 8 buckets).

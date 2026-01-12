@@ -698,7 +698,7 @@ const MyHandler = struct {
 | Add metrics exporters | `lib/serval-metrics/` |
 | Add tracing backends | `lib/serval-tracing/` |
 | Add load balancing algorithms | `lib/serval-lb/handler.zig` |
-| Modify server request loop | `lib/serval-server/http1.zig` |
+| Modify server request loop | `lib/serval-server/h1/server.zig` |
 
 ### Adding a New Pool Implementation
 

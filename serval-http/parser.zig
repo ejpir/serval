@@ -235,9 +235,11 @@ fn parseMethod(s: []const u8) ?Method {
 }
 
 fn parseVersion(s: []const u8) ?Version {
-    if (std.mem.eql(u8, s, "HTTP/1.0")) return .@"HTTP/1.0";
-    if (std.mem.eql(u8, s, "HTTP/1.1")) return .@"HTTP/1.1";
-    return null;
+    const map = std.StaticStringMap(Version).initComptime(.{
+        .{ "HTTP/1.0", .@"HTTP/1.0" },
+        .{ "HTTP/1.1", .@"HTTP/1.1" },
+    });
+    return map.get(s);
 }
 
 /// Case-insensitive substring search.
@@ -247,20 +249,11 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     if (needle.len == 0) return true;
     if (haystack.len < needle.len) return false;
 
-    const max_start = haystack.len - needle.len + 1;
-    for (0..max_start) |i| {
-        var matches = true;
-        for (0..needle.len) |j| {
-            const h = haystack[i + j];
-            const n = needle[j];
-            const h_lower = if (h >= 'A' and h <= 'Z') h + 32 else h;
-            const n_lower = if (n >= 'A' and n <= 'Z') n + 32 else n;
-            if (h_lower != n_lower) {
-                matches = false;
-                break;
-            }
+    const search_range = haystack.len - needle.len + 1;
+    for (0..search_range) |i| {
+        if (std.ascii.eqlIgnoreCase(haystack[i..][0..needle.len], needle)) {
+            return true;
         }
-        if (matches) return true;
     }
     return false;
 }
@@ -300,35 +293,25 @@ pub fn parseStatusCode(header: []const u8) ?u16 {
 /// Returns null if not found, invalid, or has leading zeros.
 /// TigerStyle: Returns u64 for Content-Length (can exceed 4GB), bounded loops.
 pub fn parseContentLength(header: []const u8) ?u64 {
-    if (header.len == 0) return null;
+    const header_name = "content-length:";
+    if (header.len < header_name.len) return null;
 
-    // Case-insensitive search for Content-Length
-    const lower_header = "content-length:";
     var search_pos: usize = 0;
-    const max_search_iterations: u32 = config.MAX_HEADER_SIZE_BYTES;
+    const max_iterations: u32 = config.MAX_HEADER_SIZE_BYTES;
     var iterations: u32 = 0;
 
-    while (search_pos + lower_header.len < header.len and iterations < max_search_iterations) : (iterations += 1) {
-        const candidate = header[search_pos .. search_pos + lower_header.len];
-        var matches = true;
-        for (candidate, 0..) |ch, i| {
-            const lower_ch = if (ch >= 'A' and ch <= 'Z') ch + 32 else ch;
-            if (lower_ch != lower_header[i]) {
-                matches = false;
-                break;
-            }
-        }
+    while (search_pos + header_name.len <= header.len and iterations < max_iterations) : (iterations += 1) {
+        const candidate = header[search_pos..][0..header_name.len];
 
-        if (matches) {
-            // Found header, parse value
-            var value_start = search_pos + lower_header.len;
+        if (std.ascii.eqlIgnoreCase(candidate, header_name)) {
+            var value_start = search_pos + header_name.len;
 
-            // Skip whitespace
+            // Skip optional whitespace after colon.
             while (value_start < header.len and (header[value_start] == ' ' or header[value_start] == '\t')) {
                 value_start += 1;
             }
 
-            // Find end of value (until \r, \n, or end)
+            // Find end of value (until \r, \n, or end).
             var value_end = value_start;
             while (value_end < header.len and header[value_end] != '\r' and header[value_end] != '\n') {
                 value_end += 1;
@@ -340,7 +323,7 @@ pub fn parseContentLength(header: []const u8) ?u64 {
             return null;
         }
 
-        // Move to next line
+        // Move to next line.
         if (std.mem.indexOfScalar(u8, header[search_pos..], '\n')) |newline_offset| {
             search_pos += newline_offset + 1;
         } else {

@@ -74,26 +74,23 @@ pub const setTcpNoDelay = net.setTcpNoDelay;
 // =============================================================================
 
 pub const http = @import("serval-http");
-pub const parser = http.parser;
 pub const Parser = http.Parser;
 
 // =============================================================================
 // Connection Pooling (from serval-pool)
 // =============================================================================
 
-pub const pool_mod = @import("serval-pool");
-pub const pool = pool_mod.pool;
-pub const Connection = pool_mod.Connection;
-pub const NoPool = pool_mod.NoPool;
-pub const SimplePool = pool_mod.SimplePool;
-pub const verifyPool = pool_mod.verifyPool;
+pub const pool = @import("serval-pool");
+pub const Connection = pool.Connection;
+pub const NoPool = pool.NoPool;
+pub const SimplePool = pool.SimplePool;
+pub const verifyPool = pool.verifyPool;
 
 // =============================================================================
 // Upstream Forwarding (from serval-proxy)
 // =============================================================================
 
 pub const proxy = @import("serval-proxy");
-pub const forwarder = proxy.forwarder;
 pub const Forwarder = proxy.Forwarder;
 pub const ForwardError = proxy.ForwardError;
 pub const ForwardResult = proxy.ForwardResult;
@@ -102,30 +99,27 @@ pub const ForwardResult = proxy.ForwardResult;
 // Metrics (from serval-metrics)
 // =============================================================================
 
-pub const metrics_mod = @import("serval-metrics");
-pub const metrics = metrics_mod.metrics;
-pub const NoopMetrics = metrics_mod.NoopMetrics;
-pub const PrometheusMetrics = metrics_mod.PrometheusMetrics;
-pub const verifyMetrics = metrics_mod.verifyMetrics;
+pub const metrics = @import("serval-metrics");
+pub const NoopMetrics = metrics.NoopMetrics;
+pub const PrometheusMetrics = metrics.PrometheusMetrics;
+pub const verifyMetrics = metrics.verifyMetrics;
 
 // =============================================================================
 // Tracing (from serval-tracing)
 // =============================================================================
 
-pub const tracing_mod = @import("serval-tracing");
-pub const tracing = tracing_mod.tracing;
-pub const SpanHandle = tracing_mod.SpanHandle;
-pub const NoopTracer = tracing_mod.NoopTracer;
-pub const verifyTracer = tracing_mod.verifyTracer;
+pub const tracing = @import("serval-tracing");
+pub const SpanHandle = tracing.SpanHandle;
+pub const NoopTracer = tracing.NoopTracer;
+pub const verifyTracer = tracing.verifyTracer;
 
 // =============================================================================
 // Server (from serval-server)
 // =============================================================================
 
-pub const server_mod = @import("serval-server");
-pub const server = server_mod.server;
-pub const Server = server_mod.Server;
-pub const MinimalServer = server_mod.MinimalServer;
+pub const server = @import("serval-server");
+pub const Server = server.Server;
+pub const MinimalServer = server.MinimalServer;
 
 // =============================================================================
 // Tests

@@ -358,41 +358,31 @@ pub const Router = struct {
         _ = self;
 
         if (!route.strip_prefix) {
-            return null; // No rewrite needed
+            return null;
         }
 
-        return switch (route.matcher.path) {
-            .prefix => |prefix| blk: {
-                assert(prefix.len > 0); // S1: Prefix must be non-empty
-
-                // Path shorter than or equal to prefix - return root
-                if (original_path.len <= prefix.len) {
-                    break :blk "/";
-                }
-
-                const stripped = original_path[prefix.len..];
-
-                // Empty after strip - return root
-                if (stripped.len == 0) {
-                    break :blk "/";
-                }
-
-                // Already starts with '/' - return as-is
-                if (stripped[0] == '/') {
-                    break :blk stripped;
-                }
-
-                // Prefix didn't end with '/', need to include the '/'
-                // e.g., prefix="/api", path="/api/users" -> stripped="users"
-                // We want "/users", so back up one character to get the '/'
-                if (prefix.len > 0 and original_path.len > prefix.len - 1) {
-                    break :blk original_path[prefix.len - 1 ..];
-                }
-
-                break :blk "/";
-            },
-            .exact => null, // Exact match: strip_prefix is no-op (path must match exactly)
+        const prefix = switch (route.matcher.path) {
+            .prefix => |p| p,
+            .exact => return null, // Exact match: strip_prefix is no-op
         };
+
+        assert(prefix.len > 0); // S1: Prefix must be non-empty
+
+        // Path shorter than or equal to prefix - return root
+        if (original_path.len <= prefix.len) {
+            return "/";
+        }
+
+        const stripped = original_path[prefix.len..];
+
+        // Already starts with '/' - return as-is
+        if (stripped[0] == '/') {
+            return stripped;
+        }
+
+        // Prefix didn't end with '/', back up one char to include the '/'
+        // e.g., prefix="/api", path="/api/users" -> "/users"
+        return original_path[prefix.len - 1 ..];
     }
 
     /// Get pool by index (for observability/testing).

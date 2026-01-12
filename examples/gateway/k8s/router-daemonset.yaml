@@ -46,6 +46,7 @@ spec:
         - "80"
         - "--admin-port"
         - "9901"
+        - "--debug"
         ports:
         - name: http
           containerPort: 80

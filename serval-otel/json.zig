@@ -126,9 +126,8 @@ pub fn JsonWriter(comptime BufferWriter: type) type {
             self.markValue();
         }
 
-        /// Write a JSON string from a hex-encoded buffer.
-        pub fn stringHex(self: *Self, bytes: []const u8, hex_buf: []u8) !void {
-            assert(hex_buf.len >= bytes.len * 2);
+        /// Write a JSON string from raw bytes as hex.
+        pub fn stringHex(self: *Self, bytes: []const u8) !void {
             const hex = std.fmt.bytesToHex(bytes, .lower);
             try self.maybeComma();
             try self.writer.writeByte('"');

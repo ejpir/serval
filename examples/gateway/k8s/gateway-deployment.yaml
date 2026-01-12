@@ -107,6 +107,7 @@ spec:
         - "default"
         - "--gateway-class"
         - "serval"
+        - "--debug"
         env:
         # Use IP directly to avoid DNS resolution issues
         - name: KUBERNETES_SERVICE_HOST

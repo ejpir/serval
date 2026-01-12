@@ -118,57 +118,12 @@ pub const RealTimeMetrics = struct {
         const latency_percentiles = self.calculateLatencyPercentiles();
 
         // Build per-upstream stats
-        var upstream_stats: [MAX_UPSTREAMS]UpstreamStats = undefined;
-        var upstream_count: u8 = 0;
-
-        for (0..MAX_UPSTREAMS) |i| {
-            const idx: u8 = @intCast(i);
-            const req_count = self.upstream_requests[i].load(.monotonic);
-            const err_count = self.upstream_errors[i].load(.monotonic);
-            const latency_sum = self.upstream_latency_sum_ns[i].load(.monotonic);
-
-            // Only include upstreams with traffic
-            if (req_count > 0) {
-                const prev_req = self.prev_upstream_requests[i];
-                const upstream_delta = req_count -| prev_req;
-                const upstream_rps = @as(f64, @floatFromInt(upstream_delta)) / elapsed_sec;
-
-                // Calculate average latency in milliseconds
-                const avg_latency_ns = if (req_count > 0) latency_sum / req_count else 0;
-                const avg_latency_ms: u32 = @intCast(avg_latency_ns / std.time.ns_per_ms);
-
-                upstream_stats[idx] = .{
-                    .requests_total = req_count,
-                    .requests_per_sec = upstream_rps,
-                    .errors_total = err_count,
-                    .avg_latency_ms = avg_latency_ms,
-                    // TigerStyle: Health determined by error rate < 50%.
-                    .healthy = err_count < req_count / UNHEALTHY_ERROR_RATE_DIVISOR,
-                };
-                // upstream_count is highest active index + 1, not count of active upstreams.
-                // Consumer must check upstream_stats[i].requests_total > 0 for active entries.
-                upstream_count = idx + 1;
-
-                // Update previous for next snapshot
-                self.prev_upstream_requests[i] = req_count;
-            } else {
-                upstream_stats[idx] = .{
-                    .requests_total = 0,
-                    .requests_per_sec = 0,
-                    .errors_total = 0,
-                    .avg_latency_ms = 0,
-                    .healthy = true,
-                };
-            }
-        }
+        const upstream_result = self.buildUpstreamStats(elapsed_sec);
 
         // Update previous values for next rate calculation
         self.prev_requests = requests_total;
         self.prev_errors = errors_total;
         self.prev_timestamp_ns = now_ns;
-
-        // TigerStyle: Postcondition - upstream_count bounded by array size.
-        assert(upstream_count <= MAX_UPSTREAMS);
 
         return .{
             .requests_total = requests_total,
@@ -179,9 +134,67 @@ pub const RealTimeMetrics = struct {
             .latency_p50_ms = latency_percentiles.p50,
             .latency_p95_ms = latency_percentiles.p95,
             .latency_p99_ms = latency_percentiles.p99,
-            .upstream_stats = upstream_stats,
-            .upstream_count = upstream_count,
+            .upstream_stats = upstream_result.stats,
+            .upstream_count = upstream_result.count,
         };
+    }
+
+    /// Build per-upstream stats from atomic counters.
+    /// TigerStyle: Extracted helper to keep snapshot() under 70 lines.
+    const UpstreamStatsResult = struct {
+        stats: [MAX_UPSTREAMS]UpstreamStats,
+        count: u8,
+    };
+
+    fn buildUpstreamStats(self: *RealTimeMetrics, elapsed_sec: f64) UpstreamStatsResult {
+        assert(elapsed_sec > 0);
+
+        var stats: [MAX_UPSTREAMS]UpstreamStats = undefined;
+        var count: u8 = 0;
+
+        for (0..MAX_UPSTREAMS) |i| {
+            const idx: u8 = @intCast(i);
+            const req_count = self.upstream_requests[i].load(.monotonic);
+            const err_count = self.upstream_errors[i].load(.monotonic);
+            const latency_sum = self.upstream_latency_sum_ns[i].load(.monotonic);
+
+            if (req_count > 0) {
+                const prev_req = self.prev_upstream_requests[i];
+                const upstream_delta = req_count -| prev_req;
+                const upstream_rps = @as(f64, @floatFromInt(upstream_delta)) / elapsed_sec;
+
+                // Calculate average latency in milliseconds (req_count already > 0 here)
+                const avg_latency_ns = latency_sum / req_count;
+                const avg_latency_ms: u32 = @intCast(avg_latency_ns / std.time.ns_per_ms);
+
+                stats[idx] = .{
+                    .requests_total = req_count,
+                    .requests_per_sec = upstream_rps,
+                    .errors_total = err_count,
+                    .avg_latency_ms = avg_latency_ms,
+                    // Health determined by error rate < 50%.
+                    .healthy = err_count < req_count / UNHEALTHY_ERROR_RATE_DIVISOR,
+                };
+                // count is highest active index + 1, not count of active upstreams.
+                count = idx + 1;
+
+                // Update previous for next snapshot
+                self.prev_upstream_requests[i] = req_count;
+            } else {
+                stats[idx] = .{
+                    .requests_total = 0,
+                    .requests_per_sec = 0,
+                    .errors_total = 0,
+                    .avg_latency_ms = 0,
+                    .healthy = true,
+                };
+            }
+        }
+
+        // TigerStyle: Postcondition - count bounded by array size.
+        assert(count <= MAX_UPSTREAMS);
+
+        return .{ .stats = stats, .count = count };
     }
 
     /// Record request start.
@@ -284,7 +297,7 @@ pub const RealTimeMetrics = struct {
         // Bucket boundaries in ms: 1, 5, 10, 50, 100, 500, 1000, 5000+
         const bucket_midpoints_ms = [_]u32{ 1, 3, 7, 30, 75, 300, 750, 5000 };
 
-        // Load bucket counts
+        // Load bucket counts and calculate total
         var counts: [8]u64 = undefined;
         var total: u64 = 0;
         for (0..8) |i| {
@@ -292,35 +305,38 @@ pub const RealTimeMetrics = struct {
             total += counts[i];
         }
 
-        // Handle no data case
         if (total == 0) {
             return .{ .p50 = 0, .p95 = 0, .p99 = 0 };
         }
 
-        // Calculate percentile thresholds
-        const p50_threshold = (total * 50) / 100;
-        const p95_threshold = (total * 95) / 100;
-        const p99_threshold = (total * 99) / 100;
+        // Find bucket index where cumulative count reaches percentile threshold
+        const p50_bucket = findPercentileBucket(&counts, total, 50);
+        const p95_bucket = findPercentileBucket(&counts, total, 95);
+        const p99_bucket = findPercentileBucket(&counts, total, 99);
 
+        return .{
+            .p50 = bucket_midpoints_ms[p50_bucket],
+            .p95 = bucket_midpoints_ms[p95_bucket],
+            .p99 = bucket_midpoints_ms[p99_bucket],
+        };
+    }
+
+    /// Find the bucket index where cumulative count reaches the percentile threshold.
+    /// TigerStyle: Bounded loop (8 iterations max), returns last bucket if threshold not reached.
+    fn findPercentileBucket(counts: *const [8]u64, total: u64, percentile: u8) u8 {
+        assert(percentile > 0 and percentile <= 100);
+        assert(total > 0);
+
+        const threshold = (total * percentile) / 100;
         var cumulative: u64 = 0;
-        var p50: u32 = bucket_midpoints_ms[7];
-        var p95: u32 = bucket_midpoints_ms[7];
-        var p99: u32 = bucket_midpoints_ms[7];
 
         for (0..8) |i| {
             cumulative += counts[i];
-            if (cumulative >= p50_threshold and p50 == bucket_midpoints_ms[7]) {
-                p50 = bucket_midpoints_ms[i];
-            }
-            if (cumulative >= p95_threshold and p95 == bucket_midpoints_ms[7]) {
-                p95 = bucket_midpoints_ms[i];
-            }
-            if (cumulative >= p99_threshold and p99 == bucket_midpoints_ms[7]) {
-                p99 = bucket_midpoints_ms[i];
+            if (cumulative >= threshold) {
+                return @intCast(i);
             }
         }
-
-        return .{ .p50 = p50, .p95 = p95, .p99 = p99 };
+        return 7; // Last bucket if threshold not reached
     }
 };
 

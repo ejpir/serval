@@ -2,7 +2,7 @@
 //! HTTP/1.1 Response Writing Utilities
 //!
 //! Standalone functions for sending HTTP/1.1 responses to clients.
-//! Extracted from http1.zig to enable code reuse and smaller file sizes.
+//! Extracted to enable code reuse and smaller file sizes.
 //!
 //! TigerStyle: Pure functions with explicit I/O parameters, no hidden state.
 

@@ -75,13 +75,13 @@ pub const Tracer = struct {
         self.provider.mutex.lock();
         defer self.provider.mutex.unlock();
 
-        const trace_id = if (parent) |p| p.span_context.trace_id else self.provider.id_gen.newTraceId();
         const span_id = self.provider.id_gen.newSpanId();
 
-        const trace_flags = if (parent) |p| p.span_context.trace_flags else TraceFlags.default();
-        const trace_state = if (parent) |p| p.span_context.trace_state else TraceState.init();
-
-        const span_context = SpanContext.init(trace_id, span_id, trace_flags, trace_state, false);
+        // Inherit context from parent or create new root context
+        const span_context = if (parent) |p|
+            SpanContext.init(p.span_context.trace_id, span_id, p.span_context.trace_flags, p.span_context.trace_state, false)
+        else
+            SpanContext.init(self.provider.id_gen.newTraceId(), span_id, TraceFlags.default(), TraceState.init(), false);
 
         var span = Span.init(span_context, name, kind, self.scope);
         if (parent) |p| {

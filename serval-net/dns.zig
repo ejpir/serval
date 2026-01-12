@@ -421,50 +421,33 @@ pub const DnsResolver = struct {
     /// Perform actual DNS resolution using Zig's async HostName API.
     /// TigerStyle: Wraps std library, handles errors explicitly.
     fn doResolve(self: *DnsResolver, hostname: []const u8, port: u16, io: Io) !Io.net.IpAddress {
-        _ = self; // cfg.timeout_ns not yet used (future: pass to lookup)
+        _ = self;
 
-        // First try parsing as IP address directly (common case for upstreams)
-        if (Io.net.IpAddress.parse(hostname, port)) |addr| {
-            debugLog("DNS: '{s}' parsed as IP address directly", .{hostname});
-            return addr;
-        } else |_| {
-            // Not a numeric IP, proceed with DNS lookup
-        }
+        // Try parsing as IP address directly (common case for upstreams)
+        if (tryParseIpAddress(hostname, port)) |addr| return addr;
 
-        // Debug: Read and log resolv.conf contents
         logResolvConf(io);
-
         debugLog("DNS: starting lookup for '{s}' port={d}", .{ hostname, port });
 
-        // Create HostName for DNS lookup
         const host = Io.net.HostName.init(hostname) catch |err| {
             std.log.err("DNS: HostName.init failed for '{s}': {s}", .{ hostname, @errorName(err) });
             return err;
         };
 
-        // Use lookup to get addresses
         var canonical_name_buffer: [Io.net.HostName.max_len]u8 = undefined;
         var lookup_buffer: [16]Io.net.HostName.LookupResult = undefined;
         var lookup_queue: Io.Queue(Io.net.HostName.LookupResult) = .init(&lookup_buffer);
 
-        debugLog("DNS: calling Io.net.HostName.lookup", .{});
-
-        // Start async lookup
         var lookup_future = io.async(Io.net.HostName.lookup, .{
             host,
             io,
             &lookup_queue,
-            .{
-                .port = port,
-                .canonical_name_buffer = &canonical_name_buffer,
-            },
+            .{ .port = port, .canonical_name_buffer = &canonical_name_buffer },
         });
         defer lookup_future.cancel(io) catch |err| switch (err) {
-            error.Canceled => {}, // Expected - future already done
+            error.Canceled => {},
             else => debugLog("DNS: lookup_future.cancel failed: {s}", .{@errorName(err)}),
         };
-
-        debugLog("DNS: waiting for lookup results", .{});
 
         // Get first address result
         var result_count: u32 = 0;
@@ -475,26 +458,43 @@ pub const DnsResolver = struct {
                     debugLog("DNS: got address result #{d}: {}", .{ result_count, addr });
                     return addr;
                 },
-                .canonical_name => |cn| {
-                    debugLog("DNS: got canonical_name result #{d}: {s}", .{ result_count, cn.bytes });
-                    continue;
-                },
+                .canonical_name => continue,
             }
         } else |err| {
-            debugLog("DNS: lookup_queue.getOne returned error: {s} after {d} results", .{ @errorName(err), result_count });
-            switch (err) {
-                error.Canceled => return error.Canceled,
-                error.Closed => {
-                    // No addresses found - check if lookup had an error
-                    debugLog("DNS: queue closed, awaiting lookup_future for final error", .{});
-                    lookup_future.await(io) catch |lookup_err| {
-                        std.log.err("DNS: lookup_future.await returned error: {s}", .{@errorName(lookup_err)});
-                        return lookup_err;
-                    };
-                    debugLog("DNS: lookup_future.await succeeded but no addresses found", .{});
-                    return error.UnknownHostName;
-                },
-            }
+            return handleLookupQueueError(err, &lookup_future, io, result_count);
+        }
+    }
+
+    /// Try parsing hostname as an IP address directly.
+    /// TigerStyle: Pure function, common path optimization.
+    fn tryParseIpAddress(hostname: []const u8, port: u16) ?Io.net.IpAddress {
+        if (Io.net.IpAddress.parse(hostname, port)) |addr| {
+            debugLog("DNS: '{s}' parsed as IP address directly", .{hostname});
+            return addr;
+        } else |_| {
+            return null;
+        }
+    }
+
+    /// Handle lookup queue errors (Canceled or Closed).
+    /// TigerStyle Y1: Extracted to keep doResolve under 70 lines.
+    fn handleLookupQueueError(
+        err: anyerror,
+        lookup_future: anytype,
+        io: Io,
+        result_count: u32,
+    ) anyerror {
+        debugLog("DNS: lookup_queue.getOne returned error: {s} after {d} results", .{ @errorName(err), result_count });
+        switch (err) {
+            error.Canceled => return error.Canceled,
+            error.Closed => {
+                lookup_future.await(io) catch |lookup_err| {
+                    std.log.err("DNS: lookup_future.await returned error: {s}", .{@errorName(lookup_err)});
+                    return lookup_err;
+                };
+                return error.UnknownHostName;
+            },
+            else => return err,
         }
     }
 
@@ -547,17 +547,14 @@ pub const DnsResolver = struct {
 
         ResolveAllResult.init(out);
 
-        // First try parsing as IP address directly
-        if (Io.net.IpAddress.parse(hostname, port)) |addr| {
-            debugLog("DNS: '{s}' parsed as IP address directly", .{hostname});
+        // Try parsing as IP address directly
+        if (tryParseIpAddress(hostname, port)) |addr| {
             out.addresses[0] = addr;
             out.count = 1;
             return;
-        } else |_| {}
+        }
 
-        // Debug: Read and log resolv.conf contents
         logResolvConf(io);
-
         debugLog("DNS: starting resolveAll lookup for '{s}' port={d}", .{ hostname, port });
 
         const host = Io.net.HostName.init(hostname) catch |err| {
@@ -573,13 +570,10 @@ pub const DnsResolver = struct {
             host,
             io,
             &lookup_queue,
-            .{
-                .port = port,
-                .canonical_name_buffer = &canonical_name_buffer,
-            },
+            .{ .port = port, .canonical_name_buffer = &canonical_name_buffer },
         });
         defer lookup_future.cancel(io) catch |err| switch (err) {
-            error.Canceled => {}, // Expected - future already done
+            error.Canceled => {},
             else => debugLog("DNS: lookup_future.cancel failed: {s}", .{@errorName(err)}),
         };
 
@@ -587,7 +581,6 @@ pub const DnsResolver = struct {
         try collectDnsAddresses(&lookup_queue, io, out);
 
         if (out.count == 0) {
-            // No addresses found - check if lookup had an error
             lookup_future.await(io) catch |lookup_err| {
                 std.log.err("DNS: lookup_future.await returned error: {s}", .{@errorName(lookup_err)});
                 return lookup_err;

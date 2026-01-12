@@ -38,17 +38,8 @@ pub const TLSSocket = struct {
     /// Performs TLS handshake with Server Name Indication.
     /// TigerStyle S1: Assertions for preconditions/postconditions.
     /// TigerStyle S5: SNI buffer zeroed, no allocation after init.
+    /// enable_ktls: If true (default), attempt kernel TLS offload. If false, use userspace TLS.
     pub fn initClient(
-        fd: i32,
-        ctx: *ssl.SSL_CTX,
-        host: []const u8,
-    ) SocketError!Socket {
-        return initClientWithOptions(fd, ctx, host, true);
-    }
-
-    /// Create client TLS socket with SNI and kTLS control.
-    /// enable_ktls: If true, attempt kernel TLS offload (default). If false, use userspace TLS.
-    pub fn initClientWithOptions(
         fd: i32,
         ctx: *ssl.SSL_CTX,
         host: []const u8,

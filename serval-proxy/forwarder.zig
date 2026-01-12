@@ -30,21 +30,16 @@ const connect = @import("connect.zig");
 const ConnectResult = connect.ConnectResult;
 const ConnectConfig = connect.ConnectConfig;
 const connectUpstream = connect.connectUpstream;
-const getLocalPortFromStream = connect.getLocalPortFromStream;
 const getLocalPortFromSocket = connect.getLocalPortFromSocket;
 
 const h1 = @import("h1/mod.zig");
 const sendRequest = h1.sendRequest;
-const buildRequestBuffer = h1.buildRequestBuffer;
 const methodToString = h1.methodToString;
-const isHopByHopHeader = h1.isHopByHopHeader;
-const eqlIgnoreCase = h1.eqlIgnoreCase;
 const streamRequestBody = h1.streamRequestBody;
 const forwardResponse = h1.forwardResponse;
 
 const serval_tls = @import("serval-tls");
 const TLSStream = serval_tls.TLSStream;
-const HandshakeInfo = serval_tls.HandshakeInfo;
 const ssl = serval_tls.ssl;
 
 const serval_net = @import("serval-net");

@@ -34,10 +34,7 @@ pub const TraceID = struct {
 
     /// A TraceID is valid if it contains at least one non-zero byte
     pub fn isValid(self: Self) bool {
-        for (self.bytes) |byte| {
-            if (byte != 0) return true;
-        }
-        return false;
+        return !std.mem.allEqual(u8, &self.bytes, 0);
     }
 
     /// Returns the binary representation (16-byte array)
@@ -82,10 +79,7 @@ pub const SpanID = struct {
 
     /// A SpanID is valid if it contains at least one non-zero byte
     pub fn isValid(self: Self) bool {
-        for (self.bytes) |byte| {
-            if (byte != 0) return true;
-        }
-        return false;
+        return !std.mem.allEqual(u8, &self.bytes, 0);
     }
 
     /// Returns the binary representation (8-byte array)

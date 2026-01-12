@@ -38,9 +38,6 @@ const Connection = pool_mod.Connection;
 const net = @import("serval-net");
 const Socket = net.Socket;
 
-const serval_tls = @import("serval-tls");
-const TLSStream = serval_tls.TLSStream;
-
 const serval_client = @import("serval-client");
 const readHeaderBytes = serval_client.readHeaderBytes;
 const ResponseError = serval_client.ResponseError;

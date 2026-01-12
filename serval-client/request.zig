@@ -180,17 +180,6 @@ pub fn sendBufferToSocket(socket: *Socket, data: []const u8) ClientError!void {
     }
 }
 
-/// Internal send buffer (private, for use within this module).
-fn sendBuffer(socket: *Socket, data: []const u8) ClientError!void {
-    return sendBufferToSocket(socket, data);
-}
-
-/// Send request body to socket (TLS or plaintext).
-/// TigerStyle: Reuses sendBuffer for consistent error handling.
-fn sendBody(socket: *Socket, body: []const u8) ClientError!void {
-    assert(body.len > 0); // S1: precondition - body must not be empty
-    try sendBuffer(socket, body);
-}
 
 /// Send complete HTTP request (headers + body) to socket.
 /// effective_path: If set, use this path instead of request.path (for path rewriting).
@@ -204,10 +193,13 @@ pub fn sendRequest(socket: *Socket, request: *const Request, effective_path: ?[]
     const header_len = buildRequestBuffer(&buffer, request, effective_path) orelse return ClientError.BufferTooSmall;
 
     assert(header_len > 0); // S2: postcondition - built valid request
-    try sendBuffer(socket, buffer[0..header_len]);
+    try sendBufferToSocket(socket, buffer[0..header_len]);
 
+    // Send body if present
     if (request.body) |body| {
-        try sendBody(socket, body);
+        if (body.len > 0) {
+            try sendBufferToSocket(socket, body);
+        }
     }
 }
 

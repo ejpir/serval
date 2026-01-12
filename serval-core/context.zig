@@ -300,20 +300,16 @@ pub const Context = struct {
     /// Check if body reading is available for this request.
     /// TigerStyle: Explicit availability check before attempting read.
     pub fn canReadBody(self: *const Context) bool {
-        if (self._body_reader) |reader| {
-            return reader.isAvailable();
-        }
-        return false;
+        const reader = self._body_reader orelse return false;
+        return reader.isAvailable();
     }
 
     /// Get expected body length if known (from Content-Length header).
     /// Returns null for chunked encoding or no body.
     /// TigerStyle: Useful for pre-checking buffer size requirements.
     pub fn getBodyLength(self: *const Context) ?u64 {
-        if (self._body_reader) |reader| {
-            return reader.getContentLength();
-        }
-        return null;
+        const reader = self._body_reader orelse return null;
+        return reader.getContentLength();
     }
 };
 

@@ -144,23 +144,7 @@ pub const OTLPExporter = struct {
         // Debug: log spans being exported (only in debug builds)
         debugLog("OTLP: exporting {d} span(s)", .{spans.len});
         for (spans) |*span| {
-            var trace_buf: [32]u8 = undefined;
-            var span_buf: [16]u8 = undefined;
-            if (span.parent_span_id) |parent_id| {
-                var parent_buf: [16]u8 = undefined;
-                debugLog("  span: {s} trace={s} span={s} parent={s}", .{
-                    span.getName(),
-                    span.span_context.trace_id.toHex(&trace_buf),
-                    span.span_context.span_id.toHex(&span_buf),
-                    parent_id.toHex(&parent_buf),
-                });
-            } else {
-                debugLog("  span: {s} trace={s} span={s} parent=ROOT", .{
-                    span.getName(),
-                    span.span_context.trace_id.toHex(&trace_buf),
-                    span.span_context.span_id.toHex(&span_buf),
-                });
-            }
+            self.logSpanDebug(span);
         }
 
         // Encode spans to OTLP JSON
@@ -174,6 +158,22 @@ pub const OTLPExporter = struct {
 
     fn shutdown(_: *anyopaque) void {
         // No cleanup needed
+    }
+
+    /// Log a single span for debugging.
+    fn logSpanDebug(_: *Self, span: *const Span) void {
+        var trace_buf: [32]u8 = undefined;
+        var span_buf: [16]u8 = undefined;
+        const parent_str: []const u8 = if (span.parent_span_id) |parent_id| blk: {
+            var parent_buf: [16]u8 = undefined;
+            break :blk parent_id.toHex(&parent_buf);
+        } else "ROOT";
+        debugLog("  span: {s} trace={s} span={s} parent={s}", .{
+            span.getName(),
+            span.span_context.trace_id.toHex(&trace_buf),
+            span.span_context.span_id.toHex(&span_buf),
+            parent_str,
+        });
     }
 
     /// Write spans as OTLP JSON format.

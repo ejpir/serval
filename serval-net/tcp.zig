@@ -180,37 +180,7 @@ pub fn attachTlsULP(fd: i32) bool {
 /// Returns true if successful.
 /// TigerStyle: Explicit crypto_info parameter, caller provides cipher config.
 pub fn setKtlsTx(fd: i32, crypto_info: []const u8) bool {
-    // Preconditions: valid fd and non-empty crypto info
-    assert(fd >= 0);
-    assert(crypto_info.len > 0);
-
-    // kTLS is Linux-only
-    if (builtin.os.tag != .linux) {
-        std.log.debug("setKtlsTx: kTLS not available (non-Linux platform)", .{});
-        return false;
-    }
-
-    // Use raw Linux syscall since SOL_TLS is not in std.posix
-    const rc = std.os.linux.setsockopt(
-        fd,
-        SOL_TLS,
-        TLS_TX,
-        crypto_info.ptr,
-        @intCast(crypto_info.len),
-    );
-
-    const err = posix.errno(rc);
-    if (err != .SUCCESS) {
-        if (err == .NOPROTOOPT) {
-            // kTLS module not loaded or not supported by kernel
-            std.log.debug("setKtlsTx: kTLS not available (ENOPROTOOPT)", .{});
-        } else {
-            std.log.debug("setKtlsTx failed on fd {d}: {s}", .{ fd, @tagName(err) });
-        }
-        return false;
-    }
-
-    return true;
+    return setKtlsDirection(fd, crypto_info, TLS_TX, "TX");
 }
 
 /// Configure kTLS RX (decrypt) offload on a socket (Linux only).
@@ -218,13 +188,20 @@ pub fn setKtlsTx(fd: i32, crypto_info: []const u8) bool {
 /// Returns true if successful.
 /// TigerStyle: Same pattern as setKtlsTx for consistency.
 pub fn setKtlsRx(fd: i32, crypto_info: []const u8) bool {
+    return setKtlsDirection(fd, crypto_info, TLS_RX, "RX");
+}
+
+/// Shared implementation for kTLS TX/RX configuration.
+/// TigerStyle: Single implementation avoids duplication.
+fn setKtlsDirection(fd: i32, crypto_info: []const u8, direction: u32, direction_name: []const u8) bool {
     // Preconditions: valid fd and non-empty crypto info
     assert(fd >= 0);
     assert(crypto_info.len > 0);
+    assert(direction == TLS_TX or direction == TLS_RX);
 
     // kTLS is Linux-only
     if (builtin.os.tag != .linux) {
-        std.log.debug("setKtlsRx: kTLS not available (non-Linux platform)", .{});
+        std.log.debug("setKtls{s}: kTLS not available (non-Linux platform)", .{direction_name});
         return false;
     }
 
@@ -232,7 +209,7 @@ pub fn setKtlsRx(fd: i32, crypto_info: []const u8) bool {
     const rc = std.os.linux.setsockopt(
         fd,
         SOL_TLS,
-        TLS_RX,
+        direction,
         crypto_info.ptr,
         @intCast(crypto_info.len),
     );
@@ -240,10 +217,9 @@ pub fn setKtlsRx(fd: i32, crypto_info: []const u8) bool {
     const err = posix.errno(rc);
     if (err != .SUCCESS) {
         if (err == .NOPROTOOPT) {
-            // kTLS module not loaded or not supported by kernel
-            std.log.debug("setKtlsRx: kTLS not available (ENOPROTOOPT)", .{});
+            std.log.debug("setKtls{s}: kTLS not available (ENOPROTOOPT)", .{direction_name});
         } else {
-            std.log.debug("setKtlsRx failed on fd {d}: {s}", .{ fd, @tagName(err) });
+            std.log.debug("setKtls{s} failed on fd {d}: {s}", .{ direction_name, fd, @tagName(err) });
         }
         return false;
     }

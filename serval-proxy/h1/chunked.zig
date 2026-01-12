@@ -233,10 +233,8 @@ fn forwardCRLF(
     };
     shiftBuffer(buffer, buffer_len, 2);
 
-    // Postcondition: CRLF is exactly 2 bytes.
-    const forwarded: u64 = 2;
-    assert(forwarded == 2);
-    return forwarded;
+    // CRLF is exactly 2 bytes.
+    return 2;
 }
 
 /// Forward trailer section after last chunk.

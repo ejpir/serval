@@ -224,25 +224,29 @@ fn attachTlsULP(fd: i32) bool {
     return true;
 }
 
-/// Configure kTLS TX (encrypt) offload on a socket (Linux only).
+/// Configure kTLS offload on a socket (Linux only).
 /// Must call attachTlsULP first. crypto_info contains cipher-specific params.
+/// Direction is TLS_TX for transmit or TLS_RX for receive.
 /// Returns true if successful.
-fn setKtlsTx(fd: i32, crypto_info: []const u8) bool {
+fn setKtlsDirection(fd: i32, direction: u32, crypto_info: []const u8) bool {
     // S1: Preconditions
     assert(fd >= 0);
     assert(crypto_info.len > 0);
+    assert(direction == TLS_TX or direction == TLS_RX);
 
     // kTLS is Linux-only
     if (builtin.os.tag != .linux) {
-        std.log.debug("setKtlsTx: kTLS not available (non-Linux platform)", .{});
+        std.log.debug("setKtlsDirection: kTLS not available (non-Linux platform)", .{});
         return false;
     }
+
+    const direction_name = if (direction == TLS_TX) "TX" else "RX";
 
     // Use raw Linux syscall since SOL_TLS is not in std.posix
     const rc = std.os.linux.setsockopt(
         fd,
         @intCast(SOL_TLS),
-        TLS_TX,
+        direction,
         crypto_info.ptr,
         @intCast(crypto_info.len),
     );
@@ -250,45 +254,9 @@ fn setKtlsTx(fd: i32, crypto_info: []const u8) bool {
     const err = posix.errno(rc);
     if (err != .SUCCESS) {
         if (err == .NOPROTOOPT) {
-            std.log.debug("setKtlsTx: kTLS not available (ENOPROTOOPT)", .{});
+            std.log.debug("setKtls{s}: kTLS not available (ENOPROTOOPT)", .{direction_name});
         } else {
-            std.log.debug("setKtlsTx failed on fd {d}: {s}", .{ fd, @tagName(err) });
-        }
-        return false;
-    }
-
-    return true;
-}
-
-/// Configure kTLS RX (decrypt) offload on a socket (Linux only).
-/// Must call attachTlsULP first. crypto_info contains cipher-specific params.
-/// Returns true if successful.
-fn setKtlsRx(fd: i32, crypto_info: []const u8) bool {
-    // S1: Preconditions
-    assert(fd >= 0);
-    assert(crypto_info.len > 0);
-
-    // kTLS is Linux-only
-    if (builtin.os.tag != .linux) {
-        std.log.debug("setKtlsRx: kTLS not available (non-Linux platform)", .{});
-        return false;
-    }
-
-    // Use raw Linux syscall since SOL_TLS is not in std.posix
-    const rc = std.os.linux.setsockopt(
-        fd,
-        @intCast(SOL_TLS),
-        TLS_RX,
-        crypto_info.ptr,
-        @intCast(crypto_info.len),
-    );
-
-    const err = posix.errno(rc);
-    if (err != .SUCCESS) {
-        if (err == .NOPROTOOPT) {
-            std.log.debug("setKtlsRx: kTLS not available (ENOPROTOOPT)", .{});
-        } else {
-            std.log.debug("setKtlsRx failed on fd {d}: {s}", .{ fd, @tagName(err) });
+            std.log.debug("setKtls{s} failed on fd {d}: {s}", .{ direction_name, fd, @tagName(err) });
         }
         return false;
     }
@@ -463,7 +431,7 @@ fn buildCryptoInfoChaCha20Poly1305(
 }
 
 /// Sets kTLS crypto parameters via setsockopt for a given cipher.
-/// Helper function to keep configureKtlsDirection under 70 lines.
+/// Helper function to keep configureKtlsForDirection under 70 lines.
 fn setKtlsCrypto(
     fd: i32,
     ktls_version: u16,
@@ -474,39 +442,32 @@ fn setKtlsCrypto(
 ) bool {
     // S1: Preconditions validated by caller
     const rec_seq = std.mem.zeroes([8]u8);
+    const direction = if (is_tx) TLS_TX else TLS_RX;
 
     return switch (ktls_cipher) {
         .aes_gcm_128 => blk: {
             var info: Tls12CryptoInfoAesGcm128 = undefined;
             buildCryptoInfoAesGcm128(ktls_version, key, iv, &rec_seq, &info);
-            break :blk if (is_tx)
-                setKtlsTx(fd, std.mem.asBytes(&info))
-            else
-                setKtlsRx(fd, std.mem.asBytes(&info));
+            break :blk setKtlsDirection(fd, direction, std.mem.asBytes(&info));
         },
         .aes_gcm_256 => blk: {
             var info: Tls12CryptoInfoAesGcm256 = undefined;
             buildCryptoInfoAesGcm256(ktls_version, key, iv, &rec_seq, &info);
-            break :blk if (is_tx)
-                setKtlsTx(fd, std.mem.asBytes(&info))
-            else
-                setKtlsRx(fd, std.mem.asBytes(&info));
+            break :blk setKtlsDirection(fd, direction, std.mem.asBytes(&info));
         },
         .chacha20_poly1305 => blk: {
             var info: Tls12CryptoInfoChaCha20Poly1305 = undefined;
             buildCryptoInfoChaCha20Poly1305(ktls_version, key, iv, &rec_seq, &info);
-            break :blk if (is_tx)
-                setKtlsTx(fd, std.mem.asBytes(&info))
-            else
-                setKtlsRx(fd, std.mem.asBytes(&info));
+            break :blk setKtlsDirection(fd, direction, std.mem.asBytes(&info));
         },
         .unsupported => false,
     };
 }
 
 /// Configures kTLS for a specific direction (TX or RX).
+/// Extracts key material from SSL and configures kernel crypto parameters.
 /// Returns true on success, false on failure.
-fn configureKtlsDirection(
+fn configureKtlsForDirection(
     fd: i32,
     ssl_ptr: *ssl.SSL,
     ktls_version: u16,
@@ -609,13 +570,13 @@ pub fn tryEnableKtls(
     }
 
     // Step 6: Configure TX (transmit) crypto
-    if (!configureKtlsDirection(fd, ssl_ptr, ktls_version, ktls_cipher, true)) {
+    if (!configureKtlsForDirection(fd, ssl_ptr, ktls_version, ktls_cipher, true)) {
         std.log.debug("kTLS: Failed to configure TX crypto", .{});
         return .userspace_fallback;
     }
 
     // Step 7: Configure RX (receive) crypto
-    if (!configureKtlsDirection(fd, ssl_ptr, ktls_version, ktls_cipher, false)) {
+    if (!configureKtlsForDirection(fd, ssl_ptr, ktls_version, ktls_cipher, false)) {
         std.log.debug("kTLS: Failed to configure RX crypto (TX may be enabled)", .{});
         // Note: TX is already enabled, but RX failed. For simplicity, we fall back
         // to userspace. Production code might want to handle TX-only kTLS mode.
