@@ -468,6 +468,8 @@ pub fn build(b: *std.Build) void {
     const integration_tests = b.addTest(.{
         .name = "integration_tests",
         .root_module = integration_tests_mod,
+        // Custom test runner that prints each test name
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
     });
     const run_integration_tests = b.addRunArtifact(integration_tests);
 
