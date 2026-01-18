@@ -161,6 +161,14 @@ pub fn forwardResponse(
         total_body_bytes += try forwardChunkedBodyWithPreread(upstream_socket, client_socket, pre_read_body);
     } else if (content_length) |length| {
         // Content-Length based: forward exact number of bytes.
+        // First, send any pre-read body bytes to client.
+        if (pre_read_body.len > 0) {
+            debugLog("recv: forwarding pre-read body bytes={d}", .{pre_read_body.len});
+            client_socket.write_all(pre_read_body) catch {
+                return ForwardError.SendFailed;
+            };
+            total_body_bytes += pre_read_body.len;
+        }
         if (length > body_already_read_bytes) {
             const remaining = length - body_already_read_bytes;
             debugLog("recv: forwarding body remaining={d}", .{remaining});
