@@ -44,6 +44,15 @@ const HEALTHY_SETTLE_MS: u64 = 12000;
 /// Number of requests to verify backend exclusion after health stabilization.
 const FAILURE_TEST_REQUESTS: u32 = 5;
 
+/// Performance test: total requests to send with hey.
+const PERF_TEST_REQUESTS: u32 = 60000;
+
+/// Performance test: concurrent connections.
+const PERF_TEST_CONCURRENCY: u32 = 50;
+
+/// Performance test: minimum acceptable requests per second.
+const PERF_TEST_MIN_RPS: f64 = 8000.0;
+
 // =============================================================================
 // Harness Utility Tests
 // =============================================================================
@@ -939,4 +948,161 @@ test "integration: backend recovery - prober marks backend healthy" {
     // Note: We allow for slight imbalance due to timing, but both should receive some traffic
     try testing.expect(b1_recovered > 0);
     try testing.expect(b2_recovered > 0);
+}
+
+// =============================================================================
+// Performance Tests
+// =============================================================================
+
+test "performance: lb achieves minimum throughput with hey" {
+    // Test: Load balancer achieves at least PERF_TEST_MIN_RPS requests/second
+    //
+    // Uses 'hey' load testing tool to measure throughput.
+    // Requires 'hey' to be installed: go install github.com/rakyll/hey@latest
+
+    const allocator = testing.allocator;
+    const backend_port = harness.getPort();
+    const lb_port = harness.getPort();
+
+    var pm = harness.ProcessManager.init(allocator);
+    defer pm.deinit();
+
+    // Start backend and load balancer
+    try pm.startEchoBackend(backend_port, "perf-backend", .{});
+
+    var backend_addr_buf: [ADDR_BUF_LEN]u8 = undefined;
+    const backend_addr = std.fmt.bufPrint(&backend_addr_buf, "127.0.0.1:{d}", .{backend_port}) catch unreachable;
+
+    try pm.startLoadBalancer(lb_port, &.{backend_addr}, .{});
+
+    // Format hey arguments
+    var url_buf: [64]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/test", .{lb_port}) catch unreachable;
+
+    var n_buf: [16]u8 = undefined;
+    const n_arg = std.fmt.bufPrint(&n_buf, "{d}", .{PERF_TEST_REQUESTS}) catch unreachable;
+
+    var c_buf: [16]u8 = undefined;
+    const c_arg = std.fmt.bufPrint(&c_buf, "{d}", .{PERF_TEST_CONCURRENCY}) catch unreachable;
+
+    // Run hey and capture output using fork+exec with pipe
+    const stdout = runCommandWithOutput(allocator, &.{ "hey", "-n", n_arg, "-c", c_arg, url }) catch |err| {
+        if (err == error.CommandNotFound) {
+            std.debug.print("SKIP: 'hey' not installed\n", .{});
+            return error.SkipZigTest;
+        }
+        return err;
+    };
+    defer allocator.free(stdout);
+
+    // Parse "Requests/sec: XXXX.XXXX" from output
+    const rps = parseRequestsPerSec(stdout) orelse {
+        std.debug.print("Failed to parse hey output:\n{s}\n", .{stdout});
+        return error.TestUnexpectedResult;
+    };
+
+    std.debug.print("\nPerformance: {d:.2} req/s (minimum: {d:.2})\n", .{ rps, PERF_TEST_MIN_RPS });
+
+    // Assert minimum throughput
+    try testing.expect(rps >= PERF_TEST_MIN_RPS);
+}
+
+/// Run a command and capture its stdout output.
+/// Returns allocated buffer that caller must free.
+fn runCommandWithOutput(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
+    // Create pipe for stdout capture
+    const pipe = try posix.pipe();
+    const read_fd = pipe[0];
+    const write_fd = pipe[1];
+
+    // Convert argv to null-terminated array for execve
+    const argv_buf = try allocator.allocSentinel(?[*:0]const u8, argv.len, null);
+    defer allocator.free(argv_buf);
+
+    for (argv, 0..) |arg, i| {
+        argv_buf[i] = (try allocator.dupeZ(u8, arg)).ptr;
+    }
+    defer {
+        for (argv_buf) |ptr| {
+            if (ptr) |p| {
+                const len = std.mem.len(p);
+                allocator.free(p[0 .. len + 1]);
+            }
+        }
+    }
+
+    const pid = posix.fork() catch return error.ForkFailed;
+    if (pid == 0) {
+        // Child process
+        posix.close(read_fd);
+
+        // Redirect stdout to pipe
+        posix.dup2(write_fd, posix.STDOUT_FILENO) catch std.process.exit(126);
+        posix.close(write_fd);
+
+        // Redirect stderr to /dev/null
+        const devnull = posix.open("/dev/null", .{ .ACCMODE = .RDWR }, 0) catch std.process.exit(126);
+        posix.dup2(devnull, posix.STDERR_FILENO) catch std.process.exit(126);
+        posix.close(devnull);
+
+        // Execute command - inherit environment from parent
+        const env: [*:null]const ?[*:0]const u8 = @ptrCast(std.os.environ.ptr);
+        _ = posix.execvpeZ(argv_buf[0].?, argv_buf, env) catch {
+            std.process.exit(127); // Exec failed
+        };
+        std.process.exit(127); // Command not found
+    }
+
+    // Parent process
+    posix.close(write_fd);
+    defer posix.close(read_fd);
+
+    // Read all stdout
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = posix.read(read_fd, &buf) catch break;
+        if (n == 0) break;
+        try output.appendSlice(allocator, buf[0..n]);
+    }
+
+    // Wait for child
+    const wait_result = posix.waitpid(pid, 0);
+    const status = wait_result.status;
+
+    if (posix.W.IFEXITED(status)) {
+        const exit_code = posix.W.EXITSTATUS(status);
+        if (exit_code == 127) {
+            output.deinit(allocator);
+            return error.CommandNotFound;
+        }
+        if (exit_code != 0) {
+            output.deinit(allocator);
+            return error.CommandFailed;
+        }
+    }
+
+    return output.toOwnedSlice(allocator);
+}
+
+/// Parse "Requests/sec: XXXX.XXXX" from hey output.
+/// Note: hey uses TAB as separator, not space.
+fn parseRequestsPerSec(output: []const u8) ?f64 {
+    const marker = "Requests/sec:";
+    const idx = std.mem.indexOf(u8, output, marker) orelse return null;
+    const after_marker = output[idx + marker.len ..];
+
+    // Skip whitespace (spaces and tabs)
+    var start: usize = 0;
+    while (start < after_marker.len and (after_marker[start] == ' ' or after_marker[start] == '\t')) : (start += 1) {}
+
+    // Find end of number
+    var end: usize = start;
+    while (end < after_marker.len and (after_marker[end] == '.' or (after_marker[end] >= '0' and after_marker[end] <= '9'))) : (end += 1) {}
+
+    if (end == start) return null;
+
+    return std.fmt.parseFloat(f64, after_marker[start..end]) catch null;
 }
