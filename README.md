@@ -89,7 +89,7 @@ exe.root_module.addImport("serval-lb", serval.module("serval-lb"));
 | `serval` | Umbrella module — re-exports everything |
 | `serval-core` | Types, config, errors, context |
 | `serval-http` | HTTP/1.1 request parser |
-| `serval-net` | Socket abstraction (plain TCP + TLS unified interface) |
+| `serval-net` | DNS resolution with TTL caching, TCP socket utilities |
 | `serval-client` | HTTP/1.1 client library for upstream connections |
 | `serval-tls` | TLS termination/origination with kTLS offload |
 | `serval-pool` | Connection pooling |

@@ -35,20 +35,8 @@
       - Performance requirements (latency targets, memory bounds)
     </principle>
 
-    <principle name="mandatory-tigerstyle">
-      ALWAYS run /tigerstyle validation:
-      - Before writing new code (to understand requirements)
-      - During implementation (to validate approach)
-      - After writing code (to verify compliance)
-      - Before committing (final check)
-
-      TigerStyle is NOT optional. It is a requirement for ALL code.
-      Check EVERY rule (S1-S7, P1-P4, C1-C5, Y1-Y6) individually.
-    </principle>
-
     <principle name="verify-all-decisions">
       Validate architectural and implementation decisions:
-      - Use /tigerstyle to check if design follows TigerStyle principles
       - Reference RFC specs for protocol decisions
       - Check layer architecture rules for module placement
       - Verify against implementation plans in docs/plans/
@@ -71,25 +59,16 @@
       Read and understand specs (RFCs, plans, TigerStyle docs)
     </step>
     <step order="2">
-      Design implementation (validate with /tigerstyle)
-    </step>
-    <step order="3">
       Write code with inline assertions and error handling
     </step>
-    <step order="4">
-      Run /tigerstyle validation on code
-    </step>
-    <step order="5">
+    <step order="3">
       Write comprehensive tests (unit, integration, edge cases)
     </step>
-    <step order="6">
+    <step order="4">
       Run all tests and verify they pass
     </step>
-    <step order="7">
+    <step order="5">
       Update documentation (README.md, ARCHITECTURE.md)
-    </step>
-    <step order="8">
-      Final /tigerstyle check before commit
     </step>
   </development-process>
 
@@ -127,7 +106,7 @@
   </testing-requirements>
 
   <code-quality-checklist>
-    <check>✓ All TigerStyle rules pass (/tigerstyle validation)</check>
+    <check>✓ All TigerStyle rules pass</check>
     <check>✓ All tests pass (unit, integration)</check>
     <check>✓ No memory leaks (valgrind or similar)</check>
     <check>✓ No undefined behavior (ubsan)</check>
@@ -530,10 +509,10 @@
   </rule>
 
   <rule name="sockets">
-    Always use serval-net.Socket for socket operations:
+    Always use serval-socket.Socket for socket operations:
     - Unified abstraction for plain TCP and TLS
     - Consistent read/write interface
-    - NEVER mix raw posix sockets with serval-net.Socket
+    - NEVER mix raw posix sockets with serval-socket.Socket
   </rule>
 
   <rule name="tls">
@@ -691,10 +670,9 @@
   <IMPORTANT>Follow these steps IN ORDER after making code changes</IMPORTANT>
 
   <step order="1">Write idiomatic Zig code</step>
-  <step order="2">Run /tigerstyle code review</step>
-  <step order="3">Update README.md files in serval-*/ folders for any modified modules</step>
-  <step order="4">Verify serval/ARCHITECTURE.md is still accurate</step>
-  <step order="5">Build and test</step>
+  <step order="2">Update README.md files in serval-*/ folders for any modified modules</step>
+  <step order="3">Verify serval/ARCHITECTURE.md is still accurate</step>
+  <step order="4">Build and test</step>
 </workflow>
 
 <documentation>
@@ -706,9 +684,9 @@
   <doc path="serval-*/README.md">Per-module purpose, exports, implementation status</doc>
 </documentation>
 
-<code-review>
-  <skill>/tigerstyle</skill>
-  <usage>Use for reviewing code changes before committing</usage>
-  <CRITICAL>You MUST check EVERY rule (S1-S7, P1-P4, C1-C5, Y1-Y6) - NO EXCEPTIONS</CRITICAL>
-  <CRITICAL>Do NOT skip rules. Do NOT summarize. Check each rule individually and report status.</CRITICAL>
-</code-review>
+  <serval-rules>
+    <rule id="Z1">Layering: no sideways deps, correct layer placement, type ownership.</rule>
+    <rule id="Z2">Component usage: serval-socket for sockets, serval-net for DNS, serval-core for config/time. Exception: serval-socket may use raw std.posix (lowest-level abstraction).</rule>
+    <rule id="Z3">Protocol specs: HTTP/TLS behavior aligns with RFCs and docs/plans/ARCHITECTURE.md.</rule>
+    <rule id="Z4">Handler interface: selectUpstream contract, hooks, DirectResponse usage.</rule>
+  </serval-rules>

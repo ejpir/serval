@@ -25,7 +25,8 @@ Serval is a modular HTTP/1.1 reverse proxy library written in Zig, following Tig
 ```
 serval (umbrella - re-exports all modules)
 ├── serval-core     # Types, config, errors, context, hooks
-├── serval-net      # Socket utilities (TCP_NODELAY, etc.)
+├── serval-net      # DNS resolution, TCP helpers (TCP_NODELAY, keepalive)
+├── serval-socket   # Unified socket abstraction (plain TCP + TLS)
 ├── serval-http     # HTTP/1.1 parser
 ├── serval-tls      # TLS termination and origination (OpenSSL)
 ├── serval-pool     # Connection pooling
@@ -88,7 +89,7 @@ Layer 0 (Foundation):
        ↑                                                           │
        │                                                           │
 Layer 1 (Protocol):                                                │
-  serval-net ──────────────────────────────────────────────────────┤
+  serval-net (DNS, TCP helpers) ───────────────────────────────────┤
        ↑                                                           │
        │                                                           │
   serval-http ─────────────────────────────────────────────────────┤
@@ -96,28 +97,30 @@ Layer 1 (Protocol):                                                │
   serval-tls ──────────────────────────────────────────────────────┤
                                                                    │
 Layer 2 (Infrastructure):                                          │
-  serval-pool ←─────────────────────────────────────────────┐      │
-                                                            │      │
-  serval-client (depends on core, net, tls, http, pool) ←───┤      │
-                                                            │      │
-  serval-health ←───────────────────────────────────────────┤      │
-                                                            │      │
-  serval-prober (depends on serval-client) ←────────────────┤      │
-                                                            │      │
-  serval-metrics ───────────────────────────────────────────┤      │
-                                                            │      │
-  serval-tracing ───────────────────────────────────────────┤      │
-       ↑                                                    │      │
-  serval-otel (implements serval-tracing interface) ────────┤      │
-                                                            │      │
-Layer 3 (Mechanics):                                        │      │
-  serval-proxy (depends on serval-client) ──────────────────┤      │
-       ↑                                                    │      │
-       │                                                    │      │
-Layer 5 (Orchestration):                                    │      │
-  serval-server ────────────────────────────────────────────┤      │
-                                                            │      │
-                                                       serval (composes all)
+  serval-socket (unified TCP/TLS socket) ←─────────────────┐       │
+                                                           │       │
+  serval-pool (depends on socket) ←────────────────────────┤       │
+                                                           │       │
+  serval-client (depends on core, net, socket, tls, http, pool) ←──┤
+                                                           │       │
+  serval-health ←──────────────────────────────────────────┤       │
+                                                           │       │
+  serval-prober (depends on serval-client) ←───────────────┤       │
+                                                           │       │
+  serval-metrics ──────────────────────────────────────────┤       │
+                                                           │       │
+  serval-tracing ──────────────────────────────────────────┤       │
+       ↑                                                   │       │
+  serval-otel (implements serval-tracing interface) ───────┤       │
+                                                           │       │
+Layer 3 (Mechanics):                                       │       │
+  serval-proxy (depends on serval-client) ─────────────────┤       │
+       ↑                                                   │       │
+       │                                                   │       │
+Layer 5 (Orchestration):                                   │       │
+  serval-server ───────────────────────────────────────────┤       │
+                                                           │       │
+                                                      serval (composes all)
 
 Standalone:
   serval-core ←── serval-lb (load balancer handler, depends on serval-health, serval-prober)
@@ -131,7 +134,8 @@ Standalone:
 | Module | Purpose | Key Exports |
 |--------|---------|-------------|
 | serval-core | Shared types, config, errors, hook verification | `Request`, `Config`, `Context`, `verifyHandler`, `hasHook` |
-| serval-net | Socket configuration utilities | `Socket`, `SocketError`, `setTcpNoDelay` |
+| serval-net | DNS resolution, TCP configuration utilities | `DnsResolver`, `set_tcp_no_delay`, `set_tcp_keep_alive` |
+| serval-socket | Unified socket abstraction (plain TCP + TLS) | `Socket`, `SocketError`, `PlainSocket` |
 | serval-http | HTTP/1.1 parsing | `Parser` |
 | serval-pool | Connection reuse (wraps Socket) | `SimplePool`, `NoPool`, `Connection` |
 | serval-client | HTTP/1.1 client for upstream requests | `Client`, `ClientError`, `ResponseHeaders`, `sendRequest`, `readResponseHeaders` |
@@ -686,19 +690,22 @@ const MyHandler = struct {
 
 | Task | Location |
 |------|----------|
-| Add new request/response types | `lib/serval-core/types.zig` |
-| Change config defaults or limits | `lib/serval-core/config.zig` |
-| Add new error types | `lib/serval-core/errors.zig` |
-| Add logging utilities | `lib/serval-core/log.zig` |
-| Modify handler hook verification | `lib/serval-core/hooks.zig` |
-| Add socket utilities or Socket abstraction | `lib/serval-net/socket.zig` |
-| Modify HTTP parsing | `lib/serval-http/parser.zig` |
-| Change connection pooling strategy | `lib/serval-pool/pool.zig` |
-| Modify forwarding behavior | `lib/serval-proxy/forwarder.zig` |
-| Add metrics exporters | `lib/serval-metrics/` |
-| Add tracing backends | `lib/serval-tracing/` |
-| Add load balancing algorithms | `lib/serval-lb/handler.zig` |
-| Modify server request loop | `lib/serval-server/h1/server.zig` |
+| Add new request/response types | `serval-core/types.zig` |
+| Change config defaults or limits | `serval-core/config.zig` |
+| Add new error types | `serval-core/errors.zig` |
+| Add logging utilities | `serval-core/log.zig` |
+| Modify handler hook verification | `serval-core/hooks.zig` |
+| Add DNS resolution features | `serval-net/dns.zig` |
+| Add TCP socket options | `serval-net/tcp.zig` |
+| Add socket abstraction features | `serval-socket/socket.zig` |
+| Add TLS socket features | `serval-socket/tls_socket.zig` |
+| Modify HTTP parsing | `serval-http/parser.zig` |
+| Change connection pooling strategy | `serval-pool/pool.zig` |
+| Modify forwarding behavior | `serval-proxy/forwarder.zig` |
+| Add metrics exporters | `serval-metrics/` |
+| Add tracing backends | `serval-tracing/` |
+| Add load balancing algorithms | `serval-lb/handler.zig` |
+| Modify server request loop | `serval-server/h1/server.zig` |
 
 ### Adding a New Pool Implementation
 

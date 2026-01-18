@@ -19,9 +19,9 @@ const types = serval_core.types;
 const BodyFraming = types.BodyFraming;
 const debugLog = serval_core.debugLog;
 
-const serval_net = @import("serval-net");
-const Socket = serval_net.Socket;
-const SocketError = serval_net.SocketError;
+const serval_socket = @import("serval-socket");
+const Socket = serval_socket.Socket;
+const SocketError = serval_socket.SocketError;
 
 const serval_http = @import("serval-http");
 const chunked = serval_http.chunked;
@@ -121,7 +121,7 @@ pub const BodyReader = struct {
     ///
     /// TigerStyle S1: Precondition assertions.
     pub fn init(socket: *Socket, framing: BodyFraming) Self {
-        assert(socket.getFd() >= 0); // S1: socket must be valid
+        assert(socket.get_fd() >= 0); // S1: socket must be valid
 
         const bytes_remaining: ?u64 = switch (framing) {
             .content_length => |len| len,
@@ -206,18 +206,18 @@ pub const BodyReader = struct {
     /// - P1: Zero-copy splice when possible (network > CPU)
     pub fn forwardTo(self: *Self, dst: *Socket, scratch: []u8) BodyError!u64 {
         // S1: Preconditions
-        assert(dst.getFd() >= 0); // Destination socket must be valid
+        assert(dst.get_fd() >= 0); // Destination socket must be valid
         assert(scratch.len >= MIN_CHUNK_BUFFER_SIZE); // Buffer for chunked framing
 
         if (self.done) return 0;
 
         // Check if zero-copy splice is possible
-        const can_splice = self.socket.canSplice() and dst.canSplice();
+        const can_splice = self.socket.can_splice() and dst.can_splice();
 
         return switch (self.framing) {
             .content_length => |len| {
                 if (can_splice) {
-                    return self.forwardContentLengthSplice(dst.getFd(), len);
+                    return self.forwardContentLengthSplice(dst.get_fd(), len);
                 } else {
                     return self.forwardContentLengthCopy(dst, scratch, len);
                 }
@@ -526,7 +526,7 @@ pub const BodyReader = struct {
     /// Forward content-length body using splice (zero-copy).
     fn forwardContentLengthSplice(self: *Self, dst_fd: i32, length: u64) BodyError!u64 {
         if (comptime builtin.os.tag != .linux) {
-            // Splice only on Linux - shouldn't reach here due to canSplice check
+            // Splice only on Linux - shouldn't reach here due to can_splice check
             return BodyError.SpliceFailed;
         }
 
@@ -539,7 +539,7 @@ pub const BodyReader = struct {
             posix.close(pipe_fds[1]);
         }
 
-        const src_fd = self.socket.getFd();
+        const src_fd = self.socket.get_fd();
         var forwarded: u64 = 0;
 
         // S3: Bounded loop
@@ -600,7 +600,7 @@ pub const BodyReader = struct {
             };
             if (n == 0) break; // EOF
 
-            dst.writeAll(scratch[0..n]) catch {
+            dst.write_all(scratch[0..n]) catch {
                 return BodyError.WriteFailed;
             };
 
@@ -628,7 +628,7 @@ pub const BodyReader = struct {
             const chunk = try self.readChunkChunked(scratch) orelse break;
 
             // Forward to destination
-            dst.writeAll(chunk) catch {
+            dst.write_all(chunk) catch {
                 return BodyError.WriteFailed;
             };
 
@@ -691,7 +691,7 @@ test "BodyReader.init content_length" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    var socket = Socket.Plain.initClient(fds[0]);
+    var socket = Socket.Plain.init_client(fds[0]);
     var reader = BodyReader.init(&socket, .{ .content_length = 100 });
 
     try std.testing.expect(!reader.done);
@@ -704,7 +704,7 @@ test "BodyReader.init content_length zero" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    var socket = Socket.Plain.initClient(fds[0]);
+    var socket = Socket.Plain.init_client(fds[0]);
     var reader = BodyReader.init(&socket, .{ .content_length = 0 });
 
     // Zero content-length means body already done
@@ -717,7 +717,7 @@ test "BodyReader.init chunked" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    var socket = Socket.Plain.initClient(fds[0]);
+    var socket = Socket.Plain.init_client(fds[0]);
     var reader = BodyReader.init(&socket, .chunked);
 
     try std.testing.expect(!reader.done);
@@ -729,7 +729,7 @@ test "BodyReader.init none" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    var socket = Socket.Plain.initClient(fds[0]);
+    var socket = Socket.Plain.init_client(fds[0]);
     var reader = BodyReader.init(&socket, .none);
 
     // No body means already done
@@ -745,7 +745,7 @@ test "BodyReader.readAll content_length" {
     const body = "Hello, World!";
     _ = posix.write(fds[1], body) catch return;
 
-    var socket = Socket.Plain.initClient(fds[0]);
+    var socket = Socket.Plain.init_client(fds[0]);
     var reader = BodyReader.init(&socket, .{ .content_length = body.len });
 
     var buf: [64]u8 = undefined;
@@ -760,7 +760,7 @@ test "BodyReader.readAll content_length buffer too small" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    var socket = Socket.Plain.initClient(fds[0]);
+    var socket = Socket.Plain.init_client(fds[0]);
     var reader = BodyReader.init(&socket, .{ .content_length = 100 });
 
     var buf: [10]u8 = undefined; // Too small for 100 bytes
@@ -777,7 +777,7 @@ test "BodyReader.readChunk content_length" {
     const body = "Hello, World!";
     _ = posix.write(fds[1], body) catch return;
 
-    var socket = Socket.Plain.initClient(fds[0]);
+    var socket = Socket.Plain.init_client(fds[0]);
     var reader = BodyReader.init(&socket, .{ .content_length = body.len });
 
     var buf: [5]u8 = undefined; // Small buffer to force multiple chunks
@@ -798,7 +798,7 @@ test "BodyReader.readAll none returns empty" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    var socket = Socket.Plain.initClient(fds[0]);
+    var socket = Socket.Plain.init_client(fds[0]);
     var reader = BodyReader.init(&socket, .none);
 
     var buf: [64]u8 = undefined;
@@ -812,7 +812,7 @@ test "BodyReader.readChunk none returns null" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    var socket = Socket.Plain.initClient(fds[0]);
+    var socket = Socket.Plain.init_client(fds[0]);
     var reader = BodyReader.init(&socket, .none);
 
     var buf: [64]u8 = undefined;
@@ -877,7 +877,7 @@ test "BodyReader.readAll chunked single chunk" {
 
     try std.testing.expectEqual(chunked_body.len, written);
 
-    var socket = Socket.Plain.initClient(fds[0]);
+    var socket = Socket.Plain.init_client(fds[0]);
     var reader = BodyReader.init(&socket, .chunked);
 
     // Precondition: reader not done initially
@@ -909,7 +909,7 @@ test "BodyReader.readAll chunked multiple chunks" {
 
     try std.testing.expectEqual(chunked_body.len, written);
 
-    var socket = Socket.Plain.initClient(fds[0]);
+    var socket = Socket.Plain.init_client(fds[0]);
     var reader = BodyReader.init(&socket, .chunked);
 
     var buf: [64]u8 = undefined;
@@ -938,7 +938,7 @@ test "BodyReader.readChunk chunked streaming" {
 
     try std.testing.expectEqual(chunked_body.len, written);
 
-    var socket = Socket.Plain.initClient(fds[0]);
+    var socket = Socket.Plain.init_client(fds[0]);
     var reader = BodyReader.init(&socket, .chunked);
 
     // Use a 4-byte buffer - large enough for first chunk but smaller than second
@@ -983,7 +983,7 @@ test "BodyReader.readAll chunked with extensions" {
 
     try std.testing.expectEqual(chunked_body.len, written);
 
-    var socket = Socket.Plain.initClient(fds[0]);
+    var socket = Socket.Plain.init_client(fds[0]);
     var reader = BodyReader.init(&socket, .chunked);
 
     var buf: [64]u8 = undefined;

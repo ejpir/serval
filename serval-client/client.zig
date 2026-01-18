@@ -20,8 +20,10 @@ const Upstream = types.Upstream;
 
 const net = @import("serval-net");
 const DnsResolver = net.DnsResolver;
-const Socket = net.Socket;
-const SocketError = net.SocketError;
+
+const serval_socket = @import("serval-socket");
+const Socket = serval_socket.Socket;
+const SocketError = serval_socket.SocketError;
 
 const pool_mod = @import("serval-pool");
 pub const Connection = pool_mod.pool.Connection;
@@ -212,8 +214,8 @@ pub const Client = struct {
         assert(fd >= 0);
 
         // Configure socket for low latency
-        _ = net.setTcpNoDelay(fd);
-        _ = net.setTcpKeepAlive(fd, 60, 10, 3);
+        _ = net.set_tcp_no_delay(fd);
+        _ = net.set_tcp_keep_alive(fd, 60, 10, 3);
 
         // Get local port for observability
         const local_port = getLocalPort(fd);
@@ -234,7 +236,7 @@ pub const Client = struct {
                 upstream.host[0 .. upstream.host.len - 1]
             else
                 upstream.host;
-            const tls_socket = Socket.TLS.TLSSocket.initClient(
+            const tls_socket = Socket.TLS.TLSSocket.init_client(
                 fd,
                 ctx,
                 sni_host,
@@ -247,7 +249,7 @@ pub const Client = struct {
             break :blk tls_socket;
         } else blk: {
             // Plaintext connection
-            break :blk Socket.Plain.initClient(fd);
+            break :blk Socket.Plain.init_client(fd);
         };
         const tls_end_ns = time.monotonicNanos();
         const tls_handshake_duration_ns = if (upstream.tls)
@@ -418,7 +420,8 @@ fn mapResponseError(err: ResponseError) ClientError {
 // =============================================================================
 
 test "Client.init creates client with valid fields" {
-    var dns_resolver = DnsResolver.init(.{});
+    var dns_resolver: DnsResolver = undefined;
+    DnsResolver.init(&dns_resolver, .{});
     const client = Client.init(
         std.testing.allocator,
         &dns_resolver,
@@ -432,7 +435,8 @@ test "Client.init creates client with valid fields" {
 }
 
 test "Client.init with TLS context" {
-    var dns_resolver = DnsResolver.init(.{});
+    var dns_resolver: DnsResolver = undefined;
+    DnsResolver.init(&dns_resolver, .{});
 
     // We can't actually create a valid SSL_CTX in tests without OpenSSL setup,
     // but we can verify the field is stored correctly with a dummy pointer.
@@ -448,7 +452,8 @@ test "Client.init with TLS context" {
 }
 
 test "Client.deinit is safe to call" {
-    var dns_resolver = DnsResolver.init(.{});
+    var dns_resolver: DnsResolver = undefined;
+    DnsResolver.init(&dns_resolver, .{});
     var client = Client.init(
         std.testing.allocator,
         &dns_resolver,
@@ -521,4 +526,3 @@ test "mapConnectError maps common errors" {
     // Unknown errors map to TcpConnectFailed
     try std.testing.expectEqual(ClientError.TcpConnectFailed, mapConnectError(error.OutOfMemory));
 }
-

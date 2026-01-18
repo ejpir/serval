@@ -171,12 +171,14 @@ const LlmHandler = struct {
         // Reset token index for new request
         self.token_idx = 0;
 
-        return .{ .stream = .{
-            .status = 200,
-            .content_type = "text/event-stream",
-            // SSE headers: disable caching and buffering
-            .extra_headers = "Cache-Control: no-cache\r\nConnection: keep-alive\r\nX-Accel-Buffering: no\r\n",
-        } };
+        return .{
+            .stream = .{
+                .status = 200,
+                .content_type = "text/event-stream",
+                // SSE headers: disable caching and buffering
+                .extra_headers = "Cache-Control: no-cache\r\nConnection: keep-alive\r\nX-Accel-Buffering: no\r\n",
+            },
+        };
     }
 
     /// 404 Not Found response.
@@ -325,7 +327,7 @@ pub fn main() !void {
         .port = args.port,
     }, null, DnsConfig{});
 
-    server.run(io, &shutdown) catch |err| {
+    server.run(io, &shutdown, null) catch |err| {
         std.debug.print("Server error: {}\n", .{err});
         return;
     };

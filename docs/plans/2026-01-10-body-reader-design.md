@@ -167,7 +167,7 @@ fn readBody(self: *Self, conn: *Connection, response: ResponseHeaders) ClientErr
 ```
 serval-client/body.zig (Layer 2: Infrastructure)
     ├── imports serval-http/chunked.zig (Layer 1: Protocol)
-    ├── imports serval-net/Socket (Layer 1: Protocol)
+    ├── imports serval-socket/Socket (Layer 2: Infrastructure)
     └── imports serval-core/types.zig (Layer 0: Foundation)
 ```
 

@@ -156,7 +156,8 @@ pub const Client = struct {
         errdefer tls.ssl.SSL_CTX_free(ssl_ctx);
 
         // Initialize DNS resolver
-        const dns_resolver = DnsResolver.init(.{});
+        var dns_resolver: DnsResolver = undefined;
+        DnsResolver.init(&dns_resolver, .{});
 
         // TigerStyle: Initialize all fields in a single struct literal
         self.* = .{
@@ -229,7 +230,8 @@ pub const Client = struct {
         errdefer tls.ssl.SSL_CTX_free(ssl_ctx);
 
         // Initialize DNS resolver
-        const dns_resolver = DnsResolver.init(.{});
+        var dns_resolver: DnsResolver = undefined;
+        DnsResolver.init(&dns_resolver, .{});
 
         // TigerStyle: Initialize all fields in a single struct literal
         self.* = .{

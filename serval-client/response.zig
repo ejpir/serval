@@ -19,9 +19,9 @@ const parseStatusCode = serval_http.parseStatusCode;
 const parseContentLength = serval_http.parseContentLength;
 const parseContentLengthValue = serval_http.parseContentLengthValue;
 
-const serval_net = @import("serval-net");
-const Socket = serval_net.Socket;
-const SocketError = serval_net.SocketError;
+const serval_socket = @import("serval-socket");
+const Socket = serval_socket.Socket;
+const SocketError = serval_socket.SocketError;
 
 // =============================================================================
 // Error Types

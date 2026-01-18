@@ -74,13 +74,14 @@ fn runAdminServer(
     io: std.Io,
     shutdown: *std.atomic.Value(bool),
 ) void {
-    admin_server.run(io, shutdown) catch |err| {
+    admin_server.run(io, shutdown, null) catch |err| {
         log.err("Admin server error: {}", .{err});
     };
 }
 
 /// Run both admin and main servers with the given tracer.
 /// TigerStyle: Generic function to avoid code duplication between tracer modes.
+/// Admin server always uses NoopTracer to avoid tracing internal health checks.
 fn runServers(
     comptime Tracer: type,
     tracer: *Tracer,
@@ -90,12 +91,13 @@ fn runServers(
     io: std.Io,
     shutdown: *std.atomic.Value(bool),
 ) !void {
-    const AdminHandlerType = admin.AdminHandler(Tracer);
+    // Admin server always uses NoopTracer - no need to trace health checks and config updates
+    const AdminHandlerType = admin.AdminHandler(serval.NoopTracer);
     const AdminServerType = serval.Server(
         AdminHandlerType,
         serval.SimplePool,
         serval.NoopMetrics,
-        Tracer,
+        serval.NoopTracer,
     );
     const RouterServerType = serval.Server(
         RouterHandler,
@@ -104,11 +106,12 @@ fn runServers(
         Tracer,
     );
 
-    // Initialize admin handler and server
-    var admin_handler = AdminHandlerType.init(tracer);
+    // Initialize admin handler and server with NoopTracer
+    var admin_noop_tracer = serval.NoopTracer{};
+    var admin_handler = AdminHandlerType.init(&admin_noop_tracer);
     var admin_pool = serval.SimplePool.init();
     var admin_metrics = serval.NoopMetrics{};
-    var admin_server = AdminServerType.init(&admin_handler, &admin_pool, &admin_metrics, tracer, .{
+    var admin_server = AdminServerType.init(&admin_handler, &admin_pool, &admin_metrics, &admin_noop_tracer, .{
         .port = admin_port,
         .tls = null,
     }, null, DnsConfig{});
@@ -135,7 +138,7 @@ fn runServers(
         .tls = null,
     }, null, DnsConfig{});
 
-    server.run(io, shutdown) catch |err| {
+    server.run(io, shutdown, null) catch |err| {
         std.debug.print("Server error: {}\n", .{err});
         return;
     };

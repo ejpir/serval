@@ -1,157 +1,104 @@
 # serval-net
 
-Network utilities for serval. Like Pingora's `connectors` module.
+Network utilities for serval. Like Pingora's `connectors` module (DNS portion).
 
 ## Purpose
 
-Unified socket abstraction (plain TCP + TLS) and TCP configuration helpers.
+DNS resolution with TTL caching and TCP socket configuration utilities.
+
+**Note:** Socket abstraction (plain TCP + TLS unified interface) has moved to `serval-socket` (Layer 2).
+
+## Layer
+
+Layer 1 (Protocol) - provides DNS and TCP helpers used by higher-level modules.
 
 ## Exports
 
 | Symbol | Description |
 |--------|-------------|
-| `Socket` | Tagged union for plain TCP and TLS sockets |
-| `SocketError` | Unified error type for socket operations |
-| `Socket.Plain.initClient(fd)` | Create plain client socket from fd |
-| `Socket.Plain.initServer(fd)` | Create plain server socket from fd |
-| `Socket.TLS.TLSSocket.initClient(fd, ctx, host, enable_ktls)` | Create TLS client socket with SNI |
-| `Socket.TLS.TLSSocket.initServer(fd, ctx)` | Create TLS server socket |
-| `socket.read(buf)` | Read data into buffer |
-| `socket.write(data)` | Write data to socket |
-| `socket.close()` | Close socket and free resources |
-| `socket.getFd()` | Get raw fd for splice/poll |
-| `socket.isTLS()` | Check if TLS socket |
-| `socket.isKtls()` | Check if kTLS kernel offload active |
-| `socket.canSplice()` | Check splice eligibility (plain or kTLS) |
-| `tcp.setTcpNoDelay(fd)` | Disable Nagle's algorithm |
-| `tcp.setTcpKeepAlive(fd, idle, interval, count)` | Configure TCP keepalive |
-| `tcp.setTcpQuickAck(fd)` | Disable delayed ACKs (Linux) |
-| `tcp.setSoLinger(fd, timeout)` | Configure SO_LINGER |
-| `parseIPv4(host)` | Parse IPv4 address to network-order u32 |
 | `DnsResolver` | Thread-safe DNS resolver with TTL caching |
-| `DnsResolver.init(config)` | Create resolver with configuration |
+| `DnsResolver.init(&resolver, config)` | Initialize resolver with configuration |
 | `resolver.resolve(hostname, port, io)` | Resolve hostname to single IP address |
-| `resolver.resolveAll(hostname, port, io, out)` | Resolve hostname to all IP addresses (out-pointer) |
-| `DnsResolver.normalizeFqdn(hostname, buf)` | Add trailing dot to FQDNs (bypass search domains) |
+| `resolver.resolve_all(hostname, port, io, out)` | Resolve hostname to all IP addresses (out-pointer) |
+| `DnsResolver.normalize_fqdn(hostname, buf)` | Add trailing dot to FQDNs (bypass search domains) |
 | `resolver.invalidate(hostname)` | Invalidate cached entry for hostname |
-| `resolver.invalidateAll()` | Clear entire DNS cache |
-| `resolver.getStats()` | Get cache hit/miss statistics |
-| `DnsConfig` | DNS resolver configuration (ttl_ns, timeout_ns) |
+| `resolver.invalidate_all()` | Clear entire DNS cache |
+| `resolver.get_stats()` | Get cache hit/miss statistics |
+| `DnsConfig` | DNS resolver configuration (ttl_ns) |
 | `DnsError` | DNS resolution error type |
 | `ResolveResult` | Single address resolution result |
 | `ResolveAllResult` | Multi-address resolution result |
+| `tcp.set_tcp_no_delay(fd)` | Disable Nagle's algorithm |
+| `tcp.set_tcp_keep_alive(fd, idle, interval, count)` | Configure TCP keepalive |
+| `tcp.set_tcp_quick_ack(fd)` | Disable delayed ACKs (Linux) |
+| `tcp.set_so_linger(fd, timeout)` | Configure SO_LINGER |
+| `parse_ipv4(host)` | Parse IPv4 address to network-order u32 |
 
-## Socket API
+## DNS Resolution API
 
-### Socket (Tagged Union)
+### DnsResolver
 
-Unified socket type for both plain TCP and TLS connections. Tagged union with explicit dispatch - not generics (TigerStyle: explicit types).
+Thread-safe DNS resolver with fixed-size TTL cache. Zero allocation after init.
 
 ```zig
-pub const Socket = union(enum) {
-    plain: PlainSocket,
-    tls: TLSSocket,
-};
+const net = @import("serval-net");
+
+// Initialize resolver with default config (30s TTL)
+var resolver: net.DnsResolver = undefined;
+net.DnsResolver.init(&resolver, .{});
+
+// Or with custom config
+var resolver_custom: net.DnsResolver = undefined;
+net.DnsResolver.init(&resolver_custom, .{
+    .ttl_ns = 60_000_000_000, // 60 second cache TTL
+});
+
+// Single address resolution
+const result = try resolver.resolve("example.com", 80, io);
+// result.address contains the resolved IP
+// result.from_cache indicates if result was cached
+// result.resolution_ns is time spent resolving (0 if cached)
+
+// All addresses resolution (out-pointer pattern per TigerStyle C3)
+var all_result: net.ResolveAllResult = undefined;
+try resolver.resolve_all("example.com", 80, io, &all_result);
+for (all_result.slice()) |addr| {
+    // Use each address (e.g., for connection failover)
+    _ = addr;
+}
+
+// FQDN normalization for search domain bypass
+// Adds trailing dot to FQDNs with 4+ dots (e.g., Kubernetes service names)
+var buf: [256]u8 = undefined;
+const normalized = try net.DnsResolver.normalize_fqdn(
+    "service.namespace.svc.cluster.local",
+    &buf,
+);
+// Returns "service.namespace.svc.cluster.local."
+// The trailing dot tells DNS resolvers to skip search domain expansion
+
+// Cache management
+resolver.invalidate("example.com"); // Invalidate single entry
+resolver.invalidate_all(); // Clear entire cache
+
+// Statistics
+const stats = resolver.get_stats();
+std.debug.print("Cache hits: {d}, misses: {d}\n", .{ stats.hits, stats.misses });
 ```
 
-### SocketError
-
-Unified error type for all socket operations:
+### DnsError
 
 | Error | Description |
 |-------|-------------|
-| `ConnectionReset` | RST received from peer |
-| `ConnectionClosed` | Clean close by peer |
-| `BrokenPipe` | Write to closed connection (EPIPE) |
-| `Timeout` | Operation timed out |
-| `TLSError` | TLS handshake, encryption, or certificate error |
-| `Unexpected` | Unknown error from syscall or SSL |
-
-### Socket.Plain.initClient(fd: i32) Socket
-
-Create plain client socket from file descriptor.
-
-**Parameters:**
-- `fd`: Socket file descriptor (must be >= 0)
-
-**Returns:** `Socket` with `.plain` variant
-
-### Socket.Plain.initServer(fd: i32) Socket
-
-Create plain server socket from file descriptor. Same as `initClient` for plain TCP, but documents intent for symmetric API with TLS.
-
-**Parameters:**
-- `fd`: Socket file descriptor (must be >= 0)
-
-**Returns:** `Socket` with `.plain` variant
-
-### Socket.TLS.TLSSocket.initClient(fd: i32, ctx: *SSL_CTX, host: []const u8, enable_ktls: bool) SocketError!Socket
-
-Create TLS client socket with Server Name Indication (SNI). Performs TLS handshake.
-
-**Parameters:**
-- `fd`: Socket file descriptor (must be >= 0)
-- `ctx`: OpenSSL SSL_CTX pointer (caller owns lifecycle)
-- `host`: Hostname for SNI (max 253 chars per RFC 6066)
-- `enable_ktls`: If true, attempt kernel TLS offload. If false, use userspace TLS.
-
-**Returns:** `Socket` with `.tls` variant, or `SocketError`
-
-### Socket.TLS.TLSSocket.initServer(fd: i32, ctx: *SSL_CTX) SocketError!Socket
-
-Create TLS server socket for incoming client connection. Performs TLS handshake.
-
-**Parameters:**
-- `fd`: Socket file descriptor (must be >= 0)
-- `ctx`: OpenSSL SSL_CTX pointer (caller owns lifecycle)
-
-**Returns:** `Socket` with `.tls` variant, or `SocketError`
-
-### socket.read(buf: []u8) SocketError!usize
-
-Read data into buffer. Works for both plain and TLS sockets.
-
-**Parameters:**
-- `buf`: Buffer to read into (must be non-empty)
-
-**Returns:** Bytes read, 0 on EOF/clean close
-
-### socket.write(data: []const u8) SocketError!usize
-
-Write data to socket. Works for both plain and TLS sockets.
-
-**Parameters:**
-- `data`: Data to write (must be non-empty)
-
-**Returns:** Bytes written
-
-### socket.close() void
-
-Close socket and free resources. For TLS, performs graceful shutdown before closing fd.
-
-### socket.getFd() i32
-
-Get raw file descriptor. Useful for splice (plaintext only) and poll operations.
-
-### socket.isTLS() bool
-
-Check if this is a TLS socket.
-
-### socket.isKtls() bool
-
-Check if this socket is using kTLS kernel offload. Returns true for TLS sockets where the kernel handles encryption/decryption, false for plain sockets or userspace TLS.
-
-### socket.canSplice() bool
-
-Check if this socket supports zero-copy splice operations. Returns true for:
-- Plain TCP sockets (always splice-capable)
-- TLS sockets with kTLS enabled (kernel handles encryption transparently)
-
-Returns false for TLS sockets using userspace crypto, where data must pass through OpenSSL.
+| `DnsResolutionFailed` | Hostname resolution failed |
+| `DnsTimeout` | Resolution timed out |
+| `InvalidHostname` | Hostname is empty or exceeds maximum length |
+| `CacheFull` | Cache is full (should not occur with LRU) |
+| `AddressOverflow` | DNS returned more addresses than buffer can hold |
 
 ## TCP Utilities API
 
-### `setTcpNoDelay(fd: i32) bool`
+### `set_tcp_no_delay(fd: i32) bool`
 
 Disable Nagle's algorithm on a TCP socket to prevent 40ms delays when sending small packets.
 
@@ -162,7 +109,7 @@ Disable Nagle's algorithm on a TCP socket to prevent 40ms delays when sending sm
 - `true`: Success (or fd was -1 sentinel)
 - `false`: setsockopt failed (logged at debug level)
 
-### `setTcpKeepAlive(fd: i32, idle_secs: u32, interval_secs: u32, count: u32) bool`
+### `set_tcp_keep_alive(fd: i32, idle_secs: u32, interval_secs: u32, count: u32) bool`
 
 Configure TCP keepalive probes for detecting dead connections in connection pools.
 
@@ -180,7 +127,7 @@ Configure TCP keepalive probes for detecting dead connections in connection pool
 - On Linux, all four options (SO_KEEPALIVE, TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_KEEPCNT) are set
 - On other platforms, only SO_KEEPALIVE is set; system defaults apply for timing
 
-### `setTcpQuickAck(fd: i32) bool`
+### `set_tcp_quick_ack(fd: i32) bool`
 
 Disable delayed ACKs for lower latency at cost of more ACK packets.
 
@@ -194,7 +141,7 @@ Disable delayed ACKs for lower latency at cost of more ACK packets.
 **Platform Notes:**
 - Linux only; returns true (no-op) on other platforms
 
-### `setSoLinger(fd: i32, timeout_secs: u16) bool`
+### `set_so_linger(fd: i32, timeout_secs: u16) bool`
 
 Configure SO_LINGER close behavior.
 
@@ -208,7 +155,7 @@ Configure SO_LINGER close behavior.
 - `true`: Success
 - `false`: setsockopt failed (logged at debug level)
 
-### `parseIPv4(host: []const u8) ?u32`
+### `parse_ipv4(host: []const u8) ?u32`
 
 Parse IPv4 address string to network-order u32.
 
@@ -221,144 +168,31 @@ Parse IPv4 address string to network-order u32.
 
 ## Usage
 
-### Plain TCP Socket
-
-```zig
-const net = @import("serval-net");
-
-// Create plain socket from accepted fd
-var socket = net.Socket.Plain.initServer(client_fd);
-defer socket.close();
-
-// Configure TCP options
-_ = net.tcp.setTcpNoDelay(socket.getFd());
-
-// Read/write
-var buf: [4096]u8 = undefined;
-const n = try socket.read(&buf);
-_ = try socket.write(buf[0..n]);
-
-// Check for splice eligibility
-if (!socket.isTLS()) {
-    // Can use zero-copy splice
-}
-```
-
-### TLS Socket (Client)
-
-```zig
-const net = @import("serval-net");
-const tls = @import("serval-tls");
-
-// SSL_CTX lifecycle is caller's responsibility
-const ctx = try tls.ssl.createClientContext();
-defer tls.ssl.destroyContext(ctx);
-
-// Create TLS socket with SNI (enable_ktls=true for kernel TLS offload)
-var socket = try net.Socket.TLS.TLSSocket.initClient(upstream_fd, ctx, "api.example.com", true);
-defer socket.close();
-
-// Read/write (encrypted transparently)
-const n = try socket.read(&buf);
-_ = try socket.write(response);
-```
-
-### TLS Socket (Server)
-
-```zig
-const net = @import("serval-net");
-const tls = @import("serval-tls");
-
-// SSL_CTX with cert/key is caller's responsibility
-const ctx = try tls.ssl.createServerContext("cert.pem", "key.pem");
-defer tls.ssl.destroyContext(ctx);
-
-// Accept and wrap with TLS
-var socket = try net.Socket.TLS.TLSSocket.initServer(client_fd, ctx);
-defer socket.close();
-
-// Read/write (decryption transparent)
-const n = try socket.read(&buf);
-_ = try socket.write(response);
-```
-
 ### TCP Configuration
 
 ```zig
 const net = @import("serval-net");
 
 // Disable Nagle for low latency
-if (!net.setTcpNoDelay(socket_fd)) {
+if (!net.set_tcp_no_delay(socket_fd)) {
     // Handle failure (rare, usually indicates invalid socket)
 }
 
 // Enable keepalive: probe after 60s idle, then every 10s, close after 3 failed probes
-_ = net.setTcpKeepAlive(socket_fd, 60, 10, 3);
+_ = net.set_tcp_keep_alive(socket_fd, 60, 10, 3);
 
 // Disable delayed ACKs for even lower latency (Linux only)
-_ = net.setTcpQuickAck(socket_fd);
+_ = net.set_tcp_quick_ack(socket_fd);
 
 // Configure close behavior: immediate RST (0) or graceful wait (seconds)
-_ = net.setSoLinger(socket_fd, 0); // Immediate close with RST
-_ = net.setSoLinger(socket_fd, 5); // Wait up to 5s for data to send
-```
-
-### DNS Resolution
-
-```zig
-const net = @import("serval-net");
-
-// Initialize resolver with default config (30s TTL, 5s timeout)
-var resolver = net.DnsResolver.init(.{});
-
-// Or with custom config
-var resolver_custom = net.DnsResolver.init(.{
-    .ttl_ns = 60_000_000_000, // 60 second cache TTL
-    .timeout_ns = 10_000_000_000, // 10 second timeout
-});
-
-// Single address resolution (existing API)
-const result = try resolver.resolve("example.com", 80, io);
-// result.address contains the resolved IP
-// result.from_cache indicates if result was cached
-// result.resolution_ns is time spent resolving (0 if cached)
-
-// All addresses resolution (out-pointer pattern per TigerStyle C3)
-var all_result: net.ResolveAllResult = undefined;
-try resolver.resolveAll("example.com", 80, io, &all_result);
-for (all_result.slice()) |addr| {
-    // Use each address (e.g., for connection failover)
-    _ = addr;
-}
-
-// FQDN normalization for search domain bypass
-// Adds trailing dot to FQDNs with 4+ dots (e.g., Kubernetes service names)
-var buf: [256]u8 = undefined;
-const normalized = net.DnsResolver.normalizeFqdn(
-    "service.namespace.svc.cluster.local",
-    &buf,
-);
-// Returns "service.namespace.svc.cluster.local."
-// The trailing dot tells DNS resolvers to skip search domain expansion
-
-// Cache management
-resolver.invalidate("example.com"); // Invalidate single entry
-resolver.invalidateAll(); // Clear entire cache
-
-// Statistics
-const stats = resolver.getStats();
-std.debug.print("Cache hits: {d}, misses: {d}\n", .{ stats.hits, stats.misses });
+_ = net.set_so_linger(socket_fd, 0); // Immediate close with RST
+_ = net.set_so_linger(socket_fd, 5); // Wait up to 5s for data to send
 ```
 
 ## Design Decisions
 
 | Decision | Rationale |
 |----------|-----------|
-| Tagged union, not generics | TigerStyle: explicit types, predictable code size |
-| Caller owns SSL_CTX | TigerStyle: explicit resource management, no hidden state |
-| Zero-copy splice only for plain | TLS requires encryption/decryption - can't splice ciphertext |
-| SNI max 253 chars | RFC 6066 limit, bounded stack buffer (no allocation) |
-| SocketError unifies errors | Single error type for both plain and TLS operations |
 | Fixed-size DNS cache | TigerStyle: no runtime allocation, bounded memory |
 | DNS TTL caching | Reduces DNS queries, configurable expiration |
 | FQDN trailing dot | Bypasses search domain expansion in Kubernetes/Docker environments |
@@ -367,45 +201,35 @@ std.debug.print("Cache hits: {d}, misses: {d}\n", .{ stats.hits, stats.misses })
 ## Dependencies
 
 - `serval-core` - Configuration constants and timing utilities
-- `serval-tls` - TLS handshake and stream operations
 - `std` - POSIX socket operations, DNS resolution
 
 ## Implementation Status
 
 | Feature | Status |
 |---------|--------|
-| Socket tagged union | Complete |
-| Plain socket read/write/close | Complete |
-| TLS socket initClient with SNI | Complete |
-| TLS socket initServer | Complete |
-| TLS socket read/write/close | Complete |
-| getFd for splice/poll | Complete |
-| isTLS check | Complete |
-| isKtls check | Complete |
-| canSplice eligibility | Complete |
+| DNS resolver with TTL caching | Complete |
+| DNS resolve (single address) | Complete |
+| DNS resolve_all (all addresses) | Complete |
+| DNS normalize_fqdn (trailing dot) | Complete |
+| DNS cache invalidation | Complete |
+| DNS cache statistics | Complete |
 | TCP_NODELAY | Complete |
 | TCP_KEEPALIVE | Complete |
 | TCP_QUICKACK | Complete (Linux) |
 | SO_LINGER | Complete |
-| parseIPv4 | Complete |
-| DNS resolver with TTL caching | Complete |
-| DNS resolve (single address) | Complete |
-| DNS resolveAll (all addresses) | Complete |
-| DNS normalizeFqdn (trailing dot) | Complete |
-| DNS cache invalidation | Complete |
-| DNS cache statistics | Complete |
+| parse_ipv4 | Complete |
 | Socket buffers (SO_RCVBUF/SO_SNDBUF) | Not implemented |
 
 ## TigerStyle Compliance
 
 | Rule | Status | Notes |
 |------|--------|-------|
-| S1: Assertions | Pass | Preconditions on all functions (fd >= 0, buf.len > 0, etc.) |
+| S1: Assertions | Pass | Preconditions on all functions (fd >= 0, hostname.len > 0, etc.) |
 | S2: No recursion | Pass | No recursive calls |
-| S3: Bounded loops | Pass | parseIPv4 uses max_iterations bound |
-| S4: No catch {} | Pass | All errors mapped explicitly to SocketError |
-| S5: No allocation after init | Pass | SNI uses stack buffer, zeroed |
-| S6: Explicit error handling | Pass | mapPosixError, mapTlsError handle all cases |
-| P1: Network >> CPU | Pass | Tagged union dispatch is negligible vs I/O |
-| C1: Units in names | Pass | timeout_secs, interval_secs |
+| S3: Bounded loops | Pass | All loops have explicit max iterations |
+| S4: No catch {} | Pass | All errors mapped explicitly |
+| S5: No allocation after init | Pass | DNS cache uses fixed-size arrays |
+| S6: Explicit error handling | Pass | DnsError, map_dns_error handle all cases |
+| P1: Network >> CPU | Pass | DNS caching reduces network round-trips |
+| C1: Units in names | Pass | timeout_secs, interval_secs, ttl_ns |
 | Y1: snake_case | Pass | All identifiers follow convention |

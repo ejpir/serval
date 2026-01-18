@@ -1,5 +1,4 @@
 ---
-name: tigerstyle
 description: Review Zig code for TigerStyle compliance. Use when reviewing code, implementing features, or checking for safety/performance issues. Checks assertions, bounded loops, memory safety, error handling, and naming conventions. (project)
 ---
 

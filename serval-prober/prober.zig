@@ -205,7 +205,8 @@ test "isSuccessStatus - 2xx range check" {
 }
 
 test "ProberContext - field validation" {
-    var dns_resolver = DnsResolver.init(.{});
+    var dns_resolver: DnsResolver = undefined;
+    DnsResolver.init(&dns_resolver, .{});
     const ctx = ProberContext{
         .upstreams = &[_]Upstream{},
         .health = undefined,

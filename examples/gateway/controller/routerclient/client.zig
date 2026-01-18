@@ -441,7 +441,8 @@ pub const RouterClient = struct {
 
         // Create DNS resolver for client
         // TigerStyle: DnsResolver has no heap allocations, no deinit needed
-        var dns_resolver = serval_net.DnsResolver.init(.{});
+        var dns_resolver: serval_net.DnsResolver = undefined;
+        serval_net.DnsResolver.init(&dns_resolver, .{});
 
         // Create HTTP client (no TLS for admin API)
         var client = Client.init(

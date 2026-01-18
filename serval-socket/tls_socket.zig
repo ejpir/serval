@@ -1,12 +1,12 @@
-// serval-net/tls_socket.zig
+// serval-socket/tls_socket.zig
 //! TLS Socket Wrapper
 //!
 //! Wraps serval-tls TLSStream to provide a Socket-compatible interface.
 //! TigerStyle: Explicit types, assertions, no runtime allocation after init.
 //!
 //! Design:
-//! - initClient: Client-side TLS handshake with SNI (upstream connections)
-//! - initServer: Server-side TLS handshake (client termination)
+//! - init_client: Client-side TLS handshake with SNI (upstream connections)
+//! - init_server: Server-side TLS handshake (client termination)
 //! - read/write: Blocking TLS I/O through TLSStream
 //! - close: Graceful TLS shutdown + fd close
 
@@ -22,8 +22,8 @@ pub const SocketError = socket_mod.SocketError;
 pub const Socket = socket_mod.Socket;
 
 /// Maximum hostname length for SNI (RFC 6066 limit).
-/// TigerStyle: Named constant with clear meaning.
-const MAX_SNI_LENGTH: u32 = 253;
+/// TigerStyle: Named constant with units suffix.
+const max_sni_length_chars: u32 = 253;
 
 /// TLS socket wrapping a TLSStream.
 /// TigerStyle: Explicit struct, no hidden state.
@@ -39,7 +39,7 @@ pub const TLSSocket = struct {
     /// TigerStyle S1: Assertions for preconditions/postconditions.
     /// TigerStyle S5: SNI buffer zeroed, no allocation after init.
     /// enable_ktls: If true (default), attempt kernel TLS offload. If false, use userspace TLS.
-    pub fn initClient(
+    pub fn init_client(
         fd: i32,
         ctx: *ssl.SSL_CTX,
         host: []const u8,
@@ -49,10 +49,10 @@ pub const TLSSocket = struct {
         assert(fd >= 0); // S1: valid fd
         assert(@intFromPtr(ctx) != 0); // S1: valid ctx pointer
         assert(host.len > 0); // S1: non-empty host
-        assert(host.len <= MAX_SNI_LENGTH); // S1: host within RFC limit
+        assert(host.len <= max_sni_length_chars); // S1: host within RFC limit
 
         // S5: Stack buffer for null-terminated SNI, zeroed
-        var sni_buf: [MAX_SNI_LENGTH + 1]u8 = std.mem.zeroes([MAX_SNI_LENGTH + 1]u8);
+        var sni_buf: [max_sni_length_chars + 1]u8 = std.mem.zeroes([max_sni_length_chars + 1]u8);
         const host_len: u32 = @intCast(host.len);
         @memcpy(sni_buf[0..host_len], host);
         // Buffer is zeroed, so sni_buf[host_len] is already 0 (null terminator)
@@ -69,7 +69,7 @@ pub const TLSSocket = struct {
             std.heap.page_allocator,
             enable_ktls,
         ) catch |err| {
-            return mapTlsError(err);
+            return map_tls_error(err);
         };
 
         // S1: postcondition - stream initialized with correct fd
@@ -86,7 +86,7 @@ pub const TLSSocket = struct {
     /// Create server TLS socket.
     /// Performs TLS handshake for incoming client connection.
     /// TigerStyle S1: Assertions for preconditions/postconditions.
-    pub fn initServer(
+    pub fn init_server(
         fd: i32,
         ctx: *ssl.SSL_CTX,
     ) SocketError!Socket {
@@ -99,7 +99,7 @@ pub const TLSSocket = struct {
             fd,
             std.heap.page_allocator,
         ) catch |err| {
-            return mapTlsError(err);
+            return map_tls_error(err);
         };
 
         // S1: postcondition - stream initialized with correct fd
@@ -116,16 +116,20 @@ pub const TLSSocket = struct {
     /// Read data through TLS.
     /// Returns bytes read, 0 on clean shutdown.
     /// TigerStyle S1: Assertions for preconditions/postconditions.
-    pub fn read(self: *TLSSocket, buf: []u8) SocketError!usize {
+    /// TigerStyle S2: Explicit u32 return type.
+    pub fn read(self: *TLSSocket, buf: []u8) SocketError!u32 {
         // S1: preconditions
         assert(self.fd >= 0); // S1: socket not closed
         assert(buf.len > 0); // S1: non-empty buffer
+        assert(buf.len <= std.math.maxInt(u32)); // S2: buffer fits in u32
 
         const n = self.stream.read(buf) catch |err| {
-            return mapTlsError(err);
+            return map_tls_error(err);
         };
 
-        const bytes_read: usize = @intCast(n);
+        // S2: explicit cast with bounds check
+        assert(n <= std.math.maxInt(u32));
+        const bytes_read: u32 = @intCast(n);
 
         // S1: postcondition - bytes read within buffer bounds
         assert(bytes_read <= buf.len);
@@ -136,16 +140,20 @@ pub const TLSSocket = struct {
     /// Write data through TLS.
     /// Returns bytes written.
     /// TigerStyle S1: Assertions for preconditions/postconditions.
-    pub fn write(self: *TLSSocket, data: []const u8) SocketError!usize {
+    /// TigerStyle S2: Explicit u32 return type.
+    pub fn write(self: *TLSSocket, data: []const u8) SocketError!u32 {
         // S1: preconditions
         assert(self.fd >= 0); // S1: socket not closed
         assert(data.len > 0); // S1: non-empty data
+        assert(data.len <= std.math.maxInt(u32)); // S2: data fits in u32
 
         const n = self.stream.write(data) catch |err| {
-            return mapTlsError(err);
+            return map_tls_error(err);
         };
 
-        const bytes_written: usize = @intCast(n);
+        // S2: explicit cast with bounds check
+        assert(n <= std.math.maxInt(u32));
+        const bytes_written: u32 = @intCast(n);
 
         // S1: postcondition - bytes written within data bounds
         assert(bytes_written <= data.len);
@@ -172,7 +180,8 @@ pub const TLSSocket = struct {
 
 /// Map TLS errors to SocketError.
 /// TigerStyle S6: Explicit error handling, no catch {}.
-fn mapTlsError(err: anyerror) SocketError {
+fn map_tls_error(err: anyerror) SocketError {
+    assert(@errorName(err).len > 0);
     return switch (err) {
         error.SslNew => SocketError.TLSError,
         error.SslSetFd => SocketError.TLSError,
@@ -199,23 +208,23 @@ test "TLSSocket struct has expected fields" {
     try std.testing.expectEqualStrings("stream", fields[1].name);
 }
 
-test "MAX_SNI_LENGTH matches RFC 6066 limit" {
+test "max_sni_length_chars matches RFC 6066 limit" {
     // RFC 6066 specifies max hostname of 253 characters
-    try std.testing.expectEqual(@as(u32, 253), MAX_SNI_LENGTH);
+    try std.testing.expectEqual(@as(u32, 253), max_sni_length_chars);
 }
 
-test "mapTlsError maps known errors to TLSError" {
-    try std.testing.expectEqual(SocketError.TLSError, mapTlsError(error.SslNew));
-    try std.testing.expectEqual(SocketError.TLSError, mapTlsError(error.SslSetFd));
-    try std.testing.expectEqual(SocketError.TLSError, mapTlsError(error.SslSetSni));
-    try std.testing.expectEqual(SocketError.TLSError, mapTlsError(error.HandshakeFailed));
-    try std.testing.expectEqual(SocketError.TLSError, mapTlsError(error.SslRead));
-    try std.testing.expectEqual(SocketError.TLSError, mapTlsError(error.SslWrite));
+test "map_tls_error maps known errors to TLSError" {
+    try std.testing.expectEqual(SocketError.TLSError, map_tls_error(error.SslNew));
+    try std.testing.expectEqual(SocketError.TLSError, map_tls_error(error.SslSetFd));
+    try std.testing.expectEqual(SocketError.TLSError, map_tls_error(error.SslSetSni));
+    try std.testing.expectEqual(SocketError.TLSError, map_tls_error(error.HandshakeFailed));
+    try std.testing.expectEqual(SocketError.TLSError, map_tls_error(error.SslRead));
+    try std.testing.expectEqual(SocketError.TLSError, map_tls_error(error.SslWrite));
 }
 
-test "mapTlsError maps unknown errors to Unexpected" {
-    try std.testing.expectEqual(SocketError.Unexpected, mapTlsError(error.OutOfMemory));
-    try std.testing.expectEqual(SocketError.Unexpected, mapTlsError(error.AccessDenied));
+test "map_tls_error maps unknown errors to Unexpected" {
+    try std.testing.expectEqual(SocketError.Unexpected, map_tls_error(error.OutOfMemory));
+    try std.testing.expectEqual(SocketError.Unexpected, map_tls_error(error.AccessDenied));
 }
 
 test "Socket union accepts TLSSocket" {

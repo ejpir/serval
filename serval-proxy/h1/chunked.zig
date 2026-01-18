@@ -19,8 +19,8 @@ const parseChunkSize = chunked.parseChunkSize;
 const isLastChunk = chunked.isLastChunk;
 const ChunkParseError = chunked.ChunkParseError;
 
-const net = @import("serval-net");
-const Socket = net.Socket;
+const serval_socket = @import("serval-socket");
+const Socket = serval_socket.Socket;
 
 const core = @import("serval-core");
 const config = core.config;
@@ -33,21 +33,31 @@ pub const CHUNK_BUFFER_SIZE_BYTES = config.CHUNK_BUFFER_SIZE_BYTES;
 // Public API
 // =============================================================================
 
-/// Forward chunked body preserving chunk format.
+/// Forward chunked body with pre-read data.
+/// pre_read contains bytes already read during header parsing that are part of the chunked body.
 /// Uses Socket abstraction for unified TLS/plaintext handling.
 /// Returns total bytes forwarded (including chunk framing).
 /// TigerStyle: Bounded main loop, explicit Socket read/write.
-pub fn forwardChunkedBody(
+pub fn forwardChunkedBodyWithPreread(
     source: *Socket,
     dest: *Socket,
+    pre_read: []const u8,
 ) ForwardError!u64 {
     // Precondition: valid socket file descriptors.
-    assert(source.getFd() >= 0);
-    assert(dest.getFd() >= 0);
+    assert(source.get_fd() >= 0);
+    assert(dest.get_fd() >= 0);
 
     // Zero buffer for defense-in-depth (don't leak stale data on partial reads).
     var buffer: [CHUNK_BUFFER_SIZE_BYTES]u8 = std.mem.zeroes([CHUNK_BUFFER_SIZE_BYTES]u8);
     var buffer_len: u32 = 0;
+
+    // Copy pre-read data into buffer.
+    if (pre_read.len > 0) {
+        const copy_len: u32 = @intCast(@min(pre_read.len, CHUNK_BUFFER_SIZE_BYTES));
+        @memcpy(buffer[0..copy_len], pre_read[0..copy_len]);
+        buffer_len = copy_len;
+    }
+
     var total_forwarded: u64 = 0;
     var chunk_iterations: u32 = 0;
 
@@ -65,7 +75,7 @@ pub fn forwardChunkedBody(
         const header_consumed: u32 = @intCast(parse_result.consumed);
 
         // Forward chunk header (size + extensions + CRLF) to destination.
-        dest.writeAll(buffer[0..header_consumed]) catch {
+        dest.write_all(buffer[0..header_consumed]) catch {
             return ForwardError.SendFailed;
         };
         total_forwarded += header_consumed;
@@ -89,6 +99,17 @@ pub fn forwardChunkedBody(
     return total_forwarded;
 }
 
+/// Forward chunked body preserving chunk format (no pre-read data).
+/// Convenience wrapper for forwardChunkedBodyWithPreread with empty pre-read.
+/// Uses Socket abstraction for unified TLS/plaintext handling.
+/// Returns total bytes forwarded (including chunk framing).
+pub fn forwardChunkedBody(
+    source: *Socket,
+    dest: *Socket,
+) ForwardError!u64 {
+    return forwardChunkedBodyWithPreread(source, dest, &.{});
+}
+
 // =============================================================================
 // Helper Functions
 // =============================================================================
@@ -101,7 +122,7 @@ fn ensureBufferHasChunkHeader(
     buffer: *[CHUNK_BUFFER_SIZE_BYTES]u8,
     buffer_len: u32,
 ) ForwardError!u32 {
-    assert(source.getFd() >= 0);
+    assert(source.get_fd() >= 0);
 
     var current_len = buffer_len;
 
@@ -133,8 +154,8 @@ fn forwardChunkData(
     buffer: *[CHUNK_BUFFER_SIZE_BYTES]u8,
     buffer_len: *u32,
 ) ForwardError!u64 {
-    assert(source.getFd() >= 0);
-    assert(dest.getFd() >= 0);
+    assert(source.get_fd() >= 0);
+    assert(dest.get_fd() >= 0);
     assert(chunk_size > 0); // Caller handles last-chunk case.
 
     var bytes_remaining = chunk_size;
@@ -143,7 +164,7 @@ fn forwardChunkData(
     // Forward any buffered data first.
     if (buffer_len.* > 0) {
         const to_send: u32 = @intCast(@min(buffer_len.*, bytes_remaining));
-        dest.writeAll(buffer[0..to_send]) catch {
+        dest.write_all(buffer[0..to_send]) catch {
             return ForwardError.SendFailed;
         };
         forwarded_bytes += to_send;
@@ -171,8 +192,8 @@ fn forwardBytes(
     length_bytes: u64,
     buffer: *[CHUNK_BUFFER_SIZE_BYTES]u8,
 ) ForwardError!u64 {
-    assert(source.getFd() >= 0);
-    assert(dest.getFd() >= 0);
+    assert(source.get_fd() >= 0);
+    assert(dest.get_fd() >= 0);
 
     var remaining_bytes = length_bytes;
     var forwarded_bytes: u64 = 0;
@@ -190,7 +211,7 @@ fn forwardBytes(
         if (n == 0) return ForwardError.RecvFailed; // Unexpected EOF.
 
         // Write to destination socket.
-        dest.writeAll(buffer[0..n]) catch {
+        dest.write_all(buffer[0..n]) catch {
             return ForwardError.SendFailed;
         };
         forwarded_bytes += n;
@@ -209,8 +230,8 @@ fn forwardCRLF(
     buffer: *[CHUNK_BUFFER_SIZE_BYTES]u8,
     buffer_len: *u32,
 ) ForwardError!u64 {
-    assert(source.getFd() >= 0);
-    assert(dest.getFd() >= 0);
+    assert(source.get_fd() >= 0);
+    assert(dest.get_fd() >= 0);
 
     // Ensure we have 2 bytes for CRLF.
     var iterations: u32 = 0;
@@ -228,7 +249,7 @@ fn forwardCRLF(
         return ForwardError.InvalidResponse;
     }
 
-    dest.writeAll(buffer[0..2]) catch {
+    dest.write_all(buffer[0..2]) catch {
         return ForwardError.SendFailed;
     };
     shiftBuffer(buffer, buffer_len, 2);
@@ -247,8 +268,8 @@ fn forwardTrailerSection(
     buffer: *[CHUNK_BUFFER_SIZE_BYTES]u8,
     buffer_len: *u32,
 ) ForwardError!u64 {
-    assert(source.getFd() >= 0);
-    assert(dest.getFd() >= 0);
+    assert(source.get_fd() >= 0);
+    assert(dest.get_fd() >= 0);
 
     var forwarded_bytes: u64 = 0;
     var iterations: u32 = 0;
@@ -266,7 +287,7 @@ fn forwardTrailerSection(
         // Check for empty line (end of trailers).
         if (buffer_len.* >= 2 and buffer[0] == '\r' and buffer[1] == '\n') {
             // Forward final CRLF and done.
-            dest.writeAll(buffer[0..2]) catch {
+            dest.write_all(buffer[0..2]) catch {
                 return ForwardError.SendFailed;
             };
             shiftBuffer(buffer, buffer_len, 2);
@@ -300,7 +321,7 @@ fn recvToBuffer(
     buffer: *[CHUNK_BUFFER_SIZE_BYTES]u8,
     offset: u32,
 ) ForwardError!u32 {
-    assert(source.getFd() >= 0);
+    assert(source.get_fd() >= 0);
     assert(offset < CHUNK_BUFFER_SIZE_BYTES);
 
     const space_remaining = CHUNK_BUFFER_SIZE_BYTES - offset;
@@ -598,8 +619,8 @@ test "forwardChunkedBody: single chunk" {
     posix.close(input2.write_fd);
 
     // Create Socket wrappers for pipes.
-    var source_socket = Socket.Plain.initClient(input2.read_fd);
-    var dest_socket = Socket.Plain.initClient(output2.write_fd);
+    var source_socket = Socket.Plain.init_client(input2.read_fd);
+    var dest_socket = Socket.Plain.init_client(output2.write_fd);
 
     const bytes_forwarded = try forwardChunkedBody(&source_socket, &dest_socket);
 
@@ -626,8 +647,8 @@ test "forwardChunkedBody: multiple chunks" {
     posix.close(input.write_fd);
 
     // Create Socket wrappers for pipes.
-    var source_socket = Socket.Plain.initClient(input.read_fd);
-    var dest_socket = Socket.Plain.initClient(output.write_fd);
+    var source_socket = Socket.Plain.init_client(input.read_fd);
+    var dest_socket = Socket.Plain.init_client(output.write_fd);
 
     const bytes_forwarded = try forwardChunkedBody(&source_socket, &dest_socket);
     posix.close(output.write_fd);
@@ -652,8 +673,8 @@ test "forwardChunkedBody: empty body" {
     posix.close(input.write_fd);
 
     // Create Socket wrappers for pipes.
-    var source_socket = Socket.Plain.initClient(input.read_fd);
-    var dest_socket = Socket.Plain.initClient(output.write_fd);
+    var source_socket = Socket.Plain.init_client(input.read_fd);
+    var dest_socket = Socket.Plain.init_client(output.write_fd);
 
     const bytes_forwarded = try forwardChunkedBody(&source_socket, &dest_socket);
     posix.close(output.write_fd);
@@ -691,8 +712,8 @@ test "forwardChunkedBody: large chunk exceeding buffer size" {
     posix.close(input.write_fd);
 
     // Create Socket wrappers for pipes.
-    var source_socket = Socket.Plain.initClient(input.read_fd);
-    var dest_socket = Socket.Plain.initClient(output.write_fd);
+    var source_socket = Socket.Plain.init_client(input.read_fd);
+    var dest_socket = Socket.Plain.init_client(output.write_fd);
 
     const bytes_forwarded = try forwardChunkedBody(&source_socket, &dest_socket);
     posix.close(output.write_fd);
@@ -732,8 +753,8 @@ test "forwardChunkedBody: many small chunks" {
     posix.close(input.write_fd);
 
     // Create Socket wrappers for pipes.
-    var source_socket = Socket.Plain.initClient(input.read_fd);
-    var dest_socket = Socket.Plain.initClient(output.write_fd);
+    var source_socket = Socket.Plain.init_client(input.read_fd);
+    var dest_socket = Socket.Plain.init_client(output.write_fd);
 
     const bytes_forwarded = try forwardChunkedBody(&source_socket, &dest_socket);
     posix.close(output.write_fd);
@@ -754,8 +775,8 @@ test "forwardChunkedBody: chunk with extension" {
     posix.close(input.write_fd);
 
     // Create Socket wrappers for pipes.
-    var source_socket = Socket.Plain.initClient(input.read_fd);
-    var dest_socket = Socket.Plain.initClient(output.write_fd);
+    var source_socket = Socket.Plain.init_client(input.read_fd);
+    var dest_socket = Socket.Plain.init_client(output.write_fd);
 
     const bytes_forwarded = try forwardChunkedBody(&source_socket, &dest_socket);
     posix.close(output.write_fd);
@@ -782,8 +803,8 @@ test "forwardChunkedBody: with trailer section discarded" {
     posix.close(input.write_fd);
 
     // Create Socket wrappers for pipes.
-    var source_socket = Socket.Plain.initClient(input.read_fd);
-    var dest_socket = Socket.Plain.initClient(output.write_fd);
+    var source_socket = Socket.Plain.init_client(input.read_fd);
+    var dest_socket = Socket.Plain.init_client(output.write_fd);
 
     const bytes_forwarded = try forwardChunkedBody(&source_socket, &dest_socket);
     posix.close(output.write_fd);
@@ -819,8 +840,8 @@ test "forwardChunkedBody: error on invalid hex" {
     posix.close(input.write_fd);
 
     // Create Socket wrappers for pipes.
-    var source_socket = Socket.Plain.initClient(input.read_fd);
-    var dest_socket = Socket.Plain.initClient(output.write_fd);
+    var source_socket = Socket.Plain.init_client(input.read_fd);
+    var dest_socket = Socket.Plain.init_client(output.write_fd);
 
     const result = forwardChunkedBody(&source_socket, &dest_socket);
     try std.testing.expectError(ForwardError.InvalidResponse, result);
@@ -840,8 +861,8 @@ test "forwardChunkedBody: error on truncated input (EOF before chunk data)" {
     posix.close(input.write_fd);
 
     // Create Socket wrappers for pipes.
-    var source_socket = Socket.Plain.initClient(input.read_fd);
-    var dest_socket = Socket.Plain.initClient(output.write_fd);
+    var source_socket = Socket.Plain.init_client(input.read_fd);
+    var dest_socket = Socket.Plain.init_client(output.write_fd);
 
     const result = forwardChunkedBody(&source_socket, &dest_socket);
     try std.testing.expectError(ForwardError.RecvFailed, result);
@@ -861,8 +882,8 @@ test "forwardChunkedBody: error on missing CRLF after chunk data" {
     posix.close(input.write_fd);
 
     // Create Socket wrappers for pipes.
-    var source_socket = Socket.Plain.initClient(input.read_fd);
-    var dest_socket = Socket.Plain.initClient(output.write_fd);
+    var source_socket = Socket.Plain.init_client(input.read_fd);
+    var dest_socket = Socket.Plain.init_client(output.write_fd);
 
     const result = forwardChunkedBody(&source_socket, &dest_socket);
     try std.testing.expectError(ForwardError.InvalidResponse, result);
@@ -882,8 +903,8 @@ test "forwardChunkedBody: error on missing terminator" {
     posix.close(input.write_fd);
 
     // Create Socket wrappers for pipes.
-    var source_socket = Socket.Plain.initClient(input.read_fd);
-    var dest_socket = Socket.Plain.initClient(output.write_fd);
+    var source_socket = Socket.Plain.init_client(input.read_fd);
+    var dest_socket = Socket.Plain.init_client(output.write_fd);
 
     const result = forwardChunkedBody(&source_socket, &dest_socket);
     try std.testing.expectError(ForwardError.RecvFailed, result);
@@ -919,8 +940,8 @@ test "forwardChunkedBody: exact buffer boundary chunk" {
     posix.close(input.write_fd);
 
     // Create Socket wrappers for pipes.
-    var source_socket = Socket.Plain.initClient(input.read_fd);
-    var dest_socket = Socket.Plain.initClient(output.write_fd);
+    var source_socket = Socket.Plain.init_client(input.read_fd);
+    var dest_socket = Socket.Plain.init_client(output.write_fd);
 
     const bytes_forwarded = try forwardChunkedBody(&source_socket, &dest_socket);
     posix.close(output.write_fd);
@@ -954,8 +975,8 @@ test "forwardChunkedBody: chunk data spans multiple reads" {
     posix.close(input.write_fd);
 
     // Create Socket wrappers for pipes.
-    var source_socket = Socket.Plain.initClient(input.read_fd);
-    var dest_socket = Socket.Plain.initClient(output.write_fd);
+    var source_socket = Socket.Plain.init_client(input.read_fd);
+    var dest_socket = Socket.Plain.init_client(output.write_fd);
 
     const bytes_forwarded = try forwardChunkedBody(&source_socket, &dest_socket);
     posix.close(output.write_fd);
@@ -1000,8 +1021,8 @@ test "forwardChunkedBody: single byte chunks" {
     posix.close(input.write_fd);
 
     // Create Socket wrappers for pipes.
-    var source_socket = Socket.Plain.initClient(input.read_fd);
-    var dest_socket = Socket.Plain.initClient(output.write_fd);
+    var source_socket = Socket.Plain.init_client(input.read_fd);
+    var dest_socket = Socket.Plain.init_client(output.write_fd);
 
     const bytes_forwarded = try forwardChunkedBody(&source_socket, &dest_socket);
     posix.close(output.write_fd);
@@ -1022,8 +1043,8 @@ test "forwardChunkedBody: uppercase hex in chunk size" {
     posix.close(input.write_fd);
 
     // Create Socket wrappers for pipes.
-    var source_socket = Socket.Plain.initClient(input.read_fd);
-    var dest_socket = Socket.Plain.initClient(output.write_fd);
+    var source_socket = Socket.Plain.init_client(input.read_fd);
+    var dest_socket = Socket.Plain.init_client(output.write_fd);
 
     const bytes_forwarded = try forwardChunkedBody(&source_socket, &dest_socket);
     posix.close(output.write_fd);
@@ -1059,8 +1080,8 @@ test "forwardChunkedBody: mixed case hex in chunk size" {
     posix.close(input.write_fd);
 
     // Create Socket wrappers for pipes.
-    var source_socket = Socket.Plain.initClient(input.read_fd);
-    var dest_socket = Socket.Plain.initClient(output.write_fd);
+    var source_socket = Socket.Plain.init_client(input.read_fd);
+    var dest_socket = Socket.Plain.init_client(output.write_fd);
 
     const bytes_forwarded = try forwardChunkedBody(&source_socket, &dest_socket);
     posix.close(output.write_fd);

@@ -70,7 +70,15 @@ pub const hasHook = core.hasHook;
 // =============================================================================
 
 pub const net = @import("serval-net");
-pub const setTcpNoDelay = net.setTcpNoDelay;
+pub const set_tcp_no_delay = net.set_tcp_no_delay;
+
+// =============================================================================
+// Socket Abstraction (from serval-socket)
+// =============================================================================
+
+pub const socket = @import("serval-socket");
+pub const Socket = socket.Socket;
+pub const SocketError = socket.SocketError;
 
 // =============================================================================
 // HTTP Parsing (from serval-http)
@@ -142,6 +150,7 @@ test {
     // Import all modules to include their tests
     _ = @import("serval-core");
     _ = @import("serval-net");
+    _ = @import("serval-socket");
     _ = @import("serval-http");
     _ = @import("serval-pool");
     _ = @import("serval-proxy");

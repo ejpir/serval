@@ -17,8 +17,8 @@ const serval_core = @import("serval-core");
 const log = serval_core.log.scoped(.pool);
 const debugLog = serval_core.debugLog;
 
-const net = @import("serval-net");
-const Socket = net.Socket;
+const serval_socket = @import("serval-socket");
+const Socket = serval_socket.Socket;
 
 // =============================================================================
 // Pool Interface Verification
@@ -94,8 +94,10 @@ pub const Connection = struct {
 
     /// Get raw file descriptor for splice operations and polling.
     /// TigerStyle: Zero-copy splice needs raw fd.
-    pub fn getFd(self: *const Connection) i32 {
-        return self.socket.getFd();
+    pub fn get_fd(self: *const Connection) i32 {
+        const fd = self.socket.get_fd();
+        assert(fd >= 0);
+        return fd;
     }
 
     /// Check if connection is unusable and should not be reused.
@@ -104,7 +106,7 @@ pub const Connection = struct {
     /// Returns true if connection should NOT be reused.
     /// TigerStyle: Positive naming - true means "bad, don't use".
     pub fn isUnusable(self: *const Connection) bool {
-        const fd = self.socket.getFd();
+        const fd = self.socket.get_fd();
         if (fd < 0) return true;
 
         var poll_fds = [_]std.posix.pollfd{

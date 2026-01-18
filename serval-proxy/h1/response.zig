@@ -31,12 +31,13 @@ const forwardBody = body_transfer.forwardBody;
 
 const chunked_transfer = @import("chunked.zig");
 const forwardChunkedBody = chunked_transfer.forwardChunkedBody;
+const forwardChunkedBodyWithPreread = chunked_transfer.forwardChunkedBodyWithPreread;
 
 const pool_mod = @import("serval-pool").pool;
 const Connection = pool_mod.Connection;
 
-const net = @import("serval-net");
-const Socket = net.Socket;
+const serval_socket = @import("serval-socket");
+const Socket = serval_socket.Socket;
 
 const serval_client = @import("serval-client");
 const readHeaderBytes = serval_client.readHeaderBytes;
@@ -120,9 +121,9 @@ pub fn forwardResponse(
 ) ForwardError!ForwardResult {
     _ = client_stream; // Unused - client_socket provides the Socket
     // Precondition: socket file descriptors must be valid (non-negative).
-    assert(upstream_conn.getFd() >= 0);
-    assert(upstream_socket.getFd() >= 0);
-    assert(client_socket.getFd() >= 0);
+    assert(upstream_conn.get_fd() >= 0);
+    assert(upstream_socket.get_fd() >= 0);
+    assert(client_socket.get_fd() >= 0);
 
     // Time the entire recv phase (headers + body from upstream)
     const recv_start_ns = time.monotonicNanos();
@@ -137,23 +138,27 @@ pub fn forwardResponse(
     // Detect body transfer mode: chunked or content-length based.
     const is_chunked = isChunkedResponse(header_buffer[0..headers.header_len]);
 
-    debugLog("recv: headers received fd={d} status={d} content_length={?d} chunked={}", .{ upstream_conn.getFd(), status, content_length, is_chunked });
+    debugLog("recv: headers received fd={d} status={d} content_length={?d} chunked={}", .{ upstream_conn.get_fd(), status, content_length, is_chunked });
 
     // Forward headers to client using client Socket.
     // TigerStyle: Use Connection wrapper for sendBuffer compatibility.
+    // Only send headers, not pre-read body bytes (those are handled separately).
     var client_conn = Connection{ .socket = client_socket.* };
-    try sendBuffer(&client_conn, io, header_buffer[0..headers.header_len]);
+    try sendBuffer(&client_conn, io, header_buffer[0..headers.header_end]);
 
     // Forward remaining body.
     // TigerStyle: Use u64 for body sizes (Content-Length can exceed 4GB).
     const body_already_read_bytes: u64 = headers.header_len - headers.header_end;
-    var total_body_bytes: u64 = body_already_read_bytes;
+    var total_body_bytes: u64 = 0;
+
+    // Pre-read body bytes (read during header parsing) need to be forwarded first.
+    const pre_read_body = header_buffer[headers.header_end..headers.header_len];
 
     if (is_chunked) {
         // Chunked transfer encoding: forward chunks until final chunk.
         // TigerStyle: Use Socket abstraction for unified TLS/plaintext handling.
-        debugLog("recv: forwarding chunked body", .{});
-        total_body_bytes += try forwardChunkedBody(upstream_socket, client_socket);
+        debugLog("recv: forwarding chunked body pre_read={d}", .{pre_read_body.len});
+        total_body_bytes += try forwardChunkedBodyWithPreread(upstream_socket, client_socket, pre_read_body);
     } else if (content_length) |length| {
         // Content-Length based: forward exact number of bytes.
         if (length > body_already_read_bytes) {
@@ -191,7 +196,7 @@ pub fn receiveHeaders(
 ) ForwardError!HeadersResult {
     _ = io; // Unused - Socket handles I/O internally
     // Precondition: socket fd must be valid.
-    assert(conn.getFd() >= 0);
+    assert(conn.get_fd() >= 0);
     // Precondition: buffer is provided (not null via pointer).
     assert(buffer.len == config.MAX_HEADER_SIZE_BYTES);
 

@@ -16,7 +16,7 @@ Provides connection reuse between the proxy and upstream backends. Implements a 
 ## Dependencies
 
 - `serval-core` - Foundation types, time utilities
-- `serval-net` - Socket type (unified plain/TLS abstraction)
+- `serval-socket` - Socket type (unified plain/TLS abstraction)
 
 ## Exports
 
@@ -39,7 +39,7 @@ var pool = pool_mod.SimplePool.init();
 // Try to reuse an existing connection
 if (pool.acquire(upstream_idx)) |conn| {
     // Use conn.socket for I/O (handles both plain and TLS)
-    // Use conn.getFd() for raw fd (splice operations)
+    // Use conn.get_fd() for raw fd (splice operations)
 } else {
     // Create new connection via Socket.connect()
     // Set created_ns for max age tracking:
@@ -66,7 +66,7 @@ pub const Connection = struct {
     pool_sentinel: u32,       // Defense against double-release
 
     pub fn close(self: *Connection) void;
-    pub fn getFd(self: *const Connection) i32;  // For splice zero-copy
+    pub fn get_fd(self: *const Connection) i32;  // For splice zero-copy
     pub fn isUnusable(self: *const Connection) bool;  // Check if connection should not be reused
 };
 ```

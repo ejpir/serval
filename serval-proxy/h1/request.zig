@@ -24,8 +24,8 @@ const Method = types.Method;
 const pool_mod = @import("serval-pool").pool;
 const Connection = pool_mod.Connection;
 
-const net = @import("serval-net");
-const Socket = net.Socket;
+const serval_socket = @import("serval-socket");
+const Socket = serval_socket.Socket;
 
 // Import serval-client request module for shared functionality
 const client_request = @import("serval-client").request;

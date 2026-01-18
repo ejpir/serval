@@ -28,8 +28,8 @@ const COPY_CHUNK_SIZE_BYTES = core.config.COPY_CHUNK_SIZE_BYTES;
 const pool_mod = @import("serval-pool").pool;
 const Connection = pool_mod.Connection;
 
-const net = @import("serval-net");
-const Socket = net.Socket;
+const serval_socket = @import("serval-socket");
+const Socket = serval_socket.Socket;
 
 // =============================================================================
 // Splice Constants (Linux)
@@ -47,21 +47,21 @@ const SPLICE_F_MORE: u32 = 4;
 
 /// Forward response body using zero-copy splice (Linux) or buffered copy.
 /// Uses Socket abstraction for unified TLS/plaintext handling.
-/// TigerStyle: Explicit TLS check via isTLS(), splice only for both plain.
+/// TigerStyle: Explicit TLS check via is_tls(), splice only for both plain.
 pub fn forwardBody(
     upstream: *Socket,
     client: *Socket,
     length_bytes: u64,
 ) ForwardError!u64 {
     // Precondition: sockets have valid fds.
-    assert(upstream.getFd() >= 0);
-    assert(client.getFd() >= 0);
+    assert(upstream.get_fd() >= 0);
+    assert(client.get_fd() >= 0);
 
     // Zero-copy splice only if BOTH sockets are plain (no TLS).
     // TigerStyle: Explicit check, splice cannot work with encrypted data.
-    if (!upstream.isTLS() and !client.isTLS()) {
+    if (!upstream.is_tls() and !client.is_tls()) {
         if (comptime builtin.os.tag == .linux) {
-            const result = try forwardBodySplice(upstream.getFd(), client.getFd(), length_bytes);
+            const result = try forwardBodySplice(upstream.get_fd(), client.get_fd(), length_bytes);
             // Postcondition: forwarded at most requested bytes (may be less on EOF/error).
             assert(result <= length_bytes);
             return result;
@@ -163,8 +163,8 @@ fn forwardBodySplice(upstream_fd: i32, client_fd: i32, length_bytes: u64) Forwar
 /// TigerStyle: Bounded loops, fixed buffer size, Y3 _bytes suffix.
 fn forwardBodyCopy(upstream: *Socket, client: *Socket, length_bytes: u64) ForwardError!u64 {
     // Precondition: sockets have valid fds.
-    assert(upstream.getFd() >= 0);
-    assert(client.getFd() >= 0);
+    assert(upstream.get_fd() >= 0);
+    assert(client.get_fd() >= 0);
 
     var buffer: [COPY_CHUNK_SIZE_BYTES]u8 = std.mem.zeroes([COPY_CHUNK_SIZE_BYTES]u8);
     var forwarded_bytes: u64 = 0;
@@ -182,7 +182,7 @@ fn forwardBodyCopy(upstream: *Socket, client: *Socket, length_bytes: u64) Forwar
         if (n == 0) break; // Clean shutdown or EOF.
 
         // Write all read bytes to client via Socket abstraction.
-        client.writeAll(buffer[0..n]) catch {
+        client.write_all(buffer[0..n]) catch {
             return ForwardError.SendFailed;
         };
 
@@ -209,8 +209,8 @@ pub fn streamRequestBody(
     body_info: BodyInfo,
 ) ForwardError!u64 {
     // Precondition: valid socket file descriptors.
-    assert(client.getFd() >= 0);
-    assert(upstream.getFd() >= 0);
+    assert(client.get_fd() >= 0);
+    assert(upstream.get_fd() >= 0);
 
     // Dispatch based on body framing mode.
     const result = switch (body_info.framing) {
@@ -251,8 +251,8 @@ fn streamContentLengthBody(
     initial_body: []const u8,
 ) ForwardError!u64 {
     // Preconditions: valid sockets, bytes_already_read cannot exceed content_length.
-    assert(client.getFd() >= 0);
-    assert(upstream.getFd() >= 0);
+    assert(client.get_fd() >= 0);
+    assert(upstream.get_fd() >= 0);
     assert(bytes_already_read <= content_length);
 
     var total_sent: u64 = 0;
@@ -293,8 +293,8 @@ fn streamChunkedRequestBody(
     initial_body: []const u8,
 ) ForwardError!u64 {
     // Precondition: valid socket file descriptors.
-    assert(client.getFd() >= 0);
-    assert(upstream.getFd() >= 0);
+    assert(client.get_fd() >= 0);
+    assert(upstream.get_fd() >= 0);
 
     var total_sent: u64 = 0;
 

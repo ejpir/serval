@@ -17,6 +17,9 @@ const debugLog = core.debugLog;
 const net = @import("serval-net");
 const DnsResolver = net.DnsResolver;
 
+const serval_socket = @import("serval-socket");
+const Socket = serval_socket.Socket;
+
 const client_mod = @import("serval-client");
 const Client = client_mod.Client;
 
@@ -270,7 +273,8 @@ pub const OTLPExporter = struct {
         const io_runtime = Io.Threaded.init(allocator, .{});
 
         // Initialize DNS resolver
-        var dns_resolver = DnsResolver.init(.{});
+        var dns_resolver: DnsResolver = undefined;
+        DnsResolver.init(&dns_resolver, .{});
 
         // Initialize HTTP client
         const http_client = Client.init(
@@ -424,7 +428,13 @@ pub const OTLPExporter = struct {
 
         // Normalize hostname for Kubernetes DNS (add trailing dot for FQDNs)
         var fqdn_buf: [core_config.DNS_MAX_HOSTNAME_LEN + 1]u8 = undefined;
-        const normalized_host = DnsResolver.normalizeFqdn(self.parsed_endpoint.getHost(), &fqdn_buf);
+        const normalized_host = DnsResolver.normalize_fqdn(
+            self.parsed_endpoint.getHost(),
+            &fqdn_buf,
+        ) catch |err| {
+            log.err("OTLP: FQDN normalization failed: {s}", .{@errorName(err)});
+            return error.ConnectionFailed;
+        };
 
         debugLog("OTLP: connecting to {s}:{d} (normalized from {s})", .{
             normalized_host,
@@ -477,7 +487,7 @@ pub const OTLPExporter = struct {
 
     /// Send HTTP POST request with custom headers.
     /// TigerStyle: Manual header construction for control over Content-Type.
-    fn sendRequestWithHeaders(self: *Self, socket: *net.Socket, body: []const u8) !void {
+    fn sendRequestWithHeaders(self: *Self, socket: *Socket, body: []const u8) !void {
         // Build request line and headers
         var req_buf: [1024]u8 = undefined;
         const req_line = std.fmt.bufPrint(&req_buf, "POST {s} HTTP/1.1\r\nHost: {s}:{d}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{

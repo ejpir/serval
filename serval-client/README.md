@@ -24,7 +24,8 @@ const serval_client = @import("serval-client");
 const Client = serval_client.Client;
 
 // Initialize client
-var dns_resolver = DnsResolver.init(.{});
+var dns_resolver: DnsResolver = undefined;
+DnsResolver.init(&dns_resolver, .{});
 var client = Client.init(
     allocator,
     &dns_resolver,

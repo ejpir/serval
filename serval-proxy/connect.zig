@@ -16,8 +16,10 @@ const debugLog = serval_core.debugLog;
 const time = serval_core.time;
 
 const serval_net = @import("serval-net");
-const Socket = serval_net.Socket;
 const DnsResolver = serval_net.DnsResolver;
+
+const serval_socket = @import("serval-socket");
+const Socket = serval_socket.Socket;
 
 const serval_client = @import("serval-client");
 const Client = serval_client.Client;
@@ -79,7 +81,6 @@ pub const ConnectResult = struct {
     local_port: u16,
 };
 
-
 // =============================================================================
 // Port Extraction
 // =============================================================================
@@ -102,7 +103,7 @@ pub fn getLocalPort(fd: i32) u16 {
 /// Get local port from Socket abstraction.
 /// TigerStyle: Works with both plain and TLS sockets.
 pub fn getLocalPortFromSocket(socket: Socket) u16 {
-    return getLocalPort(socket.getFd());
+    return getLocalPort(socket.get_fd());
 }
 
 // =============================================================================
@@ -141,14 +142,14 @@ pub fn connectUpstream(
     };
 
     debugLog("connect: complete fd={d} dns_us={d} tcp_us={d} tls_us={d}", .{
-        client_result.conn.socket.getFd(),
+        client_result.conn.socket.get_fd(),
         client_result.dns_duration_ns / 1000,
         client_result.tcp_connect_duration_ns / 1000,
         client_result.tls_handshake_duration_ns / 1000,
     });
 
     // S1: postcondition - socket fd is valid
-    assert(client_result.conn.socket.getFd() >= 0);
+    assert(client_result.conn.socket.get_fd() >= 0);
 
     return .{
         .socket = client_result.conn.socket,
@@ -271,7 +272,7 @@ test "ConnectResult: struct fields are correctly typed" {
     defer posix.close(sock);
 
     const result = ConnectResult{
-        .socket = Socket.Plain.initClient(sock),
+        .socket = Socket.Plain.init_client(sock),
         .created_ns = 12345678,
         .protocol = .h1,
         .dns_duration_ns = 500000,
@@ -286,8 +287,8 @@ test "ConnectResult: struct fields are correctly typed" {
     try testing.expectEqual(@as(u64, 1000000), result.tcp_connect_duration_ns);
     try testing.expectEqual(@as(u64, 0), result.tls_handshake_duration_ns);
     try testing.expectEqual(@as(u16, 8080), result.local_port);
-    try testing.expect(!result.socket.isTLS());
-    try testing.expectEqual(sock, result.socket.getFd());
+    try testing.expect(!result.socket.is_tls());
+    try testing.expectEqual(sock, result.socket.get_fd());
 }
 
 // =============================================================================

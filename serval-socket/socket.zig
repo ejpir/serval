@@ -1,4 +1,4 @@
-// serval-net/socket.zig
+// serval-socket/socket.zig
 //! Unified Socket Abstraction
 //!
 //! Tagged union providing a consistent interface for both plain TCP and TLS sockets.
@@ -43,29 +43,37 @@ pub const PlainSocket = struct {
     /// Read data into buffer.
     /// Returns bytes read, 0 on EOF/clean close.
     /// TigerStyle S1: Assertions for preconditions.
-    pub fn read(self: *PlainSocket, buf: []u8) SocketError!usize {
+    /// TigerStyle S2: Explicit u32 return type.
+    pub fn read(self: *PlainSocket, buf: []u8) SocketError!u32 {
         assert(self.fd >= 0); // S1: precondition
         assert(buf.len > 0); // S1: precondition
+        assert(buf.len <= std.math.maxInt(u32)); // S2: buffer fits in u32
 
         const n = posix.read(self.fd, buf) catch |err| {
-            return mapPosixError(err);
+            return map_posix_error(err);
         };
 
-        return n;
+        // S2: explicit cast with bounds check
+        assert(n <= std.math.maxInt(u32));
+        return @intCast(n);
     }
 
     /// Write data to socket.
     /// Returns bytes written.
     /// TigerStyle S1: Assertions for preconditions.
-    pub fn write(self: *PlainSocket, data: []const u8) SocketError!usize {
+    /// TigerStyle S2: Explicit u32 return type.
+    pub fn write(self: *PlainSocket, data: []const u8) SocketError!u32 {
         assert(self.fd >= 0); // S1: precondition
         assert(data.len > 0); // S1: precondition
+        assert(data.len <= std.math.maxInt(u32)); // S2: data fits in u32
 
         const n = posix.write(self.fd, data) catch |err| {
-            return mapPosixError(err);
+            return map_posix_error(err);
         };
 
-        return n;
+        // S2: explicit cast with bounds check
+        assert(n <= std.math.maxInt(u32));
+        return @intCast(n);
     }
 
     /// Close the socket.
@@ -90,16 +98,16 @@ pub const Socket = union(enum) {
     /// Plain socket creation namespace.
     pub const Plain = struct {
         /// Create plain client socket from fd.
-        /// TigerStyle: Consistent API with TLS.initClient.
-        pub fn initClient(fd: i32) Socket {
+        /// TigerStyle: Consistent API with TLS.init_client.
+        pub fn init_client(fd: i32) Socket {
             assert(fd >= 0); // S1: precondition
             return .{ .plain = .{ .fd = fd } };
         }
 
         /// Create plain server socket from fd.
-        /// Same as initClient for plain TCP, but documents intent.
-        /// TigerStyle: Symmetric API with TLS.initServer.
-        pub fn initServer(fd: i32) Socket {
+        /// Same as init_client for plain TCP, but documents intent.
+        /// TigerStyle: Symmetric API with TLS.init_server.
+        pub fn init_server(fd: i32) Socket {
             assert(fd >= 0); // S1: precondition
             return .{ .plain = .{ .fd = fd } };
         }
@@ -112,7 +120,8 @@ pub const Socket = union(enum) {
     /// Read data into buffer.
     /// Returns bytes read, 0 on EOF/clean close.
     /// TigerStyle: Dispatch to underlying implementation.
-    pub fn read(self: *Socket, buf: []u8) SocketError!usize {
+    /// TigerStyle S2: Explicit u32 return type.
+    pub fn read(self: *Socket, buf: []u8) SocketError!u32 {
         assert(buf.len > 0); // S1: precondition
 
         return switch (self.*) {
@@ -124,7 +133,8 @@ pub const Socket = union(enum) {
     /// Write data to socket.
     /// Returns bytes written.
     /// TigerStyle: Dispatch to underlying implementation.
-    pub fn write(self: *Socket, data: []const u8) SocketError!usize {
+    /// TigerStyle S2: Explicit u32 return type.
+    pub fn write(self: *Socket, data: []const u8) SocketError!u32 {
         assert(data.len > 0); // S1: precondition
 
         return switch (self.*) {
@@ -136,6 +146,8 @@ pub const Socket = union(enum) {
     /// Close the socket and free resources.
     /// TigerStyle: Single close path for both types.
     pub fn close(self: *Socket) void {
+        const fd = self.get_fd();
+        assert(fd >= 0);
         switch (self.*) {
             .plain => |*s| s.close(),
             .tls => |*s| s.close(),
@@ -145,17 +157,21 @@ pub const Socket = union(enum) {
     /// Get raw file descriptor.
     /// Useful for splice (plaintext only) and poll operations.
     /// TigerStyle: Zero-copy splice needs raw fd.
-    pub fn getFd(self: Socket) i32 {
-        return switch (self) {
+    pub fn get_fd(self: Socket) i32 {
+        const fd = switch (self) {
             .plain => |s| s.fd,
             .tls => |s| s.fd,
         };
+        assert(fd >= -1);
+        return fd;
     }
 
     /// Check if this is a TLS socket.
     /// Useful for determining splice eligibility.
     /// TigerStyle: Explicit type check, no instanceof pattern.
-    pub fn isTLS(self: Socket) bool {
+    pub fn is_tls(self: Socket) bool {
+        const fd = self.get_fd();
+        assert(fd >= -1);
         return switch (self) {
             .plain => false,
             .tls => true,
@@ -173,7 +189,9 @@ pub const Socket = union(enum) {
     /// re-enabling splice() for encrypted connections.
     ///
     /// TigerStyle: Explicit switch on socket type (no default case).
-    pub fn canSplice(self: *const Socket) bool {
+    pub fn can_splice(self: *const Socket) bool {
+        const fd = self.get_fd();
+        assert(fd >= -1);
         return switch (self.*) {
             .plain => true, // Plain TCP: kernel handles I/O, splice always works
             .tls => |*s| s.stream.isKtls(), // TLS: only splice if kTLS enabled
@@ -184,7 +202,9 @@ pub const Socket = union(enum) {
     /// Always returns false for plain sockets.
     /// For TLS sockets, returns true if kTLS is enabled.
     /// TigerStyle: Explicit switch on socket type (no default case).
-    pub fn isKtls(self: *const Socket) bool {
+    pub fn is_ktls(self: *const Socket) bool {
+        const fd = self.get_fd();
+        assert(fd >= -1);
         return switch (self.*) {
             .plain => false, // Plain TCP: not TLS, so not kTLS
             .tls => |*s| s.stream.isKtls(), // TLS: check if kTLS mode
@@ -195,63 +215,74 @@ pub const Socket = union(enum) {
     // Bulk Transfer Operations
     // =========================================================================
 
-    /// Maximum iterations for writeAll to prevent infinite loops.
+    /// Maximum iterations for write_all to prevent infinite loops.
     /// 1024 partial writes is far beyond any legitimate scenario.
     /// TigerStyle S3: Bounded loops with explicit max iterations.
-    pub const MAX_WRITE_ITERATIONS: u32 = 1024;
+    pub const max_write_iterations_count: u32 = 1024;
 
-    /// Maximum iterations for readAtLeast to prevent infinite loops.
+    /// Maximum iterations for read_at_least to prevent infinite loops.
     /// TigerStyle S3: Bounded loops with explicit max iterations.
-    pub const MAX_READ_ITERATIONS: u32 = 1024;
+    pub const max_read_iterations_count: u32 = 1024;
 
     /// Write all bytes to socket, handling partial writes.
     /// Returns error if unable to write all bytes within bounded iterations.
     /// TigerStyle: Bounded retry loop, explicit assertions.
-    pub fn writeAll(self: *Socket, data: []const u8) SocketError!void {
+    pub fn write_all(self: *Socket, data: []const u8) SocketError!void {
         // S1: Preconditions
         assert(data.len > 0); // Empty writes are programmer error
+        assert(data.len <= std.math.maxInt(u32));
 
-        var sent: usize = 0;
+        const data_len: u32 = @intCast(data.len);
+        var sent: u32 = 0;
         var iterations: u32 = 0;
 
         // S3: Bounded loop with explicit maximum
-        while (sent < data.len and iterations < MAX_WRITE_ITERATIONS) : (iterations += 1) {
-            const n = try self.write(data[sent..]);
+        while (sent < data_len and iterations < max_write_iterations_count) : (iterations += 1) {
+            const offset: usize = @intCast(sent);
+            const n: u32 = try self.write(data[offset..]);
 
             // Zero write means peer closed or unrecoverable error
             if (n == 0) return SocketError.ConnectionClosed;
 
+            assert(n <= data_len);
             sent += n;
+            assert(sent <= data_len);
         }
 
         // Check if loop exited due to iteration limit
-        if (sent < data.len) return SocketError.Unexpected;
+        if (sent < data_len) return SocketError.Unexpected;
 
         // S2: Postcondition - all bytes written
-        assert(sent == data.len);
+        assert(sent == data_len);
     }
 
     /// Read at least min_bytes into buffer.
     /// Returns total bytes read (may be more than min_bytes, up to buffer.len).
     /// Returns error if unable to read minimum bytes within bounded iterations.
     /// TigerStyle: Bounded retry loop, explicit assertions.
-    pub fn readAtLeast(self: *Socket, buffer: []u8, min_bytes: usize) SocketError!usize {
+    pub fn read_at_least(self: *Socket, buffer: []u8, min_bytes: u32) SocketError!u32 {
         // S1: Preconditions
         assert(buffer.len > 0); // Empty buffer is programmer error
+        assert(buffer.len <= std.math.maxInt(u32));
         assert(min_bytes > 0); // Zero min_bytes is programmer error
-        assert(min_bytes <= buffer.len); // min_bytes cannot exceed buffer capacity
 
-        var total_bytes: usize = 0;
+        const buffer_len: u32 = @intCast(buffer.len);
+        assert(min_bytes <= buffer_len); // min_bytes cannot exceed buffer capacity
+
+        var total_bytes: u32 = 0;
         var iterations: u32 = 0;
 
         // S3: Bounded loop with explicit maximum
-        while (total_bytes < min_bytes and iterations < MAX_READ_ITERATIONS) : (iterations += 1) {
-            const n = try self.read(buffer[total_bytes..]);
+        while (total_bytes < min_bytes and iterations < max_read_iterations_count) : (iterations += 1) {
+            const offset: usize = @intCast(total_bytes);
+            const n: u32 = try self.read(buffer[offset..]);
 
             // Zero read means EOF before min_bytes reached
             if (n == 0) return SocketError.ConnectionClosed;
 
+            assert(n <= buffer_len);
             total_bytes += n;
+            assert(total_bytes <= buffer_len);
         }
 
         // Check if loop exited due to iteration limit
@@ -259,7 +290,7 @@ pub const Socket = union(enum) {
 
         // S2: Postcondition - read at least min_bytes
         assert(total_bytes >= min_bytes);
-        assert(total_bytes <= buffer.len);
+        assert(total_bytes <= buffer_len);
         return total_bytes;
     }
 };
@@ -270,7 +301,8 @@ pub const Socket = union(enum) {
 
 /// Map posix errors to SocketError.
 /// TigerStyle S6: Explicit error handling, no catch {}.
-fn mapPosixError(err: anyerror) SocketError {
+fn map_posix_error(err: anyerror) SocketError {
+    assert(@errorName(err).len > 0);
     return switch (err) {
         error.ConnectionResetByPeer => SocketError.ConnectionReset,
         error.BrokenPipe => SocketError.BrokenPipe,
@@ -284,214 +316,190 @@ fn mapPosixError(err: anyerror) SocketError {
 // Tests
 // =============================================================================
 
-test "Socket.Plain.initClient creates plain socket" {
-    // Use a real socket for testing
-    const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch {
-        return; // Skip if socket creation fails
-    };
+test "Socket.Plain.init_client creates plain socket" {
+    // Verify init_client returns a non-TLS socket with correct fd.
+    const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
     defer posix.close(fd);
 
-    var sock = Socket.Plain.initClient(fd);
-    try std.testing.expect(!sock.isTLS());
-    try std.testing.expectEqual(fd, sock.getFd());
+    var sock = Socket.Plain.init_client(fd);
+    try std.testing.expect(!sock.is_tls());
+    try std.testing.expectEqual(fd, sock.get_fd());
 }
 
-test "Socket.Plain.initServer creates plain socket" {
-    const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch {
-        return;
-    };
+test "Socket.Plain.init_server creates plain socket" {
+    const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
     defer posix.close(fd);
 
-    var sock = Socket.Plain.initServer(fd);
-    try std.testing.expect(!sock.isTLS());
-    try std.testing.expectEqual(fd, sock.getFd());
+    var sock = Socket.Plain.init_server(fd);
+    try std.testing.expect(!sock.is_tls());
+    try std.testing.expectEqual(fd, sock.get_fd());
 }
 
-test "Socket.isTLS returns correct value" {
-    const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch {
-        return;
-    };
+test "Socket.is_tls returns correct value" {
+    const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
     defer posix.close(fd);
 
-    const plain_sock = Socket.Plain.initClient(fd);
-    try std.testing.expect(!plain_sock.isTLS());
+    const plain_sock = Socket.Plain.init_client(fd);
+    try std.testing.expect(!plain_sock.is_tls());
 }
 
-test "Socket.getFd returns underlying fd" {
-    const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch {
-        return;
-    };
+test "Socket.get_fd returns underlying fd" {
+    const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
     defer posix.close(fd);
 
-    const sock = Socket.Plain.initClient(fd);
-    try std.testing.expectEqual(fd, sock.getFd());
+    const sock = Socket.Plain.init_client(fd);
+    try std.testing.expectEqual(fd, sock.get_fd());
 }
 
-test "mapPosixError maps common errors" {
-    try std.testing.expectEqual(SocketError.ConnectionReset, mapPosixError(error.ConnectionResetByPeer));
-    try std.testing.expectEqual(SocketError.BrokenPipe, mapPosixError(error.BrokenPipe));
-    try std.testing.expectEqual(SocketError.Timeout, mapPosixError(error.ConnectionTimedOut));
-    try std.testing.expectEqual(SocketError.Timeout, mapPosixError(error.WouldBlock));
-    try std.testing.expectEqual(SocketError.Unexpected, mapPosixError(error.OutOfMemory));
+test "map_posix_error maps common errors" {
+    try std.testing.expectEqual(SocketError.ConnectionReset, map_posix_error(error.ConnectionResetByPeer));
+    try std.testing.expectEqual(SocketError.BrokenPipe, map_posix_error(error.BrokenPipe));
+    try std.testing.expectEqual(SocketError.Timeout, map_posix_error(error.ConnectionTimedOut));
+    try std.testing.expectEqual(SocketError.Timeout, map_posix_error(error.WouldBlock));
+    try std.testing.expectEqual(SocketError.Unexpected, map_posix_error(error.OutOfMemory));
 }
 
 test "PlainSocket read/write require valid fd" {
     // Create socket pair for testing read/write
-    const fds = posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch {
-        return; // Skip if socketpair not available
-    };
+    const fds = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    var sock = Socket.Plain.initClient(fds[0]);
+    var sock = Socket.Plain.init_client(fds[0]);
 
-    // Write to one end
+    // Inject data via raw posix to verify Socket.read() retrieves it.
     const msg = "hello";
-    _ = posix.write(fds[1], msg) catch return;
+    _ = try posix.write(fds[1], msg);
 
-    // Read from socket
+    // Socket.read must return the injected data.
     var buf: [16]u8 = undefined;
     const n = try sock.read(&buf);
-    try std.testing.expectEqual(@as(usize, 5), n);
+    try std.testing.expectEqual(@as(u32, 5), n);
     try std.testing.expectEqualStrings("hello", buf[0..n]);
 }
 
 test "PlainSocket write sends data" {
-    const fds = posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch {
-        return;
-    };
+    const fds = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    var sock = Socket.Plain.initClient(fds[0]);
+    var sock = Socket.Plain.init_client(fds[0]);
 
     // Write through socket
     const msg = "world";
     const written = try sock.write(msg);
-    try std.testing.expectEqual(@as(usize, 5), written);
+    try std.testing.expectEqual(@as(u32, 5), written);
 
-    // Read from other end
+    // Verify data written via Socket.write() arrives at the other end.
     var buf: [16]u8 = undefined;
-    const n = posix.read(fds[1], &buf) catch return;
+    const n = try posix.read(fds[1], &buf);
     try std.testing.expectEqual(@as(usize, 5), n);
     try std.testing.expectEqualStrings("world", buf[0..n]);
 }
 
-test "Socket.canSplice returns true for plain sockets" {
-    const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch {
-        return;
-    };
+test "Socket.can_splice returns true for plain sockets" {
+    const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
     defer posix.close(fd);
 
-    const sock = Socket.Plain.initClient(fd);
+    const sock = Socket.Plain.init_client(fd);
     // Plain sockets always support splice (kernel handles I/O)
-    try std.testing.expect(sock.canSplice());
+    try std.testing.expect(sock.can_splice());
 }
 
-test "Socket.isKtls returns false for plain sockets" {
-    const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch {
-        return;
-    };
+test "Socket.is_ktls returns false for plain sockets" {
+    const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
     defer posix.close(fd);
 
-    const sock = Socket.Plain.initClient(fd);
+    const sock = Socket.Plain.init_client(fd);
     // Plain sockets are not TLS, so cannot be kTLS
-    try std.testing.expect(!sock.isKtls());
+    try std.testing.expect(!sock.is_ktls());
 }
 
 // =============================================================================
 // Bulk Transfer Operation Tests
 // =============================================================================
 
-test "Socket.writeAll sends all bytes" {
-    const fds = posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch {
-        return; // Skip if socketpair not available
-    };
+test "Socket.write_all sends all bytes" {
+    const fds = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    var sock = Socket.Plain.initClient(fds[0]);
+    var sock = Socket.Plain.init_client(fds[0]);
 
-    // Write all bytes via writeAll
+    // Write all bytes via write_all
     const msg = "hello world test message";
-    try sock.writeAll(msg);
+    try sock.write_all(msg);
 
     // Read from other end and verify all bytes received
     var buf: [64]u8 = undefined;
-    const n = posix.read(fds[1], &buf) catch return;
+    const n = try posix.read(fds[1], &buf);
     try std.testing.expectEqual(msg.len, n);
     try std.testing.expectEqualStrings(msg, buf[0..n]);
 }
 
-test "Socket.writeAll error on closed connection" {
-    const fds = posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch {
-        return;
-    };
+test "Socket.write_all error on closed connection" {
+    const fds = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
     defer posix.close(fds[0]);
 
-    var sock = Socket.Plain.initClient(fds[0]);
+    var sock = Socket.Plain.init_client(fds[0]);
 
     // Close the read end to trigger broken pipe on write
     posix.close(fds[1]);
 
-    // writeAll should fail when peer is closed
-    const result = sock.writeAll("test data");
+    // write_all should fail when peer is closed
+    const result = sock.write_all("test data");
     try std.testing.expectError(SocketError.BrokenPipe, result);
 }
 
-test "Socket.readAtLeast reads minimum bytes" {
-    const fds = posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch {
-        return;
-    };
+test "Socket.read_at_least reads minimum bytes" {
+    const fds = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    var sock = Socket.Plain.initClient(fds[0]);
+    var sock = Socket.Plain.init_client(fds[0]);
 
-    // Write data to be read
+    // Write data to be read - if socketpair works, write must work
     const msg = "hello world";
-    _ = posix.write(fds[1], msg) catch return;
+    _ = try posix.write(fds[1], msg);
 
     // Read at least 5 bytes (may get more)
     var buf: [32]u8 = undefined;
-    const n = try sock.readAtLeast(&buf, 5);
+    const n = try sock.read_at_least(&buf, 5);
+    const msg_len: u32 = @intCast(msg.len);
     try std.testing.expect(n >= 5);
-    try std.testing.expect(n <= msg.len);
+    try std.testing.expect(n <= msg_len);
 }
 
-test "Socket.readAtLeast error on EOF before min_bytes" {
-    const fds = posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch {
-        return;
-    };
+test "Socket.read_at_least error on EOF before min_bytes" {
+    const fds = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
     defer posix.close(fds[0]);
 
-    var sock = Socket.Plain.initClient(fds[0]);
+    var sock = Socket.Plain.init_client(fds[0]);
 
-    // Write only 3 bytes then close
-    _ = posix.write(fds[1], "abc") catch return;
+    // Write only 3 bytes then close - if socketpair works, write must work
+    _ = try posix.write(fds[1], "abc");
     posix.close(fds[1]);
 
     // Try to read at least 10 bytes - should fail due to EOF
     var buf: [32]u8 = undefined;
-    const result = sock.readAtLeast(&buf, 10);
+    const result = sock.read_at_least(&buf, 10);
     try std.testing.expectError(SocketError.ConnectionClosed, result);
 }
 
-test "Socket.readAtLeast reads exact minimum when available" {
-    const fds = posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch {
-        return;
-    };
+test "Socket.read_at_least reads exact minimum when available" {
+    const fds = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    var sock = Socket.Plain.initClient(fds[0]);
+    var sock = Socket.Plain.init_client(fds[0]);
 
-    // Write exactly 5 bytes
-    _ = posix.write(fds[1], "12345") catch return;
+    // Write exactly 5 bytes - if socketpair works, write must work
+    _ = try posix.write(fds[1], "12345");
 
     // Read at least 5 bytes
     var buf: [32]u8 = undefined;
-    const n = try sock.readAtLeast(&buf, 5);
-    try std.testing.expectEqual(@as(usize, 5), n);
-    try std.testing.expectEqualStrings("12345", buf[0..n]);
+    const n = try sock.read_at_least(&buf, 5);
+    try std.testing.expectEqual(@as(u32, 5), n);
+    const n_usize: usize = @intCast(n);
+    try std.testing.expectEqualStrings("12345", buf[0..n_usize]);
 }

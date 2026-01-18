@@ -24,11 +24,20 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // Network utilities - depends on core (for config, time) and tls for TLSSocket
+    // Network utilities - DNS + TCP helpers (Layer 1 - Protocol)
+    // Note: Socket abstraction moved to serval-socket (Layer 2)
     const serval_net_module = b.addModule("serval-net", .{
         .root_source_file = b.path("serval-net/mod.zig"),
         .imports = &.{
             .{ .name = "serval-core", .module = serval_core_module },
+        },
+    });
+
+    // Socket abstraction - unified TCP/TLS socket (Layer 2 - Infrastructure)
+    // Composes serval-tls primitives into a tagged union Socket type
+    const serval_socket_module = b.addModule("serval-socket", .{
+        .root_source_file = b.path("serval-socket/mod.zig"),
+        .imports = &.{
             .{ .name = "serval-tls", .module = serval_tls_module },
         },
     });
@@ -38,12 +47,12 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("serval-cli/mod.zig"),
     });
 
-    // Pool module - depends on core and net
+    // Pool module - depends on core and socket
     const serval_pool_module = b.addModule("serval-pool", .{
         .root_source_file = b.path("serval-pool/mod.zig"),
         .imports = &.{
             .{ .name = "serval-core", .module = serval_core_module },
-            .{ .name = "serval-net", .module = serval_net_module },
+            .{ .name = "serval-socket", .module = serval_socket_module },
         },
     });
 
@@ -79,7 +88,7 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // Client module - depends on core, http, net, pool, tls (Layer 3 - Mechanics)
+    // Client module - depends on core, http, net, socket, pool, tls (Layer 3 - Mechanics)
     // HTTP/1.1 client for making requests to upstream servers
     const serval_client_module = b.addModule("serval-client", .{
         .root_source_file = b.path("serval-client/mod.zig"),
@@ -87,12 +96,13 @@ pub fn build(b: *std.Build) void {
             .{ .name = "serval-core", .module = serval_core_module },
             .{ .name = "serval-http", .module = serval_http_module },
             .{ .name = "serval-net", .module = serval_net_module },
+            .{ .name = "serval-socket", .module = serval_socket_module },
             .{ .name = "serval-pool", .module = serval_pool_module },
             .{ .name = "serval-tls", .module = serval_tls_module },
         },
     });
 
-    // OpenTelemetry module - depends on core, tracing, client, net, tls, pool
+    // OpenTelemetry module - depends on core, tracing, client, net, socket, tls, pool
     // Uses serval-client for HTTP export with proper K8s DNS resolution
     const serval_otel_module = b.addModule("serval-otel", .{
         .root_source_file = b.path("serval-otel/mod.zig"),
@@ -101,17 +111,19 @@ pub fn build(b: *std.Build) void {
             .{ .name = "serval-tracing", .module = serval_tracing_module },
             .{ .name = "serval-client", .module = serval_client_module },
             .{ .name = "serval-net", .module = serval_net_module },
+            .{ .name = "serval-socket", .module = serval_socket_module },
             .{ .name = "serval-tls", .module = serval_tls_module },
             .{ .name = "serval-pool", .module = serval_pool_module },
         },
     });
 
-    // Proxy module - depends on core, net, pool, tracing, http, tls, client
+    // Proxy module - depends on core, net, socket, pool, tracing, http, tls, client
     const serval_proxy_module = b.addModule("serval-proxy", .{
         .root_source_file = b.path("serval-proxy/mod.zig"),
         .imports = &.{
             .{ .name = "serval-core", .module = serval_core_module },
             .{ .name = "serval-net", .module = serval_net_module },
+            .{ .name = "serval-socket", .module = serval_socket_module },
             .{ .name = "serval-pool", .module = serval_pool_module },
             .{ .name = "serval-tracing", .module = serval_tracing_module },
             .{ .name = "serval-http", .module = serval_http_module },
@@ -120,12 +132,13 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // Server module - composes core, net, http, pool, proxy, metrics, tracing, tls
+    // Server module - composes core, net, socket, http, pool, proxy, metrics, tracing, tls
     const serval_server_module = b.addModule("serval-server", .{
         .root_source_file = b.path("serval-server/mod.zig"),
         .imports = &.{
             .{ .name = "serval-core", .module = serval_core_module },
             .{ .name = "serval-net", .module = serval_net_module },
+            .{ .name = "serval-socket", .module = serval_socket_module },
             .{ .name = "serval-http", .module = serval_http_module },
             .{ .name = "serval-pool", .module = serval_pool_module },
             .{ .name = "serval-proxy", .module = serval_proxy_module },
@@ -193,6 +206,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "serval-core", .module = serval_core_module },
             .{ .name = "serval-net", .module = serval_net_module },
+            .{ .name = "serval-socket", .module = serval_socket_module },
             .{ .name = "serval-http", .module = serval_http_module },
             .{ .name = "serval-pool", .module = serval_pool_module },
             .{ .name = "serval-proxy", .module = serval_proxy_module },
@@ -220,6 +234,7 @@ pub fn build(b: *std.Build) void {
     serval_tests_mod.linkSystemLibrary("crypto", .{});
     serval_tests_mod.addImport("serval-core", serval_core_module);
     serval_tests_mod.addImport("serval-net", serval_net_module);
+    serval_tests_mod.addImport("serval-socket", serval_socket_module);
     serval_tests_mod.addImport("serval-http", serval_http_module);
     serval_tests_mod.addImport("serval-pool", serval_pool_module);
     serval_tests_mod.addImport("serval-proxy", serval_proxy_module);
@@ -255,6 +270,7 @@ pub fn build(b: *std.Build) void {
     lb_tests_mod.addImport("serval-http", serval_http_module);
     lb_tests_mod.addImport("serval-pool", serval_pool_module);
     lb_tests_mod.addImport("serval-net", serval_net_module);
+    lb_tests_mod.addImport("serval-socket", serval_socket_module);
     lb_tests_mod.addImport("serval-client", serval_client_module);
     const lb_tests = b.addTest(.{
         .name = "lb_tests",
@@ -284,6 +300,7 @@ pub fn build(b: *std.Build) void {
     router_tests_mod.addImport("serval-http", serval_http_module);
     router_tests_mod.addImport("serval-pool", serval_pool_module);
     router_tests_mod.addImport("serval-net", serval_net_module);
+    router_tests_mod.addImport("serval-socket", serval_socket_module);
     router_tests_mod.addImport("serval-client", serval_client_module);
     const router_tests = b.addTest(.{
         .name = "router_tests",
@@ -312,6 +329,7 @@ pub fn build(b: *std.Build) void {
     gateway_tests_mod.addImport("serval-http", serval_http_module);
     gateway_tests_mod.addImport("serval-pool", serval_pool_module);
     gateway_tests_mod.addImport("serval-net", serval_net_module);
+    gateway_tests_mod.addImport("serval-socket", serval_socket_module);
     gateway_tests_mod.addImport("serval-client", serval_client_module);
     gateway_tests_mod.addImport("serval-lb", serval_lb_module);
     gateway_tests_mod.addImport("serval-health", serval_health_module);
@@ -360,18 +378,13 @@ pub fn build(b: *std.Build) void {
     const tls_test_step = b.step("test-tls", "Run serval-tls library tests");
     tls_test_step.dependOn(&run_tls_tests.step);
 
-    // Network module tests
-    // Note: Links SSL libraries since serval-net now depends on serval-tls
+    // Network module tests (DNS + TCP helpers)
     const net_tests_mod = b.createModule(.{
         .root_source_file = b.path("serval-net/mod.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = true,
     });
-    net_tests_mod.linkSystemLibrary("ssl", .{});
-    net_tests_mod.linkSystemLibrary("crypto", .{});
     net_tests_mod.addImport("serval-core", serval_core_module);
-    net_tests_mod.addImport("serval-tls", serval_tls_module);
     const net_tests = b.addTest(.{
         .name = "net_tests",
         .root_module = net_tests_mod,
@@ -380,6 +393,26 @@ pub fn build(b: *std.Build) void {
 
     const net_test_step = b.step("test-net", "Run serval-net library tests");
     net_test_step.dependOn(&run_net_tests.step);
+
+    // Socket module tests (unified TCP/TLS socket abstraction)
+    // Note: Links SSL libraries since serval-socket depends on serval-tls
+    const socket_tests_mod = b.createModule(.{
+        .root_source_file = b.path("serval-socket/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    socket_tests_mod.linkSystemLibrary("ssl", .{});
+    socket_tests_mod.linkSystemLibrary("crypto", .{});
+    socket_tests_mod.addImport("serval-tls", serval_tls_module);
+    const socket_tests = b.addTest(.{
+        .name = "socket_tests",
+        .root_module = socket_tests_mod,
+    });
+    const run_socket_tests = b.addRunArtifact(socket_tests);
+
+    const socket_test_step = b.step("test-socket", "Run serval-socket library tests");
+    socket_test_step.dependOn(&run_socket_tests.step);
 
     // OpenTelemetry module tests
     const otel_tests_mod = b.createModule(.{
@@ -413,6 +446,7 @@ pub fn build(b: *std.Build) void {
     client_tests_mod.addImport("serval-core", serval_core_module);
     client_tests_mod.addImport("serval-http", serval_http_module);
     client_tests_mod.addImport("serval-net", serval_net_module);
+    client_tests_mod.addImport("serval-socket", serval_socket_module);
     client_tests_mod.addImport("serval-pool", serval_pool_module);
     client_tests_mod.addImport("serval-tls", serval_tls_module);
     const client_tests = b.addTest(.{
@@ -423,6 +457,22 @@ pub fn build(b: *std.Build) void {
 
     const client_test_step = b.step("test-client", "Run serval-client library tests");
     client_test_step.dependOn(&run_client_tests.step);
+
+    // Integration tests (end-to-end tests using subprocess spawning)
+    // Note: No serval dependencies - spawns binaries as subprocesses
+    const integration_tests_mod = b.createModule(.{
+        .root_source_file = b.path("integration/tests.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const integration_tests = b.addTest(.{
+        .name = "integration_tests",
+        .root_module = integration_tests_mod,
+    });
+    const run_integration_tests = b.addRunArtifact(integration_tests);
+
+    const integration_test_step = b.step("test-integration", "Run integration tests");
+    integration_test_step.dependOn(&run_integration_tests.step);
 
     // =========================================================================
     // Examples

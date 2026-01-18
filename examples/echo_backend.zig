@@ -261,7 +261,7 @@ pub fn main() !void {
         .tls = tls_config,
     }, null, DnsConfig{});
 
-    server.run(io, &shutdown) catch |err| {
+    server.run(io, &shutdown, null) catch |err| {
         std.debug.print("Server error: {}\n", .{err});
         return;
     };

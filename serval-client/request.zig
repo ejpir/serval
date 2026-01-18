@@ -15,8 +15,8 @@ const eqlIgnoreCase = serval_core.eqlIgnoreCase;
 const Request = types.Request;
 const Method = types.Method;
 
-const net = @import("serval-net");
-const Socket = net.Socket;
+const serval_socket = @import("serval-socket");
+const Socket = serval_socket.Socket;
 
 // =============================================================================
 // Error Types
@@ -179,7 +179,6 @@ pub fn sendBufferToSocket(socket: *Socket, data: []const u8) ClientError!void {
         return ClientError.SendTimeout; // Write exceeded max iterations
     }
 }
-
 
 /// Send complete HTTP request (headers + body) to socket.
 /// effective_path: If set, use this path instead of request.path (for path rewriting).

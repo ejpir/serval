@@ -41,7 +41,7 @@
 //!  │  └─────────────────────────────────────────────────────────────────┘    │
 //!  │                                                                         │
 //!  │  Components used:                                                       │
-//!  │  - serval-net.Socket: TCP/TLS socket abstraction                        │
+//!  │  - serval-socket: TCP/TLS unified socket abstraction                     │
 //!  │  - serval-http: HTTP/1.1 request parser                                 │
 //!  │  - serval-tls: TLS termination (if --cert/--key provided)               │
 //!  │  - serval-pool: Connection pooling (SimplePool)                         │
@@ -123,7 +123,7 @@
 //!  │  Components used:                                                       │
 //!  │  - serval-pool: Connection pooling (acquire/release by upstream.idx)   │
 //!  │  - serval-net.DnsResolver: DNS resolution with TTL caching             │
-//!  │  - serval-net.Socket: Unified TCP/TLS read/write                       │
+//!  │  - serval-socket: Unified TCP/TLS read/write                           │
 //!  │  - serval-tls: TLS origination for HTTPS upstreams                     │
 //!  │  - serval-client.request: buildRequestBuffer, sendBufferToSocket       │
 //!  │  - serval-core.config: CONNECT_TIMEOUT_NS, MAX_BODY_SIZE_BYTES, etc.   │
@@ -374,7 +374,8 @@ pub fn main() !void {
 
     // Create DNS resolver for health probes
     // TigerStyle: Resolver uses default TTL (60s) and timeout (5s)
-    var dns_resolver = serval_net.DnsResolver.init(.{});
+    var dns_resolver: serval_net.DnsResolver = undefined;
+    serval_net.DnsResolver.init(&dns_resolver, .{});
 
     // Initialize load balancer with automatic health tracking and probing
     var handler: LbHandler = undefined;
@@ -400,9 +401,16 @@ pub fn main() !void {
     var shutdown = std.atomic.Value(bool).init(false);
 
     // Print startup info
-    std.debug.print("Load balancer listening on :{d} ({s})\n", .{ args.port, if (tls_config != null) "HTTPS" else "HTTP" });
+    // Server-side TLS (HTTPS) requires cert and key; upstream-only TLS config doesn't
+    const has_server_tls = if (tls_config) |cfg| cfg.cert_path != null else false;
+    std.debug.print("Load balancer listening on :{d} ({s})\n", .{ args.port, if (has_server_tls) "HTTPS" else "HTTP" });
     if (tls_config) |tls_cfg| {
-        std.debug.print("TLS: enabled (cert={s}, key={s})\n", .{ tls_cfg.cert_path.?, tls_cfg.key_path.? });
+        if (tls_cfg.cert_path) |cert| {
+            std.debug.print("TLS: enabled (cert={s}, key={s})\n", .{ cert, tls_cfg.key_path.? });
+        }
+        if (!tls_cfg.verify_upstream) {
+            std.debug.print("TLS verification: DISABLED (insecure, for testing only)\n", .{});
+        }
     }
     std.debug.print("Health tracking: enabled (unhealthy after {d} failures, healthy after {d} successes)\n", .{
         serval.config.DEFAULT_UNHEALTHY_THRESHOLD,
@@ -464,7 +472,7 @@ pub fn main() !void {
             .tls = tls_config,
         }, probe_ctx, DnsConfig{});
 
-        server.run(io, &shutdown) catch |err| {
+        server.run(io, &shutdown, null) catch |err| {
             std.debug.print("Server error: {}\n", .{err});
             return;
         };
@@ -486,7 +494,7 @@ pub fn main() !void {
             .tls = tls_config,
         }, probe_ctx, DnsConfig{});
 
-        server.run(io, &shutdown) catch |err| {
+        server.run(io, &shutdown, null) catch |err| {
             std.debug.print("Server error: {}\n", .{err});
             return;
         };

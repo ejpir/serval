@@ -443,7 +443,7 @@ fn adminServerLoop(
     );
 
     // Run server until shutdown
-    server.run(io, shutdown) catch |err| {
+    server.run(io, shutdown, null) catch |err| {
         log.err("admin server error: {s}", .{@errorName(err)});
     };
 }

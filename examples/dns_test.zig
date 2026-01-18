@@ -58,7 +58,8 @@ pub fn main() !void {
     const io = io_runtime.io();
 
     // Initialize DNS resolver
-    var resolver = DnsResolver.init(.{
+    var resolver: DnsResolver = undefined;
+    DnsResolver.init(&resolver, .{
         .ttl_ns = 60 * time.ns_per_s,
         .timeout_ns = 10 * time.ns_per_s,
     });
@@ -81,11 +82,11 @@ pub fn main() !void {
         std.debug.print("  Time: {d:.2}ms\n", .{elapsed_ms});
     }
 
-    // Then try resolveAll
-    std.debug.print("\nTrying resolveAll() for all addresses...\n", .{});
+    // Then try resolve_all
+    std.debug.print("\nTrying resolve_all() for all addresses...\n", .{});
     var all_result: ResolveAllResult = undefined;
     const start2 = time.monotonicNanos();
-    if (resolver.resolveAll(hostname, port, io, &all_result)) {
+    if (resolver.resolve_all(hostname, port, io, &all_result)) {
         const elapsed_ms = @as(f64, @floatFromInt(time.monotonicNanos() - start2)) / 1_000_000.0;
         std.debug.print("  Success! Found {d} addresses:\n", .{all_result.count});
         for (all_result.slice(), 0..) |addr, i| {
@@ -101,7 +102,10 @@ pub fn main() !void {
 
     // Try with FQDN normalization
     var fqdn_buf: [config.DNS_MAX_HOSTNAME_LEN + 1]u8 = undefined;
-    const normalized = DnsResolver.normalizeFqdn(hostname, &fqdn_buf);
+    const normalized = DnsResolver.normalize_fqdn(hostname, &fqdn_buf) catch |err| {
+        std.debug.print("FQDN normalization failed: {s}\n", .{@errorName(err)});
+        return;
+    };
     if (!std.mem.eql(u8, normalized, hostname)) {
         std.debug.print("\nTrying with FQDN normalization: '{s}'...\n", .{normalized});
         const start3 = time.monotonicNanos();
@@ -119,7 +123,7 @@ pub fn main() !void {
     }
 
     // Show cache stats
-    const stats = resolver.getStats();
+    const stats = resolver.get_stats();
     std.debug.print("\n=== Cache Stats ===\n", .{});
     std.debug.print("Hits: {d}\n", .{stats.hits});
     std.debug.print("Misses: {d}\n", .{stats.misses});

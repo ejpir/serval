@@ -17,7 +17,7 @@ const errors = serval_core.errors;
 const hooks = serval_core.hooks;
 
 const serval_net = @import("serval-net");
-const setTcpNoDelay = serval_net.setTcpNoDelay;
+const set_tcp_no_delay = serval_net.set_tcp_no_delay;
 const DnsConfig = serval_net.DnsConfig;
 
 const pool_mod = @import("serval-pool").pool;
@@ -137,7 +137,19 @@ pub fn Server(
 
         /// Run the server with concurrent connection handling.
         /// TigerStyle: Explicit resource cleanup with defer.
-        pub fn run(self: *Self, io: Io, shutdown: *std.atomic.Value(bool)) !void {
+        ///
+        /// Parameters:
+        ///   - io: The async I/O runtime
+        ///   - shutdown: Atomic flag to signal shutdown (checked between accepts)
+        ///   - listener_fd_out: Optional pointer to store listener socket FD for external shutdown.
+        ///                      Close this FD from another thread to interrupt accept() and trigger shutdown.
+        ///                      TigerStyle: Explicit shutdown mechanism for testability.
+        pub fn run(
+            self: *Self,
+            io: Io,
+            shutdown: *std.atomic.Value(bool),
+            listener_fd_out: ?*std.atomic.Value(i32),
+        ) !void {
             assert(self.config.port > 0);
 
             const addr = Io.net.IpAddress.parse("0.0.0.0", self.config.port) catch
@@ -147,11 +159,29 @@ pub fn Server(
                 .kernel_backlog = self.config.kernel_backlog,
                 .reuse_address = true,
             }) catch return error.ListenFailed;
-            defer tcp_server.deinit(io);
 
-            // TLS: Initialize SSL_CTX if TLS is configured
+            // Store listener FD for external shutdown (if requested)
+            // TigerStyle: Atomic store for cross-thread access
+            if (listener_fd_out) |fd_out| {
+                fd_out.store(@intCast(tcp_server.socket.handle), .release);
+            }
+            defer {
+                // Clear listener FD on exit
+                if (listener_fd_out) |fd_out| {
+                    fd_out.store(-1, .release);
+                }
+                tcp_server.deinit(io);
+            }
+
+            // TLS: Initialize SSL_CTX if server-side TLS is configured (cert + key)
             // TigerStyle: C5 - Resource grouping with immediate defer
+            // Note: tls_config may be set just for upstream verification (verify_upstream)
+            // without server-side TLS. Only create SSL_CTX if cert_path is present.
             const tls_ctx: ?*ssl.SSL_CTX = if (self.config.tls) |tls_cfg| blk: {
+                // Check if server-side TLS is configured (requires cert + key)
+                const cert_path = tls_cfg.cert_path orelse break :blk null;
+                const key_path = tls_cfg.key_path orelse break :blk null;
+
                 ssl.init();
                 const ctx = try ssl.createServerCtx();
                 // S1: postcondition - ctx is non-null (verified in createServerCtx)
@@ -160,7 +190,7 @@ pub fn Server(
                 const allocator = std.heap.c_allocator;
 
                 // Load certificate chain
-                const cert_z = try allocator.dupeZ(u8, tls_cfg.cert_path.?);
+                const cert_z = try allocator.dupeZ(u8, cert_path);
                 defer allocator.free(cert_z);
                 assert(cert_z.len > 0); // S1: precondition
                 if (ssl.SSL_CTX_use_certificate_chain_file(ctx, cert_z) != 1) {
@@ -169,7 +199,7 @@ pub fn Server(
                 }
 
                 // Load private key
-                const key_z = try allocator.dupeZ(u8, tls_cfg.key_path.?);
+                const key_z = try allocator.dupeZ(u8, key_path);
                 defer allocator.free(key_z);
                 assert(key_z.len > 0); // S1: precondition
                 if (ssl.SSL_CTX_use_PrivateKey_file(ctx, key_z, ssl.SSL_FILETYPE_PEM) != 1) {
@@ -539,7 +569,7 @@ pub fn Server(
             assert(cfg.max_requests_per_connection > 0);
 
             // Setup: TCP_NODELAY, connection ID, metrics
-            _ = setTcpNoDelay(stream.socket.handle);
+            _ = set_tcp_no_delay(stream.socket.handle);
             const connection_id = nextConnectionId();
             const connection_start_ns = realtimeNanos();
             defer stream.close(io);

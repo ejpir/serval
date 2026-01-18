@@ -43,9 +43,11 @@ const TLSStream = serval_tls.TLSStream;
 const ssl = serval_tls.ssl;
 
 const serval_net = @import("serval-net");
-const Socket = serval_net.Socket;
 const DnsResolver = serval_net.DnsResolver;
 const DnsConfig = serval_net.DnsConfig;
+
+const serval_socket = @import("serval-socket");
+const Socket = serval_socket.Socket;
 
 const Request = types.Request;
 const Upstream = types.Upstream;
@@ -85,12 +87,15 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             assert(@intFromPtr(p) != 0);
             assert(@intFromPtr(t) != 0);
 
+            var dns_resolver: DnsResolver = undefined;
+            DnsResolver.init(&dns_resolver, dns_config);
+
             return .{
                 .pool = p,
                 .tracer = t,
                 .verify_upstream_tls = verify_upstream_tls,
                 .client_ctx = client_ctx,
-                .dns_resolver = DnsResolver.init(dns_config),
+                .dns_resolver = dns_resolver,
             };
         }
 
@@ -155,7 +160,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
                     }
 
                     // DON'T end span here - wait until we know connection works
-                    debugLog("forward: pool HIT, reusing connection fd={d}", .{pooled_conn.socket.getFd()});
+                    debugLog("forward: pool HIT, reusing connection fd={d}", .{pooled_conn.socket.get_fd()});
 
                     // Get local port from pooled connection
                     const local_port = getLocalPortFromSocket(pooled_conn.socket);
@@ -247,7 +252,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
 
             // TLS handshake span (if TLS was used)
             // Access TLS stream info from Socket union if TLS variant.
-            if (connect_result.socket.isTLS()) {
+            if (connect_result.socket.is_tls()) {
                 const tls_socket = connect_result.socket.tls;
                 const tls_span = self.tracer.startSpan("tls.handshake.client", forward_span);
                 const info = &tls_socket.stream.info;
@@ -350,7 +355,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             var client_socket = if (client_tls) |tls|
                 Socket{ .tls = .{ .fd = client_stream.socket.handle, .stream = tls.* } }
             else
-                Socket.Plain.initClient(client_stream.socket.handle);
+                Socket.Plain.init_client(client_stream.socket.handle);
 
             // Stream request body if present
             if (body_info.getContentLength()) |content_length| {
