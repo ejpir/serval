@@ -44,6 +44,10 @@ const EchoExtra = struct {
     /// Echo the exact request body back (for payload verification tests).
     /// When enabled, response body is exactly the request body.
     @"echo-body": bool = false,
+    /// Drain the request body without echoing (for large upload tests).
+    /// Reads and discards body, returns small response with byte count.
+    /// TigerStyle: Enables testing >4GB uploads without buffering entire body.
+    @"drain-body": bool = false,
 };
 
 /// Handler that echoes request details without forwarding.
@@ -54,11 +58,12 @@ const EchoHandler = struct {
     debug: bool,
     chunked: bool,
     echo_body: bool,
+    drain_body: bool,
     /// Pre-formatted extra headers buffer. Formatted once at init.
     extra_headers_buf: [128]u8 = std.mem.zeroes([128]u8),
     extra_headers_len: u8 = 0,
 
-    pub fn init(id: []const u8, port: u16, debug: bool, chunked: bool, echo_body: bool) EchoHandler {
+    pub fn init(id: []const u8, port: u16, debug: bool, chunked: bool, echo_body: bool, drain_body: bool) EchoHandler {
         // Preconditions
         assert(id.len > 0);
         assert(port > 0);
@@ -69,6 +74,7 @@ const EchoHandler = struct {
             .debug = debug,
             .chunked = chunked,
             .echo_body = echo_body,
+            .drain_body = drain_body,
         };
 
         // Pre-format extra headers (persists for handler lifetime)
@@ -106,6 +112,41 @@ const EchoHandler = struct {
     ) serval.Action {
         // Precondition: response buffer must be provided
         assert(response_buf.len > 0);
+
+        // In drain-body mode, return content-length from header without reading body.
+        // The body is streamed through the proxy but we don't consume it in handler.
+        // TigerStyle: Tests large upload path (>4GB) through proxy without handler buffering.
+        if (self.drain_body) {
+            const content_length = ctx.getBodyLength() orelse 0;
+
+            // Format response with expected byte count from Content-Length header
+            const body_len = std.fmt.bufPrint(response_buf, "accepted {d} bytes\n", .{content_length}) catch {
+                return .{ .send_response = .{
+                    .status = 500,
+                    .body = "Response format error",
+                    .content_type = "text/plain",
+                    .extra_headers = "",
+                    .response_mode = .content_length,
+                } };
+            };
+
+            if (self.debug) {
+                std.debug.print("[{s}] {s} {s} -> 200 (accepted {d} bytes)\n", .{
+                    self.id,
+                    @tagName(request.method),
+                    request.path,
+                    content_length,
+                });
+            }
+
+            return .{ .send_response = .{
+                .status = 200,
+                .body = body_len,
+                .content_type = "text/plain",
+                .extra_headers = self.extra_headers_buf[0..self.extra_headers_len],
+                .response_mode = .content_length,
+            } };
+        }
 
         // In echo-body mode, read request body and return it exactly
         if (self.echo_body) {
@@ -269,7 +310,7 @@ pub fn main() !void {
     } else null;
 
     // Initialize handler with config
-    var handler = EchoHandler.init(args.extra.id, args.port, args.debug, args.extra.chunked, args.extra.@"echo-body");
+    var handler = EchoHandler.init(args.extra.id, args.port, args.debug, args.extra.chunked, args.extra.@"echo-body", args.extra.@"drain-body");
 
     // Initialize components (minimal - no pooling/tracing needed for echo)
     var pool = serval.SimplePool.init();

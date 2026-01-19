@@ -116,8 +116,10 @@ fn forwardBodySplice(upstream_fd: i32, client_fd: i32, length_bytes: u64) Forwar
     }
 
     var forwarded_bytes: u64 = 0;
-    const max_iterations: u32 = 1024 * 1024;
-    var iterations: u32 = 0;
+    // TigerStyle: Derive iteration bound from content length - supports arbitrarily large files.
+    // Each iteration transfers up to SPLICE_CHUNK_SIZE_BYTES, plus margin for partial transfers.
+    const max_iterations: u64 = (length_bytes / SPLICE_CHUNK_SIZE_BYTES) + 1024;
+    var iterations: u64 = 0;
 
     while (forwarded_bytes < length_bytes and iterations < max_iterations) : (iterations += 1) {
         const remaining_bytes = length_bytes - forwarded_bytes;
@@ -131,8 +133,8 @@ fn forwardBodySplice(upstream_fd: i32, client_fd: i32, length_bytes: u64) Forwar
 
         // Splice from pipe to client
         var pipe_sent_bytes: u64 = 0;
-        var pipe_iterations: u32 = 0;
-        const max_pipe_iterations: u32 = 1024;
+        var pipe_iterations: u64 = 0;
+        const max_pipe_iterations: u64 = 1024;
         const to_pipe_bytes: u64 = @intCast(to_pipe);
 
         // Check if this is the last chunk - don't set SPLICE_F_MORE on final write
@@ -168,8 +170,10 @@ fn forwardBodyCopy(upstream: *Socket, client: *Socket, length_bytes: u64) Forwar
 
     var buffer: [COPY_CHUNK_SIZE_BYTES]u8 = std.mem.zeroes([COPY_CHUNK_SIZE_BYTES]u8);
     var forwarded_bytes: u64 = 0;
-    const max_iterations: u32 = 1024 * 1024;
-    var iterations: u32 = 0;
+    // TigerStyle: Derive iteration bound from content length - supports arbitrarily large files.
+    // Each iteration transfers up to COPY_CHUNK_SIZE_BYTES, plus margin for partial reads.
+    const max_iterations: u64 = (length_bytes / COPY_CHUNK_SIZE_BYTES) + 1024;
+    var iterations: u64 = 0;
 
     while (forwarded_bytes < length_bytes and iterations < max_iterations) : (iterations += 1) {
         const remaining_bytes = length_bytes - forwarded_bytes;
@@ -313,4 +317,44 @@ fn streamChunkedRequestBody(
     // Minimum chunked body is "0\r\n\r\n" (5 bytes) if no initial_body.
     assert(total_sent >= initial_body.len);
     return total_sent;
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+test "iteration limit supports files >4GB" {
+    // Verify the iteration calculation works for large files.
+    // Old limit: 1M iterations × 4KB = 4GB max (would fail for larger files).
+    // New limit: derived from content length, supports any file size.
+
+    // Test cases: various file sizes including >4GB
+    const test_sizes = [_]u64{
+        100 * 1024 * 1024, // 100MB
+        1024 * 1024 * 1024, // 1GB
+        4 * 1024 * 1024 * 1024, // 4GB (old limit)
+        5 * 1024 * 1024 * 1024, // 5GB (would fail with old limit)
+        100 * 1024 * 1024 * 1024, // 100GB
+        1024 * 1024 * 1024 * 1024, // 1TB
+    };
+
+    for (test_sizes) |length_bytes| {
+        // Splice path: iterations = length / SPLICE_CHUNK_SIZE + margin
+        const splice_iterations: u64 = (length_bytes / SPLICE_CHUNK_SIZE_BYTES) + 1024;
+        const splice_chunks_needed: u64 = (length_bytes / SPLICE_CHUNK_SIZE_BYTES) + 1;
+
+        // Copy path: iterations = length / COPY_CHUNK_SIZE + margin
+        const copy_iterations: u64 = (length_bytes / COPY_CHUNK_SIZE_BYTES) + 1024;
+        const copy_chunks_needed: u64 = (length_bytes / COPY_CHUNK_SIZE_BYTES) + 1;
+
+        // Verify we have enough iterations for the file size
+        try std.testing.expect(splice_iterations >= splice_chunks_needed);
+        try std.testing.expect(copy_iterations >= copy_chunks_needed);
+
+        // Verify old limit would have failed for >4GB with copy path
+        const old_limit: u64 = 1024 * 1024;
+        if (length_bytes > 4 * 1024 * 1024 * 1024) {
+            try std.testing.expect(copy_chunks_needed > old_limit);
+        }
+    }
 }

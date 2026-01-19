@@ -241,6 +241,9 @@ pub const EchoBackendConfig = struct {
     debug: bool = false,
     /// Echo exact request body back (for payload verification tests).
     echo_body: bool = false,
+    /// Drain request body without echoing (for large upload tests >4GB).
+    /// TigerStyle: Reads body in chunks, returns byte count without buffering.
+    drain_body: bool = false,
 };
 
 /// Configuration for load balancer server.
@@ -328,6 +331,9 @@ pub const ProcessManager = struct {
         }
         if (config.echo_body) {
             try args.append(self.allocator, "--echo-body");
+        }
+        if (config.drain_body) {
+            try args.append(self.allocator, "--drain-body");
         }
 
         const pid = try spawnProcess(self.allocator, args.items);

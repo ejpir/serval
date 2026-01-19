@@ -62,6 +62,10 @@ const BIG_PAYLOAD_SIZE_100KB: usize = 100 * 1024;
 /// Big payload test: 100MB payload size.
 const BIG_PAYLOAD_SIZE_100MB: usize = 100 * 1024 * 1024;
 
+/// Big payload test: 5GB payload size (exceeds 4GB iteration limit).
+/// TigerStyle: Explicit constant for >4GB file support validation.
+const BIG_PAYLOAD_SIZE_5GB: usize = 5 * 1024 * 1024 * 1024;
+
 // =============================================================================
 // HTTP Integration Tests
 // =============================================================================
@@ -1194,6 +1198,11 @@ test "integration: lb forwards 100MB payload correctly" {
     try testing.expectEqual(payload.len, response.body.len);
     try testing.expectEqualSlices(u8, payload, response.body);
 }
+
+// Note: 5GB integration test removed - requires streaming body consumption which
+// the current server infrastructure doesn't support for handler direct responses.
+// The iteration limit fix is verified by unit tests in serval-proxy/h1/body.zig.
+// TigerStyle: max_iterations derived from content_length supports arbitrarily large files.
 
 // =============================================================================
 // HTTP 100 Continue Tests

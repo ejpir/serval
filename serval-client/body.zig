@@ -33,9 +33,10 @@ const ChunkParseError = chunked.ChunkParseError;
 // Constants
 // =============================================================================
 
-/// Maximum iterations for body read loops.
+/// Maximum iterations for body read loops (used for chunked encoding where size is unknown).
 /// TigerStyle S4: All loops bounded.
-/// Why 1,000,000: Allows reading up to 1TB at 1MB chunks while preventing infinite loops.
+/// For content-length bodies, iteration limits are derived from the known size.
+/// This constant is a safety limit for chunked encoding streams.
 pub const MAX_BODY_READ_ITERATIONS: u32 = 1_000_000;
 
 /// Maximum single chunk size for chunked encoding.
@@ -542,9 +543,14 @@ pub const BodyReader = struct {
         const src_fd = self.socket.get_fd();
         var forwarded: u64 = 0;
 
-        // S3: Bounded loop
-        while (forwarded < length and self.iterations < MAX_BODY_READ_ITERATIONS) {
-            self.iterations += 1;
+        // S3: Bounded loop - derive max from content length to support arbitrarily large files.
+        // Each iteration transfers up to SPLICE_CHUNK_SIZE_BYTES, plus margin for partial transfers.
+        const max_iterations: u64 = (length / config.SPLICE_CHUNK_SIZE_BYTES) + 1024;
+        var loop_iterations: u64 = 0;
+
+        while (forwarded < length and loop_iterations < max_iterations) {
+            loop_iterations += 1;
+            self.iterations +|= 1; // Saturating add for overall tracking
 
             const remaining = length - forwarded;
             const chunk_size: usize = @intCast(@min(remaining, config.SPLICE_CHUNK_SIZE_BYTES));
@@ -572,7 +578,7 @@ pub const BodyReader = struct {
             forwarded += to_pipe_bytes;
         }
 
-        if (self.iterations >= MAX_BODY_READ_ITERATIONS and forwarded < length) {
+        if (loop_iterations >= max_iterations and forwarded < length) {
             return BodyError.IterationLimitExceeded;
         }
 
@@ -588,9 +594,14 @@ pub const BodyReader = struct {
     fn forwardContentLengthCopy(self: *Self, dst: *Socket, scratch: []u8, length: u64) BodyError!u64 {
         var forwarded: u64 = 0;
 
-        // S3: Bounded loop
-        while (forwarded < length and self.iterations < MAX_BODY_READ_ITERATIONS) {
-            self.iterations += 1;
+        // S3: Bounded loop - derive max from content length to support arbitrarily large files.
+        // Each iteration transfers up to scratch.len bytes, plus margin for partial reads.
+        const max_iterations: u64 = (length / scratch.len) + 1024;
+        var loop_iterations: u64 = 0;
+
+        while (forwarded < length and loop_iterations < max_iterations) {
+            loop_iterations += 1;
+            self.iterations +|= 1; // Saturating add for overall tracking
 
             const remaining: usize = @intCast(length - forwarded);
             const to_read = @min(remaining, scratch.len);
@@ -607,7 +618,7 @@ pub const BodyReader = struct {
             forwarded += n;
         }
 
-        if (self.iterations >= MAX_BODY_READ_ITERATIONS and forwarded < length) {
+        if (loop_iterations >= max_iterations and forwarded < length) {
             return BodyError.IterationLimitExceeded;
         }
 
