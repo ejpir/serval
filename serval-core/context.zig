@@ -111,8 +111,9 @@ pub const BodyReader = struct {
                     const read_ctx = self.read_ctx orelse return error.BodyReaderNotConfigured;
                     const read_fn = self.read_fn orelse return error.BodyReaderNotConfigured;
 
-                    // S3: Bounded loop - max iterations based on content_length
-                    const max_iterations: u32 = 1024;
+                    // S3: Bounded loop - max iterations based on 1KB minimum read assumption
+                    // For 128MB max body size, worst case is 128K iterations
+                    const max_iterations: u32 = 256 * 1024;
                     var iterations: u32 = 0;
 
                     while (dest_offset < body_len and iterations < max_iterations) {

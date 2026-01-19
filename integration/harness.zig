@@ -239,6 +239,8 @@ pub const EchoBackendConfig = struct {
     chunked: bool = false,
     /// Enable debug logging.
     debug: bool = false,
+    /// Echo exact request body back (for payload verification tests).
+    echo_body: bool = false,
 };
 
 /// Configuration for load balancer server.
@@ -323,6 +325,9 @@ pub const ProcessManager = struct {
         }
         if (config.debug) {
             try args.append(self.allocator, "--debug");
+        }
+        if (config.echo_body) {
+            try args.append(self.allocator, "--echo-body");
         }
 
         const pid = try spawnProcess(self.allocator, args.items);
@@ -901,6 +906,105 @@ pub const TestClient = struct {
         else
             &[_]u8{};
         // TigerStyle S5: errdefer to free body if backend_id allocation fails
+        errdefer if (resp_body.len > 0) self.allocator.free(resp_body);
+
+        const backend_id_slice = findHeader(data, "X-Backend-Id");
+        const backend_id = if (backend_id_slice) |id|
+            try self.allocator.dupe(u8, id)
+        else
+            null;
+
+        return .{
+            .status = status,
+            .body = resp_body,
+            .backend_id = backend_id,
+            .allocator = self.allocator,
+        };
+    }
+
+    /// Make HTTP POST request with large body support.
+    /// Uses streaming write for body and dynamic allocation for response.
+    /// Suitable for payload sizes up to several MB.
+    pub fn postLarge(self: *TestClient, port: u16, path: []const u8, body: []const u8, content_type: []const u8) !Response {
+        // S1: Preconditions
+        assert(port > 0);
+        assert(path.len > 0);
+        assert(content_type.len > 0);
+
+        const sock = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
+        defer posix.close(sock);
+
+        // Longer timeout for large payloads (100MB+ needs time)
+        const timeout = posix.timeval{ .sec = 120, .usec = 0 };
+        try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout));
+        try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&timeout));
+
+        const addr: posix.sockaddr.in = .{
+            .port = std.mem.nativeToBig(u16, port),
+            .addr = std.mem.nativeToBig(u32, LOOPBACK_IPV4_BE),
+        };
+
+        try posix.connect(sock, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
+
+        // Send headers first
+        var header_buf: [512]u8 = undefined;
+        const headers = std.fmt.bufPrint(&header_buf, "POST {s} HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ path, port, content_type, body.len }) catch return error.BufferTooSmall;
+
+        // Send headers
+        var sent: usize = 0;
+        while (sent < headers.len) {
+            const n = posix.send(sock, headers[sent..], 0) catch |err| {
+                if (err == error.Interrupted) continue;
+                return err;
+            };
+            if (n == 0) return error.ConnectionReset;
+            sent += n;
+        }
+
+        // Send body in chunks
+        sent = 0;
+        while (sent < body.len) {
+            const n = posix.send(sock, body[sent..], 0) catch |err| {
+                if (err == error.Interrupted) continue;
+                return err;
+            };
+            if (n == 0) return error.ConnectionReset;
+            sent += n;
+        }
+
+        // Read response - allocate buffer dynamically based on expected size
+        // Assume response is roughly same size as request body + headers
+        const expected_size = body.len + 1024;
+        var resp_data: std.ArrayList(u8) = .empty;
+        defer resp_data.deinit(self.allocator);
+
+        var read_buf: [8192]u8 = undefined;
+        var read_count: u32 = 0;
+        const max_reads: u32 = 20000; // Allow many reads for 100MB+ responses
+
+        while (read_count < max_reads) : (read_count += 1) {
+            const n = posix.recv(sock, &read_buf, 0) catch |err| {
+                if (err == error.Interrupted) continue;
+                if (err == error.WouldBlock) break;
+                break;
+            };
+            if (n == 0) break;
+            try resp_data.appendSlice(self.allocator, read_buf[0..n]);
+
+            // Check if we have complete response
+            if (resp_data.items.len > expected_size) break;
+        }
+
+        if (resp_data.items.len == 0) return error.EmptyResponse;
+
+        const data = resp_data.items;
+        const status = parseStatusCode(data) orelse return error.InvalidResponse;
+
+        const body_slice = findBody(data) orelse "";
+        const resp_body = if (body_slice.len > 0)
+            try self.allocator.dupe(u8, body_slice)
+        else
+            &[_]u8{};
         errdefer if (resp_body.len > 0) self.allocator.free(resp_body);
 
         const backend_id_slice = findHeader(data, "X-Backend-Id");

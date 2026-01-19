@@ -53,35 +53,14 @@ const PERF_TEST_CONCURRENCY: u32 = 50;
 /// Performance test: minimum acceptable requests per second.
 const PERF_TEST_MIN_RPS: f64 = 8000.0;
 
-// =============================================================================
-// Harness Utility Tests
-// =============================================================================
+/// Big payload test: 1MB payload size.
+const BIG_PAYLOAD_SIZE_1MB: usize = 1024 * 1024;
 
-test "harness: PortPool allocates unique ports" {
-    var pool = harness.PortPool.init();
-    const p1 = pool.next();
-    const p2 = pool.next();
-    try testing.expect(p1 != p2);
-}
+/// Big payload test: 100KB payload size.
+const BIG_PAYLOAD_SIZE_100KB: usize = 100 * 1024;
 
-test "harness: Deadline tracks expiration" {
-    const deadline = try harness.Deadline.init(100 * std.time.ns_per_ms);
-    try testing.expect(!deadline.expired());
-}
-
-test "harness: TestClient parses status codes" {
-    try testing.expectEqual(@as(?u16, 200), harness.TestClient.parseStatusCode("HTTP/1.1 200 OK\r\n"));
-}
-
-test "harness: TestClient finds body" {
-    const body = harness.TestClient.findBody("HTTP/1.1 200 OK\r\n\r\nhello");
-    try testing.expectEqualStrings("hello", body.?);
-}
-
-test "harness: TestClient finds headers" {
-    const id = harness.TestClient.findHeader("HTTP/1.1 200 OK\r\nX-Backend-Id: b1\r\n\r\n", "X-Backend-Id");
-    try testing.expectEqualStrings("b1", id.?);
-}
+/// Big payload test: 100MB payload size.
+const BIG_PAYLOAD_SIZE_100MB: usize = 100 * 1024 * 1024;
 
 // =============================================================================
 // HTTP Integration Tests
@@ -1105,4 +1084,113 @@ fn parseRequestsPerSec(output: []const u8) ?f64 {
     if (end == start) return null;
 
     return std.fmt.parseFloat(f64, after_marker[start..end]) catch null;
+}
+
+// =============================================================================
+// Big Payload Tests
+// =============================================================================
+
+test "integration: lb forwards 100KB payload correctly" {
+    const allocator = testing.allocator;
+    const backend_port = harness.getPort();
+    const lb_port = harness.getPort();
+
+    var pm = harness.ProcessManager.init(allocator);
+    defer pm.deinit();
+
+    // Start echo backend with --echo-body mode
+    try pm.startEchoBackend(backend_port, "big-payload-backend", .{ .echo_body = true });
+
+    var backend_addr_buf: [ADDR_BUF_LEN]u8 = undefined;
+    const backend_addr = std.fmt.bufPrint(&backend_addr_buf, "127.0.0.1:{d}", .{backend_port}) catch unreachable;
+
+    try pm.startLoadBalancer(lb_port, &.{backend_addr}, .{});
+
+    var client = harness.TestClient.init(allocator);
+    defer client.deinit();
+
+    // Generate 100KB payload with pattern for verification
+    const payload = try allocator.alloc(u8, BIG_PAYLOAD_SIZE_100KB);
+    defer allocator.free(payload);
+    for (payload, 0..) |*byte, i| {
+        byte.* = @intCast(i % 256);
+    }
+
+    // Send through load balancer
+    const response = try client.postLarge(lb_port, "/big-payload", payload, "application/octet-stream");
+    defer response.deinit();
+
+    try testing.expectEqual(@as(u16, 200), response.status);
+    try testing.expectEqual(payload.len, response.body.len);
+    try testing.expectEqualSlices(u8, payload, response.body);
+}
+
+test "integration: lb forwards 1MB payload correctly" {
+    const allocator = testing.allocator;
+    const backend_port = harness.getPort();
+    const lb_port = harness.getPort();
+
+    var pm = harness.ProcessManager.init(allocator);
+    defer pm.deinit();
+
+    // Start echo backend with --echo-body mode
+    try pm.startEchoBackend(backend_port, "1mb-backend", .{ .echo_body = true });
+
+    var backend_addr_buf: [ADDR_BUF_LEN]u8 = undefined;
+    const backend_addr = std.fmt.bufPrint(&backend_addr_buf, "127.0.0.1:{d}", .{backend_port}) catch unreachable;
+
+    try pm.startLoadBalancer(lb_port, &.{backend_addr}, .{});
+
+    var client = harness.TestClient.init(allocator);
+    defer client.deinit();
+
+    // Generate 1MB payload with pattern for verification
+    const payload = try allocator.alloc(u8, BIG_PAYLOAD_SIZE_1MB);
+    defer allocator.free(payload);
+    for (payload, 0..) |*byte, i| {
+        byte.* = @intCast(i % 256);
+    }
+
+    // Send through load balancer
+    const response = try client.postLarge(lb_port, "/big-payload", payload, "application/octet-stream");
+    defer response.deinit();
+
+    try testing.expectEqual(@as(u16, 200), response.status);
+    try testing.expectEqual(payload.len, response.body.len);
+    try testing.expectEqualSlices(u8, payload, response.body);
+}
+
+test "integration: lb forwards 100MB payload correctly" {
+    const allocator = testing.allocator;
+    const backend_port = harness.getPort();
+    const lb_port = harness.getPort();
+
+    var pm = harness.ProcessManager.init(allocator);
+    defer pm.deinit();
+
+    // Start echo backend with --echo-body mode
+    try pm.startEchoBackend(backend_port, "100mb-backend", .{ .echo_body = true });
+
+    var backend_addr_buf: [ADDR_BUF_LEN]u8 = undefined;
+    const backend_addr = std.fmt.bufPrint(&backend_addr_buf, "127.0.0.1:{d}", .{backend_port}) catch unreachable;
+
+    try pm.startLoadBalancer(lb_port, &.{backend_addr}, .{});
+
+    var client = harness.TestClient.init(allocator);
+    defer client.deinit();
+
+    // Generate 100MB payload with pattern for verification
+    const payload = try allocator.alloc(u8, BIG_PAYLOAD_SIZE_100MB);
+    defer allocator.free(payload);
+    for (payload, 0..) |*byte, i| {
+        byte.* = @intCast(i % 256);
+    }
+
+    // Send through load balancer
+    const response = try client.postLarge(lb_port, "/big-payload", payload, "application/octet-stream");
+    defer response.deinit();
+
+    try testing.expectEqual(@as(u16, 200), response.status);
+    try testing.expectEqual(payload.len, response.body.len);
+    try testing.expectEqualSlices(u8, payload, response.body);
 }

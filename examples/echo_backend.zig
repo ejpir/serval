@@ -41,6 +41,9 @@ const EchoExtra = struct {
     /// Why configurable: Allows testing how clients and proxies handle
     /// chunked vs content-length responses from backends.
     chunked: bool = false,
+    /// Echo the exact request body back (for payload verification tests).
+    /// When enabled, response body is exactly the request body.
+    @"echo-body": bool = false,
 };
 
 /// Handler that echoes request details without forwarding.
@@ -50,11 +53,12 @@ const EchoHandler = struct {
     port: u16,
     debug: bool,
     chunked: bool,
+    echo_body: bool,
     /// Pre-formatted extra headers buffer. Formatted once at init.
     extra_headers_buf: [128]u8 = std.mem.zeroes([128]u8),
     extra_headers_len: u8 = 0,
 
-    pub fn init(id: []const u8, port: u16, debug: bool, chunked: bool) EchoHandler {
+    pub fn init(id: []const u8, port: u16, debug: bool, chunked: bool, echo_body: bool) EchoHandler {
         // Preconditions
         assert(id.len > 0);
         assert(port > 0);
@@ -64,6 +68,7 @@ const EchoHandler = struct {
             .port = port,
             .debug = debug,
             .chunked = chunked,
+            .echo_body = echo_body,
         };
 
         // Pre-format extra headers (persists for handler lifetime)
@@ -99,11 +104,50 @@ const EchoHandler = struct {
         request: *serval.Request,
         response_buf: []u8,
     ) serval.Action {
-        _ = ctx;
         // Precondition: response buffer must be provided
         assert(response_buf.len > 0);
 
+        // In echo-body mode, read request body and return it exactly
+        if (self.echo_body) {
+            // Read body lazily using context's body reader
+            const body = ctx.readBody(response_buf) catch |err| {
+                if (self.debug) {
+                    std.debug.print("[{s}] {s} {s} -> 500 (body read error: {s})\n", .{
+                        self.id,
+                        @tagName(request.method),
+                        request.path,
+                        @errorName(err),
+                    });
+                }
+                return .{ .send_response = .{
+                    .status = 500,
+                    .body = "Failed to read request body",
+                    .content_type = "text/plain",
+                    .extra_headers = "",
+                    .response_mode = .content_length,
+                } };
+            };
+
+            if (self.debug) {
+                std.debug.print("[{s}] {s} {s} -> 200 (echo-body: {d} bytes)\n", .{
+                    self.id,
+                    @tagName(request.method),
+                    request.path,
+                    body.len,
+                });
+            }
+
+            return .{ .send_response = .{
+                .status = 200,
+                .body = body,
+                .content_type = "application/octet-stream",
+                .extra_headers = self.extra_headers_buf[0..self.extra_headers_len],
+                .response_mode = if (self.chunked) .chunked else .content_length,
+            } };
+        }
+
         // Format echo response into server-provided buffer
+        // Note: ctx not used in non-echo-body path
         const body_len = formatEchoBody(response_buf, request, self.id, self.port);
 
         if (self.debug) {
@@ -225,7 +269,7 @@ pub fn main() !void {
     } else null;
 
     // Initialize handler with config
-    var handler = EchoHandler.init(args.extra.id, args.port, args.debug, args.extra.chunked);
+    var handler = EchoHandler.init(args.extra.id, args.port, args.debug, args.extra.chunked, args.extra.@"echo-body");
 
     // Initialize components (minimal - no pooling/tracing needed for echo)
     var pool = serval.SimplePool.init();

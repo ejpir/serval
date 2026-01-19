@@ -31,7 +31,7 @@ pub const MAX_HEADER_SIZE_BYTES: u32 = 8192;
 pub const MAX_URI_LENGTH_BYTES: u32 = 8192;
 
 /// Maximum request body size in bytes
-pub const MAX_BODY_SIZE_BYTES: u32 = 1024 * 1024;
+pub const MAX_BODY_SIZE_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Async stream write buffer size in bytes
 /// TigerStyle: Sized for typical HTTP headers in single io_uring op.
@@ -74,8 +74,8 @@ pub const MAX_STREAM_CHUNK_COUNT: u32 = 65536;
 
 /// Buffer size for direct response handlers (echo backends, health checks, etc.)
 /// Only allocated when handler implements onRequest hook.
-/// TigerStyle: Sized for typical API/debug responses, bounded.
-pub const DIRECT_RESPONSE_BUFFER_SIZE_BYTES: u32 = 8192;
+/// TigerStyle: Heap-allocated to support large payloads (128MB).
+pub const DIRECT_RESPONSE_BUFFER_SIZE_BYTES: u32 = 128 * 1024 * 1024;
 
 /// Header buffer size for direct responses (status line + standard headers + extra).
 /// TigerStyle: Explicit limit, prevents unbounded formatting.
@@ -84,8 +84,8 @@ pub const DIRECT_RESPONSE_HEADER_SIZE_BYTES: u32 = 1024;
 /// Buffer size for reading request body in direct response handlers.
 /// Only allocated when handler implements onRequest hook.
 /// Bodies larger than this receive 413 Payload Too Large response.
-/// TigerStyle: Stack-safe size (64KB), bounded.
-pub const DIRECT_REQUEST_BODY_SIZE_BYTES: u32 = 65536;
+/// TigerStyle: Matches DIRECT_RESPONSE_BUFFER_SIZE_BYTES for echo handlers.
+pub const DIRECT_REQUEST_BODY_SIZE_BYTES: u32 = 128 * 1024 * 1024;
 
 // =============================================================================
 // Connection Pool Limits

@@ -289,22 +289,14 @@ pub fn Server(
                 };
                 return n;
             } else {
-                // Plain socket read
-                var reader_buf: [1]u8 = std.mem.zeroes([1]u8);
-                var stream_reader = stream.reader(io.*, &reader_buf);
-                var bufs: [1][]u8 = .{buf};
-                const n = stream_reader.interface.readVec(&bufs) catch |err| {
-                    if (err != error.EndOfStream) {
-                        // Log underlying error from stream_reader.err (ReadFailed wraps the real error)
-                        if (stream_reader.err) |underlying| {
-                            log.debug("server: conn={d} read error: {s} (underlying: {s})", .{ conn_id, @errorName(err), @errorName(underlying) });
-                        } else {
-                            log.debug("server: conn={d} read error: {s}", .{ conn_id, @errorName(err) });
-                        }
-                    }
+                // Plain socket read - use blocking recv directly
+                // TigerStyle: Direct syscall avoids stateful reader issues.
+                const n = std.posix.recv(stream.socket.handle, buf, 0) catch |err| {
+                    log.debug("server: conn={d} recv error: {s}", .{ conn_id, @errorName(err) });
                     return null;
                 };
-                if (n == 0) return null; // S1: postcondition
+                _ = io; // io not needed for blocking recv
+                if (n == 0) return null; // EOF
                 return n;
             }
         }
@@ -661,11 +653,16 @@ pub fn Server(
 
             // Direct response buffer - only allocated if handler has onRequest hook.
             // TigerStyle: Comptime conditional eliminates overhead for pure proxy handlers.
+            // Heap-allocated to support large payloads (128MB+) without stack overflow.
             const has_on_request = comptime hooks.hasHook(Handler, "onRequest");
-            const ResponseBufType = if (has_on_request) [DIRECT_RESPONSE_BUFFER_SIZE_BYTES]u8 else void;
-            var response_buf: ResponseBufType = if (has_on_request)
-                std.mem.zeroes([DIRECT_RESPONSE_BUFFER_SIZE_BYTES]u8)
-            else {};
+            const response_buf: []u8 = if (has_on_request)
+                std.heap.page_allocator.alloc(u8, DIRECT_RESPONSE_BUFFER_SIZE_BYTES) catch {
+                    log.err("server: conn={d} failed to allocate response buffer", .{connection_id});
+                    return;
+                }
+            else
+                &[_]u8{};
+            defer if (has_on_request) std.heap.page_allocator.free(response_buf);
 
             // Note: Request body buffer removed - handlers use ctx.readBody() with their own buffer.
             // This enables lazy body reading - body only read when handler explicitly requests it.
@@ -771,7 +768,7 @@ pub fn Server(
                     // Attach body reader to context for handler access
                     ctx._body_reader = &body_reader;
 
-                    switch (handler.onRequest(&ctx, &parser.request, &response_buf)) {
+                    switch (handler.onRequest(&ctx, &parser.request, response_buf)) {
                         .continue_request => {}, // Fall through to selectUpstream
                         .send_response => |resp| {
                             // Handler wants to send direct response without forwarding
@@ -831,7 +828,7 @@ pub fn Server(
                                 var stream_error: bool = false;
 
                                 while (chunk_count < max_chunk_count) : (chunk_count += 1) {
-                                    const maybe_len = handler.nextChunk(&ctx, &response_buf) catch |err| {
+                                    const maybe_len = handler.nextChunk(&ctx, response_buf) catch |err| {
                                         // S6: Log error before terminating stream
                                         log.err("streaming response failed at chunk {d}: {s}", .{ chunk_count, @errorName(err) });
                                         sendFinalChunk(&tls_writer) catch {};
