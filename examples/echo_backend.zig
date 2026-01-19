@@ -118,10 +118,14 @@ const EchoHandler = struct {
         // TigerStyle: Tests large upload path (>4GB) with bounded memory usage.
         if (self.drain_body) {
             var total_bytes: u64 = 0;
+            var last_progress: u64 = 0;
             var chunk_buf: [65536]u8 = undefined; // 64KB chunks
+
+            std.debug.print("[DEBUG drain-body] starting to drain body\n", .{});
 
             // Read body in chunks until fully consumed (null = end of body)
             while (ctx.readBodyChunk(&chunk_buf) catch |err| {
+                std.debug.print("[DEBUG drain-body] error after {d} bytes: {s}\n", .{ total_bytes, @errorName(err) });
                 if (self.debug) {
                     std.debug.print("[{s}] {s} {s} -> 500 (drain error: {s})\n", .{
                         self.id,
@@ -139,7 +143,13 @@ const EchoHandler = struct {
                 } };
             }) |chunk| {
                 total_bytes += chunk.len;
+                // Progress every 100MB
+                if (total_bytes - last_progress >= 100 * 1024 * 1024) {
+                    std.debug.print("[DEBUG drain-body] drained {d} MB\n", .{total_bytes / (1024 * 1024)});
+                    last_progress = total_bytes;
+                }
             }
+            std.debug.print("[DEBUG drain-body] done, total {d} bytes\n", .{total_bytes});
 
             // Format response with actual byte count
             const body_len = std.fmt.bufPrint(response_buf, "drained {d} bytes\n", .{total_bytes}) catch {

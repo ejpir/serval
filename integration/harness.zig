@@ -951,6 +951,7 @@ pub const TestClient = struct {
         };
 
         try posix.connect(sock, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
+        std.debug.print("[DEBUG postLarge] connected to port {d}, body size: {d}\n", .{ port, body.len });
 
         // Send headers first
         var header_buf: [512]u8 = undefined;
@@ -966,9 +967,11 @@ pub const TestClient = struct {
             if (n == 0) return error.ConnectionReset;
             sent += n;
         }
+        std.debug.print("[DEBUG postLarge] headers sent\n", .{});
 
         // Send body in chunks (handle WouldBlock for large transfers)
         sent = 0;
+        var last_progress: usize = 0;
         while (sent < body.len) {
             const n = posix.send(sock, body[sent..], 0) catch |err| {
                 if (err == error.Interrupted) continue;
@@ -981,7 +984,13 @@ pub const TestClient = struct {
             };
             if (n == 0) return error.ConnectionReset;
             sent += n;
+            // Progress every 100MB
+            if (sent - last_progress >= 100 * 1024 * 1024) {
+                std.debug.print("[DEBUG postLarge] sent {d} MB / {d} MB\n", .{ sent / (1024 * 1024), body.len / (1024 * 1024) });
+                last_progress = sent;
+            }
         }
+        std.debug.print("[DEBUG postLarge] body fully sent ({d} bytes)\n", .{sent});
 
         // Read response - allocate buffer dynamically based on expected size
         // Assume response is roughly same size as request body + headers
@@ -992,20 +1001,38 @@ pub const TestClient = struct {
         var read_buf: [8192]u8 = undefined;
         var read_count: u32 = 0;
         const max_reads: u32 = 20000; // Allow many reads for 100MB+ responses
+        var wouldblock_count: u32 = 0;
+        const max_wouldblock: u32 = 60000; // 60 seconds max wait (1ms per iteration)
 
+        std.debug.print("[DEBUG postLarge] waiting for response...\n", .{});
         while (read_count < max_reads) : (read_count += 1) {
             const n = posix.recv(sock, &read_buf, 0) catch |err| {
                 if (err == error.Interrupted) continue;
-                if (err == error.WouldBlock) break;
+                if (err == error.WouldBlock) {
+                    // No data yet - wait and retry (needed for large uploads)
+                    wouldblock_count += 1;
+                    if (wouldblock_count % 1000 == 0) {
+                        std.debug.print("[DEBUG postLarge] WouldBlock count: {d}\n", .{wouldblock_count});
+                    }
+                    if (wouldblock_count >= max_wouldblock) break;
+                    posix.nanosleep(0, 1_000_000); // 1ms
+                    continue;
+                }
+                std.debug.print("[DEBUG postLarge] recv error: {s}\n", .{@errorName(err)});
                 break;
             };
-            if (n == 0) break;
+            if (n == 0) {
+                std.debug.print("[DEBUG postLarge] recv returned 0 (EOF)\n", .{});
+                break;
+            }
+            wouldblock_count = 0; // Reset on successful read
             try resp_data.appendSlice(self.allocator, read_buf[0..n]);
 
             // Check if we have complete response
             if (resp_data.items.len > expected_size) break;
         }
 
+        std.debug.print("[DEBUG postLarge] response received: {d} bytes\n", .{resp_data.items.len});
         if (resp_data.items.len == 0) return error.EmptyResponse;
 
         const data = resp_data.items;

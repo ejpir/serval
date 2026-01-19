@@ -1204,6 +1204,7 @@ test "integration: lb forwards 5GB payload correctly" {
     // The previous iteration limit (1M iterations × 4KB chunks = 4GB max) would fail here.
     // Uses drain-body mode: backend reads body in chunks via readBodyChunk(), returns byte count.
     // TigerStyle: Explicit test for >4GB file support with bounded memory usage.
+    std.debug.print("[DEBUG 5GB test] starting\n", .{});
     const allocator = testing.allocator;
     const backend_port = harness.getPort();
     const lb_port = harness.getPort();
@@ -1212,24 +1213,31 @@ test "integration: lb forwards 5GB payload correctly" {
     defer pm.deinit();
 
     // Start echo backend with --drain-body mode (reads body in chunks, returns byte count)
+    std.debug.print("[DEBUG 5GB test] starting echo backend on port {d}\n", .{backend_port});
     try pm.startEchoBackend(backend_port, "5gb-backend", .{ .drain_body = true });
 
     var backend_addr_buf: [ADDR_BUF_LEN]u8 = undefined;
     const backend_addr = std.fmt.bufPrint(&backend_addr_buf, "127.0.0.1:{d}", .{backend_port}) catch unreachable;
 
+    std.debug.print("[DEBUG 5GB test] starting load balancer on port {d}\n", .{lb_port});
     try pm.startLoadBalancer(lb_port, &.{backend_addr}, .{});
 
     var client = harness.TestClient.init(allocator);
     defer client.deinit();
 
     // Generate 5GB payload (pattern not needed since we verify byte count, not content)
+    std.debug.print("[DEBUG 5GB test] allocating {d} bytes\n", .{BIG_PAYLOAD_SIZE_5GB});
     const payload = try allocator.alloc(u8, BIG_PAYLOAD_SIZE_5GB);
     defer allocator.free(payload);
+    std.debug.print("[DEBUG 5GB test] filling payload\n", .{});
     @memset(payload, 0xAB); // Simple fill pattern
+    std.debug.print("[DEBUG 5GB test] payload ready\n", .{});
 
     // Send through load balancer
+    std.debug.print("[DEBUG 5GB test] sending request\n", .{});
     const response = try client.postLarge(lb_port, "/big-payload", payload, "application/octet-stream");
     defer response.deinit();
+    std.debug.print("[DEBUG 5GB test] got response, status={d}\n", .{response.status});
 
     try testing.expectEqual(@as(u16, 200), response.status);
 
