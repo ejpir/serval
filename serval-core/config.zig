@@ -30,8 +30,9 @@ pub const MAX_HEADER_SIZE_BYTES: u32 = 8192;
 /// Maximum URI length in bytes
 pub const MAX_URI_LENGTH_BYTES: u32 = 8192;
 
-/// Maximum request body size in bytes
-pub const MAX_BODY_SIZE_BYTES: u64 = 128 * 1024 * 1024;
+/// Maximum request body size in bytes (10GB - supports large file transfers)
+/// TigerStyle: Bounded limit prevents unbounded resource consumption.
+pub const MAX_BODY_SIZE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
 /// Async stream write buffer size in bytes
 /// TigerStyle: Sized for typical HTTP headers in single io_uring op.

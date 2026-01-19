@@ -142,6 +142,64 @@ pub const BodyReader = struct {
         }
     }
 
+    /// Read one chunk of body data (up to buf.len bytes).
+    /// Returns null when body is fully consumed.
+    /// TigerStyle: Enables incremental body reading for large uploads without full buffering.
+    ///
+    /// Use this for streaming large bodies where buffering the entire body is impractical.
+    /// Each call returns the next chunk of data, empty slice signals end of body.
+    pub fn readChunk(self: *BodyReader, buf: []u8) !?[]const u8 {
+        // S1: Precondition - buffer must be provided
+        assert(buf.len > 0);
+
+        // Handle body framing modes
+        switch (self.framing) {
+            .none => return null, // No body expected
+            .chunked => return error.ChunkedNotSupported, // Chunked requires different handling
+            .content_length => |content_length| {
+                // Check if we've read everything
+                if (self.total_bytes_read >= content_length) {
+                    return null; // Body fully consumed
+                }
+
+                // First, return any unconsumed initial body bytes
+                if (!self.initial_consumed and self.initial_body.len > 0) {
+                    const remaining_content: u64 = content_length - self.total_bytes_read;
+                    const initial_remaining = self.initial_body.len - @as(usize, @intCast(@min(self.total_bytes_read, self.initial_body.len)));
+                    const copy_len = @min(@min(initial_remaining, buf.len), @as(usize, @intCast(remaining_content)));
+
+                    if (copy_len > 0) {
+                        const start = self.initial_body.len - initial_remaining;
+                        @memcpy(buf[0..copy_len], self.initial_body[start..][0..copy_len]);
+                        self.total_bytes_read += copy_len;
+
+                        if (self.total_bytes_read >= self.initial_body.len) {
+                            self.initial_consumed = true;
+                        }
+                        return buf[0..copy_len];
+                    }
+                    self.initial_consumed = true;
+                }
+
+                // Read from socket
+                const remaining: u64 = content_length - self.total_bytes_read;
+                if (remaining == 0) return null;
+
+                const read_ctx = self.read_ctx orelse return error.BodyReaderNotConfigured;
+                const read_fn = self.read_fn orelse return error.BodyReaderNotConfigured;
+
+                const to_read: usize = @intCast(@min(remaining, buf.len));
+                const n = read_fn(read_ctx, buf[0..to_read]) orelse {
+                    return error.ReadFailed;
+                };
+                if (n == 0) return error.ReadFailed; // Unexpected EOF
+
+                self.total_bytes_read += n;
+                return buf[0..n];
+            },
+        }
+    }
+
     /// Check if body reading is available.
     /// TigerStyle: Explicit availability check.
     pub fn isAvailable(self: *const BodyReader) bool {
@@ -296,6 +354,26 @@ pub const Context = struct {
 
         const reader = self._body_reader orelse return error.BodyReaderNotAvailable;
         return reader.read(buf);
+    }
+
+    /// Read one chunk of body data (up to buf.len bytes).
+    /// Returns null when body is fully consumed.
+    /// TigerStyle: Enables incremental body reading for large uploads (>4GB) without full buffering.
+    ///
+    /// Example:
+    /// ```zig
+    /// var chunk_buf: [65536]u8 = undefined;
+    /// var total: u64 = 0;
+    /// while (try ctx.readBodyChunk(&chunk_buf)) |chunk| {
+    ///     total += chunk.len;
+    /// }
+    /// ```
+    pub fn readBodyChunk(self: *Context, buf: []u8) BodyReadError!?[]const u8 {
+        // S1: Precondition - buffer must be provided
+        assert(buf.len > 0);
+
+        const reader = self._body_reader orelse return error.BodyReaderNotAvailable;
+        return reader.readChunk(buf);
     }
 
     /// Check if body reading is available for this request.

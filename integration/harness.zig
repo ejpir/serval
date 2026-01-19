@@ -967,11 +967,16 @@ pub const TestClient = struct {
             sent += n;
         }
 
-        // Send body in chunks
+        // Send body in chunks (handle WouldBlock for large transfers)
         sent = 0;
         while (sent < body.len) {
             const n = posix.send(sock, body[sent..], 0) catch |err| {
                 if (err == error.Interrupted) continue;
+                if (err == error.WouldBlock) {
+                    // Socket buffer full - wait briefly and retry
+                    posix.nanosleep(0, 1_000_000); // 1ms
+                    continue;
+                }
                 return err;
             };
             if (n == 0) return error.ConnectionReset;

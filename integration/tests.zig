@@ -1199,10 +1199,45 @@ test "integration: lb forwards 100MB payload correctly" {
     try testing.expectEqualSlices(u8, payload, response.body);
 }
 
-// Note: 5GB integration test removed - requires streaming body consumption which
-// the current server infrastructure doesn't support for handler direct responses.
-// The iteration limit fix is verified by unit tests in serval-proxy/h1/body.zig.
-// TigerStyle: max_iterations derived from content_length supports arbitrarily large files.
+test "integration: lb forwards 5GB payload correctly" {
+    // This test validates that files >4GB work correctly.
+    // The previous iteration limit (1M iterations × 4KB chunks = 4GB max) would fail here.
+    // Uses drain-body mode: backend reads body in chunks via readBodyChunk(), returns byte count.
+    // TigerStyle: Explicit test for >4GB file support with bounded memory usage.
+    const allocator = testing.allocator;
+    const backend_port = harness.getPort();
+    const lb_port = harness.getPort();
+
+    var pm = harness.ProcessManager.init(allocator);
+    defer pm.deinit();
+
+    // Start echo backend with --drain-body mode (reads body in chunks, returns byte count)
+    try pm.startEchoBackend(backend_port, "5gb-backend", .{ .drain_body = true });
+
+    var backend_addr_buf: [ADDR_BUF_LEN]u8 = undefined;
+    const backend_addr = std.fmt.bufPrint(&backend_addr_buf, "127.0.0.1:{d}", .{backend_port}) catch unreachable;
+
+    try pm.startLoadBalancer(lb_port, &.{backend_addr}, .{});
+
+    var client = harness.TestClient.init(allocator);
+    defer client.deinit();
+
+    // Generate 5GB payload (pattern not needed since we verify byte count, not content)
+    const payload = try allocator.alloc(u8, BIG_PAYLOAD_SIZE_5GB);
+    defer allocator.free(payload);
+    @memset(payload, 0xAB); // Simple fill pattern
+
+    // Send through load balancer
+    const response = try client.postLarge(lb_port, "/big-payload", payload, "application/octet-stream");
+    defer response.deinit();
+
+    try testing.expectEqual(@as(u16, 200), response.status);
+
+    // Verify backend received all 5GB - response body is "drained N bytes\n"
+    const expected_response = std.fmt.allocPrint(allocator, "drained {d} bytes\n", .{BIG_PAYLOAD_SIZE_5GB}) catch unreachable;
+    defer allocator.free(expected_response);
+    try testing.expectEqualStrings(expected_response, response.body);
+}
 
 // =============================================================================
 // HTTP 100 Continue Tests

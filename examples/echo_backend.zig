@@ -113,14 +113,36 @@ const EchoHandler = struct {
         // Precondition: response buffer must be provided
         assert(response_buf.len > 0);
 
-        // In drain-body mode, return content-length from header without reading body.
-        // The body is streamed through the proxy but we don't consume it in handler.
-        // TigerStyle: Tests large upload path (>4GB) through proxy without handler buffering.
+        // In drain-body mode, read and discard body in chunks, return byte count.
+        // This actually transfers all bytes through the proxy without buffering entire body.
+        // TigerStyle: Tests large upload path (>4GB) with bounded memory usage.
         if (self.drain_body) {
-            const content_length = ctx.getBodyLength() orelse 0;
+            var total_bytes: u64 = 0;
+            var chunk_buf: [65536]u8 = undefined; // 64KB chunks
 
-            // Format response with expected byte count from Content-Length header
-            const body_len = std.fmt.bufPrint(response_buf, "accepted {d} bytes\n", .{content_length}) catch {
+            // Read body in chunks until fully consumed (null = end of body)
+            while (ctx.readBodyChunk(&chunk_buf) catch |err| {
+                if (self.debug) {
+                    std.debug.print("[{s}] {s} {s} -> 500 (drain error: {s})\n", .{
+                        self.id,
+                        @tagName(request.method),
+                        request.path,
+                        @errorName(err),
+                    });
+                }
+                return .{ .send_response = .{
+                    .status = 500,
+                    .body = "Failed to drain request body",
+                    .content_type = "text/plain",
+                    .extra_headers = "",
+                    .response_mode = .content_length,
+                } };
+            }) |chunk| {
+                total_bytes += chunk.len;
+            }
+
+            // Format response with actual byte count
+            const body_len = std.fmt.bufPrint(response_buf, "drained {d} bytes\n", .{total_bytes}) catch {
                 return .{ .send_response = .{
                     .status = 500,
                     .body = "Response format error",
@@ -131,11 +153,11 @@ const EchoHandler = struct {
             };
 
             if (self.debug) {
-                std.debug.print("[{s}] {s} {s} -> 200 (accepted {d} bytes)\n", .{
+                std.debug.print("[{s}] {s} {s} -> 200 (drained {d} bytes)\n", .{
                     self.id,
                     @tagName(request.method),
                     request.path,
-                    content_length,
+                    total_bytes,
                 });
             }
 
