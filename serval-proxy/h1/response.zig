@@ -108,6 +108,11 @@ pub fn isChunkedResponse(header: []const u8) bool {
     return false;
 }
 
+/// Maximum number of 1xx responses to skip before giving up.
+/// RFC 7231 allows multiple 1xx responses, but we bound this to prevent infinite loops.
+/// TigerStyle S3: Bounded loop constant.
+const MAX_1XX_RESPONSES: u32 = 10;
+
 /// Forward upstream response to client.
 /// TigerStyle: Uses Socket abstraction for unified TLS/plaintext handling.
 /// upstream_socket and client_socket handle body forwarding.
@@ -130,9 +135,52 @@ pub fn forwardResponse(
 
     var header_buffer: [config.MAX_HEADER_SIZE_BYTES]u8 = std.mem.zeroes([config.MAX_HEADER_SIZE_BYTES]u8);
 
-    const headers = try receiveHeaders(upstream_conn, io, &header_buffer, is_pooled);
-    const status = parseStatusCode(header_buffer[0..headers.header_len]) orelse
+    // Read headers, skipping any 1xx informational responses (e.g., 100 Continue).
+    // RFC 7231 Section 6.2: A client MUST be able to parse one or more 1xx responses.
+    // TigerStyle S3: Bounded loop to prevent infinite loop on malformed responses.
+    var headers: HeadersResult = undefined;
+    var status: u16 = undefined;
+    var response_count: u32 = 0;
+    var pre_read_bytes: usize = 0; // Bytes already in buffer from previous 1xx response
+
+    while (response_count < MAX_1XX_RESPONSES) : (response_count += 1) {
+        headers = try receiveHeadersWithPreread(upstream_conn, io, &header_buffer, is_pooled, pre_read_bytes);
+        status = parseStatusCode(header_buffer[0..headers.header_len]) orelse
+            return ForwardError.InvalidResponse;
+
+        // 1xx responses are informational - discard and read next response.
+        // The 1xx response has no body (RFC 9112 Section 6.3), so we just
+        // need to read the next set of headers.
+        if (status >= 200) {
+            break; // Got a final response
+        }
+
+        debugLog("recv: skipping 1xx response status={d}", .{status});
+
+        // Move any data after the 1xx headers to the beginning of the buffer.
+        // The receiveHeaders may have read bytes belonging to the next response.
+        const bytes_after_100 = headers.header_len - headers.header_end;
+        if (bytes_after_100 > 0) {
+            // Move data to beginning of buffer
+            const src = header_buffer[headers.header_end..headers.header_len];
+            std.mem.copyForwards(u8, header_buffer[0..bytes_after_100], src);
+            // Zero out the rest
+            @memset(header_buffer[bytes_after_100..], 0);
+            pre_read_bytes = bytes_after_100;
+        } else {
+            // No leftover data, just clear the buffer
+            @memset(&header_buffer, 0);
+            pre_read_bytes = 0;
+        }
+    }
+
+    // S3: Postcondition - we exited the loop with a final status
+    if (status < 200) {
+        // Too many 1xx responses - treat as invalid
+        debugLog("recv: too many 1xx responses, giving up", .{});
         return ForwardError.InvalidResponse;
+    }
+
     const content_length = parseContentLength(header_buffer[0..headers.header_len]);
 
     // Detect body transfer mode: chunked or content-length based.
@@ -184,7 +232,8 @@ pub fn forwardResponse(
     const recv_duration_ns = time.elapsedNanos(recv_start_ns, recv_end_ns);
     debugLog("recv: complete duration_us={d} total_body={d}", .{ recv_duration_ns / 1000, total_body_bytes });
 
-    assert(status >= 100 and status <= 599);
+    // S1: Postcondition - final status is in valid range (1xx already skipped)
+    assert(status >= 200 and status <= 599);
     return .{
         .status = status,
         .response_bytes = @intCast(headers.header_end + total_body_bytes),
@@ -220,6 +269,118 @@ pub fn receiveHeaders(
     return .{
         .header_len = @intCast(result.total_bytes),
         .header_end = @intCast(result.header_end),
+    };
+}
+
+/// Receive HTTP response headers with pre-existing data in buffer.
+/// Used when handling 1xx responses where data after the 1xx headers
+/// may already contain the start of the next response.
+/// TigerStyle: Explicit pre_read_bytes parameter, bounded loop.
+fn receiveHeadersWithPreread(
+    conn: *Connection,
+    io: Io,
+    buffer: *[config.MAX_HEADER_SIZE_BYTES]u8,
+    is_pooled: bool,
+    pre_read_bytes: usize,
+) ForwardError!HeadersResult {
+    _ = io; // Unused - Socket handles I/O internally
+    // Precondition: socket fd must be valid.
+    assert(conn.get_fd() >= 0);
+    // Precondition: buffer is provided (not null via pointer).
+    assert(buffer.len == config.MAX_HEADER_SIZE_BYTES);
+    // Precondition: pre_read_bytes is within buffer bounds
+    assert(pre_read_bytes <= config.MAX_HEADER_SIZE_BYTES);
+
+    // Read header bytes with initial offset for pre-read data
+    const result = readHeaderBytesWithPreread(&conn.socket, buffer, pre_read_bytes) catch |err| {
+        return mapResponseErrorToForwardError(err, is_pooled);
+    };
+
+    // S2: Postcondition - header_end is within total_bytes
+    assert(result.header_end <= result.total_bytes);
+
+    return .{
+        .header_len = @intCast(result.total_bytes),
+        .header_end = @intCast(result.header_end),
+    };
+}
+
+/// Maximum iterations for the header read loop.
+/// TigerStyle S3: All loops must be bounded.
+const MAX_READ_ITERATIONS: u32 = 10_000;
+
+/// Read response header bytes from socket with pre-existing data in buffer.
+/// Similar to serval-client's readHeaderBytes but supports starting with
+/// data already in the buffer (used when handling 1xx responses).
+/// TigerStyle: Bounded read loop, explicit error handling.
+fn readHeaderBytesWithPreread(
+    socket: *Socket,
+    header_buf: *[config.MAX_HEADER_SIZE_BYTES]u8,
+    pre_read_bytes: usize,
+) ResponseError!HeaderBytesResult {
+    // S1: Preconditions
+    assert(header_buf.len > 0);
+    assert(pre_read_bytes <= header_buf.len);
+
+    var total_read: usize = pre_read_bytes;
+    var iteration: u32 = 0;
+
+    // S3: Bounded loop - read until we find \r\n\r\n or hit limits
+    while (iteration < MAX_READ_ITERATIONS) : (iteration += 1) {
+        // Check if we've already found the header terminator
+        if (total_read >= 4) {
+            if (std.mem.indexOf(u8, header_buf[0..total_read], "\r\n\r\n")) |end_pos| {
+                // Found \r\n\r\n
+                const header_end = end_pos + 4; // Include the \r\n\r\n
+                // S2: Postcondition - header_end is within bounds
+                assert(header_end <= total_read);
+                return .{
+                    .total_bytes = total_read,
+                    .header_end = header_end,
+                };
+            }
+        }
+
+        // Check buffer space before reading
+        if (total_read >= header_buf.len) {
+            return error.ResponseHeadersTooLarge;
+        }
+
+        // Read more data
+        const remaining_buf = header_buf[total_read..];
+        const bytes_read = socket.read(remaining_buf) catch |err| {
+            return mapSocketErrorLocal(err);
+        };
+
+        if (bytes_read == 0) {
+            // Connection closed before complete headers
+            return error.ConnectionClosed;
+        }
+
+        total_read += bytes_read;
+
+        // S2: Postcondition - bytes read is bounded
+        assert(total_read <= header_buf.len);
+    }
+
+    // S3: Bounded loop exhausted - should not happen with correct limits
+    return error.ResponseHeadersTooLarge;
+}
+
+/// Import SocketError from serval-socket.
+const serval_socket_types = @import("serval-socket");
+const SocketError = serval_socket_types.SocketError;
+
+/// Map SocketError to ResponseError locally.
+/// TigerStyle S6: Explicit error handling, no catch {}.
+fn mapSocketErrorLocal(err: SocketError) ResponseError {
+    return switch (err) {
+        SocketError.ConnectionReset => ResponseError.ConnectionClosed,
+        SocketError.ConnectionClosed => ResponseError.ConnectionClosed,
+        SocketError.BrokenPipe => ResponseError.ConnectionClosed,
+        SocketError.Timeout => ResponseError.RecvTimeout,
+        SocketError.TLSError => ResponseError.RecvFailed,
+        SocketError.Unexpected => ResponseError.RecvFailed,
     };
 }
 

@@ -1194,3 +1194,218 @@ test "integration: lb forwards 100MB payload correctly" {
     try testing.expectEqual(payload.len, response.body.len);
     try testing.expectEqualSlices(u8, payload, response.body);
 }
+
+// =============================================================================
+// HTTP 100 Continue Tests
+// =============================================================================
+
+test "integration: lb handles Expect 100-continue correctly" {
+    // Test: Client sends request with Expect: 100-continue header through LB
+    //
+    // This tests that the proxy correctly handles 100 Continue responses from
+    // backends. When a backend receives Expect: 100-continue, it may respond with:
+    // 1. HTTP/1.1 100 Continue\r\n\r\n
+    // 2. Then the actual response: HTTP/1.1 200 OK\r\n...
+    //
+    // The proxy must skip the 100 Continue and forward only the final response.
+
+    const allocator = testing.allocator;
+    const backend_port = harness.getPort();
+    const lb_port = harness.getPort();
+
+    var pm = harness.ProcessManager.init(allocator);
+    defer pm.deinit();
+
+    // Start echo backend with --echo-body mode to echo back the body
+    try pm.startEchoBackend(backend_port, "continue-backend", .{ .echo_body = true });
+
+    var backend_addr_buf: [ADDR_BUF_LEN]u8 = undefined;
+    const backend_addr = std.fmt.bufPrint(&backend_addr_buf, "127.0.0.1:{d}", .{backend_port}) catch unreachable;
+
+    try pm.startLoadBalancer(lb_port, &.{backend_addr}, .{});
+
+    // Give the LB extra time to mark backend healthy for this test
+    posix.nanosleep(1, 0);
+
+    // Use curl with Expect: 100-continue header to trigger the 100 Continue flow
+    // curl -X POST with data > 1024 bytes automatically sends Expect: 100-continue
+    // We explicitly set it with --header to ensure the behavior
+    const response = try curlPostWithExpect100(allocator, lb_port, "/test-continue", "test-body-data");
+    defer response.deinit();
+
+    // Verify we got the final 200 response (not 100 Continue)
+    try testing.expectEqual(@as(u16, 200), response.status);
+
+    // Verify the body was echoed back correctly
+    try testing.expectEqualStrings("test-body-data", response.body);
+
+    // Verify backend ID header is present (proves LB forwarded correctly)
+    try testing.expect(response.backend_id != null);
+    try testing.expectEqualStrings("continue-backend", response.backend_id.?);
+}
+
+/// Curl constants for Expect: 100-continue test.
+const CURL_EXPECT100_TIMEOUT_S: u32 = 10;
+
+/// Maximum body buffer length for curl POST with Expect: 100-continue.
+const CURL_BODY_MAX_BYTES: u32 = 256;
+
+/// Helper to make HTTP POST request with Expect: 100-continue using curl.
+/// TigerStyle: Returns owned response, caller must call deinit().
+fn curlPostWithExpect100(allocator: std.mem.Allocator, port: u16, path: []const u8, body: []const u8) !CurlResponse {
+    // TigerStyle S1: Preconditions
+    std.debug.assert(port > 0);
+    std.debug.assert(path.len > 0);
+    std.debug.assert(body.len > 0);
+    std.debug.assert(body.len < CURL_BODY_MAX_BYTES);
+
+    // TigerStyle S7: Use sentinel-terminated buffer for URL to avoid UB
+    var url_buf: [CURL_URL_MAX_BYTES:0]u8 = undefined;
+    const url_len = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}{s}", .{ port, path }) catch {
+        return error.UrlTooLong;
+    };
+    url_buf[url_len.len] = 0; // Ensure NUL termination
+    const url_z: [*:0]const u8 = @ptrCast(&url_buf);
+
+    // NUL-terminate body for argv
+    var body_buf: [CURL_BODY_MAX_BYTES:0]u8 = undefined;
+    @memcpy(body_buf[0..body.len], body);
+    body_buf[body.len] = 0;
+    const body_z: [*:0]const u8 = @ptrCast(&body_buf);
+
+    // Create pipe for capturing stdout
+    const pipe = try posix.pipe();
+    const read_fd = pipe[0];
+    const write_fd = pipe[1];
+    defer posix.close(read_fd);
+
+    // Fork and exec curl
+    const pid = try posix.fork();
+    if (pid == 0) {
+        // Child process
+        posix.close(read_fd);
+
+        // Redirect stdout to pipe
+        posix.dup2(write_fd, posix.STDOUT_FILENO) catch std.process.exit(126);
+        if (write_fd != posix.STDOUT_FILENO) posix.close(write_fd);
+
+        // Redirect stderr to /dev/null
+        const devnull = posix.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0) catch std.process.exit(126);
+        posix.dup2(devnull, posix.STDERR_FILENO) catch std.process.exit(126);
+        posix.close(devnull);
+
+        // Run curl with:
+        // -X POST: POST method
+        // -d: request body
+        // -H "Expect: 100-continue": explicitly request 100 Continue
+        // -s: silent mode
+        // -S: show errors
+        // -i: include headers in output
+        // -m: timeout in seconds
+        // --expect100-timeout 1: wait 1 second for 100 Continue before sending body
+        const argv = [_:null]?[*:0]const u8{
+            "curl",
+            "-X",
+            "POST",
+            "-d",
+            body_z,
+            "-H",
+            "Expect: 100-continue",
+            "-H",
+            "Content-Type: application/octet-stream",
+            "-s",
+            "-S",
+            "-i",
+            "-m",
+            std.fmt.comptimePrint("{d}", .{CURL_EXPECT100_TIMEOUT_S}),
+            "--expect100-timeout",
+            "1",
+            url_z,
+            null,
+        };
+        const env: [*:null]const ?[*:0]const u8 = @ptrCast(std.os.environ.ptr);
+        // TigerStyle S5: execvpeZ returns error (noreturn on success)
+        // If we get here, exec failed - exit with error code
+        posix.execvpeZ("curl", &argv, env) catch {
+            std.process.exit(127);
+        };
+        unreachable; // execvpeZ only returns on error
+    }
+
+    // Parent process
+    posix.close(write_fd);
+
+    // Read output from pipe
+    var output_buf: [CURL_OUTPUT_MAX_BYTES]u8 = undefined;
+    var total: u32 = 0;
+    var read_count: u32 = 0;
+
+    // TigerStyle S3: Bounded loop with explicit iteration limit
+    while (total < CURL_OUTPUT_MAX_BYTES and read_count < CURL_MAX_READS) : (read_count += 1) {
+        const n = posix.read(read_fd, output_buf[total..]) catch |err| {
+            // TigerStyle S5: Handle EINTR by continuing, others break
+            if (err == error.Interrupted) continue;
+            break;
+        };
+        if (n == 0) break;
+        total += @intCast(n);
+    }
+
+    // Wait for curl to exit
+    const wait_result = posix.waitpid(pid, 0);
+    // Extract exit status from raw status (WEXITSTATUS macro)
+    // On Linux: exit_code = (status >> 8) & 0xff if WIFEXITED(status)
+    const exit_code = (wait_result.status >> 8) & 0xff;
+    const exited_normally = (wait_result.status & 0x7f) == 0;
+    if (!exited_normally or exit_code != 0) {
+        return error.CurlFailed;
+    }
+
+    if (total == 0) return error.EmptyResponse;
+
+    var data = output_buf[0..total];
+
+    // Skip any 100 Continue responses (curl includes them in output)
+    // TigerStyle S3: Bounded loop to prevent infinite loop on malformed data
+    var skip_count: u32 = 0;
+    const max_skips: u32 = 10;
+    while (skip_count < max_skips) : (skip_count += 1) {
+        const status = harness.TestClient.parseStatusCode(data) orelse return error.InvalidResponse;
+        if (status >= 200) break; // Got final response
+
+        // Skip 1xx response - find next response after \r\n\r\n
+        if (std.mem.indexOf(u8, data, "\r\n\r\n")) |end| {
+            const next_start = end + 4;
+            if (next_start >= data.len) return error.InvalidResponse;
+            data = data[next_start..];
+        } else {
+            return error.InvalidResponse;
+        }
+    }
+
+    // Parse final status
+    const status = harness.TestClient.parseStatusCode(data) orelse return error.InvalidResponse;
+
+    // Parse body
+    const body_slice = harness.TestClient.findBody(data) orelse "";
+    const resp_body = if (body_slice.len > 0)
+        try allocator.dupe(u8, body_slice)
+    else
+        &[_]u8{};
+    // TigerStyle S5: errdefer to free body if backend_id allocation fails
+    errdefer if (resp_body.len > 0) allocator.free(resp_body);
+
+    // Parse backend ID header
+    const backend_id_slice = harness.TestClient.findHeader(data, "X-Backend-Id");
+    const backend_id = if (backend_id_slice) |id|
+        try allocator.dupe(u8, id)
+    else
+        null;
+
+    return .{
+        .status = status,
+        .body = resp_body,
+        .backend_id = backend_id,
+        .allocator = allocator,
+    };
+}
