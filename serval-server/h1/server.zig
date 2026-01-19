@@ -247,22 +247,13 @@ pub fn Server(
         // TigerStyle: Abstract TLS vs plain socket I/O
         // =========================================================================
 
-        /// Stream reader type for plain socket connections.
-        /// TigerStyle: Explicit type alias for clarity.
-        const StreamReader = Io.net.Stream.Reader;
-
         /// Context for BodyReader read operations.
         /// Captures all state needed to read from TLS or plain socket.
-        /// TigerStyle: Stack-allocated, no runtime allocation.
+        /// TigerStyle: Stack-allocated, no runtime allocation, no hidden buffering.
         const BodyReadContext = struct {
             maybe_tls: ?*TLSStream,
-            io: *Io,
             stream: Io.net.Stream,
             conn_id: u64,
-            /// Persistent stream reader for plain socket reads.
-            /// Created once per connection, reused for all body reads.
-            /// TigerStyle: Reuse reader to preserve buffered state.
-            stream_reader: ?*StreamReader,
         };
 
         /// Read function for BodyReader - reads from TLS or plain socket.
@@ -273,14 +264,15 @@ pub fn Server(
             assert(@intFromPtr(ctx_ptr) != 0);
 
             const ctx: *BodyReadContext = @ptrCast(@alignCast(ctx_ptr));
-            return connectionRead(ctx.maybe_tls, ctx.stream_reader, buf, ctx.conn_id);
+            return connectionRead(ctx.maybe_tls, ctx.stream, buf, ctx.conn_id);
         }
 
-        /// Read from connection (TLS or plain).
-        /// TigerStyle: Runtime dispatch based on TLS availability.
+        /// Read from connection (TLS or plain socket).
+        /// Uses direct recv() for plain sockets - no buffering, no hidden state.
+        /// TigerStyle: Explicit reads, deterministic behavior, zero buffering overhead.
         fn connectionRead(
             maybe_tls: ?*const TLSStream,
-            stream_reader: ?*StreamReader,
+            stream: Io.net.Stream,
             buf: []u8,
             conn_id: u64,
         ) ?usize {
@@ -296,17 +288,10 @@ pub fn Server(
                 };
                 return n;
             } else {
-                // Plain socket read - use persistent stream reader
-                // TigerStyle: Reuse reader to preserve buffered state across reads.
-                const rdr = stream_reader orelse {
-                    log.debug("server: conn={d} no stream reader available", .{conn_id});
-                    return null;
-                };
-                var bufs: [1][]u8 = .{buf};
-                const n = rdr.interface.readVec(&bufs) catch |err| {
-                    if (err != error.EndOfStream) {
-                        log.debug("server: conn={d} read error: {s}", .{ conn_id, @errorName(err) });
-                    }
+                // Plain socket read - direct recv() with no buffering.
+                // TigerStyle: No hidden state, reads exactly what's requested.
+                const n = std.posix.recv(stream.socket.handle, buf, 0) catch |err| {
+                    log.debug("server: conn={d} recv error: {s}", .{ conn_id, @errorName(err) });
                     return null;
                 };
                 if (n == 0) return null; // EOF
@@ -366,7 +351,6 @@ pub fn Server(
         /// TigerStyle: Bounded loop with explicit iteration limit.
         fn accumulateHeaders(
             maybe_tls: ?*const TLSStream,
-            stream_reader: ?*StreamReader,
             io: *Io,
             stream: Io.net.Stream,
             recv_buf: *[REQUEST_BUFFER_SIZE_BYTES]u8,
@@ -388,7 +372,7 @@ pub fn Server(
                     sendErrorResponseTls(maybe_tls, io, stream, 431, "Request Header Fields Too Large");
                     return false;
                 }
-                const n = connectionRead(maybe_tls, stream_reader, recv_buf[buffer_len.*..], conn_id) orelse return false;
+                const n = connectionRead(maybe_tls, stream, recv_buf[buffer_len.*..], conn_id) orelse return false;
                 if (n == 0) return false;
                 buffer_len.* += n;
             }
@@ -658,14 +642,6 @@ pub fn Server(
             // TigerStyle: Mutable pointer needed for forwarder to write TLS responses.
             const maybe_tls_ptr: ?*TLSStream = if (maybe_tls_stream) |*tls| tls else null;
 
-            // Create persistent stream reader for plain socket connections.
-            // TigerStyle: Reader created once, reused for all body reads on this connection.
-            // This preserves buffered state across multiple reads.
-            // Buffer size: 8KB matches pattern in reader.zig for efficient read operations.
-            var stream_reader_buf: [8192]u8 = undefined;
-            var stream_reader_instance: StreamReader = stream.reader(io_mut, &stream_reader_buf);
-            const maybe_stream_reader: ?*StreamReader = if (maybe_tls_stream == null) &stream_reader_instance else null;
-
             // Request processing state
             var parser = Parser.init();
             var recv_buf: [REQUEST_BUFFER_SIZE_BYTES]u8 = std.mem.zeroes([REQUEST_BUFFER_SIZE_BYTES]u8);
@@ -700,13 +676,13 @@ pub fn Server(
                 log.debug("server: conn={d} waiting for request handler_start={d}", .{ connection_id, @as(u64, @intCast(handler_start_ns)) });
                 const read_start_ns = realtimeNanos();
                 if (buffer_offset >= buffer_len) {
-                    const n = connectionRead(maybe_tls_ptr, maybe_stream_reader, &recv_buf, connection_id) orelse return;
+                    const n = connectionRead(maybe_tls_ptr, stream, &recv_buf, connection_id) orelse return;
                     buffer_len = n;
                     buffer_offset = 0;
                 }
 
                 // Accumulate reads until complete headers received
-                if (!accumulateHeaders(maybe_tls_ptr, maybe_stream_reader, &io_mut, stream, &recv_buf, buffer_offset, &buffer_len, connection_id)) return;
+                if (!accumulateHeaders(maybe_tls_ptr, &io_mut, stream, &recv_buf, buffer_offset, &buffer_len, connection_id)) return;
                 const read_elapsed_ns = realtimeNanos() - read_start_ns;
                 const read_duration_us: u64 = if (read_elapsed_ns >= 0) @intCast(@divFloor(read_elapsed_ns, 1000)) else 0;
                 log.debug("server: conn={d} received bytes={d} read_us={d}", .{ connection_id, buffer_len - buffer_offset, read_duration_us });
@@ -770,10 +746,8 @@ pub fn Server(
                     // Set up BodyReadContext for the read function
                     var body_read_ctx = BodyReadContext{
                         .maybe_tls = maybe_tls_ptr,
-                        .io = &io_mut,
                         .stream = stream,
                         .conn_id = connection_id,
-                        .stream_reader = maybe_stream_reader,
                     };
 
                     // Set up BodyReader with lazy read capability
