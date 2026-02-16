@@ -19,7 +19,7 @@
 
 const std = @import("std");
 const testing = std.testing;
-const posix = std.posix;
+const posix = @import("posix_compat.zig");
 const harness = @import("harness.zig");
 
 // =============================================================================
@@ -360,7 +360,7 @@ fn curlHttps(allocator: std.mem.Allocator, port: u16, path: []const u8) !CurlRes
             url_z,
             null,
         };
-        const env: [*:null]const ?[*:0]const u8 = @ptrCast(std.os.environ.ptr);
+        const env = posix.environPtr();
         // TigerStyle S5: execvpeZ returns error (noreturn on success)
         // If we get here, exec failed - exit with error code
         posix.execvpeZ("curl", &argv, env) catch {
@@ -1029,7 +1029,7 @@ fn runCommandWithOutput(allocator: std.mem.Allocator, argv: []const []const u8) 
         posix.close(devnull);
 
         // Execute command - inherit environment from parent
-        const env: [*:null]const ?[*:0]const u8 = @ptrCast(std.os.environ.ptr);
+        const env = posix.environPtr();
         _ = posix.execvpeZ(argv_buf[0].?, argv_buf, env) catch {
             std.process.exit(127); // Exec failed
         };
@@ -1375,7 +1375,7 @@ fn curlPostWithExpect100(allocator: std.mem.Allocator, port: u16, path: []const 
             url_z,
             null,
         };
-        const env: [*:null]const ?[*:0]const u8 = @ptrCast(std.os.environ.ptr);
+        const env = posix.environPtr();
         // TigerStyle S5: execvpeZ returns error (noreturn on success)
         // If we get here, exec failed - exit with error code
         posix.execvpeZ("curl", &argv, env) catch {

@@ -479,6 +479,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("integration/tests.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     const integration_tests = b.addTest(.{
         .name = "integration_tests",

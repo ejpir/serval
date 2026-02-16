@@ -39,7 +39,7 @@
 //! These are for testing only. Use `--insecure-skip-verify` with self-signed certs.
 
 const std = @import("std");
-const posix = std.posix;
+const posix = @import("posix_compat.zig");
 const assert = std.debug.assert;
 
 // =============================================================================
@@ -168,8 +168,19 @@ pub fn getPort() u16 {
 // =============================================================================
 
 /// Timeout tracker for operations with deadlines.
+fn monotonic_now_ns() u64 {
+    const now_result = std.Io.Clock.awake.now(std.Options.debug_io);
+    const ts = switch (@typeInfo(@TypeOf(now_result))) {
+        .error_union => now_result catch return 0,
+        else => now_result,
+    };
+
+    assert(ts.nanoseconds >= 0);
+    return @intCast(ts.nanoseconds);
+}
+
 pub const Deadline = struct {
-    start: std.time.Instant,
+    start_ns: u64,
     timeout_ns: u64,
 
     pub const InitError = error{TimerUnavailable};
@@ -177,23 +188,23 @@ pub const Deadline = struct {
     /// Initialize a deadline with the given timeout.
     /// TigerStyle: Returns error instead of unreachable on timer failure.
     pub fn init(timeout_ns: u64) InitError!Deadline {
-        const start = std.time.Instant.now() catch return error.TimerUnavailable;
         return .{
-            .start = start,
+            .start_ns = monotonic_now_ns(),
             .timeout_ns = timeout_ns,
         };
     }
 
     pub fn expired(self: Deadline) bool {
-        const now = std.time.Instant.now() catch return true;
-        return now.since(self.start) >= self.timeout_ns;
+        const now_ns = monotonic_now_ns();
+        const elapsed_ns = now_ns -| self.start_ns;
+        return elapsed_ns >= self.timeout_ns;
     }
 
     pub fn remaining_ns(self: Deadline) u64 {
-        const now = std.time.Instant.now() catch return 0;
-        const elapsed = now.since(self.start);
-        if (elapsed >= self.timeout_ns) return 0;
-        return self.timeout_ns - elapsed;
+        const now_ns = monotonic_now_ns();
+        const elapsed_ns = now_ns -| self.start_ns;
+        if (elapsed_ns >= self.timeout_ns) return 0;
+        return self.timeout_ns - elapsed_ns;
     }
 };
 
@@ -585,7 +596,7 @@ fn spawnProcess(allocator: std.mem.Allocator, argv: []const []const u8) SpawnErr
 
         // Execute the program - inherit environment from parent
         // execvpeZ only returns on error, so if we get here, exec failed
-        const env: [*:null]const ?[*:0]const u8 = @ptrCast(std.os.environ.ptr);
+        const env = posix.environPtr();
         _ = posix.execvpeZ(argv_buf[0].?, argv_buf, env) catch {
             std.process.exit(127); // Exec failed
         };
@@ -611,7 +622,7 @@ pub fn waitForPort(port: u16, timeout_ms: u64) WaitError!void {
     assert(port > 0);
     assert(timeout_ms > 0);
 
-    const start = std.time.Instant.now() catch return error.TimerUnavailable;
+    const start_ns = monotonic_now_ns();
     const timeout_ns = timeout_ms * std.time.ns_per_ms;
 
     // TigerStyle: Bounded loop with explicit iteration limit
@@ -622,8 +633,8 @@ pub fn waitForPort(port: u16, timeout_ms: u64) WaitError!void {
         if (tryConnect(port)) {
             return;
         }
-        const now = std.time.Instant.now() catch return error.TimerUnavailable;
-        if (now.since(start) >= timeout_ns) {
+        const now_ns = monotonic_now_ns();
+        if (now_ns -| start_ns >= timeout_ns) {
             return error.PortTimeout;
         }
         posix.nanosleep(0, READY_POLL_INTERVAL_MS * std.time.ns_per_ms);
