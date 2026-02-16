@@ -85,7 +85,12 @@ pub const TLSStream = struct {
     /// Setup kTLS after successful handshake.
     /// Tries OpenSSL native kTLS first, falls back to manual kTLS for BoringSSL.
     /// Returns the appropriate mode and updates info.ktls_enabled.
-    fn setupKtlsAfterHandshake(ssl_conn: *ssl.SSL, fd: c_int, info: *HandshakeInfo) Mode {
+    fn setupKtlsAfterHandshake(ssl_conn: *ssl.SSL, fd: c_int, info: *HandshakeInfo, enable_ktls: bool) Mode {
+        if (!enable_ktls) {
+            info.ktls_enabled = false;
+            return .{ .userspace = ssl_conn };
+        }
+
         // Check if OpenSSL successfully enabled kTLS (set before handshake)
         // OpenSSL handles key extraction and setsockopt internally
         const openssl_ktls_tx = if (ssl.SSL_get_wbio(ssl_conn)) |wbio| ssl.BIO_get_ktls_send(wbio) else false;
@@ -134,9 +139,12 @@ pub const TLSStream = struct {
 
         if (ssl.SSL_set_fd(ssl_conn, fd) != 1) return error.SslSetFd;
 
-        // Enable kTLS before handshake - OpenSSL will attempt kTLS setup automatically
-        // This must be done before the handshake for OpenSSL to configure kTLS internally
-        _ = ssl.SSL_set_options(ssl_conn, ssl.SSL_OP_ENABLE_KTLS);
+        const enable_ktls: bool = ktls.isKtlsRuntimeAvailable();
+        if (enable_ktls) {
+            // Enable kTLS before handshake - OpenSSL will attempt kTLS setup automatically
+            // This must be done before the handshake for OpenSSL to configure kTLS internally
+            _ = ssl.SSL_set_options(ssl_conn, ssl.SSL_OP_ENABLE_KTLS);
+        }
 
         ssl.SSL_set_accept_state(ssl_conn);
 
@@ -162,7 +170,7 @@ pub const TLSStream = struct {
         populateHandshakeInfo(ssl_conn, &info);
 
         // Setup kTLS and get appropriate mode
-        const mode = setupKtlsAfterHandshake(ssl_conn, fd, &info);
+        const mode = setupKtlsAfterHandshake(ssl_conn, fd, &info, enable_ktls);
         logKtlsStatus(&info, true);
 
         return .{
@@ -192,8 +200,9 @@ pub const TLSStream = struct {
 
         if (ssl.SSL_set_fd(ssl_conn, fd) != 1) return error.SslSetFd;
 
-        // Enable kTLS before handshake if requested
-        if (enable_ktls) {
+        const should_enable_ktls: bool = enable_ktls and ktls.isKtlsRuntimeAvailable();
+        if (should_enable_ktls) {
+            // Enable kTLS before handshake if requested and runtime support exists
             _ = ssl.SSL_set_options(ssl_conn, ssl.SSL_OP_ENABLE_KTLS);
         }
 
@@ -223,12 +232,17 @@ pub const TLSStream = struct {
         info.handshake_duration_ns = @intCast(end_ns - start_ns);
         populateHandshakeInfo(ssl_conn, &info);
 
-        // Setup kTLS and get appropriate mode (only if enabled)
-        const mode: Mode = if (enable_ktls) blk: {
-            const m = setupKtlsAfterHandshake(ssl_conn, fd, &info);
+        // Setup kTLS and get appropriate mode (only if enabled and runtime support exists)
+        const mode: Mode = if (should_enable_ktls) blk: {
+            const m = setupKtlsAfterHandshake(ssl_conn, fd, &info, true);
             logKtlsStatus(&info, false);
             break :blk m;
         } else .{ .userspace = ssl_conn };
+
+        if (!should_enable_ktls) {
+            info.ktls_enabled = false;
+            logKtlsStatus(&info, false);
+        }
 
         return .{
             .fd = fd,

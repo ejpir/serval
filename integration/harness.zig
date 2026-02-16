@@ -108,7 +108,7 @@ const LOOPBACK_IPV4_BE: u32 = 0x7F000001;
 // =============================================================================
 
 /// Check if kTLS kernel module is loaded and available.
-/// TLS tests require kTLS for the server to work properly.
+/// Diagnostic helper: TLS tests should still pass via userspace fallback when false.
 /// Returns false if /proc/sys/net/ipv4/tcp_available_ulp doesn't contain "tls".
 pub fn isKtlsAvailable() bool {
     // Read available ULPs from /proc

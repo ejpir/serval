@@ -181,6 +181,54 @@ const SSL_CIPHER_ECDHE_RSA_AES_256_GCM_SHA384: u16 = 0xc030;
 const SSL_CIPHER_ECDHE_ECDSA_CHACHA20_POLY1305: u16 = 0xcca9;
 const SSL_CIPHER_ECDHE_RSA_CHACHA20_POLY1305: u16 = 0xcca8;
 
+const KTLS_ULP_PROC_PATH: []const u8 = "/proc/sys/net/ipv4/tcp_available_ulp";
+const KTLS_DISABLE_ENV_NAME: [*:0]const u8 = "SERVAL_DISABLE_KTLS";
+
+fn parseDisableKtlsEnvValue(value: []const u8) bool {
+    if (value.len == 0) return false;
+
+    return std.mem.eql(u8, value, "1") or
+        std.ascii.eqlIgnoreCase(value, "true") or
+        std.ascii.eqlIgnoreCase(value, "yes") or
+        std.ascii.eqlIgnoreCase(value, "on");
+}
+
+fn isKtlsDisabledByEnv() bool {
+    const value_ptr = std.c.getenv(KTLS_DISABLE_ENV_NAME) orelse return false;
+    const value = std.mem.sliceTo(value_ptr, 0);
+    return parseDisableKtlsEnvValue(value);
+}
+
+fn procAvailableUlpsContainsTls(content: []const u8) bool {
+    var token_iter = std.mem.tokenizeAny(u8, content, " \t\r\n");
+    while (token_iter.next()) |token| {
+        if (std.mem.eql(u8, token, "tls")) return true;
+    }
+    return false;
+}
+
+pub fn isKtlsRuntimeAvailable() bool {
+    if (builtin.os.tag != .linux) return false;
+
+    if (isKtlsDisabledByEnv()) {
+        log.debug("kTLS: disabled by env var {s}", .{KTLS_DISABLE_ENV_NAME});
+        return false;
+    }
+
+    const ulp_fd = posix.openat(posix.AT.FDCWD, KTLS_ULP_PROC_PATH, .{ .ACCMODE = .RDONLY }, 0) catch {
+        return false;
+    };
+    defer posix.close(ulp_fd);
+
+    var buf: [256]u8 = undefined;
+    const n = posix.read(ulp_fd, &buf) catch {
+        return false;
+    };
+    if (n == 0) return false;
+
+    return procAvailableUlpsContainsTls(buf[0..n]);
+}
+
 // ============================================================================
 // kTLS Socket Configuration Functions
 // ============================================================================
@@ -536,9 +584,9 @@ pub fn tryEnableKtls(
     assert(@intFromPtr(ssl_ptr) != 0); // Valid SSL pointer
     assert(fd > 0); // Valid file descriptor
 
-    // Step 1: Check if running on Linux - kTLS is Linux-only
-    if (builtin.os.tag != .linux) {
-        log.debug("kTLS: Not on Linux, using userspace fallback", .{});
+    // Step 1: Check runtime kTLS availability (platform + module + env override)
+    if (!isKtlsRuntimeAvailable()) {
+        log.debug("kTLS: Runtime unavailable, using userspace fallback", .{});
         return .userspace_fallback;
     }
 
@@ -690,6 +738,28 @@ test "buildCryptoInfoChaCha20Poly1305 populates struct correctly" {
 test "KtlsResult.isKtls returns correct values" {
     try std.testing.expect(KtlsResult.ktls_enabled.isKtls());
     try std.testing.expect(!KtlsResult.userspace_fallback.isKtls());
+}
+test "parseDisableKtlsEnvValue handles truthy values" {
+    try std.testing.expect(parseDisableKtlsEnvValue("1"));
+    try std.testing.expect(parseDisableKtlsEnvValue("true"));
+    try std.testing.expect(parseDisableKtlsEnvValue("TRUE"));
+    try std.testing.expect(parseDisableKtlsEnvValue("yes"));
+    try std.testing.expect(parseDisableKtlsEnvValue("on"));
+}
+
+test "parseDisableKtlsEnvValue handles falsey values" {
+    try std.testing.expect(!parseDisableKtlsEnvValue(""));
+    try std.testing.expect(!parseDisableKtlsEnvValue("0"));
+    try std.testing.expect(!parseDisableKtlsEnvValue("false"));
+    try std.testing.expect(!parseDisableKtlsEnvValue("no"));
+    try std.testing.expect(!parseDisableKtlsEnvValue("off"));
+    try std.testing.expect(!parseDisableKtlsEnvValue("random"));
+}
+
+test "procAvailableUlpsContainsTls detects tls token only" {
+    try std.testing.expect(procAvailableUlpsContainsTls("espintcp mptcp tls\n"));
+    try std.testing.expect(!procAvailableUlpsContainsTls("espintcp mptcp\n"));
+    try std.testing.expect(!procAvailableUlpsContainsTls("notls-token\n"));
 }
 
 test "struct sizes match Linux kernel expectations" {

@@ -29,15 +29,15 @@ This creates:
 - `zig-out/bin/echo_backend` - Echo HTTP server for testing
 - `zig-out/bin/lb_example` - Load balancer with health checking
 
-### TLS Tests: kTLS Kernel Module
+### TLS Tests: kTLS Kernel Module (Optional)
 
-TLS tests require the Linux kTLS kernel module to be loaded. If not loaded, TLS tests will be skipped automatically.
+TLS tests do **not** require kTLS. If the Linux `tls` kernel module is unavailable, the stack automatically falls back to userspace TLS.
 
 ```bash
-# Check if kTLS is available
+# Optional: check if kTLS is available
 cat /proc/sys/net/ipv4/tcp_available_ulp | grep tls
 
-# Load kTLS module (requires root)
+# Optional: load kTLS module (requires root)
 sudo modprobe tls
 ```
 
@@ -59,7 +59,7 @@ These are for testing only. Use `--insecure-skip-verify` with self-signed certif
 | `lb forwards to single backend` | Load balancer with one backend |
 | `lb round-robins across 2 backends` | Verify round-robin distribution |
 
-### TLS Tests (Require kTLS)
+### TLS Tests (kTLS Optional; userspace fallback supported)
 
 | Test | Description |
 |------|-------------|
@@ -99,12 +99,6 @@ test "integration: my new test" {
 
 ```zig
 test "integration: TLS test" {
-    // Skip if kTLS not available
-    if (!harness.isKtlsAvailable()) {
-        std.debug.print("SKIP: kTLS kernel module not loaded\n", .{});
-        return error.SkipZigTest;
-    }
-
     const allocator = testing.allocator;
 
     var pm = harness.ProcessManager.init(allocator);
@@ -194,12 +188,11 @@ const port = harness.getPort();  // Returns unique port >= 19000
 
 ### isKtlsAvailable
 
-Check if kTLS kernel module is loaded.
+Check whether the host kernel exposes kTLS ULP support (diagnostic only).
 
 ```zig
-if (!harness.isKtlsAvailable()) {
-    return error.SkipZigTest;
-}
+const host_has_ktls = harness.isKtlsAvailable();
+_ = host_has_ktls; // Use for logging/diagnostics; tests should still pass without it.
 ```
 
 ## Debugging Failed Tests

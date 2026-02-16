@@ -435,12 +435,6 @@ test "integration: TLS termination - HTTPS frontend, HTTP backend" {
     // This tests TLS termination at the load balancer.
     // The LB accepts HTTPS connections and forwards to HTTP backends.
 
-    // Skip if kTLS kernel module is not loaded
-    if (!harness.isKtlsAvailable()) {
-        std.debug.print("SKIP: kTLS kernel module not loaded\n", .{});
-        return error.SkipZigTest;
-    }
-
     const allocator = testing.allocator;
     const backend_port = harness.getPort();
     const lb_port = harness.getPort();
@@ -475,12 +469,6 @@ test "integration: TLS origination - HTTP frontend, HTTPS backend" {
     //
     // This tests TLS origination at the load balancer.
     // The LB accepts HTTP connections and forwards to HTTPS backends.
-
-    // Skip if kTLS kernel module is not loaded
-    if (!harness.isKtlsAvailable()) {
-        std.debug.print("SKIP: kTLS kernel module not loaded\n", .{});
-        return error.SkipZigTest;
-    }
 
     const allocator = testing.allocator;
     const backend_port = harness.getPort();
@@ -523,12 +511,6 @@ test "integration: TLS full path - HTTPS frontend, HTTPS backend" {
     // This tests full TLS path: TLS termination + TLS origination.
     // The LB terminates client TLS and originates new TLS to backend.
 
-    // Skip if kTLS kernel module is not loaded
-    if (!harness.isKtlsAvailable()) {
-        std.debug.print("SKIP: kTLS kernel module not loaded\n", .{});
-        return error.SkipZigTest;
-    }
-
     const allocator = testing.allocator;
     const backend_port = harness.getPort();
     const lb_port = harness.getPort();
@@ -568,12 +550,6 @@ test "integration: mixed backends - HTTP and HTTPS round-robin" {
     //
     // This tests that health probes and forwarding work correctly
     // when some backends are HTTP and some are HTTPS.
-
-    // Skip if kTLS kernel module is not loaded
-    if (!harness.isKtlsAvailable()) {
-        std.debug.print("SKIP: kTLS kernel module not loaded\n", .{});
-        return error.SkipZigTest;
-    }
 
     const allocator = testing.allocator;
     const http_backend_port = harness.getPort();
@@ -633,12 +609,6 @@ test "integration: health probe over HTTPS" {
     // Test: LB health-probes an HTTPS backend and marks it healthy
     //
     // This verifies that the prober performs TLS handshake for HTTPS backends.
-
-    // Skip if kTLS kernel module is not loaded
-    if (!harness.isKtlsAvailable()) {
-        std.debug.print("SKIP: kTLS kernel module not loaded\n", .{});
-        return error.SkipZigTest;
-    }
 
     const allocator = testing.allocator;
     const backend_port = harness.getPort();

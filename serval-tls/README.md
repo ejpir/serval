@@ -22,7 +22,7 @@ No business logic, only protocol implementation. Sits alongside serval-http and 
 
 **Phase 2 - Complete**
 - kTLS kernel offload (OpenSSL native + BoringSSL manual)
-- Automatic detection and fallback to userspace
+- Automatic runtime detection and fallback to userspace (module missing/non-Linux/disabled)
 - Zero-copy sendfile() support when kTLS active
 
 ## Exports
@@ -72,7 +72,7 @@ No business logic, only protocol implementation. Sits alongside serval-http and 
 ### Phase 2 (Complete)
 - [x] kTLS kernel offload (OpenSSL native via SSL_OP_ENABLE_KTLS)
 - [x] kTLS manual key extraction (BoringSSL fallback path)
-- [x] Automatic kTLS detection and userspace fallback
+- [x] Automatic kTLS runtime detection and userspace fallback
 - [x] HandshakeInfo.ktls_enabled status tracking
 - [x] TLSStream.isKtls() / queryKtlsStatus() for runtime checks
 
@@ -150,10 +150,13 @@ pub const Upstream = struct {
 - Reduced context switches (crypto in kernel space)
 - Hardware crypto offload on supported NICs
 
-**Requirements:**
+**Requirements (for kTLS offload mode):**
 - Linux kernel with `tls` module (`modprobe tls`)
 - OpenSSL 3.0+ for native kTLS
 - Supported ciphers: AES-GCM-128, AES-GCM-256, CHACHA20-POLY1305
+
+If any requirement is missing, TLS continues in userspace mode (no handshake failure).
+For diagnostics/testing, set `SERVAL_DISABLE_KTLS=1` to force userspace mode.
 
 ## Integration Points
 
@@ -246,7 +249,7 @@ tls_mode: enum { none, userspace, ktls }
 
 - OpenSSL 3.x or BoringSSL (system-installed)
 - Development headers (`libssl-dev` on Debian/Ubuntu, `openssl-devel` on RHEL)
-- For Phase 2 kTLS: Linux kernel with `tls` module (`modprobe tls`)
+- For Phase 2 kTLS offload: Linux kernel with `tls` module (`modprobe tls`) (optional; userspace fallback is automatic)
 
 ## Design References
 
