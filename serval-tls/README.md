@@ -21,7 +21,7 @@ No business logic, only protocol implementation. Sits alongside serval-http and 
 - Manual SSL bindings (avoids @cImport macro issues)
 
 **Phase 2 - Complete**
-- kTLS kernel offload (OpenSSL native + BoringSSL manual)
+- kTLS kernel offload (manual key extraction path with deterministic fallback)
 - Automatic runtime detection and fallback to userspace (module missing/non-Linux/disabled)
 - Zero-copy sendfile() support when kTLS active
 
@@ -70,7 +70,7 @@ No business logic, only protocol implementation. Sits alongside serval-http and 
 - [x] Graceful shutdown (close_notify)
 
 ### Phase 2 (Complete)
-- [x] kTLS kernel offload (OpenSSL native via SSL_OP_ENABLE_KTLS)
+- [x] kTLS kernel offload (manual key extraction + kernel crypto setup)
 - [x] kTLS manual key extraction (BoringSSL fallback path)
 - [x] Automatic kTLS runtime detection and userspace fallback
 - [x] HandshakeInfo.ktls_enabled status tracking
@@ -135,14 +135,14 @@ pub const Upstream = struct {
 - Easier to maintain and understand
 - POC confirmed this approach works
 
-### kTLS with Dual-Path Support
+### kTLS with Deterministic Manual Path
 
-**Decision:** Support both OpenSSL native kTLS and manual BoringSSL key extraction.
+**Decision:** Use manual kTLS setup path consistently after handshake, with explicit runtime checks and userspace fallback.
 
 **Rationale:**
-- OpenSSL 3.x has native kTLS via `SSL_OP_ENABLE_KTLS` - handles key extraction internally
-- BoringSSL requires manual key extraction via `SSL_export_keying_material`
-- Automatic detection: try OpenSSL path first, fall back to manual if needed
+- Manual key extraction via `SSL_export_keying_material` enables one consistent path across OpenSSL/BoringSSL
+- Runtime checks gate kTLS setup (platform, module presence, optional env disable)
+- Deterministic fallback: any setup failure stays on userspace TLS without failing handshakes
 - Transparent to users - TLSStream API unchanged, `isKtls()` for status
 
 **kTLS Benefits:**
@@ -152,7 +152,7 @@ pub const Upstream = struct {
 
 **Requirements (for kTLS offload mode):**
 - Linux kernel with `tls` module (`modprobe tls`)
-- OpenSSL 3.0+ for native kTLS
+- OpenSSL/BoringSSL with `SSL_export_keying_material` support for key extraction
 - Supported ciphers: AES-GCM-128, AES-GCM-256, CHACHA20-POLY1305
 
 If any requirement is missing, TLS continues in userspace mode (no handshake failure).
@@ -227,8 +227,7 @@ zig build test-tls-integ    # Requires test certs in /tmp/test-certs/
 | SNI support | Complete | stream.zig |
 | Config types | Complete | serval-core |
 | kTLS kernel offload | Complete | ktls.zig, stream.zig |
-| kTLS OpenSSL native | Complete | stream.zig (SSL_OP_ENABLE_KTLS) |
-| kTLS BoringSSL manual | Complete | ktls.zig (key extraction) |
+| kTLS manual key extraction | Complete | ktls.zig + stream.zig |
 | HandshakeInfo | Complete | handshake_info.zig |
 
 ## Build Integration
