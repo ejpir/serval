@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Zig 0.16.0-dev.2565+684032671
+        run: |
+          set -euxo pipefail
+          curl -L "https://ziglang.org/builds/zig-x86_64-linux-0.16.0-dev.2565+684032671.tar.xz" -o zig.tar.xz
+          tar -xf zig.tar.xz
+          echo "$GITHUB_WORKSPACE/zig-x86_64-linux-0.16.0-dev.2565+684032671" >> "$GITHUB_PATH"
+
+      - name: Show Zig version
+        run: zig version
+
+      - name: Build
+        run: zig build
+
+      - name: Run integration tests
+        run: zig build test-integration
