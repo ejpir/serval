@@ -318,11 +318,8 @@ pub const RouterClient = struct {
                 }
 
                 // Sleep with exponential backoff
-                // TigerStyle: Use posix nanosleep for sleeping
                 const backoff_ns = backoff_ms * time.ns_per_ms;
-                const backoff_secs: u64 = backoff_ns / time.ns_per_s;
-                const backoff_remaining_ns: u64 = backoff_ns % time.ns_per_s;
-                std.posix.nanosleep(backoff_secs, backoff_remaining_ns);
+                std.Io.sleep(std.Options.debug_io, .fromNanoseconds(@intCast(backoff_ns)), .awake) catch {};
 
                 // Increase backoff (capped at MAX_BACKOFF_MS)
                 backoff_ms = @min(backoff_ms * 2, MAX_BACKOFF_MS);

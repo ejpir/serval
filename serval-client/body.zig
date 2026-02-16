@@ -532,9 +532,10 @@ pub const BodyReader = struct {
         }
 
         // Create pipe for splice
-        const pipe_fds = posix.pipe() catch {
+        var pipe_fds: [2]c_int = undefined;
+        if (std.c.pipe(&pipe_fds) != 0) {
             return BodyError.PipeCreationFailed;
-        };
+        }
         defer {
             posix.close(pipe_fds[0]);
             posix.close(pipe_fds[1]);

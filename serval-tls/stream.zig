@@ -37,11 +37,9 @@ pub const Mode = union(enum) {
 /// Get monotonic timestamp in nanoseconds for timing measurements.
 /// TigerStyle: Local helper to avoid serval-core dependency (layer isolation).
 fn monotonicNanos() u64 {
-    const ts = posix.clock_gettime(.MONOTONIC) catch return 0;
-    assert(ts.sec >= 0);
-    const sec_ns: u64 = @as(u64, @intCast(ts.sec)) *% std.time.ns_per_s;
-    const nsec: u64 = @intCast(ts.nsec);
-    return sec_ns +% nsec;
+    const ts = std.Io.Clock.awake.now(std.Options.debug_io);
+    assert(ts.nanoseconds >= 0);
+    return @intCast(ts.nanoseconds);
 }
 
 pub const TLSStream = struct {
@@ -255,7 +253,6 @@ pub const TLSStream = struct {
                     // Map posix errors to TLS errors for consistent API
                     return switch (err) {
                         error.ConnectionResetByPeer => error.ConnectionReset,
-                        error.BrokenPipe => error.ConnectionReset,
                         else => error.KtlsRead,
                     };
                 };
@@ -290,11 +287,13 @@ pub const TLSStream = struct {
         switch (self.mode) {
             .ktls => {
                 // kTLS: write directly to kernel (kernel handles TLS encryption)
-                const result = posix.write(self.fd, data);
-                const n = result catch |err| {
-                    // Map posix errors to TLS errors for consistent API
+                const file: std.Io.File = .{
+                    .handle = self.fd,
+                    .flags = .{ .nonblocking = true },
+                };
+                const n = file.writeStreaming(std.Options.debug_io, &.{}, &.{data}, 1) catch |err| {
+                    // Map write errors to TLS errors for consistent API
                     return switch (err) {
-                        error.ConnectionResetByPeer => error.ConnectionReset,
                         error.BrokenPipe => error.ConnectionReset,
                         else => error.KtlsWrite,
                     };

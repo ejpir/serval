@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .boring_tls = .{
-            .url = "https://github.com/Thomvanoorschot/boring_tls/archive/main.tar.gz",
-            .hash = "boring_tls-0.0.1-QM_9thFoAACIlp-uVSmoePInIrh7Rd1RPLHs_eTNBTyo",
+            .url = "https://github.com/Thomvanoorschot/boring_tls/archive/b4af7f235d4659d692b053287721be4c655ceb47.tar.gz",
+            .hash = "boring_tls-0.0.1-QM_9tq2XAADFF_DjPe-71Okg5_WUBCZddVLns4-bMwN2",
         },
     },
     .paths = .{

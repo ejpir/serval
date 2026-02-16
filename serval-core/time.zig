@@ -6,7 +6,6 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
-const posix = std.posix;
 
 // =============================================================================
 // Time Unit Constants
@@ -58,9 +57,11 @@ pub inline fn nanosToSecondsI128(nanos: i128) u64 {
 /// Sleep for the specified number of nanoseconds.
 /// TigerStyle: Single sleep function, hides sec/nsec split.
 pub fn sleep(duration_ns: u64) void {
-    const seconds: u64 = duration_ns / ns_per_s;
-    const remaining_ns: u64 = duration_ns % ns_per_s;
-    posix.nanosleep(seconds, remaining_ns);
+    std.Io.sleep(
+        std.Options.debug_io,
+        .fromNanoseconds(@intCast(duration_ns)),
+        .awake,
+    ) catch {};
 }
 
 // =============================================================================
@@ -72,10 +73,10 @@ pub fn sleep(duration_ns: u64) void {
 /// Returns 0 on clock failure (non-fatal, allows request to proceed).
 /// TigerStyle: Graceful degradation on error.
 pub fn realtimeNanos() i128 {
-    const ts = posix.clock_gettime(.REALTIME) catch return 0;
+    const ts = std.Io.Clock.real.now(std.Options.debug_io);
     // TigerStyle: Assert precondition - REALTIME clock should represent valid Unix time.
-    assert(ts.sec >= 0);
-    return @as(i128, ts.sec) * ns_per_s + ts.nsec;
+    assert(ts.nanoseconds >= 0);
+    return @intCast(ts.nanoseconds);
 }
 
 // =============================================================================
@@ -87,12 +88,10 @@ pub fn realtimeNanos() i128 {
 /// Returns 0 if timing is unavailable (non-fatal).
 /// TigerStyle: Monotonic time for intervals, realtime for timestamps.
 pub fn monotonicNanos() u64 {
-    const ts = posix.clock_gettime(.MONOTONIC) catch return 0;
-    // TigerStyle: Assert precondition - MONOTONIC clock starts at boot, always positive.
-    assert(ts.sec >= 0);
-    const sec_ns: u64 = @as(u64, @intCast(ts.sec)) *% ns_per_s;
-    const nsec: u64 = @intCast(ts.nsec);
-    return sec_ns +% nsec;
+    const ts = std.Io.Clock.awake.now(std.Options.debug_io);
+    // TigerStyle: Assert precondition - monotonic clock should be non-negative.
+    assert(ts.nanoseconds >= 0);
+    return @intCast(ts.nanoseconds);
 }
 
 /// Compute elapsed nanoseconds between two monotonic timestamps.

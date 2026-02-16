@@ -177,7 +177,7 @@ pub const SimplePool = struct {
 
     /// Mutex protects connections and counts arrays.
     /// TigerStyle: Simple mutex over complex lock-free for correctness.
-    mutex: std.Thread.Mutex = .{},
+    mutex: std.Io.Mutex = .init,
     connections: [MAX_UPSTREAMS][MAX_CONNS_PER_UPSTREAM]?Connection =
         [_][MAX_CONNS_PER_UPSTREAM]?Connection{[_]?Connection{null} ** MAX_CONNS_PER_UPSTREAM} ** MAX_UPSTREAMS,
     counts: [MAX_UPSTREAMS]u8 = [_]u8{0} ** MAX_UPSTREAMS,
@@ -225,8 +225,8 @@ pub const SimplePool = struct {
         var result: ?Connection = null;
 
         {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(std.Options.debug_io);
+            defer self.mutex.unlock(std.Options.debug_io);
 
             // Try connections from top of stack (LIFO), skipping stale ones
             while (self.counts[idx] > 0) {
@@ -306,8 +306,8 @@ pub const SimplePool = struct {
         // Single lock acquisition for atomic state transition.
         // TigerStyle: Decrement checked_out and store connection atomically.
         {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(std.Options.debug_io);
+            defer self.mutex.unlock(std.Options.debug_io);
 
             // Always decrement checked_out count
             if (self.checked_out_counts[idx] > 0) {
@@ -351,8 +351,8 @@ pub const SimplePool = struct {
         var close_count: u32 = 0;
 
         {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(std.Options.debug_io);
+            defer self.mutex.unlock(std.Options.debug_io);
 
             for (0..MAX_UPSTREAMS) |upstream_idx| {
                 while (self.counts[upstream_idx] > 0) {
@@ -391,8 +391,8 @@ pub const SimplePool = struct {
     /// Get current pool statistics.
     /// TigerStyle: Snapshot under single lock acquisition for consistency.
     pub fn getStats(self: *SimplePool) PoolStats {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
 
         var stats = PoolStats{
             .available = self.counts,

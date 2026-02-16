@@ -105,11 +105,12 @@ fn forwardBodySplice(upstream_fd: i32, client_fd: i32, length_bytes: u64) Forwar
     assert(client_fd >= 0);
 
     // Create pipe for splice
-    const pipe_fds = posix.pipe() catch {
+    var pipe_fds: [2]c_int = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) {
         // Fallback to copy if pipe creation fails.
         // TigerStyle: Cannot use forwardBodyCopy here as we only have fds.
         return ForwardError.SpliceFailed;
-    };
+    }
     defer {
         posix.close(pipe_fds[0]);
         posix.close(pipe_fds[1]);

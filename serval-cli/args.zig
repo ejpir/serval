@@ -27,7 +27,7 @@ pub const ParseResult = enum {
 ///     algorithm: enum { round_robin, least_conn } = .round_robin,
 /// };
 ///
-/// var args = cli.Args(LbExtra).init("lb", "0.1.0");
+/// var args = cli.Args(LbExtra).init("lb", "0.1.0", init.minimal.args);
 /// switch (args.parse()) {
 ///     .ok => {},
 ///     .help => return,
@@ -71,7 +71,7 @@ pub fn Args(comptime Extra: type) type {
         version: []const u8,
 
         /// Iterator over process args
-        args_iter: std.process.ArgIterator,
+        args_iter: std.process.Args.Iterator,
 
         /// Parse error message (if any)
         err_msg: ?[]const u8 = null,
@@ -82,14 +82,14 @@ pub fn Args(comptime Extra: type) type {
 
         /// Initialize argument parser.
         /// TigerStyle: Requires non-empty binary_name and version.
-        pub fn init(binary_name: []const u8, version: []const u8) Self {
+        pub fn init(binary_name: []const u8, version: []const u8, process_args: std.process.Args) Self {
             assert(binary_name.len > 0);
             assert(version.len > 0);
 
             return .{
                 .binary_name = binary_name,
                 .version = version,
-                .args_iter = std.process.args(),
+                .args_iter = process_args.iterate(),
             };
         }
 
@@ -317,7 +317,7 @@ pub const NoExtra = struct {};
 
 test "Args with no extra fields" {
     const TestArgs = Args(NoExtra);
-    const args = TestArgs.init("test", "1.0.0");
+    const args = TestArgs.init("test", "1.0.0", std.process.Args{ .vector = &.{} });
     _ = args;
 }
 
@@ -328,6 +328,6 @@ test "Args with extra fields compiles" {
         verbose: bool = false,
     };
     const TestArgs = Args(Extra);
-    const args = TestArgs.init("test", "1.0.0");
+    const args = TestArgs.init("test", "1.0.0", std.process.Args{ .vector = &.{} });
     _ = args;
 }

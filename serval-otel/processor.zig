@@ -53,14 +53,14 @@ pub const SpanExporter = struct {
 /// Low latency but higher overhead - use for debugging or low-volume tracing.
 pub const SimpleProcessor = struct {
     exporter: SpanExporter,
-    mutex: std.Thread.Mutex,
+    mutex: std.Io.Mutex,
 
     const Self = @This();
 
     pub fn init(exporter: SpanExporter) Self {
         return .{
             .exporter = exporter,
-            .mutex = .{},
+            .mutex = .init,
         };
     }
 
@@ -78,8 +78,8 @@ pub const SimpleProcessor = struct {
 
         if (!span.is_recording) return;
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
 
         var spans = [_]Span{span};
         self.exporter.exportSpans(&spans) catch |err| {
@@ -121,8 +121,8 @@ pub const BatchingProcessor = struct {
     export_buffer: [MAX_EXPORT_BATCH_SIZE]Span,
 
     // Thread synchronization
-    mutex: std.Thread.Mutex,
-    condition: std.Thread.Condition,
+    mutex: std.Io.Mutex,
+    wake_event: std.Io.Event,
     export_thread: ?std.Thread,
     should_shutdown: std.atomic.Value(bool),
 
@@ -142,8 +142,8 @@ pub const BatchingProcessor = struct {
             .queue = undefined,
             .queue_len = 0,
             .export_buffer = undefined,
-            .mutex = .{},
-            .condition = .{},
+            .mutex = .init,
+            .wake_event = .unset,
             .export_thread = null,
             .should_shutdown = std.atomic.Value(bool).init(false),
         };
@@ -174,11 +174,11 @@ pub const BatchingProcessor = struct {
 
         if (!span.is_recording) return;
 
-        self.mutex.lock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
 
         // Drop span if queue is full (TigerStyle: bounded, no panic)
         if (self.queue_len >= MAX_QUEUE_SIZE) {
-            self.mutex.unlock();
+            self.mutex.unlock(std.Options.debug_io);
             log.warn("BatchingProcessor queue full, dropping span", .{});
             return;
         }
@@ -189,22 +189,22 @@ pub const BatchingProcessor = struct {
 
         // Signal if batch size reached
         const should_signal = self.queue_len >= self.config.max_export_batch_size;
-        self.mutex.unlock();
+        self.mutex.unlock(std.Options.debug_io);
 
         if (should_signal) {
-            self.condition.signal();
+            self.wake_event.set(std.Options.debug_io);
         }
     }
 
     /// Force export of all queued spans (for graceful shutdown)
     pub fn forceFlush(self: *Self) !void {
-        self.mutex.lock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
 
         if (self.queue_len > 0) {
             // exportBatchUnlocked releases the mutex
-            self.exportBatchUnlocked();
+            self.exportBatchUnlocked(std.Options.debug_io);
         } else {
-            self.mutex.unlock();
+            self.mutex.unlock(std.Options.debug_io);
         }
     }
 
@@ -214,9 +214,7 @@ pub const BatchingProcessor = struct {
         self.should_shutdown.store(true, .release);
 
         // Wake up export thread
-        self.mutex.lock();
-        self.condition.signal();
-        self.mutex.unlock();
+        self.wake_event.set(std.Options.debug_io);
 
         // Wait for thread to finish
         if (self.export_thread) |thread| {
@@ -228,38 +226,37 @@ pub const BatchingProcessor = struct {
     }
 
     fn exportLoop(self: *Self) void {
+        const io = std.Options.debug_io;
+        const timeout: std.Io.Timeout = .{ .duration = .{
+            .clock = .awake,
+            .raw = .fromMilliseconds(@intCast(self.config.scheduled_delay_ms)),
+        } };
         while (!self.should_shutdown.load(.acquire)) {
-            self.mutex.lock();
-
-            // Wait for batch size or timeout
-            if (self.queue_len < self.config.max_export_batch_size) {
-                self.condition.timedWait(
-                    &self.mutex,
-                    @as(u64, self.config.scheduled_delay_ms) * time.ns_per_ms,
-                ) catch {};
-            }
-
-            // Export if we have spans (releases mutex during I/O)
+            _ = self.wake_event.waitTimeout(io, timeout) catch |err| switch (err) {
+                error.Timeout => {},
+                error.Canceled => {},
+            };
+            self.wake_event.reset();
+            self.mutex.lockUncancelable(io);
             if (self.queue_len > 0) {
-                self.exportBatchUnlocked();
+                self.exportBatchUnlocked(io);
             } else {
-                self.mutex.unlock();
+                self.mutex.unlock(io);
             }
         }
-
         // Final export on shutdown
-        self.mutex.lock();
+        self.mutex.lockUncancelable(io);
         if (self.queue_len > 0) {
-            self.exportBatchUnlocked();
+            self.exportBatchUnlocked(io);
         } else {
-            self.mutex.unlock();
+            self.mutex.unlock(io);
         }
     }
 
     /// Copy spans to export buffer, release mutex, then export.
     /// TigerStyle: I/O happens outside critical section to avoid blocking producers.
     /// IMPORTANT: Caller must hold mutex. This function releases it.
-    fn exportBatchUnlocked(self: *Self) void {
+    fn exportBatchUnlocked(self: *Self, io: std.Io) void {
         assert(self.queue_len > 0); // Precondition
 
         const batch_size = @min(self.queue_len, self.config.max_export_batch_size);
@@ -278,7 +275,7 @@ pub const BatchingProcessor = struct {
         self.queue_len -= batch_size;
 
         // Release mutex BEFORE I/O
-        self.mutex.unlock();
+        self.mutex.unlock(io);
 
         // Export spans (outside critical section)
         self.exporter.exportSpans(self.export_buffer[0..batch_size]) catch |err| {

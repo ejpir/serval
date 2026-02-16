@@ -75,9 +75,9 @@ const MAX_CLI_ARGS: u32 = 32;
 
 /// Parse command line arguments into CliConfig.
 /// TigerStyle: Bounded iteration, explicit defaults.
-fn parseArgs() CliConfig {
+fn parseArgs(process_args: std.process.Args) CliConfig {
     var config = CliConfig{};
-    var args = std.process.args();
+    var args = process_args.iterate();
     assert(config.admin_port > 0); // S1: postcondition - valid default port
     assert(config.data_plane_port > 0); // S1: postcondition - valid default port
 
@@ -171,14 +171,14 @@ fn printUsage() void {
 
 /// Main entry point.
 /// TigerStyle Y1: Under 70 lines with extracted helpers.
-pub fn main() !void {
+pub fn main(process_init: std.process.Init) !void {
     log.info("=== MAIN STARTING ===", .{});
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     // Parse command line args
-    const cli_config = parseArgs();
+    const cli_config = parseArgs(process_init.minimal.args);
 
     // Initialize and run
     try run(allocator, cli_config);
@@ -389,7 +389,7 @@ fn waitForShutdown(ctrl: *Controller) void {
 
     while (iteration < max_iterations) : (iteration += 1) {
         if (ctrl.isShutdown()) break;
-        std.posix.nanosleep(0, sleep_interval_ns);
+        std.Io.sleep(std.Options.debug_io, .fromNanoseconds(@intCast(sleep_interval_ns)), .awake) catch {};
     }
 }
 
@@ -471,7 +471,7 @@ fn runEndpointSyncLoop(allocator: std.mem.Allocator, ctrl: *Controller) void {
         if (ctrl.isShutdown()) break;
 
         // Sleep first to allow initial config to be pushed
-        std.posix.nanosleep(sync_interval_ns / time.ns_per_s, sync_interval_ns % time.ns_per_s);
+        std.Io.sleep(std.Options.debug_io, .fromNanoseconds(@intCast(sync_interval_ns)), .awake) catch {};
 
         if (ctrl.isShutdown()) break;
 

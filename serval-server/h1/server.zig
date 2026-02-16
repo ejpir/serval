@@ -290,7 +290,7 @@ pub fn Server(
             } else {
                 // Plain socket read - direct recv() with no buffering.
                 // TigerStyle: No hidden state, reads exactly what's requested.
-                const n = std.posix.recv(stream.socket.handle, buf, 0) catch |err| {
+                const n = std.posix.read(stream.socket.handle, buf) catch |err| {
                     log.debug("server: conn={d} recv error: {s}", .{ conn_id, @errorName(err) });
                     return null;
                 };

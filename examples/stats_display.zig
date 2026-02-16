@@ -69,7 +69,11 @@ const ANSI_CLEAR_SCREEN = "\x1b[2J";
 /// Write bytes to stdout using posix write.
 /// TigerStyle: Simple, synchronous output for terminal control.
 fn writeStdout(bytes: []const u8) void {
-    _ = posix.write(posix.STDOUT_FILENO, bytes) catch |err| {
+    const stdout_file: std.Io.File = .{
+        .handle = posix.STDOUT_FILENO,
+        .flags = .{ .nonblocking = false },
+    };
+    stdout_file.writeStreamingAll(std.Options.debug_io, bytes) catch |err| {
         // TigerStyle: Log errors in debug builds, don't crash for terminal I/O
         if (@import("builtin").mode == .Debug) {
             log.debug("stats_display: stdout write failed: {s}", .{@errorName(err)});
@@ -173,7 +177,7 @@ pub const StatsDisplay = struct {
 
         while (self.running.load(.acquire) and iteration < max_iterations) : (iteration += 1) {
             self.drawHeader();
-            std.posix.nanosleep(1, 0);
+            std.Io.sleep(std.Options.debug_io, .fromSeconds(1), .awake) catch {};
         }
     }
 

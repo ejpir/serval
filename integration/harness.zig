@@ -136,18 +136,18 @@ pub fn isKtlsAvailable() bool {
 /// TigerStyle: Wrapping arithmetic prevents overflow panic.
 pub const PortPool = struct {
     next_port: u16,
-    mutex: std.Thread.Mutex,
+    mutex: std.Io.Mutex,
 
     pub fn init() PortPool {
         return .{
             .next_port = BASE_TEST_PORT,
-            .mutex = .{},
+            .mutex = .init,
         };
     }
 
     pub fn next(self: *PortPool) u16 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
         const port = self.next_port;
         self.next_port +%= 1;
         if (self.next_port < BASE_TEST_PORT) {

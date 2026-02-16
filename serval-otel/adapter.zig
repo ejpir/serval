@@ -62,7 +62,7 @@ pub const OtelTracer = struct {
     /// Instrumentation scope for all spans
     scope: InstrumentationScope,
     /// Mutex for thread-safe access
-    mutex: std.Thread.Mutex,
+    mutex: std.Io.Mutex,
 
     const Self = @This();
 
@@ -92,7 +92,7 @@ pub const OtelTracer = struct {
         self.id_generator = RandomIDGenerator.initRandom();
         self.processor = processor;
         self.scope = InstrumentationScope.init(scope_name, scope_version);
-        self.mutex = .{};
+        self.mutex = .init;
 
         // Initialize all slots as not in use
         for (&self.spans) |*slot| {
@@ -115,8 +115,8 @@ pub const OtelTracer = struct {
     /// Start a new span, optionally as a child of parent.
     /// Returns a SpanHandle that can be used to reference the span.
     pub fn startSpan(self: *Self, name: []const u8, parent: ?SpanHandle) SpanHandle {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
 
         // Find a free slot
         const slot_index = self.findFreeSlot() orelse {
@@ -168,11 +168,11 @@ pub const OtelTracer = struct {
     /// End a span and submit for export.
     /// If err is non-null, sets the span status to Error with the description.
     pub fn endSpan(self: *Self, handle: SpanHandle, err: ?[]const u8) void {
-        self.mutex.lock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
 
         // Find the span by span_id
         const slot_index = self.findSpanBySpanId(handle.span_id) orelse {
-            self.mutex.unlock();
+            self.mutex.unlock(std.Options.debug_io);
             return; // Span not found (already ended or invalid)
         };
 
@@ -195,7 +195,7 @@ pub const OtelTracer = struct {
         span.end();
 
         // Release mutex before I/O (TigerStyle: I/O outside critical section)
-        self.mutex.unlock();
+        self.mutex.unlock(std.Options.debug_io);
 
         // Export via processor
         self.processor.onEnd(span);
@@ -203,8 +203,8 @@ pub const OtelTracer = struct {
 
     /// Set a string attribute on an active span.
     pub fn setStringAttribute(self: *Self, handle: SpanHandle, key: []const u8, value: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
 
         if (self.findSpanBySpanId(handle.span_id)) |slot_index| {
             self.spans[slot_index].span.setStringAttribute(key, value);
@@ -213,8 +213,8 @@ pub const OtelTracer = struct {
 
     /// Set an integer attribute on an active span.
     pub fn setIntAttribute(self: *Self, handle: SpanHandle, key: []const u8, value: i64) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
 
         if (self.findSpanBySpanId(handle.span_id)) |slot_index| {
             self.spans[slot_index].span.setIntAttribute(key, value);
@@ -223,8 +223,8 @@ pub const OtelTracer = struct {
 
     /// Add an event (log) to an active span.
     pub fn addEvent(self: *Self, handle: SpanHandle, name: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
 
         if (self.findSpanBySpanId(handle.span_id)) |slot_index| {
             self.spans[slot_index].span.addEvent(name) catch |err| {
@@ -263,8 +263,8 @@ pub const OtelTracer = struct {
 
     /// Get the number of active spans (for diagnostics).
     pub fn getActiveCount(self: *Self) u32 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
         return self.active_count;
     }
 };

@@ -7,7 +7,6 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
-const posix = std.posix;
 const Io = std.Io;
 
 const core = @import("serval-core");
@@ -47,8 +46,7 @@ pub fn probeLoop(ctx: ProberContext) void {
     assert(ctx.probe_interval_ms > 0);
     assert(ctx.probe_timeout_ms > 0);
 
-    const interval_s: u64 = ctx.probe_interval_ms / 1000;
-    const interval_ns: u64 = (@as(u64, ctx.probe_interval_ms) % 1000) * 1_000_000;
+    const interval_duration = std.Io.Duration.fromMilliseconds(@intCast(ctx.probe_interval_ms));
 
     // One-time init at thread start, no allocation in probe loop.
     var io_runtime = Io.Threaded.init(ctx.allocator, .{});
@@ -67,7 +65,7 @@ pub fn probeLoop(ctx: ProberContext) void {
 
     while (ctx.probe_running.load(.acquire)) {
         probeUnhealthyBackends(ctx, &client, io);
-        posix.nanosleep(interval_s, interval_ns);
+        std.Io.sleep(std.Options.debug_io, interval_duration, .awake) catch {};
     }
 }
 

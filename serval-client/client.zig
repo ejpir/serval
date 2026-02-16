@@ -360,9 +360,9 @@ fn getLocalPort(fd: i32) u16 {
     var addr: posix.sockaddr.in = std.mem.zeroes(posix.sockaddr.in);
     var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
 
-    posix.getsockname(fd, @ptrCast(&addr), &addr_len) catch {
+    if (std.c.getsockname(fd, @ptrCast(&addr), &addr_len) != 0) {
         return 0;
-    };
+    }
 
     return std.mem.bigToNative(u16, addr.port);
 }

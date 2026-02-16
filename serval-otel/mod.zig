@@ -98,7 +98,7 @@ const GlobalState = struct {
 };
 
 var global_state: ?GlobalState = null;
-var global_mutex: std.Thread.Mutex = .{};
+var global_mutex: std.Io.Mutex = .init;
 
 /// Configuration for global tracing initialization
 pub const Config = struct {
@@ -124,8 +124,8 @@ pub const Config = struct {
 /// Must be called before using any tracing functions.
 /// TigerStyle: All-or-nothing initialization, no partial state.
 pub fn init(allocator: std.mem.Allocator, cfg: Config) !void {
-    global_mutex.lock();
-    defer global_mutex.unlock();
+    global_mutex.lockUncancelable(std.Options.debug_io);
+    defer global_mutex.unlock(std.Options.debug_io);
 
     // TigerStyle: assertion on precondition
     if (global_state != null) {
@@ -170,8 +170,8 @@ pub fn init(allocator: std.mem.Allocator, cfg: Config) !void {
 /// Shutdown global tracing (flushes and closes connections)
 /// TigerStyle: All-or-nothing cleanup, no partial state.
 pub fn deinit() void {
-    global_mutex.lock();
-    defer global_mutex.unlock();
+    global_mutex.lockUncancelable(std.Options.debug_io);
+    defer global_mutex.unlock(std.Options.debug_io);
 
     const state = global_state orelse return;
 
@@ -192,8 +192,8 @@ pub fn isEnabled() bool {
 
 /// Start a server span (for handling incoming requests)
 pub fn startServerSpan(name: []const u8) Span {
-    global_mutex.lock();
-    defer global_mutex.unlock();
+    global_mutex.lockUncancelable(std.Options.debug_io);
+    defer global_mutex.unlock(std.Options.debug_io);
 
     if (global_state) |state| {
         return state.tracer_instance.startServerSpan(name);
@@ -203,8 +203,8 @@ pub fn startServerSpan(name: []const u8) Span {
 
 /// Start a client span (for outgoing requests)
 pub fn startClientSpan(name: []const u8) Span {
-    global_mutex.lock();
-    defer global_mutex.unlock();
+    global_mutex.lockUncancelable(std.Options.debug_io);
+    defer global_mutex.unlock(std.Options.debug_io);
 
     if (global_state) |state| {
         return state.tracer_instance.startClientSpan(name);
@@ -214,8 +214,8 @@ pub fn startClientSpan(name: []const u8) Span {
 
 /// Start an internal span
 pub fn startSpan(name: []const u8) Span {
-    global_mutex.lock();
-    defer global_mutex.unlock();
+    global_mutex.lockUncancelable(std.Options.debug_io);
+    defer global_mutex.unlock(std.Options.debug_io);
 
     if (global_state) |state| {
         return state.tracer_instance.startSpan(name, .Internal);
@@ -225,8 +225,8 @@ pub fn startSpan(name: []const u8) Span {
 
 /// Start a child span from parent
 pub fn startChildSpan(parent: *const Span, name: []const u8, kind: SpanKind) Span {
-    global_mutex.lock();
-    defer global_mutex.unlock();
+    global_mutex.lockUncancelable(std.Options.debug_io);
+    defer global_mutex.unlock(std.Options.debug_io);
 
     if (global_state) |state| {
         return state.tracer_instance.startChildSpan(parent, name, kind);
@@ -236,8 +236,8 @@ pub fn startChildSpan(parent: *const Span, name: []const u8, kind: SpanKind) Spa
 
 /// End a span and submit for export
 pub fn endSpan(s: *Span) void {
-    global_mutex.lock();
-    defer global_mutex.unlock();
+    global_mutex.lockUncancelable(std.Options.debug_io);
+    defer global_mutex.unlock(std.Options.debug_io);
 
     if (global_state) |state| {
         state.tracer_instance.endSpan(s);
@@ -248,8 +248,8 @@ pub fn endSpan(s: *Span) void {
 
 /// Force flush pending spans
 pub fn flush() !void {
-    global_mutex.lock();
-    defer global_mutex.unlock();
+    global_mutex.lockUncancelable(std.Options.debug_io);
+    defer global_mutex.unlock(std.Options.debug_io);
 
     if (global_state) |state| {
         try state.processor_instance.forceFlush();

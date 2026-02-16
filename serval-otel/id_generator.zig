@@ -30,12 +30,10 @@ pub const RandomIDGenerator = struct {
 
     /// Initialize with random seed from OS
     pub fn initRandom() Self {
-        var seed: u64 = undefined;
-        std.posix.getrandom(std.mem.asBytes(&seed)) catch {
-            // Fallback to timestamp-based seed using serval-core time
-            const timestamp = core.realtimeNanos();
-            seed = @intCast(@max(0, timestamp) & 0xFFFFFFFFFFFFFFFF);
-        };
+        const realtime_ns = core.realtimeNanos();
+        const monotonic_ns = core.monotonicNanos();
+        const realtime_u64: u64 = @intCast(@max(0, realtime_ns) & 0xFFFFFFFFFFFFFFFF);
+        const seed: u64 = realtime_u64 ^ monotonic_ns;
         return init(seed);
     }
 

@@ -1,5 +1,10 @@
 const std = @import("std");
 
+fn force_llvm_lld(compile_step: *std.Build.Step.Compile) void {
+    compile_step.use_llvm = true;
+    compile_step.use_lld = true;
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -247,6 +252,7 @@ pub fn build(b: *std.Build) void {
         .name = "serval_tests",
         .root_module = serval_tests_mod,
     });
+    force_llvm_lld(serval_tests);
     const run_serval_tests = b.addRunArtifact(serval_tests);
 
     const test_step = b.step("test", "Run all serval library tests");
@@ -276,6 +282,7 @@ pub fn build(b: *std.Build) void {
         .name = "lb_tests",
         .root_module = lb_tests_mod,
     });
+    force_llvm_lld(lb_tests);
     const run_lb_tests = b.addRunArtifact(lb_tests);
 
     const lb_test_step = b.step("test-lb", "Run serval-lb library tests");
@@ -306,6 +313,7 @@ pub fn build(b: *std.Build) void {
         .name = "router_tests",
         .root_module = router_tests_mod,
     });
+    force_llvm_lld(router_tests);
     const run_router_tests = b.addRunArtifact(router_tests);
 
     const router_test_step = b.step("test-router", "Run serval-router library tests");
@@ -338,6 +346,7 @@ pub fn build(b: *std.Build) void {
         .name = "gateway_tests",
         .root_module = gateway_tests_mod,
     });
+    force_llvm_lld(gateway_tests);
     const run_gateway_tests = b.addRunArtifact(gateway_tests);
 
     const gateway_test_step = b.step("test-k8s-gateway", "Run serval-k8s-gateway library tests");
@@ -354,6 +363,7 @@ pub fn build(b: *std.Build) void {
         .name = "health_tests",
         .root_module = health_tests_mod,
     });
+    force_llvm_lld(health_tests);
     const run_health_tests = b.addRunArtifact(health_tests);
 
     const health_test_step = b.step("test-health", "Run serval-health library tests");
@@ -373,6 +383,7 @@ pub fn build(b: *std.Build) void {
         .name = "tls_tests",
         .root_module = tls_tests_mod,
     });
+    force_llvm_lld(tls_tests);
     const run_tls_tests = b.addRunArtifact(tls_tests);
 
     const tls_test_step = b.step("test-tls", "Run serval-tls library tests");
@@ -389,6 +400,7 @@ pub fn build(b: *std.Build) void {
         .name = "net_tests",
         .root_module = net_tests_mod,
     });
+    force_llvm_lld(net_tests);
     const run_net_tests = b.addRunArtifact(net_tests);
 
     const net_test_step = b.step("test-net", "Run serval-net library tests");
@@ -409,6 +421,7 @@ pub fn build(b: *std.Build) void {
         .name = "socket_tests",
         .root_module = socket_tests_mod,
     });
+    force_llvm_lld(socket_tests);
     const run_socket_tests = b.addRunArtifact(socket_tests);
 
     const socket_test_step = b.step("test-socket", "Run serval-socket library tests");
@@ -428,6 +441,7 @@ pub fn build(b: *std.Build) void {
         .name = "otel_tests",
         .root_module = otel_tests_mod,
     });
+    force_llvm_lld(otel_tests);
     const run_otel_tests = b.addRunArtifact(otel_tests);
 
     const otel_test_step = b.step("test-otel", "Run serval-otel library tests");
@@ -453,6 +467,7 @@ pub fn build(b: *std.Build) void {
         .name = "client_tests",
         .root_module = client_tests_mod,
     });
+    force_llvm_lld(client_tests);
     const run_client_tests = b.addRunArtifact(client_tests);
 
     const client_test_step = b.step("test-client", "Run serval-client library tests");
@@ -471,6 +486,7 @@ pub fn build(b: *std.Build) void {
         // Custom test runner that prints each test name
         .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
     });
+    force_llvm_lld(integration_tests);
     const run_integration_tests = b.addRunArtifact(integration_tests);
 
     const integration_test_step = b.step("test-integration", "Run integration tests");
@@ -513,6 +529,7 @@ pub fn build(b: *std.Build) void {
         .name = "lb_example",
         .root_module = lb_example_mod,
     });
+    force_llvm_lld(lb_example);
     const build_lb_example = b.addInstallArtifact(lb_example, .{});
     const run_lb_example = b.addRunArtifact(lb_example);
 
@@ -542,6 +559,7 @@ pub fn build(b: *std.Build) void {
         .name = "router_example",
         .root_module = router_example_mod,
     });
+    force_llvm_lld(router_example);
     const build_router_example = b.addInstallArtifact(router_example, .{});
     const run_router_example = b.addRunArtifact(router_example);
 
@@ -580,6 +598,7 @@ pub fn build(b: *std.Build) void {
         .name = "gateway_example",
         .root_module = gateway_example_mod,
     });
+    force_llvm_lld(gateway_example);
     const build_gateway_example = b.addInstallArtifact(gateway_example, .{});
     const run_gateway_example = b.addRunArtifact(gateway_example);
 
@@ -610,6 +629,7 @@ pub fn build(b: *std.Build) void {
         .name = "echo_backend",
         .root_module = echo_backend_mod,
     });
+    force_llvm_lld(echo_backend);
     const build_echo_backend = b.addInstallArtifact(echo_backend, .{});
     const run_echo_backend = b.addRunArtifact(echo_backend);
 
@@ -638,6 +658,7 @@ pub fn build(b: *std.Build) void {
         .name = "otel_test",
         .root_module = otel_test_mod,
     });
+    force_llvm_lld(otel_test);
     const build_otel_test = b.addInstallArtifact(otel_test, .{});
 
     const run_otel_test = b.addRunArtifact(otel_test);
@@ -656,6 +677,7 @@ pub fn build(b: *std.Build) void {
         .name = "dns_test",
         .root_module = dns_test_mod,
     });
+    force_llvm_lld(dns_test);
     const build_dns_test = b.addInstallArtifact(dns_test, .{});
     _ = build_dns_test;
 
@@ -683,6 +705,7 @@ pub fn build(b: *std.Build) void {
         .name = "llm_streaming",
         .root_module = llm_streaming_mod,
     });
+    force_llvm_lld(llm_streaming);
     const build_llm_streaming = b.addInstallArtifact(llm_streaming, .{});
     const run_llm_streaming = b.addRunArtifact(llm_streaming);
 

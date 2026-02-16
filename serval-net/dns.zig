@@ -229,7 +229,7 @@ pub const DnsResolver = struct {
     /// Resolver configuration.
     resolver_config: DnsConfig,
     /// Mutex for thread safety.
-    mutex: std.Thread.Mutex,
+    mutex: std.Io.Mutex,
     /// Statistics: cache hits.
     stats_hits: u64,
     /// Statistics: cache misses.
@@ -246,7 +246,7 @@ pub const DnsResolver = struct {
         out.* = .{
             .cache = undefined,
             .resolver_config = dns_config,
-            .mutex = .{},
+            .mutex = .init,
             .stats_hits = 0,
             .stats_misses = 0,
         };
@@ -278,8 +278,8 @@ pub const DnsResolver = struct {
 
         // Check cache first (under lock)
         {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(std.Options.debug_io);
+            defer self.mutex.unlock(std.Options.debug_io);
 
             if (self.find_in_cache(hostname, now_ns)) |entry| {
                 self.stats_hits +|= 1; // S4: saturating add to prevent overflow
@@ -306,8 +306,8 @@ pub const DnsResolver = struct {
 
         // Store in cache (under lock) - single address as slice
         {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(std.Options.debug_io);
+            defer self.mutex.unlock(std.Options.debug_io);
             const addr_slice: []const Io.net.IpAddress = &[_]Io.net.IpAddress{address};
             self.store_in_cache(hostname, addr_slice, now_ns);
         }
@@ -346,8 +346,8 @@ pub const DnsResolver = struct {
         // Check cache first (under lock)
         // Cache stores multiple addresses for failover
         {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(std.Options.debug_io);
+            defer self.mutex.unlock(std.Options.debug_io);
 
             if (self.find_in_cache(hostname, now_ns)) |entry| {
                 self.stats_hits +|= 1;
@@ -375,8 +375,8 @@ pub const DnsResolver = struct {
 
         // Store all addresses in cache (under lock)
         if (out.count > 0) {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(std.Options.debug_io);
+            defer self.mutex.unlock(std.Options.debug_io);
             self.store_in_cache(hostname, out.addresses[0..out.count], now_ns);
         }
 
@@ -391,8 +391,8 @@ pub const DnsResolver = struct {
     pub fn invalidate(self: *DnsResolver, hostname: []const u8) void {
         assert(hostname.len > 0);
         assert(hostname.len <= config.DNS_MAX_HOSTNAME_LEN);
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
 
         for (&self.cache) |*entry| {
             if (entry.matches(hostname)) {
@@ -406,8 +406,8 @@ pub const DnsResolver = struct {
     /// TigerStyle: Thread-safe, clears entire cache.
     pub fn invalidate_all(self: *DnsResolver) void {
         assert(config.DNS_MAX_CACHE_ENTRIES > 0);
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
 
         for (&self.cache) |*entry| {
             entry.valid = false;
@@ -418,8 +418,8 @@ pub const DnsResolver = struct {
     /// TigerStyle: Read-only, returns copies.
     pub fn get_stats(self: *DnsResolver) struct { hits: u64, misses: u64 } {
         assert(@intFromPtr(self) != 0);
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
         return .{ .hits = self.stats_hits, .misses = self.stats_misses };
     }
 

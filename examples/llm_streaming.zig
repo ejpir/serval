@@ -73,16 +73,6 @@ const LlmHandler = struct {
     /// can be active at a time. For production, use per-context state.
     token_idx: u32 = 0,
 
-    /// Convert nanoseconds to (seconds, remaining_ns) for nanosleep.
-    /// TigerStyle: Trivial pure function, inline calculation.
-    fn nsToSecAndNs(total_ns: u64) struct { s: u64, ns: u64 } {
-        const ns_per_s: u64 = 1_000_000_000;
-        return .{
-            .s = total_ns / ns_per_s,
-            .ns = total_ns % ns_per_s,
-        };
-    }
-
     pub fn init(port: u16, debug: bool) LlmHandler {
         // S1: Preconditions
         assert(port > 0);
@@ -238,8 +228,7 @@ const LlmHandler = struct {
 
         // Simulate thinking delay between tokens
         if (self.token_idx > 0) {
-            const delay = nsToSecAndNs(TOKEN_DELAY_NS);
-            std.posix.nanosleep(delay.s, delay.ns);
+            std.Io.sleep(std.Options.debug_io, .fromNanoseconds(@intCast(TOKEN_DELAY_NS)), .awake) catch {};
         }
 
         // Get current token
@@ -278,10 +267,10 @@ const LlmHandler = struct {
     }
 };
 
-pub fn main() !void {
+pub fn main(process_init: std.process.Init) !void {
     // Parse command-line arguments
     // Note: cli.Args expects a struct for extra options, use NoExtra for none
-    var args = cli.Args(cli.NoExtra).init("llm_streaming", VERSION);
+    var args = cli.Args(cli.NoExtra).init("llm_streaming", VERSION, process_init.minimal.args);
     switch (args.parse()) {
         .ok => {},
         .help, .version => return,

@@ -133,7 +133,7 @@ pub const Watcher = struct {
 
     /// Mutex for protecting shared state during reconciliation.
     /// TigerStyle: Explicit synchronization for thread safety.
-    mutex: std.Thread.Mutex,
+    mutex: std.Io.Mutex,
 
     /// Watch thread handles (one per resource type).
     /// Stored for clean shutdown via join().
@@ -272,7 +272,7 @@ pub const Watcher = struct {
             .temp_listeners = undefined,
             .line_buffers = line_buffers,
             .current_backoff_ms = initial_backoffs,
-            .mutex = .{},
+            .mutex = .init,
             .watch_threads = initial_threads,
             .active_thread_count = std.atomic.Value(u8).init(0),
         };
@@ -554,8 +554,8 @@ pub const Watcher = struct {
 
         // Acquire mutex for thread-safe access to shared ResourceStores.
         // TigerStyle: Explicit synchronization, mutex held during store modification.
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
 
         // Handle based on event type.
         switch (event.event_type) {
@@ -995,9 +995,8 @@ pub const Watcher = struct {
         const current_ms = self.current_backoff_ms[thread_idx];
 
         // Sleep for current backoff duration.
-        const backoff_s: u64 = current_ms / 1000;
-        const backoff_ns: u64 = (@as(u64, current_ms) % 1000) * 1_000_000;
-        posix.nanosleep(backoff_s, backoff_ns);
+        const backoff_ns: u64 = @as(u64, current_ms) * std.time.ns_per_ms;
+        std.Io.sleep(std.Options.debug_io, .fromNanoseconds(@intCast(backoff_ns)), .awake) catch {};
 
         // Increase backoff for next attempt (capped at MAX_BACKOFF_MS).
         const new_backoff = current_ms * BACKOFF_MULTIPLIER;

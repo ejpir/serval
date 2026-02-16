@@ -736,7 +736,7 @@ fn mapBodyError(err: anyerror) ClientError {
 
 /// Read a file into a buffer, returning the number of bytes read.
 fn readFileIntoBuffer(path: []const u8, buffer: []u8) !usize {
-    const fd = posix.open(path, .{}, 0) catch |err| {
+    const fd = posix.openat(posix.AT.FDCWD, path, .{}, 0) catch |err| {
         return switch (err) {
             error.FileNotFound => error.FileNotFound,
             error.AccessDenied => error.AccessDenied,

@@ -50,7 +50,7 @@ pub fn main() !void {
     request_span.setIntAttribute("http.request_content_length", 0);
 
     // Simulate some work
-    std.posix.nanosleep(0, 10_000_000); // 10ms
+    std.Io.sleep(std.Options.debug_io, .fromNanoseconds(10_000_000), .awake) catch {};
 
     // Create a child span (simulating a database query)
     var db_span = tracer.startChildSpan(&request_span, "SELECT * FROM users", .Client);
@@ -59,7 +59,7 @@ pub fn main() !void {
     db_span.setStringAttribute("db.statement", "SELECT * FROM users WHERE active = true");
 
     // Simulate DB query time
-    std.posix.nanosleep(0, 25_000_000); // 25ms
+    std.Io.sleep(std.Options.debug_io, .fromNanoseconds(25_000_000), .awake) catch {};
 
     db_span.setIntAttribute("db.rows_affected", 42);
     db_span.setOk();
@@ -67,7 +67,7 @@ pub fn main() !void {
 
     // Create another child span (simulating JSON serialization)
     var serialize_span = tracer.startChildSpan(&request_span, "serialize response", .Internal);
-    std.posix.nanosleep(0, 2_000_000); // 2ms
+    std.Io.sleep(std.Options.debug_io, .fromNanoseconds(2_000_000), .awake) catch {};
     serialize_span.setIntAttribute("response.size_bytes", 4096);
     serialize_span.setOk();
     tracer.endSpan(&serialize_span);

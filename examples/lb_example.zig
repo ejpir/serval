@@ -293,9 +293,9 @@ fn parseBackends(
     return count;
 }
 
-pub fn main() !void {
+pub fn main(process_init: std.process.Init) !void {
     // Parse command-line arguments
-    var args = cli.Args(LbExtra).init("lb_example", VERSION);
+    var args = cli.Args(LbExtra).init("lb_example", VERSION, process_init.minimal.args);
     switch (args.parse()) {
         .ok => {},
         .help, .version => return,

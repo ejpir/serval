@@ -14,7 +14,6 @@
 //! TigerStyle: No runtime allocation after init, bounded grace period, explicit error handling.
 
 const std = @import("std");
-const posix = std.posix;
 const assert = std.debug.assert;
 
 const serval = @import("serval");
@@ -194,7 +193,7 @@ var slot_initialized: [config.MAX_ROUTER_SLOTS]bool = .{ false, false };
 
 /// Mutex to serialize config swaps.
 /// TigerStyle: Prevents concurrent swap race conditions during grace period.
-var swap_mutex: std.Thread.Mutex = .{};
+var swap_mutex: std.Io.Mutex = .init;
 
 // =============================================================================
 // Public API
@@ -230,8 +229,8 @@ pub fn swapRouter(
 
     // Serialize config swaps to prevent race during grace period.
     // TigerStyle: Explicit locking, defer unlock for exception safety.
-    swap_mutex.lock();
-    defer swap_mutex.unlock();
+    swap_mutex.lockUncancelable(std.Options.debug_io);
+    defer swap_mutex.unlock(std.Options.debug_io);
 
     // Calculate inactive slot (toggle between 0 and 1)
     const current_slot: u8 = active_slot.load(.acquire);
@@ -283,9 +282,7 @@ pub fn swapRouter(
     // TigerStyle: Bounded wait with explicit timeout from config.
     // TigerStyle: Grace period in milliseconds converted to seconds + nanoseconds
     const grace_ns: u64 = config.CONFIG_SWAP_GRACE_MS * time.ns_per_ms;
-    const grace_secs: u64 = grace_ns / time.ns_per_s;
-    const grace_remaining_ns: u64 = grace_ns % time.ns_per_s;
-    posix.nanosleep(grace_secs, grace_remaining_ns);
+    std.Io.sleep(std.Options.debug_io, .fromNanoseconds(@intCast(grace_ns)), .awake) catch {};
 
     // S2: Postcondition - current_router points to newly initialized slot
     const final_router = current_router.load(.acquire);

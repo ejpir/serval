@@ -67,7 +67,11 @@ pub const PlainSocket = struct {
         assert(data.len > 0); // S1: precondition
         assert(data.len <= std.math.maxInt(u32)); // S2: data fits in u32
 
-        const n = posix.write(self.fd, data) catch |err| {
+        const file: std.Io.File = .{
+            .handle = self.fd,
+            .flags = .{ .nonblocking = true },
+        };
+        const n = file.writeStreaming(std.Options.debug_io, &.{}, &.{data}, 1) catch |err| {
             return map_posix_error(err);
         };
 
@@ -369,7 +373,8 @@ test "PlainSocket read/write require valid fd" {
 
     // Inject data via raw posix to verify Socket.read() retrieves it.
     const msg = "hello";
-    _ = try posix.write(fds[1], msg);
+    const write_file: std.Io.File = .{ .handle = fds[1], .flags = .{ .nonblocking = false } };
+    try write_file.writeStreamingAll(std.Options.debug_io, msg);
 
     // Socket.read must return the injected data.
     var buf: [16]u8 = undefined;
@@ -460,7 +465,8 @@ test "Socket.read_at_least reads minimum bytes" {
 
     // Write data to be read - if socketpair works, write must work
     const msg = "hello world";
-    _ = try posix.write(fds[1], msg);
+    const write_file: std.Io.File = .{ .handle = fds[1], .flags = .{ .nonblocking = false } };
+    try write_file.writeStreamingAll(std.Options.debug_io, msg);
 
     // Read at least 5 bytes (may get more)
     var buf: [32]u8 = undefined;
@@ -477,7 +483,8 @@ test "Socket.read_at_least error on EOF before min_bytes" {
     var sock = Socket.Plain.init_client(fds[0]);
 
     // Write only 3 bytes then close - if socketpair works, write must work
-    _ = try posix.write(fds[1], "abc");
+    const write_file: std.Io.File = .{ .handle = fds[1], .flags = .{ .nonblocking = false } };
+    try write_file.writeStreamingAll(std.Options.debug_io, "abc");
     posix.close(fds[1]);
 
     // Try to read at least 10 bytes - should fail due to EOF
@@ -494,7 +501,8 @@ test "Socket.read_at_least reads exact minimum when available" {
     var sock = Socket.Plain.init_client(fds[0]);
 
     // Write exactly 5 bytes - if socketpair works, write must work
-    _ = try posix.write(fds[1], "12345");
+    const write_file: std.Io.File = .{ .handle = fds[1], .flags = .{ .nonblocking = false } };
+    try write_file.writeStreamingAll(std.Options.debug_io, "12345");
 
     // Read at least 5 bytes
     var buf: [32]u8 = undefined;

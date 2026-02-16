@@ -72,8 +72,8 @@ pub const Tracer = struct {
 
     /// Start a new span with optional parent
     pub fn startSpanWithParent(self: *Self, name: []const u8, kind: SpanKind, parent: ?*const Span) Span {
-        self.provider.mutex.lock();
-        defer self.provider.mutex.unlock();
+        self.provider.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.provider.mutex.unlock(std.Options.debug_io);
 
         const span_id = self.provider.id_gen.newSpanId();
 
@@ -124,7 +124,7 @@ pub const Tracer = struct {
 pub const TracerProvider = struct {
     id_gen: RandomIDGenerator,
     processor: ?SpanProcessor,
-    mutex: std.Thread.Mutex,
+    mutex: std.Io.Mutex,
 
     const Self = @This();
 
@@ -133,7 +133,7 @@ pub const TracerProvider = struct {
         return .{
             .id_gen = RandomIDGenerator.initRandom(),
             .processor = processor,
-            .mutex = .{},
+            .mutex = .init,
         };
     }
 
@@ -142,7 +142,7 @@ pub const TracerProvider = struct {
         return .{
             .id_gen = RandomIDGenerator.init(seed),
             .processor = processor,
-            .mutex = .{},
+            .mutex = .init,
         };
     }
 
