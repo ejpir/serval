@@ -34,9 +34,15 @@ const getLocalPortFromSocket = connect.getLocalPortFromSocket;
 
 const h1 = @import("h1/mod.zig");
 const sendRequest = h1.sendRequest;
+const sendUpgradeRequest = h1.sendUpgradeRequest;
 const methodToString = h1.methodToString;
 const streamRequestBody = h1.streamRequestBody;
 const forwardResponse = h1.forwardResponse;
+const forwardUpgradeResponse = h1.forwardUpgradeResponse;
+
+const tunnel_mod = @import("tunnel.zig");
+
+const serval_websocket = @import("serval-websocket");
 
 const serval_tls = @import("serval-tls");
 const TLSStream = serval_tls.TLSStream;
@@ -221,6 +227,102 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             return result;
         }
 
+        /// Forward a WebSocket upgrade request and switch to tunnel mode on 101.
+        /// Upgraded upstream connections are always closed, never returned to the pool.
+        pub fn forwardWebSocket(
+            self: *Self,
+            io: Io,
+            client_stream: Io.net.Stream,
+            client_tls: ?*TLSStream,
+            request: *const Request,
+            upstream: *const Upstream,
+            initial_client_bytes: []const u8,
+            parent_span: SpanHandle,
+            effective_path: ?[]const u8,
+        ) ForwardError!ForwardResult {
+            assert(upstream.port > 0);
+            const request_key = request.headers.get("Sec-WebSocket-Key") orelse return ForwardError.InvalidResponse;
+
+            var accept_key_buf: [serval_websocket.websocket_accept_key_size_bytes]u8 = undefined;
+            const expected_accept = serval_websocket.computeAcceptKey(request_key, &accept_key_buf) catch {
+                return ForwardError.InvalidResponse;
+            };
+
+            const forward_span = self.tracer.startSpan("forward_websocket_upgrade", parent_span);
+            errdefer self.tracer.endSpan(forward_span, "forward_error");
+
+            const pool_span = self.tracer.startSpan("pool_acquire", forward_span);
+            const pool_start_ns = time.monotonicNanos();
+            var stale_retries: u8 = 0;
+
+            while (stale_retries < MAX_STALE_RETRIES) : (stale_retries += 1) {
+                if (self.pool.acquire(upstream.idx)) |pooled_conn| {
+                    const pool_wait_ns = time.elapsedNanos(pool_start_ns, time.monotonicNanos());
+                    if (pooled_conn.isUnusable()) {
+                        var stale_conn = pooled_conn;
+                        stale_conn.close();
+                        continue;
+                    }
+
+                    const result = self.forwardWebSocketWithConnection(
+                        io,
+                        client_stream,
+                        client_tls,
+                        request,
+                        upstream,
+                        pooled_conn,
+                        true,
+                        initial_client_bytes,
+                        expected_accept,
+                        0,
+                        0,
+                        getLocalPortFromSocket(pooled_conn.socket),
+                        pool_wait_ns,
+                        forward_span,
+                        effective_path,
+                    ) catch |err| {
+                        if (err == ForwardError.StaleConnection and stale_retries + 1 < MAX_STALE_RETRIES) {
+                            continue;
+                        }
+                        self.tracer.setIntAttribute(pool_span, "wait_ns", @intCast(pool_wait_ns));
+                        self.tracer.setIntAttribute(pool_span, "hit", 0);
+                        self.tracer.setIntAttribute(pool_span, "stale_retries", stale_retries);
+                        self.tracer.endSpan(pool_span, @errorName(err));
+                        return err;
+                    };
+
+                    self.tracer.setIntAttribute(pool_span, "wait_ns", @intCast(pool_wait_ns));
+                    self.tracer.setIntAttribute(pool_span, "hit", 1);
+                    self.tracer.setIntAttribute(pool_span, "stale_retries", stale_retries);
+                    self.tracer.endSpan(pool_span, null);
+                    self.tracer.endSpan(forward_span, null);
+                    return result;
+                }
+                break;
+            }
+
+            const pool_wait_ns = time.elapsedNanos(pool_start_ns, time.monotonicNanos());
+            self.tracer.setIntAttribute(pool_span, "wait_ns", @intCast(pool_wait_ns));
+            self.tracer.setIntAttribute(pool_span, "hit", 0);
+            self.tracer.setIntAttribute(pool_span, "stale_retries", stale_retries);
+            self.tracer.endSpan(pool_span, null);
+
+            const result = try self.forwardFreshWebSocket(
+                io,
+                client_stream,
+                client_tls,
+                request,
+                upstream,
+                initial_client_bytes,
+                expected_accept,
+                pool_wait_ns,
+                forward_span,
+                effective_path,
+            );
+            self.tracer.endSpan(forward_span, null);
+            return result;
+        }
+
         fn forwardFresh(
             self: *Self,
             io: Io,
@@ -297,6 +399,161 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
                 forward_span,
                 effective_path,
             );
+        }
+
+        fn forwardFreshWebSocket(
+            self: *Self,
+            io: Io,
+            client_stream: Io.net.Stream,
+            client_tls: ?*TLSStream,
+            request: *const Request,
+            upstream: *const Upstream,
+            initial_client_bytes: []const u8,
+            expected_accept: []const u8,
+            pool_wait_ns: u64,
+            forward_span: SpanHandle,
+            effective_path: ?[]const u8,
+        ) ForwardError!ForwardResult {
+            assert(upstream.port > 0);
+
+            const connect_span = self.tracer.startSpan("tcp_connect", forward_span);
+            const connect_config = ConnectConfig{
+                .timeout_ns = config.CONNECT_TIMEOUT_NS,
+                .verify_upstream_tls = self.verify_upstream_tls,
+                .client_ctx = self.client_ctx,
+            };
+            const connect_result = connectUpstream(upstream, io, connect_config, &self.dns_resolver) catch |err| {
+                self.tracer.endSpan(connect_span, @errorName(err));
+                return err;
+            };
+            self.tracer.setIntAttribute(connect_span, "duration_ns", @intCast(connect_result.tcp_connect_duration_ns));
+            self.tracer.setIntAttribute(connect_span, "port", connect_result.local_port);
+            self.tracer.endSpan(connect_span, null);
+
+            const conn = Connection{
+                .socket = connect_result.socket,
+                .created_ns = connect_result.created_ns,
+            };
+
+            return self.forwardWebSocketWithConnection(
+                io,
+                client_stream,
+                client_tls,
+                request,
+                upstream,
+                conn,
+                false,
+                initial_client_bytes,
+                expected_accept,
+                connect_result.dns_duration_ns,
+                connect_result.tcp_connect_duration_ns,
+                connect_result.local_port,
+                pool_wait_ns,
+                forward_span,
+                effective_path,
+            );
+        }
+
+        fn forwardWebSocketWithConnection(
+            self: *Self,
+            io: Io,
+            client_stream: Io.net.Stream,
+            client_tls: ?*TLSStream,
+            request: *const Request,
+            upstream: *const Upstream,
+            conn: Connection,
+            is_pooled: bool,
+            initial_client_bytes: []const u8,
+            expected_accept: []const u8,
+            dns_duration_ns: u64,
+            tcp_connect_duration_ns: u64,
+            local_port: u16,
+            pool_wait_ns: u64,
+            forward_span: SpanHandle,
+            effective_path: ?[]const u8,
+        ) ForwardError!ForwardResult {
+            var mutable_conn = conn;
+            defer {
+                if (is_pooled) {
+                    self.pool.release(upstream.idx, mutable_conn, false);
+                } else {
+                    mutable_conn.close();
+                }
+            }
+
+            const send_span = self.tracer.startSpan("send_request", forward_span);
+            const send_start_ns = time.monotonicNanos();
+            sendUpgradeRequest(&mutable_conn, io, request, effective_path) catch |err| {
+                self.tracer.endSpan(send_span, @errorName(err));
+                if (is_pooled and err == ForwardError.SendFailed) {
+                    return ForwardError.StaleConnection;
+                }
+                return err;
+            };
+            const send_duration_ns = time.elapsedNanos(send_start_ns, time.monotonicNanos());
+            self.tracer.setIntAttribute(send_span, "duration_ns", @intCast(send_duration_ns));
+            self.tracer.endSpan(send_span, null);
+
+            var client_socket = if (client_tls) |tls|
+                Socket{ .tls = .{ .fd = client_stream.socket.handle, .stream = tls.* } }
+            else
+                Socket.Plain.init_client(client_stream.socket.handle);
+
+            const recv_span = self.tracer.startSpan("recv_response", forward_span);
+            const recv_start_ns = time.monotonicNanos();
+            const upgrade_result = forwardUpgradeResponse(
+                io,
+                &mutable_conn,
+                &client_socket,
+                is_pooled,
+                expected_accept,
+            ) catch |err| {
+                self.tracer.endSpan(recv_span, @errorName(err));
+                return err;
+            };
+            const recv_duration_ns = time.elapsedNanos(recv_start_ns, time.monotonicNanos());
+            self.tracer.setIntAttribute(recv_span, "duration_ns", @intCast(recv_duration_ns));
+            self.tracer.setIntAttribute(recv_span, "status", upgrade_result.status);
+            self.tracer.endSpan(recv_span, null);
+
+            var result = ForwardResult{
+                .status = upgrade_result.status,
+                .response_bytes = upgrade_result.response_bytes,
+                .connection_reused = is_pooled,
+                .dns_duration_ns = dns_duration_ns,
+                .tcp_connect_duration_ns = tcp_connect_duration_ns,
+                .send_duration_ns = send_duration_ns,
+                .recv_duration_ns = recv_duration_ns,
+                .pool_wait_ns = pool_wait_ns,
+                .upstream_local_port = local_port,
+            };
+
+            if (!upgrade_result.upgraded) {
+                return result;
+            }
+
+            const tunnel_span = self.tracer.startSpan("websocket_tunnel", forward_span);
+            const tunnel_stats = tunnel_mod.relay(
+                &client_socket,
+                &mutable_conn.socket,
+                initial_client_bytes,
+                &[_]u8{},
+            );
+            self.tracer.setIntAttribute(tunnel_span, "duration_ns", @intCast(tunnel_stats.duration_ns));
+            self.tracer.setIntAttribute(tunnel_span, "client_to_upstream_bytes", @intCast(tunnel_stats.client_to_upstream_bytes));
+            self.tracer.setIntAttribute(tunnel_span, "upstream_to_client_bytes", @intCast(tunnel_stats.upstream_to_client_bytes));
+            self.tracer.setStringAttribute(tunnel_span, "termination", @tagName(tunnel_stats.termination));
+            self.tracer.endSpan(tunnel_span, null);
+
+            debugLog("websocket tunnel complete termination={s} up_bytes={d} down_bytes={d}", .{
+                @tagName(tunnel_stats.termination),
+                tunnel_stats.client_to_upstream_bytes,
+                tunnel_stats.upstream_to_client_bytes,
+            });
+
+            result.response_bytes += tunnel_stats.upstream_to_client_bytes;
+            result.recv_duration_ns += tunnel_stats.duration_ns;
+            return result;
         }
 
         /// Forward request using an established upstream connection.

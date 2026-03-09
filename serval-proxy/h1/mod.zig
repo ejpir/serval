@@ -7,6 +7,7 @@
 pub const request = @import("request.zig");
 pub const response = @import("response.zig");
 pub const body = @import("body.zig");
+pub const websocket = @import("websocket.zig");
 
 // Re-export commonly used functions for convenience
 pub const sendRequest = request.sendRequest;
@@ -14,6 +15,10 @@ pub const buildRequestBuffer = request.buildRequestBuffer;
 pub const methodToString = request.methodToString;
 pub const isHopByHopHeader = request.isHopByHopHeader;
 pub const eqlIgnoreCase = request.eqlIgnoreCase;
+
+pub const sendUpgradeRequest = websocket.sendUpgradeRequest;
+pub const buildUpgradeRequestBuffer = websocket.buildUpgradeRequestBuffer;
+pub const forwardUpgradeResponse = websocket.forwardUpgradeResponse;
 
 pub const forwardResponse = response.forwardResponse;
 
@@ -25,4 +30,5 @@ test {
     _ = @import("response.zig");
     _ = @import("body.zig");
     _ = @import("chunked.zig");
+    _ = @import("websocket.zig");
 }

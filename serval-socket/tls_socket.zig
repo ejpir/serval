@@ -161,6 +161,22 @@ pub const TLSSocket = struct {
         return bytes_written;
     }
 
+    /// Returns true if userspace TLS has decrypted bytes buffered internally.
+    /// Needed for single-threaded tunnel relay correctness: SSL may hold plaintext
+    /// even when the underlying socket fd is not poll-readable.
+    pub fn has_pending_read(self: *const TLSSocket) bool {
+        assert(self.fd >= 0);
+
+        return switch (self.stream.mode) {
+            .ktls => false,
+            .userspace => |ssl_conn| blk: {
+                const pending = ssl.SSL_pending(ssl_conn);
+                assert(pending >= 0);
+                break :blk pending > 0;
+            },
+        };
+    }
+
     /// Close TLS session and underlying fd.
     /// TigerStyle S1: Assertions for preconditions.
     pub fn close(self: *TLSSocket) void {

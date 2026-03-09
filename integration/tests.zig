@@ -19,6 +19,8 @@
 
 const std = @import("std");
 const testing = std.testing;
+const serval = @import("serval");
+const serval_net = @import("serval-net");
 const posix = @import("posix_compat.zig");
 const harness = @import("harness.zig");
 
@@ -272,6 +274,838 @@ test "integration: lb forwards chunked response correctly" {
     try testing.expect(response.body.len > 0);
     try testing.expect(std.mem.indexOf(u8, response.body, "Method: GET") != null);
     try testing.expect(std.mem.indexOf(u8, response.body, "Path: /test") != null);
+}
+
+// =============================================================================
+// WebSocket Integration Tests
+// =============================================================================
+
+const c = std.c;
+
+/// Loopback IPv4 address in big-endian form.
+const LOOPBACK_IPV4_BE: u32 = 0x7F000001;
+
+/// Fixed RFC 6455 sample key for deterministic tests.
+const WS_TEST_KEY: []const u8 = "dGhlIHNhbXBsZSBub25jZQ==";
+
+/// RFC 6455 sample accept value for WS_TEST_KEY.
+const WS_TEST_ACCEPT: []const u8 = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
+
+/// Maximum bytes for WebSocket HTTP handshake + immediate frame data in tests.
+const WS_TEST_BUFFER_SIZE_BYTES: u32 = 2048;
+
+/// Maximum payload size for simple text-frame test helpers.
+const WS_TEST_MAX_PAYLOAD_BYTES: u32 = 125;
+
+/// Maximum recv iterations for bounded read loops in websocket tests.
+const WS_TEST_MAX_READS: u32 = 64;
+
+/// Listener backlog for raw websocket test backend.
+const WS_TEST_LISTENER_BACKLOG: c_int = 8;
+
+/// Startup delay for in-process native websocket test server.
+const WS_NATIVE_SERVER_STARTUP_DELAY_MS: u64 = 100;
+
+const WebSocketBackendMode = enum {
+    echo_after_upgrade,
+    immediate_frame_after_upgrade,
+    invalid_accept,
+};
+
+const WebSocketBackendConfig = struct {
+    port: u16,
+    mode: WebSocketBackendMode,
+    path: []const u8,
+    payload: []const u8,
+};
+
+fn startWebSocketBackend(config: WebSocketBackendConfig) !std.Thread {
+    return try std.Thread.spawn(.{}, websocketBackendMain, .{config});
+}
+
+fn websocketBackendMain(config: WebSocketBackendConfig) !void {
+    const listener = try createTcpListener(config.port);
+    defer posix.close(listener);
+
+    const conn = try acceptTcp(listener);
+    defer posix.close(conn);
+
+    var request_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const request_len = try readUntilHeadersComplete(conn, &request_buf);
+    const request = request_buf[0..request_len];
+
+    try testing.expect(std.mem.indexOf(u8, request, "GET ") != null);
+    try testing.expect(std.mem.indexOf(u8, request, config.path) != null);
+    try testing.expect(std.mem.indexOf(u8, request, "Upgrade: websocket") != null);
+    try testing.expect(std.mem.indexOf(u8, request, "Sec-WebSocket-Key: " ++ WS_TEST_KEY) != null);
+
+    switch (config.mode) {
+        .echo_after_upgrade => {
+            var response_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+            const response = try buildSwitchingProtocolsResponse(WS_TEST_ACCEPT, &response_buf);
+            try sendAllTcp(conn, response);
+
+            var frame_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+            const payload = try readMaskedClientTextFrame(conn, &frame_buf);
+
+            var response_frame_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+            const frame = try buildServerTextFrame(payload, &response_frame_buf);
+            try sendAllTcp(conn, frame);
+        },
+        .immediate_frame_after_upgrade => {
+            var frame_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+            const frame = try buildServerTextFrame(config.payload, &frame_buf);
+
+            var response_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+            const response = try std.fmt.bufPrint(
+                &response_buf,
+                "HTTP/1.1 101 Switching Protocols\r\n" ++
+                    "Upgrade: websocket\r\n" ++
+                    "Connection: Upgrade\r\n" ++
+                    "Sec-WebSocket-Accept: {s}\r\n" ++
+                    "\r\n{s}",
+                .{ WS_TEST_ACCEPT, frame },
+            );
+            try sendAllTcp(conn, response);
+        },
+        .invalid_accept => {
+            var response_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+            const response = try buildSwitchingProtocolsResponse("invalid-accept-value", &response_buf);
+            try sendAllTcp(conn, response);
+        },
+    }
+}
+
+fn createTcpListener(port: u16) !posix.socket_t {
+    const listener = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
+    errdefer posix.close(listener);
+
+    const reuse_addr: c_int = 1;
+    try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&reuse_addr));
+
+    const addr: std.posix.sockaddr.in = .{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, LOOPBACK_IPV4_BE),
+    };
+
+    while (true) {
+        const rc = c.bind(listener, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in));
+        switch (c.errno(rc)) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => return error.BindFailed,
+        }
+    }
+
+    while (true) {
+        const rc = c.listen(listener, WS_TEST_LISTENER_BACKLOG);
+        switch (c.errno(rc)) {
+            .SUCCESS => return listener,
+            .INTR => continue,
+            else => return error.ListenFailed,
+        }
+    }
+}
+
+fn acceptTcp(listener: posix.socket_t) !posix.socket_t {
+    while (true) {
+        const rc = c.accept(listener, null, null);
+        switch (c.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            else => return error.AcceptFailed,
+        }
+    }
+}
+
+fn connectTcp(port: u16) !posix.socket_t {
+    const sock = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
+    errdefer posix.close(sock);
+
+    const addr: posix.sockaddr.in = .{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, LOOPBACK_IPV4_BE),
+    };
+    try posix.connect(sock, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
+    return sock;
+}
+
+fn sendAllTcp(sock: posix.socket_t, data: []const u8) !void {
+    var sent: usize = 0;
+    var iterations: u32 = 0;
+
+    while (sent < data.len and iterations < WS_TEST_MAX_READS) : (iterations += 1) {
+        const n = try posix.send(sock, data[sent..], 0);
+        if (n == 0) return error.ConnectionClosed;
+        sent += n;
+    }
+
+    if (sent < data.len) return error.SendFailed;
+}
+
+fn readUntilHeadersComplete(sock: posix.socket_t, buf: []u8) !usize {
+    var total: usize = 0;
+    var iterations: u32 = 0;
+
+    while (total < buf.len and iterations < WS_TEST_MAX_READS) : (iterations += 1) {
+        const n = try posix.recv(sock, buf[total..], 0);
+        if (n == 0) return error.ConnectionClosed;
+        total += n;
+        if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) return total;
+    }
+
+    return error.HeadersTooLarge;
+}
+
+fn buildSwitchingProtocolsResponse(accept_key: []const u8, out: []u8) ![]const u8 {
+    return std.fmt.bufPrint(
+        out,
+        "HTTP/1.1 101 Switching Protocols\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: Upgrade\r\n" ++
+            "Sec-WebSocket-Accept: {s}\r\n" ++
+            "\r\n",
+        .{accept_key},
+    );
+}
+
+fn buildClientHandshake(path: []const u8, port: u16, out: []u8) ![]const u8 {
+    return std.fmt.bufPrint(
+        out,
+        "GET {s} HTTP/1.1\r\n" ++
+            "Host: 127.0.0.1:{d}\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: Upgrade\r\n" ++
+            "Sec-WebSocket-Key: {s}\r\n" ++
+            "Sec-WebSocket-Version: 13\r\n" ++
+            "\r\n",
+        .{ path, port, WS_TEST_KEY },
+    );
+}
+
+fn buildMaskedClientTextFrame(payload: []const u8, out: []u8) ![]const u8 {
+    if (payload.len > WS_TEST_MAX_PAYLOAD_BYTES) return error.PayloadTooLarge;
+    if (out.len < payload.len + 6) return error.BufferTooSmall;
+
+    const mask = [_]u8{ 0x37, 0xfa, 0x21, 0x3d };
+    out[0] = 0x81;
+    out[1] = 0x80 | @as(u8, @intCast(payload.len));
+    @memcpy(out[2..6], &mask);
+
+    for (payload, 0..) |byte, idx| {
+        out[idx + 6] = byte ^ mask[idx % mask.len];
+    }
+
+    return out[0 .. payload.len + 6];
+}
+
+fn buildServerTextFrame(payload: []const u8, out: []u8) ![]const u8 {
+    if (payload.len > WS_TEST_MAX_PAYLOAD_BYTES) return error.PayloadTooLarge;
+    if (out.len < payload.len + 2) return error.BufferTooSmall;
+
+    out[0] = 0x81;
+    out[1] = @intCast(payload.len);
+    @memcpy(out[2..][0..payload.len], payload);
+    return out[0 .. payload.len + 2];
+}
+
+fn readMaskedClientTextFrame(sock: posix.socket_t, out: []u8) ![]const u8 {
+    const total = try readFrameBytes(sock, out);
+    if (total < 6) return error.ShortFrame;
+    if (out[0] != 0x81) return error.InvalidFrame;
+    if ((out[1] & 0x80) == 0) return error.InvalidFrame;
+
+    const payload_len: usize = out[1] & 0x7f;
+    if (payload_len > WS_TEST_MAX_PAYLOAD_BYTES) return error.PayloadTooLarge;
+    if (total < payload_len + 6) return error.ShortFrame;
+
+    const mask = [_]u8{ out[2], out[3], out[4], out[5] };
+    for (0..payload_len) |idx| {
+        out[idx] = out[idx + 6] ^ mask[idx % mask.len];
+    }
+
+    return out[0..payload_len];
+}
+
+fn readServerTextFrame(sock: posix.socket_t, initial: []const u8, out: []u8) ![]const u8 {
+    var total: usize = 0;
+    if (initial.len > 0) {
+        if (initial.len > out.len) return error.BufferTooSmall;
+        @memcpy(out[0..initial.len], initial);
+        total = initial.len;
+    }
+
+    while (total < 2) {
+        const n = try posix.recv(sock, out[total..], 0);
+        if (n == 0) return error.ConnectionClosed;
+        total += n;
+    }
+
+    if (out[0] != 0x81) return error.InvalidFrame;
+    if ((out[1] & 0x80) != 0) return error.InvalidFrame;
+
+    const payload_len: usize = out[1] & 0x7f;
+    if (payload_len > WS_TEST_MAX_PAYLOAD_BYTES) return error.PayloadTooLarge;
+    while (total < payload_len + 2) {
+        const n = try posix.recv(sock, out[total..], 0);
+        if (n == 0) return error.ConnectionClosed;
+        total += n;
+    }
+
+    return out[2 .. 2 + payload_len];
+}
+
+fn readFrameBytes(sock: posix.socket_t, out: []u8) !usize {
+    var total: usize = 0;
+    var iterations: u32 = 0;
+
+    while (total < out.len and iterations < WS_TEST_MAX_READS) : (iterations += 1) {
+        const n = try posix.recv(sock, out[total..], 0);
+        if (n == 0) break;
+        total += n;
+        if (total >= 2) {
+            const masked = (out[1] & 0x80) != 0;
+            const header_len: usize = if (masked) 6 else 2;
+            const payload_len: usize = out[1] & 0x7f;
+            if (total >= header_len + payload_len) return total;
+        }
+    }
+
+    return total;
+}
+
+const WS_CLIENT_MASK = [4]u8{ 0x37, 0xFA, 0x21, 0x3D };
+
+const NativeWebSocketHandler = struct {
+    native_path: []const u8,
+    selected_subprotocol: ?[]const u8 = null,
+    upstream: ?serval.Upstream = null,
+
+    pub fn selectUpstream(
+        self: *@This(),
+        ctx: *serval.Context,
+        request: *const serval.Request,
+    ) serval.Upstream {
+        _ = ctx;
+        _ = request;
+        return self.upstream orelse .{ .host = "127.0.0.1", .port = 1, .idx = 0 };
+    }
+
+    pub fn selectWebSocket(
+        self: *@This(),
+        ctx: *serval.Context,
+        request: *const serval.Request,
+    ) serval.WebSocketRouteAction {
+        _ = ctx;
+
+        if (!std.mem.eql(u8, request.path, self.native_path)) {
+            return .decline;
+        }
+
+        return .{ .accept = .{
+            .subprotocol = self.selected_subprotocol,
+        } };
+    }
+
+    pub fn handleWebSocket(
+        self: *@This(),
+        ctx: *serval.Context,
+        request: *const serval.Request,
+        session: *serval.WebSocketSession,
+    ) !void {
+        _ = self;
+        _ = ctx;
+        _ = request;
+
+        var msg_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+        while (try session.readMessage(&msg_buf)) |message| {
+            switch (message.kind) {
+                .text => try session.sendText(message.payload),
+                .binary => try session.sendBinary(message.payload),
+            }
+        }
+    }
+};
+
+const NativeWebSocketServerConfig = struct {
+    port: u16,
+    native_path: []const u8,
+    selected_subprotocol: ?[]const u8 = null,
+    upstream: ?serval.Upstream = null,
+};
+
+const NativeWebSocketServerShared = struct {
+    port: u16,
+    shutdown: std.atomic.Value(bool),
+    listener_fd: std.atomic.Value(i32),
+};
+
+const NativeWebSocketServer = struct {
+    shared: *NativeWebSocketServerShared,
+    thread: ?std.Thread,
+
+    fn start(config: NativeWebSocketServerConfig) !NativeWebSocketServer {
+        const shared = try std.heap.page_allocator.create(NativeWebSocketServerShared);
+        errdefer std.heap.page_allocator.destroy(shared);
+
+        shared.* = .{
+            .port = config.port,
+            .shutdown = std.atomic.Value(bool).init(false),
+            .listener_fd = std.atomic.Value(i32).init(-1),
+        };
+
+        var server = NativeWebSocketServer{
+            .shared = shared,
+            .thread = null,
+        };
+        server.thread = try std.Thread.spawn(.{}, nativeWebSocketServerMain, .{ shared, config });
+        posix.nanosleep(0, WS_NATIVE_SERVER_STARTUP_DELAY_MS * std.time.ns_per_ms);
+        return server;
+    }
+
+    fn stop(self: *NativeWebSocketServer) void {
+        self.shared.shutdown.store(true, .release);
+
+        const wake_sock = connectTcp(self.shared.port) catch null;
+        if (wake_sock) |sock| {
+            posix.close(sock);
+        }
+
+        _ = self.shared.listener_fd.swap(-1, .acq_rel);
+        if (self.thread) |thread| {
+            thread.join();
+            self.thread = null;
+        }
+        std.heap.page_allocator.destroy(self.shared);
+    }
+};
+
+fn nativeWebSocketServerMain(
+    shared: *NativeWebSocketServerShared,
+    config: NativeWebSocketServerConfig,
+) void {
+    var handler = NativeWebSocketHandler{
+        .native_path = config.native_path,
+        .selected_subprotocol = config.selected_subprotocol,
+        .upstream = config.upstream,
+    };
+    var pool = serval.SimplePool.init();
+    var metrics = serval.NoopMetrics{};
+    var tracer = serval.NoopTracer{};
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+
+    const ServerType = serval.Server(
+        NativeWebSocketHandler,
+        serval.SimplePool,
+        serval.NoopMetrics,
+        serval.NoopTracer,
+    );
+    var server = ServerType.init(
+        &handler,
+        &pool,
+        &metrics,
+        &tracer,
+        .{ .port = config.port },
+        null,
+        serval_net.DnsConfig{},
+    );
+
+    server.run(threaded.io(), &shared.shutdown, &shared.listener_fd) catch |err| {
+        std.log.err("native websocket test server failed: {s}", .{@errorName(err)});
+    };
+}
+
+fn buildClientHandshakeWithSubprotocol(
+    path: []const u8,
+    port: u16,
+    subprotocol: ?[]const u8,
+    out: []u8,
+) ![]const u8 {
+    if (subprotocol) |selected| {
+        return std.fmt.bufPrint(
+            out,
+            "GET {s} HTTP/1.1\r\n" ++
+                "Host: 127.0.0.1:{d}\r\n" ++
+                "Upgrade: websocket\r\n" ++
+                "Connection: Upgrade\r\n" ++
+                "Sec-WebSocket-Key: {s}\r\n" ++
+                "Sec-WebSocket-Version: 13\r\n" ++
+                "Sec-WebSocket-Protocol: {s}\r\n" ++
+                "\r\n",
+            .{ path, port, WS_TEST_KEY, selected },
+        );
+    }
+
+    return buildClientHandshake(path, port, out);
+}
+
+fn buildMaskedClientFrameWithOpcode(
+    opcode: serval.WebSocketOpcode,
+    fin: bool,
+    payload: []const u8,
+    out: []u8,
+) ![]const u8 {
+    var header_buf: [serval.websocket.max_frame_header_size_bytes]u8 = undefined;
+    const header = serval.buildWebSocketFrameHeader(&header_buf, .{
+        .fin = fin,
+        .opcode = opcode,
+        .payload_len = payload.len,
+        .mask_key = WS_CLIENT_MASK,
+    }) orelse return error.BufferTooSmall;
+
+    if (out.len < header.len + payload.len) return error.BufferTooSmall;
+    @memcpy(out[0..header.len], header);
+    @memcpy(out[header.len..][0..payload.len], payload);
+
+    const payload_slice = out[header.len .. header.len + payload.len];
+    serval.applyWebSocketMask(payload_slice, WS_CLIENT_MASK);
+    return out[0 .. header.len + payload.len];
+}
+
+const ServerFrame = struct {
+    opcode: serval.WebSocketOpcode,
+    fin: bool,
+    payload: []const u8,
+    remaining: []const u8,
+};
+
+fn readServerFrame(sock: posix.socket_t, initial: []const u8, out: []u8) !ServerFrame {
+    var total: usize = 0;
+    if (initial.len > 0) {
+        if (initial.len > out.len) return error.BufferTooSmall;
+        std.mem.copyForwards(u8, out[0..initial.len], initial);
+        total = initial.len;
+    }
+
+    while (total < 2) {
+        const n = try posix.recv(sock, out[total..], 0);
+        if (n == 0) return error.ConnectionClosed;
+        total += n;
+    }
+
+    const payload_code = out[1] & 0x7F;
+    const header_len: usize = switch (payload_code) {
+        0...125 => 2,
+        126 => 4,
+        127 => 10,
+        else => unreachable,
+    };
+
+    while (total < header_len) {
+        const n = try posix.recv(sock, out[total..], 0);
+        if (n == 0) return error.ConnectionClosed;
+        total += n;
+    }
+
+    const header = try serval.parseWebSocketFrameHeader(out[0..header_len], .server);
+    const frame_len: usize = header_len + @as(usize, @intCast(header.payload_len));
+
+    while (total < frame_len) {
+        const n = try posix.recv(sock, out[total..], 0);
+        if (n == 0) return error.ConnectionClosed;
+        total += n;
+    }
+
+    return .{
+        .opcode = header.opcode,
+        .fin = header.fin,
+        .payload = out[header_len..frame_len],
+        .remaining = out[frame_len..total],
+    };
+}
+
+fn sendClientClose(sock: posix.socket_t) !void {
+    var payload_buf: [serval.config.WEBSOCKET_MAX_CONTROL_PAYLOAD_SIZE_BYTES]u8 = undefined;
+    const payload = try serval.buildWebSocketClosePayload(
+        &payload_buf,
+        serval.websocket.close_normal_closure,
+        "",
+    );
+
+    var frame_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const frame_bytes = try buildMaskedClientFrameWithOpcode(.close, true, payload, &frame_buf);
+    try sendAllTcp(sock, frame_bytes);
+}
+
+fn performClientCloseHandshake(sock: posix.socket_t) !void {
+    try sendClientClose(sock);
+
+    var frame_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const server_frame = readServerFrame(sock, &[_]u8{}, &frame_buf) catch |err| switch (err) {
+        error.ConnectionClosed => return,
+        else => return err,
+    };
+    if (server_frame.opcode != .close) return error.InvalidFrame;
+}
+
+test "integration: lb proxies websocket upgrade and relays client text frame" {
+    const allocator = testing.allocator;
+    const backend_port = harness.getPort();
+    const lb_port = harness.getPort();
+
+    var pm = harness.ProcessManager.init(allocator);
+    defer pm.deinit();
+
+    const backend_thread = try startWebSocketBackend(.{
+        .port = backend_port,
+        .mode = .echo_after_upgrade,
+        .path = "/ws",
+        .payload = "",
+    });
+    defer backend_thread.join();
+
+    var backend_addr_buf: [ADDR_BUF_LEN]u8 = undefined;
+    const backend_addr = std.fmt.bufPrint(&backend_addr_buf, "127.0.0.1:{d}", .{backend_port}) catch unreachable;
+    try pm.startLoadBalancer(lb_port, &.{backend_addr}, .{});
+
+    const sock = try connectTcp(lb_port);
+    defer posix.close(sock);
+
+    var handshake_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const handshake = try buildClientHandshake("/ws", lb_port, &handshake_buf);
+
+    var client_frame_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const client_frame = try buildMaskedClientTextFrame("hello-through-lb", &client_frame_buf);
+
+    var request_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const request = try std.fmt.bufPrint(&request_buf, "{s}{s}", .{ handshake, client_frame });
+    try sendAllTcp(sock, request);
+
+    var response_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const response_len = try readUntilHeadersComplete(sock, &response_buf);
+    const status = harness.TestClient.parseStatusCode(response_buf[0..response_len]) orelse return error.InvalidResponse;
+    try testing.expectEqual(@as(u16, 101), status);
+
+    const header_end = std.mem.indexOf(u8, response_buf[0..response_len], "\r\n\r\n").? + 4;
+    var frame_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const frame_payload = try readServerTextFrame(sock, response_buf[header_end..response_len], &frame_buf);
+    try testing.expectEqualStrings("hello-through-lb", frame_payload);
+}
+
+test "integration: lb forwards websocket 101 with immediate upstream bytes" {
+    const allocator = testing.allocator;
+    const backend_port = harness.getPort();
+    const lb_port = harness.getPort();
+
+    var pm = harness.ProcessManager.init(allocator);
+    defer pm.deinit();
+
+    const backend_thread = try startWebSocketBackend(.{
+        .port = backend_port,
+        .mode = .immediate_frame_after_upgrade,
+        .path = "/ws-push",
+        .payload = "server-push",
+    });
+    defer backend_thread.join();
+
+    var backend_addr_buf: [ADDR_BUF_LEN]u8 = undefined;
+    const backend_addr = std.fmt.bufPrint(&backend_addr_buf, "127.0.0.1:{d}", .{backend_port}) catch unreachable;
+    try pm.startLoadBalancer(lb_port, &.{backend_addr}, .{});
+
+    const sock = try connectTcp(lb_port);
+    defer posix.close(sock);
+
+    var handshake_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const handshake = try buildClientHandshake("/ws-push", lb_port, &handshake_buf);
+    try sendAllTcp(sock, handshake);
+
+    var response_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const response_len = try readUntilHeadersComplete(sock, &response_buf);
+    const status = harness.TestClient.parseStatusCode(response_buf[0..response_len]) orelse return error.InvalidResponse;
+    try testing.expectEqual(@as(u16, 101), status);
+
+    const header_end = std.mem.indexOf(u8, response_buf[0..response_len], "\r\n\r\n").? + 4;
+    var frame_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const frame_payload = try readServerTextFrame(sock, response_buf[header_end..response_len], &frame_buf);
+    try testing.expectEqualStrings("server-push", frame_payload);
+}
+
+test "integration: lb rejects invalid upstream websocket switching-protocols response" {
+    const allocator = testing.allocator;
+    const backend_port = harness.getPort();
+    const lb_port = harness.getPort();
+
+    var pm = harness.ProcessManager.init(allocator);
+    defer pm.deinit();
+
+    const backend_thread = try startWebSocketBackend(.{
+        .port = backend_port,
+        .mode = .invalid_accept,
+        .path = "/ws-bad",
+        .payload = "",
+    });
+    defer backend_thread.join();
+
+    var backend_addr_buf: [ADDR_BUF_LEN]u8 = undefined;
+    const backend_addr = std.fmt.bufPrint(&backend_addr_buf, "127.0.0.1:{d}", .{backend_port}) catch unreachable;
+    try pm.startLoadBalancer(lb_port, &.{backend_addr}, .{});
+
+    const sock = try connectTcp(lb_port);
+    defer posix.close(sock);
+
+    var handshake_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const handshake = try buildClientHandshake("/ws-bad", lb_port, &handshake_buf);
+    try sendAllTcp(sock, handshake);
+
+    var response_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const response_len = try readUntilHeadersComplete(sock, &response_buf);
+    const status = harness.TestClient.parseStatusCode(response_buf[0..response_len]) orelse return error.InvalidResponse;
+    try testing.expectEqual(@as(u16, 502), status);
+}
+
+test "integration: native websocket endpoint echoes text frame with preread payload" {
+    const port = harness.getPort();
+    var server = try NativeWebSocketServer.start(.{
+        .port = port,
+        .native_path = "/ws-native",
+    });
+    defer server.stop();
+
+    const sock = try connectTcp(port);
+    defer posix.close(sock);
+
+    var handshake_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const handshake = try buildClientHandshake("/ws-native", port, &handshake_buf);
+
+    var frame_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const frame_bytes = try buildMaskedClientFrameWithOpcode(.text, true, "hello-native", &frame_buf);
+
+    var request_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const request = try std.fmt.bufPrint(&request_buf, "{s}{s}", .{ handshake, frame_bytes });
+    try sendAllTcp(sock, request);
+
+    var response_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const response_len = try readUntilHeadersComplete(sock, &response_buf);
+    const status = harness.TestClient.parseStatusCode(response_buf[0..response_len]) orelse return error.InvalidResponse;
+    try testing.expectEqual(@as(u16, 101), status);
+
+    const header_end = std.mem.indexOf(u8, response_buf[0..response_len], "\r\n\r\n").? + 4;
+    var server_frame_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const server_frame = try readServerFrame(sock, response_buf[header_end..response_len], &server_frame_buf);
+    try testing.expectEqual(serval.WebSocketOpcode.text, server_frame.opcode);
+    try testing.expectEqualStrings("hello-native", server_frame.payload);
+    try performClientCloseHandshake(sock);
+}
+
+test "integration: native websocket endpoint auto-pongs and reassembles fragmented text" {
+    const port = harness.getPort();
+    var server = try NativeWebSocketServer.start(.{
+        .port = port,
+        .native_path = "/ws-fragmented",
+    });
+    defer server.stop();
+
+    const sock = try connectTcp(port);
+    defer posix.close(sock);
+
+    var handshake_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const handshake = try buildClientHandshake("/ws-fragmented", port, &handshake_buf);
+    try sendAllTcp(sock, handshake);
+
+    var response_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const response_len = try readUntilHeadersComplete(sock, &response_buf);
+    const status = harness.TestClient.parseStatusCode(response_buf[0..response_len]) orelse return error.InvalidResponse;
+    try testing.expectEqual(@as(u16, 101), status);
+
+    var frame_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const first = try buildMaskedClientFrameWithOpcode(.text, false, "hel", frame_buf[0..]);
+    const ping = try buildMaskedClientFrameWithOpcode(.ping, true, "!", frame_buf[first.len..]);
+    const second = try buildMaskedClientFrameWithOpcode(.continuation, true, "lo", frame_buf[first.len + ping.len ..]);
+    try sendAllTcp(sock, frame_buf[0 .. first.len + ping.len + second.len]);
+
+    var server_frame_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const first_server_frame = try readServerFrame(sock, &[_]u8{}, &server_frame_buf);
+    try testing.expectEqual(serval.WebSocketOpcode.pong, first_server_frame.opcode);
+    try testing.expectEqualStrings("!", first_server_frame.payload);
+
+    const second_server_frame = try readServerFrame(sock, first_server_frame.remaining, &server_frame_buf);
+    try testing.expectEqual(serval.WebSocketOpcode.text, second_server_frame.opcode);
+    try testing.expectEqualStrings("hello", second_server_frame.payload);
+    try performClientCloseHandshake(sock);
+}
+
+test "integration: native websocket endpoint negotiates subprotocol" {
+    const port = harness.getPort();
+    var server = try NativeWebSocketServer.start(.{
+        .port = port,
+        .native_path = "/ws-subprotocol",
+        .selected_subprotocol = "chat",
+    });
+    defer server.stop();
+
+    const sock = try connectTcp(port);
+    defer posix.close(sock);
+
+    var handshake_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const handshake = try buildClientHandshakeWithSubprotocol("/ws-subprotocol", port, "chat, superchat", &handshake_buf);
+    try sendAllTcp(sock, handshake);
+
+    var response_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const response_len = try readUntilHeadersComplete(sock, &response_buf);
+    const status = harness.TestClient.parseStatusCode(response_buf[0..response_len]) orelse return error.InvalidResponse;
+    try testing.expectEqual(@as(u16, 101), status);
+    try testing.expect(std.mem.indexOf(u8, response_buf[0..response_len], "Sec-WebSocket-Protocol: chat\r\n") != null);
+    try performClientCloseHandshake(sock);
+}
+
+test "integration: native websocket endpoint and proxy websocket fallback coexist" {
+    const backend_port = harness.getPort();
+    const server_port = harness.getPort();
+
+    const backend_thread = try startWebSocketBackend(.{
+        .port = backend_port,
+        .mode = .echo_after_upgrade,
+        .path = "/ws-proxy",
+        .payload = "",
+    });
+    defer backend_thread.join();
+
+    var server = try NativeWebSocketServer.start(.{
+        .port = server_port,
+        .native_path = "/ws-local",
+        .upstream = .{ .host = "127.0.0.1", .port = backend_port, .idx = 0 },
+    });
+    defer server.stop();
+
+    const local_sock = try connectTcp(server_port);
+    defer posix.close(local_sock);
+
+    var local_handshake_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const local_handshake = try buildClientHandshake("/ws-local", server_port, &local_handshake_buf);
+    var local_frame_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const local_frame = try buildMaskedClientFrameWithOpcode(.text, true, "local-echo", &local_frame_buf);
+    var local_request_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const local_request = try std.fmt.bufPrint(&local_request_buf, "{s}{s}", .{ local_handshake, local_frame });
+    try sendAllTcp(local_sock, local_request);
+
+    var local_response_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const local_response_len = try readUntilHeadersComplete(local_sock, &local_response_buf);
+    try testing.expectEqual(@as(u16, 101), harness.TestClient.parseStatusCode(local_response_buf[0..local_response_len]).?);
+    const local_header_end = std.mem.indexOf(u8, local_response_buf[0..local_response_len], "\r\n\r\n").? + 4;
+    var local_server_frame_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const local_server_frame = try readServerFrame(local_sock, local_response_buf[local_header_end..local_response_len], &local_server_frame_buf);
+    try testing.expectEqualStrings("local-echo", local_server_frame.payload);
+    try performClientCloseHandshake(local_sock);
+
+    const proxy_sock = try connectTcp(server_port);
+    defer posix.close(proxy_sock);
+
+    var proxy_handshake_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const proxy_handshake = try buildClientHandshake("/ws-proxy", server_port, &proxy_handshake_buf);
+    var proxy_frame_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const proxy_frame = try buildMaskedClientFrameWithOpcode(.text, true, "proxy-echo", &proxy_frame_buf);
+    var proxy_request_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const proxy_request = try std.fmt.bufPrint(&proxy_request_buf, "{s}{s}", .{ proxy_handshake, proxy_frame });
+    try sendAllTcp(proxy_sock, proxy_request);
+
+    var proxy_response_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const proxy_response_len = try readUntilHeadersComplete(proxy_sock, &proxy_response_buf);
+    try testing.expectEqual(@as(u16, 101), harness.TestClient.parseStatusCode(proxy_response_buf[0..proxy_response_len]).?);
+    const proxy_header_end = std.mem.indexOf(u8, proxy_response_buf[0..proxy_response_len], "\r\n\r\n").? + 4;
+    var proxy_server_frame_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const proxy_server_frame = try readServerFrame(proxy_sock, proxy_response_buf[proxy_header_end..proxy_response_len], &proxy_server_frame_buf);
+    try testing.expectEqualStrings("proxy-echo", proxy_server_frame.payload);
 }
 
 // =============================================================================

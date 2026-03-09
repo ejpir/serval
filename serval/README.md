@@ -12,6 +12,7 @@ Complete, batteries-included server library that composes all serval modules. Im
 serval (this module)
 ├── serval-core     # Types, config, errors, context
 ├── serval-http     # HTTP/1.1 parser
+├── serval-websocket # RFC 6455 handshake + frame helpers
 ├── serval-pool     # Connection pooling
 ├── serval-proxy    # Upstream forwarding
 ├── serval-metrics  # Request metrics
@@ -43,7 +44,7 @@ var server = serval.Server(
 ).init(&handler, &pool, &metrics, &tracer, .{ .port = 8080 }, null, serval_net.DnsConfig{});
 
 var shutdown = std.atomic.Value(bool).init(false);
-try server.run(io, &shutdown);
+try server.run(io, &shutdown, null);
 ```
 
 ## Re-exports
@@ -63,6 +64,22 @@ You can access types two ways:
 ### From serval-http
 - `Parser`
 
+### From serval-websocket
+- `WebSocketHandshakeError`
+- `WebSocketFrameError`
+- `WebSocketCloseError`
+- `WebSocketSubprotocolError`
+- `WebSocketOpcode`
+- `WebSocketFrameHeader`
+- `looksLikeWebSocketUpgradeRequest`
+- `validateWebSocketRequest`
+- `computeWebSocketAcceptKey`
+- `parseWebSocketFrameHeader`
+- `buildWebSocketFrameHeader`
+- `parseWebSocketClosePayload`
+- `buildWebSocketClosePayload`
+- `validateWebSocketSubprotocolSelection`
+
 ### From serval-pool
 - `Connection`, `SimplePool`, `NoPool`, `verifyPool`
 
@@ -78,6 +95,8 @@ You can access types two ways:
 ### Local
 - `Server` - Generic HTTP/1.1 server
 - `MinimalServer` - Server with SimplePool + NoopMetrics + NoopTracer
+- `WebSocketRouteAction`, `WebSocketAccept`, `WebSocketSession`
+- `WebSocketMessage`, `WebSocketMessageKind`, `WebSocketSessionStats`
 - `verifyHandler`, `hasHook` - Handler interface utilities
 
 ## Server Generic Parameters
@@ -104,9 +123,15 @@ pub fn onRequest(self, ctx: *Context, request: *Request, response_buf: []u8) Act
 pub fn onResponse(self, ctx: *Context, response: *Response) void
 pub fn onError(self, ctx: *Context, err: ErrorContext) void
 pub fn onLog(self, ctx: *Context, entry: LogEntry) void
+pub fn selectWebSocket(self, ctx: *Context, request: *const Request) WebSocketRouteAction
+pub fn handleWebSocket(self, ctx: *Context, request: *const Request, session: *WebSocketSession) !void
 ```
 
 `onRequest` can return `.continue_request` to forward, or `.{ .send_response = DirectResponse{...} }` to respond directly without forwarding (for backends, health endpoints, etc.).
+
+`selectWebSocket` lets the handler accept native WebSocket termination for a request.
+If it returns `.{ .accept = ... }`, the server sends `101 Switching Protocols` and then
+calls `handleWebSocket()` with a message-oriented session API.
 
 ## Implementation Status
 
@@ -116,14 +141,16 @@ pub fn onLog(self, ctx: *Context, entry: LogEntry) void
 | Keep-alive connections | Complete |
 | Connection: close handling | Complete (RFC 9112) |
 | Upstream forwarding | Complete |
+| WebSocket proxy tunneling | Complete |
+| Native WebSocket endpoint serving | Complete |
 | Connection pooling | Complete |
 | Zero-copy (splice) | Complete |
 | Metrics collection | Complete |
 | Handler hooks | Complete |
 | HTTP/2 | Not implemented |
-| TLS termination | Not implemented |
+| TLS termination | Complete |
 | Request body forwarding | Complete |
-| Chunked encoding | Not implemented |
+| Chunked encoding | Complete |
 
 ## TigerStyle Compliance
 

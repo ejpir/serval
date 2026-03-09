@@ -88,6 +88,28 @@ pub const http = @import("serval-http");
 pub const Parser = http.Parser;
 
 // =============================================================================
+// WebSocket Protocol Helpers (from serval-websocket)
+// =============================================================================
+
+pub const websocket = @import("serval-websocket");
+pub const WebSocketHandshakeError = websocket.HandshakeError;
+pub const WebSocketFrameError = websocket.FrameError;
+pub const WebSocketCloseError = websocket.CloseError;
+pub const WebSocketSubprotocolError = websocket.SubprotocolError;
+pub const WebSocketOpcode = websocket.Opcode;
+pub const WebSocketFrameHeader = websocket.FrameHeader;
+pub const WebSocketCloseInfo = websocket.CloseInfo;
+pub const looksLikeWebSocketUpgradeRequest = websocket.looksLikeWebSocketUpgradeRequest;
+pub const validateWebSocketRequest = websocket.validateClientRequest;
+pub const computeWebSocketAcceptKey = websocket.computeAcceptKey;
+pub const parseWebSocketFrameHeader = websocket.parseFrameHeader;
+pub const buildWebSocketFrameHeader = websocket.buildFrameHeader;
+pub const applyWebSocketMask = websocket.applyFrameMask;
+pub const parseWebSocketClosePayload = websocket.parseClosePayload;
+pub const buildWebSocketClosePayload = websocket.buildClosePayload;
+pub const validateWebSocketSubprotocolSelection = websocket.validateSubprotocolSelection;
+
+// =============================================================================
 // Connection Pooling (from serval-pool)
 // =============================================================================
 
@@ -131,6 +153,14 @@ pub const verifyTracer = tracing.verifyTracer;
 pub const server = @import("serval-server");
 pub const Server = server.Server;
 pub const MinimalServer = server.MinimalServer;
+pub const WebSocketRouteAction = server.WebSocketRouteAction;
+pub const WebSocketAccept = server.WebSocketAccept;
+pub const WebSocketMessageKind = server.WebSocketMessageKind;
+pub const WebSocketMessage = server.WebSocketMessage;
+pub const WebSocketSession = server.WebSocketSession;
+pub const WebSocketSessionError = server.WebSocketSessionError;
+pub const WebSocketSessionState = server.WebSocketSessionState;
+pub const WebSocketSessionStats = server.WebSocketSessionStats;
 
 // =============================================================================
 // Router (from serval-router)
@@ -152,6 +182,7 @@ test {
     _ = @import("serval-net");
     _ = @import("serval-socket");
     _ = @import("serval-http");
+    _ = @import("serval-websocket");
     _ = @import("serval-pool");
     _ = @import("serval-proxy");
     _ = @import("serval-metrics");

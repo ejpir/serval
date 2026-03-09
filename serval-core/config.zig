@@ -170,6 +170,37 @@ pub const MAX_STALE_RETRIES: u8 = 2;
 /// TigerStyle: u64 nanoseconds, 30 seconds default (typical for load balancers).
 pub const CONNECT_TIMEOUT_NS: u64 = 30 * 1000 * 1000 * 1000;
 
+/// Maximum idle time for an upgraded WebSocket tunnel.
+/// TigerStyle: Explicit timeout bounds long-lived relay loops.
+pub const WEBSOCKET_TUNNEL_IDLE_TIMEOUT_NS: u64 = time.secondsToNanos(3600);
+
+/// poll(2) timeout for WebSocket tunnel relay.
+/// TigerStyle: Small fixed interval keeps timeout checks responsive without busy-looping.
+pub const WEBSOCKET_TUNNEL_POLL_TIMEOUT_MS: i32 = 1000;
+
+/// Maximum application message size for native WebSocket endpoints.
+/// TigerStyle: Explicit bound prevents unbounded buffering during fragmentation reassembly.
+pub const WEBSOCKET_MAX_MESSAGE_SIZE_BYTES: u32 = 1024 * 1024;
+
+/// Maximum fragments allowed in a single native WebSocket message.
+/// TigerStyle: Bounded fragmentation prevents infinite continuation streams.
+pub const WEBSOCKET_MAX_FRAGMENTS_PER_MESSAGE: u32 = 1024;
+
+/// Maximum idle time for native WebSocket sessions.
+/// TigerStyle: Explicit timeout bounds long-lived receive loops.
+pub const WEBSOCKET_SESSION_IDLE_TIMEOUT_NS: u64 = time.secondsToNanos(60);
+
+/// Maximum time to wait for peer close after sending a WebSocket close frame.
+/// TigerStyle: Close handshake loops must be explicitly bounded.
+pub const WEBSOCKET_CLOSE_TIMEOUT_NS: u64 = time.secondsToNanos(5);
+
+/// poll(2) timeout for native WebSocket session reads.
+/// TigerStyle: Fixed interval keeps timeout checks responsive without busy-waiting.
+pub const WEBSOCKET_SESSION_POLL_TIMEOUT_MS: i32 = 1000;
+
+/// Maximum allowed control-frame payload size per RFC 6455 Section 5.5.
+pub const WEBSOCKET_MAX_CONTROL_PAYLOAD_SIZE_BYTES: u32 = 125;
+
 // =============================================================================
 // Health Check Limits
 // =============================================================================

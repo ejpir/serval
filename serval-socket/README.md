@@ -33,6 +33,7 @@ This allows higher-level modules (pool, proxy, client, server) to work with sock
 | `socket.get_fd()` | Get raw fd for splice/poll |
 | `socket.is_tls()` | Check if TLS socket |
 | `socket.is_ktls()` | Check if kTLS kernel offload active |
+| `socket.has_pending_read()` | Check if userspace TLS has decrypted buffered bytes |
 | `socket.can_splice()` | Check splice eligibility (plain or kTLS) |
 
 ## Socket API
@@ -153,6 +154,17 @@ Check if this is a TLS socket.
 ### socket.is_ktls() bool
 
 Check if this socket is using kTLS kernel offload. Returns true for TLS sockets where the kernel handles encryption/decryption, false for plain sockets or userspace TLS.
+
+### socket.has_pending_read() bool
+
+Returns true when a userspace TLS socket has already-decrypted plaintext buffered inside
+OpenSSL/BoringSSL even though the underlying fd may not currently be poll-readable.
+
+Why this matters: single-threaded tunnel relay must drain buffered TLS plaintext before
+waiting on `poll(2)`, otherwise a WebSocket relay can stall with unread bytes trapped in
+userspace TLS state.
+
+Plain TCP and kTLS sockets always return false.
 
 ### socket.can_splice() bool
 

@@ -215,6 +215,18 @@ pub const Socket = union(enum) {
         };
     }
 
+    /// Returns true if a TLS socket has decrypted bytes buffered internally.
+    /// Plain sockets always return false because the kernel poll state fully
+    /// represents read availability.
+    pub fn has_pending_read(self: *const Socket) bool {
+        const fd = self.get_fd();
+        assert(fd >= -1);
+        return switch (self.*) {
+            .plain => false,
+            .tls => |*s| s.has_pending_read(),
+        };
+    }
+
     // =========================================================================
     // Bulk Transfer Operations
     // =========================================================================
@@ -320,9 +332,33 @@ fn map_posix_error(err: anyerror) SocketError {
 // Tests
 // =============================================================================
 
+fn testSocket(domain: u32, sock_type: u32, protocol: u32) !posix.socket_t {
+    while (true) {
+        const rc = std.c.socket(@intCast(domain), @intCast(sock_type), @intCast(protocol));
+        switch (std.c.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            else => return error.SocketFailed,
+        }
+    }
+}
+
+fn testSocketPair(domain: u32, sock_type: u32, protocol: u32) ![2]posix.socket_t {
+    var fds: [2]posix.socket_t = undefined;
+
+    while (true) {
+        const rc = std.c.socketpair(@intCast(domain), @intCast(sock_type), @intCast(protocol), &fds);
+        switch (std.c.errno(rc)) {
+            .SUCCESS => return fds,
+            .INTR => continue,
+            else => return error.SocketFailed,
+        }
+    }
+}
+
 test "Socket.Plain.init_client creates plain socket" {
     // Verify init_client returns a non-TLS socket with correct fd.
-    const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    const fd = try testSocket(posix.AF.INET, posix.SOCK.STREAM, 0);
     defer posix.close(fd);
 
     var sock = Socket.Plain.init_client(fd);
@@ -331,7 +367,7 @@ test "Socket.Plain.init_client creates plain socket" {
 }
 
 test "Socket.Plain.init_server creates plain socket" {
-    const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    const fd = try testSocket(posix.AF.INET, posix.SOCK.STREAM, 0);
     defer posix.close(fd);
 
     var sock = Socket.Plain.init_server(fd);
@@ -340,7 +376,7 @@ test "Socket.Plain.init_server creates plain socket" {
 }
 
 test "Socket.is_tls returns correct value" {
-    const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    const fd = try testSocket(posix.AF.INET, posix.SOCK.STREAM, 0);
     defer posix.close(fd);
 
     const plain_sock = Socket.Plain.init_client(fd);
@@ -348,7 +384,7 @@ test "Socket.is_tls returns correct value" {
 }
 
 test "Socket.get_fd returns underlying fd" {
-    const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    const fd = try testSocket(posix.AF.INET, posix.SOCK.STREAM, 0);
     defer posix.close(fd);
 
     const sock = Socket.Plain.init_client(fd);
@@ -365,7 +401,7 @@ test "map_posix_error maps common errors" {
 
 test "PlainSocket read/write require valid fd" {
     // Create socket pair for testing read/write
-    const fds = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    const fds = try testSocketPair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
@@ -384,7 +420,7 @@ test "PlainSocket read/write require valid fd" {
 }
 
 test "PlainSocket write sends data" {
-    const fds = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    const fds = try testSocketPair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
@@ -403,7 +439,7 @@ test "PlainSocket write sends data" {
 }
 
 test "Socket.can_splice returns true for plain sockets" {
-    const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    const fd = try testSocket(posix.AF.INET, posix.SOCK.STREAM, 0);
     defer posix.close(fd);
 
     const sock = Socket.Plain.init_client(fd);
@@ -412,7 +448,7 @@ test "Socket.can_splice returns true for plain sockets" {
 }
 
 test "Socket.is_ktls returns false for plain sockets" {
-    const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    const fd = try testSocket(posix.AF.INET, posix.SOCK.STREAM, 0);
     defer posix.close(fd);
 
     const sock = Socket.Plain.init_client(fd);
@@ -425,7 +461,7 @@ test "Socket.is_ktls returns false for plain sockets" {
 // =============================================================================
 
 test "Socket.write_all sends all bytes" {
-    const fds = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    const fds = try testSocketPair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
@@ -443,7 +479,7 @@ test "Socket.write_all sends all bytes" {
 }
 
 test "Socket.write_all error on closed connection" {
-    const fds = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    const fds = try testSocketPair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
     defer posix.close(fds[0]);
 
     var sock = Socket.Plain.init_client(fds[0]);
@@ -457,7 +493,7 @@ test "Socket.write_all error on closed connection" {
 }
 
 test "Socket.read_at_least reads minimum bytes" {
-    const fds = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    const fds = try testSocketPair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
@@ -477,7 +513,7 @@ test "Socket.read_at_least reads minimum bytes" {
 }
 
 test "Socket.read_at_least error on EOF before min_bytes" {
-    const fds = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    const fds = try testSocketPair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
     defer posix.close(fds[0]);
 
     var sock = Socket.Plain.init_client(fds[0]);
@@ -494,7 +530,7 @@ test "Socket.read_at_least error on EOF before min_bytes" {
 }
 
 test "Socket.read_at_least reads exact minimum when available" {
-    const fds = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    const fds = try testSocketPair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 

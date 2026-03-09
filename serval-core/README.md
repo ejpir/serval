@@ -53,9 +53,17 @@ const custom = headers.get("X-Custom");    // ?[]const u8
 - `MAX_HEADERS` - 64
 - `MAX_HEADER_SIZE_BYTES` - 8192
 - `MAX_URI_LENGTH_BYTES` - 8192
-- `MAX_BODY_SIZE_BYTES` - 1MB
+- `MAX_BODY_SIZE_BYTES` - 10GB
 - `STREAM_WRITE_BUFFER_SIZE_BYTES` - 4096
 - `STREAM_READ_BUFFER_SIZE_BYTES` - 4096
+- `WEBSOCKET_TUNNEL_IDLE_TIMEOUT_NS` - 1 hour idle timeout for upgraded tunnel relay
+- `WEBSOCKET_TUNNEL_POLL_TIMEOUT_MS` - 1000ms poll interval for tunnel timeout checks
+- `WEBSOCKET_MAX_MESSAGE_SIZE_BYTES` - 1MiB max native WebSocket message size
+- `WEBSOCKET_MAX_FRAGMENTS_PER_MESSAGE` - 1024 continuation frames per message
+- `WEBSOCKET_SESSION_IDLE_TIMEOUT_NS` - 60s native WebSocket idle timeout
+- `WEBSOCKET_CLOSE_TIMEOUT_NS` - 5s close-handshake timeout
+- `WEBSOCKET_SESSION_POLL_TIMEOUT_MS` - 1000ms native session poll interval
+- `WEBSOCKET_MAX_CONTROL_PAYLOAD_SIZE_BYTES` - 125-byte RFC 6455 control-frame limit
 
 ### Logging
 - `debugLog` - Comptime-conditional debug logging (zero overhead in release)

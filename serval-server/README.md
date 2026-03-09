@@ -8,26 +8,33 @@ Provides generic HTTP server infrastructure with protocol-specific implementatio
 
 ```
 lib/serval-server/
-├── mod.zig           # Main module exports (Server, MinimalServer)
-├── README.md         # This file
-└── h1/               # HTTP/1.1 implementation
-    ├── mod.zig       # H1 module exports
-    ├── server.zig    # Generic Server struct with connection handling
-    ├── connection.zig # Connection state (ID generation, keep-alive detection)
-    ├── response.zig  # Response writing utilities (status text, response sending)
-    └── reader.zig    # Request reading utilities (header accumulation, body length)
+├── mod.zig            # Main module exports (Server, MinimalServer)
+├── README.md          # This file
+├── h1/                # HTTP/1.1 implementation
+│   ├── mod.zig        # H1 module exports
+│   ├── server.zig     # Generic Server struct with connection handling
+│   ├── connection.zig # Connection state (ID generation, keep-alive detection)
+│   ├── response.zig   # Response writing utilities (status text, response sending)
+│   └── reader.zig     # Request reading utilities (header accumulation, body length)
+└── websocket/         # Native WebSocket endpoint support
+    ├── mod.zig        # Public WebSocket server exports + hook verification
+    ├── accept.zig     # `101 Switching Protocols` response builder
+    ├── io.zig         # Plain/TLS connection transport adapters
+    └── session.zig    # Message-oriented WebSocket session API
 ```
 
 ## Purpose
 
 Generic HTTP server parameterized by Handler, Pool, Metrics, and Tracer types.
-Handles accept loop, connection lifecycle, request parsing, and forwarding orchestration.
+Handles accept loop, connection lifecycle, request parsing, HTTP forwarding orchestration,
+WebSocket upgrade handoff to the proxy tunnel path, and native WebSocket endpoint
+termination with a message-oriented session API.
 
 Protocol implementations are isolated in subdirectories (h1/, h2/) to prepare for multi-protocol support while maintaining backwards-compatible top-level exports.
 
 ## Handler Hooks
 
-The server calls handler hooks at specific points in the request lifecycle. All hooks except `selectUpstream` are optional (detected at comptime).
+The server calls handler hooks at specific points in the request lifecycle. `selectUpstream` remains required today; all other hooks are optional, including the native WebSocket pair `selectWebSocket` + `handleWebSocket`.
 
 ### Request Lifecycle
 
@@ -46,7 +53,15 @@ The server calls handler hooks at specific points in the request lifecycle. All 
 │  ├─ onRequestBody(ctx, chunk, is_last) → BodyAction
 │  │    └─ .continue_body | .reject
 │  │
-│  ├─ selectUpstream(ctx, request) → Upstream     [REQUIRED]
+│  ├─ If valid `Upgrade: websocket` and handler implements it:
+│  │    selectWebSocket(ctx, request) → WebSocketRouteAction
+│  │      └─ .decline | .accept | .reject
+│  │
+│  ├─ If `.accept`:
+│  │    handleWebSocket(ctx, request, session)    ← Native endpoint session loop
+│  │
+│  ├─ Otherwise:
+│  │    selectUpstream(ctx, request) → Upstream   [REQUIRED]
 │  │
 │  ├─ onUpstreamRequest(ctx, request)             ← Path rewriting
 │  │
@@ -70,7 +85,9 @@ The server calls handler hooks at specific points in the request lifecycle. All 
 
 | Hook | Signature | Purpose |
 |------|-----------|---------|
-| `selectUpstream` | `(ctx, request) → Upstream` | Select backend (required) |
+| `selectUpstream` | `(ctx, request) → Upstream` | Select backend for non-native requests (required today) |
+| `selectWebSocket` | `(ctx, request) → WebSocketRouteAction` | Accept/decline native WebSocket endpoint handling |
+| `handleWebSocket` | `(ctx, request, session) !void` | Native message-oriented WebSocket session loop |
 | `onRequest` | `(ctx, request, response_buf) → Action` | Request validation, direct responses |
 | `onRequestBody` | `(ctx, chunk, is_last) → BodyAction` | WAF body inspection |
 | `onUpstreamRequest` | `(ctx, request) → void` | Path rewriting, header injection |
@@ -87,6 +104,7 @@ The server calls handler hooks at specific points in the request lifecycle. All 
 - **Action**: `.continue_request` (proceed), `.send_response` (direct response), `.reject` (block with status)
 - **BodyAction**: `.continue_body` (proceed), `.reject` (block with status)
 - **ErrorAction**: `.default` (502), `.send_response` (custom error), `.retry` (try different upstream)
+- **WebSocketRouteAction**: `.decline` (continue normal flow), `.accept` (send `101` and enter native session), `.reject` (send HTTP rejection)
 
 ## Design Rationale
 
@@ -107,7 +125,12 @@ The h1/ subdirectory structure follows TigerStyle modular design principles:
 |--------|-------------|
 | `Server(Handler, Pool, Metrics, Tracer)` | Generic HTTP/1.1 server |
 | `MinimalServer(Handler)` | Server with SimplePool, NoopMetrics, NoopTracer |
+| `WebSocketRouteAction` | Native WebSocket accept/decline/reject decision |
+| `WebSocketAccept` | Native WebSocket accept configuration |
+| `WebSocketSession` | Message-oriented native WebSocket session API |
+| `WebSocketMessage` | Text/binary message returned by `readMessage()` |
 | `h1` | HTTP/1.1 implementation module (re-exports Server, MinimalServer) |
+| `websocket` | Native WebSocket server module |
 
 ## Usage
 
@@ -129,7 +152,7 @@ var server = serval_server.Server(
 ).init(&handler, &pool, &metrics, &tracer, .{ .port = 8080 }, null, serval_net.DnsConfig{});
 
 var shutdown = std.atomic.Value(bool).init(false);
-try server.run(io, &shutdown);
+try server.run(io, &shutdown, null);
 ```
 
 ## File Responsibilities
@@ -140,6 +163,9 @@ Main Server generic parameterized by Handler, Pool, Metrics, Tracer types. Imple
 - TCP_NODELAY configuration for low-latency responses
 - Request parsing via reader utilities
 - Handler invocation (onRequest hooks)
+- WebSocket upgrade detection and fail-closed validation
+- Native WebSocket routing (`selectWebSocket`) and session handoff (`handleWebSocket`)
+- Proxy fallback for declined WebSocket upgrades
 - Response sending via response utilities
 - Keep-alive detection and connection lifecycle
 
@@ -166,6 +192,25 @@ Request reading utilities with zero allocation:
 - `getBodyLength()`: Extract Content-Length from parsed request headers
 - Handles incomplete headers and body length validation
 
+### websocket/accept.zig
+Native `101 Switching Protocols` response building:
+- computes `Sec-WebSocket-Accept`
+- validates selected subprotocol against the client offer
+- writes canonical upgrade response headers
+
+### websocket/io.zig
+Transport adapter for native WebSocket sessions:
+- plain TCP vs TLS read/write dispatch
+- `SSL_pending()` support for userspace TLS buffered reads
+- bounded write-all loops
+
+### websocket/session.zig
+Message-oriented native session API:
+- `readMessage()` with fragmentation reassembly
+- `sendText()`, `sendBinary()`, `sendPing()`, `close()`
+- auto-pong handling
+- close-handshake timeout enforcement
+
 ## Future: HTTP/2 Structure
 
 When HTTP/2 support is added, an h2/ subdirectory will mirror the h1/ organization:
@@ -187,6 +232,7 @@ The mod.zig would dispatch based on negotiated protocol (via ALPN or h2c preface
 - serval-core: types, config, errors, context, traits
 - serval-net: socket utilities
 - serval-http: HTTP parser
+- serval-websocket: WebSocket handshake, frame, close, and subprotocol helpers
 - serval-pool: connection pooling
 - serval-proxy: upstream forwarding
 - serval-metrics: metrics interface
@@ -205,6 +251,8 @@ The mod.zig would dispatch based on negotiated protocol (via ALPN or h2c preface
 | Modular h1/ structure | ✅ Complete |
 | TLS termination | ✅ Complete |
 | TLS response forwarding | ✅ Complete |
+| WebSocket upgrade proxy handoff | ✅ Complete |
+| Native WebSocket endpoint serving | ✅ Complete |
 | HTTP/2 | ⏳ Planned (h2/ structure) |
 | Daemon mode | ❌ Not implemented |
 | Hot reload | ❌ Not implemented |

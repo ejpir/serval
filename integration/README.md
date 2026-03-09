@@ -1,6 +1,7 @@
 # Integration Tests
 
-End-to-end integration tests for serval. Tests spawn actual server binaries as subprocesses and make real HTTP/HTTPS requests.
+End-to-end integration tests for serval. The suite mixes subprocess-based example binaries
+with in-process native WebSocket test servers and makes real HTTP/HTTPS/WebSocket requests.
 
 ## Running Tests
 
@@ -10,10 +11,10 @@ zig build test-integration
 
 # Run with summary
 zig build test-integration --summary all
-
-# Run specific test (filter by name)
-zig build test-integration -- --test-filter "TLS termination"
 ```
+
+Note: the integration suite uses a custom verbose test runner, so standard Zig
+`--test-filter` passthrough is not currently wired up for this build step.
 
 ## Prerequisites
 
@@ -58,6 +59,18 @@ These are for testing only. Use `--insecure-skip-verify` with self-signed certif
 | `echo backend responds with 200` | Basic HTTP echo server |
 | `lb forwards to single backend` | Load balancer with one backend |
 | `lb round-robins across 2 backends` | Verify round-robin distribution |
+
+### WebSocket Tests
+
+| Test | Description |
+|------|-------------|
+| `lb proxies websocket upgrade and relays client text frame` | End-to-end RFC 6455 upgrade + bidirectional relay |
+| `lb forwards websocket 101 with immediate upstream bytes` | Validates upstream preread bytes after `101` |
+| `lb rejects invalid upstream websocket switching-protocols response` | Ensures invalid `101` is converted to `502` |
+| `native websocket endpoint echoes text frame with preread payload` | Native endpoint serves WebSocket directly in Serval |
+| `native websocket endpoint auto-pongs and reassembles fragmented text` | Native endpoint handles control frames + fragmentation |
+| `native websocket endpoint negotiates subprotocol` | Native endpoint returns selected `Sec-WebSocket-Protocol` |
+| `native websocket endpoint and proxy websocket fallback coexist` | One path terminates locally, another declines to proxy fallback |
 
 ### TLS Tests (kTLS Optional; userspace fallback supported)
 

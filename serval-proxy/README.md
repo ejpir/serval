@@ -13,6 +13,8 @@ Handles request forwarding to backend servers using async `Io.net.Stream` I/O in
 - `ForwardResult` - Success result with status and bytes
 - `BodyInfo` - Request body metadata for streaming
 - `Protocol` - Wire protocol enum (h1, h2)
+- `TunnelStats` - WebSocket tunnel relay statistics
+- `TunnelTermination` - Tunnel shutdown reason
 
 ## Usage
 
@@ -84,6 +86,8 @@ Timing fields default to 0 for backward compatibility. Use these for detailed Pi
 | `h1/response.zig` | HTTP/1.1 response receiving, header parsing |
 | `h1/body.zig` | HTTP/1.1 splice/copy body streaming |
 | `h1/chunked.zig` | Chunked transfer encoding forwarding |
+| `h1/websocket.zig` | Dedicated HTTP/1.1 WebSocket upgrade request/response handling |
+| `tunnel.zig` | Bidirectional byte relay after successful upgrade |
 
 ## Dependencies
 
@@ -92,6 +96,7 @@ Timing fields default to 0 for backward compatibility. Use these for detailed Pi
 - `serval-pool` - Connection pooling
 - `serval-tracing` - Distributed tracing interface
 - `serval-http` - HTTP/1.1 parser
+- `serval-websocket` - RFC 6455 handshake validation helpers
 - `serval-tls` - TLS termination/origination
 - `serval-client` - HTTP/1.1 client request building (shared implementation)
 
@@ -111,6 +116,9 @@ detection for cleartext).
 - Userspace copy for TLS paths (both client and upstream)
 - Content-Length body forwarding
 - Response streaming to client
+- WebSocket upgrade forwarding with RFC 6455 handshake validation
+- Bidirectional tunnel relay after `101 Switching Protocols`
+- Upgraded connections are closed instead of being returned to the HTTP pool
 
 ## Implementation Status
 
@@ -126,6 +134,7 @@ detection for cleartext).
 | Request body forwarding | Complete |
 | Client TLS responses | Complete |
 | Upstream TLS | Complete |
+| WebSocket proxy tunnel | Complete |
 | HTTP/2 upstream | Not implemented |
 
 ## TigerStyle Compliance

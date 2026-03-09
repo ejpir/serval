@@ -69,6 +69,14 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // WebSocket protocol helpers - depends on core (Layer 1 - Protocol)
+    const serval_websocket_module = b.addModule("serval-websocket", .{
+        .root_source_file = b.path("serval-websocket/mod.zig"),
+        .imports = &.{
+            .{ .name = "serval-core", .module = serval_core_module },
+        },
+    });
+
     // Metrics module - depends on core
     const serval_metrics_module = b.addModule("serval-metrics", .{
         .root_source_file = b.path("serval-metrics/mod.zig"),
@@ -122,7 +130,7 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // Proxy module - depends on core, net, socket, pool, tracing, http, tls, client
+    // Proxy module - depends on core, net, socket, pool, tracing, http, websocket, tls, client
     const serval_proxy_module = b.addModule("serval-proxy", .{
         .root_source_file = b.path("serval-proxy/mod.zig"),
         .imports = &.{
@@ -132,12 +140,13 @@ pub fn build(b: *std.Build) void {
             .{ .name = "serval-pool", .module = serval_pool_module },
             .{ .name = "serval-tracing", .module = serval_tracing_module },
             .{ .name = "serval-http", .module = serval_http_module },
+            .{ .name = "serval-websocket", .module = serval_websocket_module },
             .{ .name = "serval-tls", .module = serval_tls_module },
             .{ .name = "serval-client", .module = serval_client_module },
         },
     });
 
-    // Server module - composes core, net, socket, http, pool, proxy, metrics, tracing, tls
+    // Server module - composes core, net, socket, http, websocket, pool, proxy, metrics, tracing, tls
     const serval_server_module = b.addModule("serval-server", .{
         .root_source_file = b.path("serval-server/mod.zig"),
         .imports = &.{
@@ -145,6 +154,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "serval-net", .module = serval_net_module },
             .{ .name = "serval-socket", .module = serval_socket_module },
             .{ .name = "serval-http", .module = serval_http_module },
+            .{ .name = "serval-websocket", .module = serval_websocket_module },
             .{ .name = "serval-pool", .module = serval_pool_module },
             .{ .name = "serval-proxy", .module = serval_proxy_module },
             .{ .name = "serval-metrics", .module = serval_metrics_module },
@@ -213,6 +223,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "serval-net", .module = serval_net_module },
             .{ .name = "serval-socket", .module = serval_socket_module },
             .{ .name = "serval-http", .module = serval_http_module },
+            .{ .name = "serval-websocket", .module = serval_websocket_module },
             .{ .name = "serval-pool", .module = serval_pool_module },
             .{ .name = "serval-proxy", .module = serval_proxy_module },
             .{ .name = "serval-metrics", .module = serval_metrics_module },
@@ -241,6 +252,7 @@ pub fn build(b: *std.Build) void {
     serval_tests_mod.addImport("serval-net", serval_net_module);
     serval_tests_mod.addImport("serval-socket", serval_socket_module);
     serval_tests_mod.addImport("serval-http", serval_http_module);
+    serval_tests_mod.addImport("serval-websocket", serval_websocket_module);
     serval_tests_mod.addImport("serval-pool", serval_pool_module);
     serval_tests_mod.addImport("serval-proxy", serval_proxy_module);
     serval_tests_mod.addImport("serval-metrics", serval_metrics_module);
@@ -406,6 +418,52 @@ pub fn build(b: *std.Build) void {
     const net_test_step = b.step("test-net", "Run serval-net library tests");
     net_test_step.dependOn(&run_net_tests.step);
 
+    // WebSocket protocol module tests
+    const websocket_tests_mod = b.createModule(.{
+        .root_source_file = b.path("serval-websocket/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    websocket_tests_mod.addImport("serval-core", serval_core_module);
+    const websocket_tests = b.addTest(.{
+        .name = "websocket_tests",
+        .root_module = websocket_tests_mod,
+    });
+    force_llvm_lld(websocket_tests);
+    const run_websocket_tests = b.addRunArtifact(websocket_tests);
+
+    const websocket_test_step = b.step("test-websocket", "Run serval-websocket library tests");
+    websocket_test_step.dependOn(&run_websocket_tests.step);
+
+    // Server module tests
+    const server_tests_mod = b.createModule(.{
+        .root_source_file = b.path("serval-server/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    server_tests_mod.linkSystemLibrary("ssl", .{});
+    server_tests_mod.linkSystemLibrary("crypto", .{});
+    server_tests_mod.addImport("serval-core", serval_core_module);
+    server_tests_mod.addImport("serval-net", serval_net_module);
+    server_tests_mod.addImport("serval-socket", serval_socket_module);
+    server_tests_mod.addImport("serval-http", serval_http_module);
+    server_tests_mod.addImport("serval-websocket", serval_websocket_module);
+    server_tests_mod.addImport("serval-pool", serval_pool_module);
+    server_tests_mod.addImport("serval-proxy", serval_proxy_module);
+    server_tests_mod.addImport("serval-metrics", serval_metrics_module);
+    server_tests_mod.addImport("serval-tracing", serval_tracing_module);
+    server_tests_mod.addImport("serval-tls", serval_tls_module);
+    const server_tests = b.addTest(.{
+        .name = "server_tests",
+        .root_module = server_tests_mod,
+    });
+    force_llvm_lld(server_tests);
+    const run_server_tests = b.addRunArtifact(server_tests);
+
+    const server_test_step = b.step("test-server", "Run serval-server library tests");
+    server_test_step.dependOn(&run_server_tests.step);
+
     // Socket module tests (unified TCP/TLS socket abstraction)
     // Note: Links SSL libraries since serval-socket depends on serval-tls
     const socket_tests_mod = b.createModule(.{
@@ -473,14 +531,18 @@ pub fn build(b: *std.Build) void {
     const client_test_step = b.step("test-client", "Run serval-client library tests");
     client_test_step.dependOn(&run_client_tests.step);
 
-    // Integration tests (end-to-end tests using subprocess spawning)
-    // Note: No serval dependencies - spawns binaries as subprocesses
+    // Integration tests (end-to-end tests using subprocesses and in-process native WS servers)
+    // Links serval modules for native WebSocket endpoint coverage.
     const integration_tests_mod = b.createModule(.{
         .root_source_file = b.path("integration/tests.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
+    integration_tests_mod.linkSystemLibrary("ssl", .{});
+    integration_tests_mod.linkSystemLibrary("crypto", .{});
+    integration_tests_mod.addImport("serval", serval_module);
+    integration_tests_mod.addImport("serval-net", serval_net_module);
     const integration_tests = b.addTest(.{
         .name = "integration_tests",
         .root_module = integration_tests_mod,

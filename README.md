@@ -9,6 +9,8 @@ High-performance HTTP infrastructure for Zig — reverse proxies, load balancers
 - **TLS support** — Client-side termination and upstream HTTPS (OpenSSL)
 - **kTLS kernel offload** — Hardware-accelerated TLS with automatic fallback
 - **Zero-copy forwarding** — Linux splice() for body transfer (including kTLS)
+- **WebSocket proxying** — RFC 6455 upgrade validation and bidirectional tunnel relay
+- **Native WebSocket serving** — Accept WebSocket endpoints directly in Serval handlers with message-oriented session API
 - **Connection pooling** — Reuse upstream connections across requests
 - **Pluggable components** — Custom handlers, metrics, and tracing implementations
 - **No runtime allocation** — All memory allocated at startup
@@ -55,7 +57,7 @@ var server = serval.Server(
 }, null, serval_net.DnsConfig{});  // DNS config with default TTL
 
 var shutdown = std.atomic.Value(bool).init(false);
-try server.run(io, &shutdown);
+try server.run(io, &shutdown, null);
 ```
 
 ## Installation
@@ -89,6 +91,7 @@ exe.root_module.addImport("serval-lb", serval.module("serval-lb"));
 | `serval` | Umbrella module — re-exports everything |
 | `serval-core` | Types, config, errors, context |
 | `serval-http` | HTTP/1.1 request parser |
+| `serval-websocket` | RFC 6455 handshake, frame, close, and subprotocol helpers |
 | `serval-net` | DNS resolution with TTL caching, TCP socket utilities |
 | `serval-client` | HTTP/1.1 client library for upstream connections |
 | `serval-tls` | TLS termination/origination with kTLS offload |
@@ -136,6 +139,25 @@ const MyHandler = struct {
 };
 ```
 
+Native WebSocket handlers add two optional hooks:
+
+```zig
+pub fn selectWebSocket(self: *@This(), ctx: *serval.Context, req: *const serval.Request) serval.WebSocketRouteAction {
+    if (!std.mem.eql(u8, req.path, "/ws")) return .decline;
+    return .{ .accept = .{ .subprotocol = "chat" } };
+}
+
+pub fn handleWebSocket(self: *@This(), ctx: *serval.Context, req: *const serval.Request, session: *serval.WebSocketSession) !void {
+    var msg_buf: [4096]u8 = undefined;
+    while (try session.readMessage(&msg_buf)) |msg| {
+        switch (msg.kind) {
+            .text => try session.sendText(msg.payload),
+            .binary => try session.sendBinary(msg.payload),
+        }
+    }
+}
+```
+
 ## Building
 
 ```bash
@@ -145,7 +167,10 @@ zig build run-router-example    # Run content-based router
 zig build run-llm-example       # Run LLM streaming example
 zig build run-echo-backend      # Run echo backend
 zig build build-gateway-example # Build K8s gateway controller
-zig build test                  # Run all tests
+zig build test                  # Run umbrella tests
+zig build test-server           # Run serval-server tests
+zig build test-websocket        # Run serval-websocket tests
+zig build test-integration      # Run end-to-end integration tests
 ```
 
 ## Examples
@@ -441,6 +466,8 @@ zig build run-echo-backend -- --help
 | TLS origination (upstream HTTPS) | Complete |
 | kTLS kernel offload | Complete |
 | Chunked encoding | Complete |
+| WebSocket proxy tunneling | Complete |
+| Native WebSocket endpoint serving | Complete |
 | Content-based routing | Complete |
 | Path rewriting | Complete |
 | K8s Gateway API types | Complete |

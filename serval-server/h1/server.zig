@@ -27,6 +27,8 @@ const SpanHandle = tracing_mod.SpanHandle;
 const serval_http = @import("serval-http");
 const parser_mod = serval_http.parser;
 const parseContentLengthValue = serval_http.parseContentLengthValue;
+const serval_websocket = @import("serval-websocket");
+const websocket_server = @import("../websocket/mod.zig");
 const forwarder_mod = @import("serval-proxy").forwarder;
 const serval_tls = @import("serval-tls");
 const ssl = serval_tls.ssl;
@@ -81,6 +83,7 @@ pub fn Server(
     // Compile-time interface verification
     comptime {
         hooks.verifyHandler(Handler);
+        websocket_server.verifyHandlerExtensions(Handler);
         pool_mod.verifyPool(Pool);
         metrics_mod.verifyMetrics(Metrics);
         tracing_mod.verifyTracer(Tracer);
@@ -653,6 +656,7 @@ pub fn Server(
             // TigerStyle: Comptime conditional eliminates overhead for pure proxy handlers.
             // Heap-allocated to support large payloads (128MB+) without stack overflow.
             const has_on_request = comptime hooks.hasHook(Handler, "onRequest");
+            const has_select_websocket = comptime websocket_server.hasHook(Handler, "selectWebSocket");
             const response_buf: []u8 = if (has_on_request)
                 std.heap.page_allocator.alloc(u8, DIRECT_RESPONSE_BUFFER_SIZE_BYTES) catch {
                     log.err("server: conn={d} failed to allocate response buffer", .{connection_id});
@@ -714,6 +718,8 @@ pub fn Server(
                         send100ContinueTls(maybe_tls_ptr, &io_mut, stream);
                     }
                 }
+
+                const websocket_candidate = serval_websocket.looksLikeWebSocketUpgradeRequest(&parser.request);
 
                 // Start a tracing span for this request (child of TLS span if present)
                 var span_name_buf: [config.OTEL_MAX_NAME_LEN]u8 = std.mem.zeroes([config.OTEL_MAX_NAME_LEN]u8);
@@ -871,6 +877,157 @@ pub fn Server(
                     }
                 }
 
+                if (websocket_candidate) {
+                    serval_websocket.validateClientRequest(&parser.request, parser.body_framing) catch |err| {
+                        sendErrorResponseTls(maybe_tls_ptr, &io_mut, stream, 400, "Bad WebSocket Request");
+                        const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
+                        metrics.requestEnd(400, duration_ns);
+                        tracer.setIntAttribute(span_handle, "http.response.status_code", 400);
+                        tracer.endSpan(span_handle, @errorName(err));
+                        return;
+                    };
+
+                    if (comptime has_select_websocket) {
+                        switch (handler.selectWebSocket(&ctx, &parser.request)) {
+                            .decline => {},
+                            .reject => |reject| {
+                                sendErrorResponseTls(maybe_tls_ptr, &io_mut, stream, reject.status, reject.reason);
+                                const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
+                                ctx.duration_ns = duration_ns;
+                                ctx.response_status = reject.status;
+                                metrics.requestEnd(reject.status, duration_ns);
+                                if (comptime hooks.hasHook(Handler, "onLog")) {
+                                    const log_entry = serval_core.log.LogEntry{
+                                        .timestamp_s = time.nanosToSecondsI128(ctx.start_time_ns),
+                                        .start_time_ns = ctx.start_time_ns,
+                                        .duration_ns = duration_ns,
+                                        .method = parser.request.method,
+                                        .path = parser.request.path,
+                                        .request_bytes = @intCast(parser.headers_end),
+                                        .status = reject.status,
+                                        .response_bytes = 0,
+                                        .upstream = null,
+                                        .upstream_duration_ns = 0,
+                                        .error_phase = null,
+                                        .error_name = null,
+                                        .connection_reused = false,
+                                        .keepalive = false,
+                                        .parse_duration_ns = ctx.parse_duration_ns,
+                                        .connection_id = ctx.connection_id,
+                                        .request_number = ctx.request_number,
+                                        .client_addr = ctx.client_addr,
+                                    };
+                                    handler.onLog(&ctx, log_entry);
+                                }
+                                tracer.setIntAttribute(span_handle, "http.response.status_code", @intCast(reject.status));
+                                tracer.endSpan(span_handle, reject.reason);
+                                return;
+                            },
+                            .accept => |accept_cfg| {
+                                var transport_ctx = websocket_server.ConnectionTransportContext{
+                                    .fd = @intCast(stream.socket.handle),
+                                    .maybe_tls = maybe_tls_ptr,
+                                    .connection_id = connection_id,
+                                };
+                                const transport = websocket_server.initConnectionTransport(&transport_ctx);
+
+                                const handshake_bytes = websocket_server.sendSwitchingProtocols(
+                                    &transport,
+                                    &parser.request,
+                                    accept_cfg,
+                                ) catch |err| {
+                                    if (err != error.WriteFailed) {
+                                        sendErrorResponseTls(maybe_tls_ptr, &io_mut, stream, 500, "WebSocket Accept Failed");
+                                    }
+                                    const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
+                                    ctx.duration_ns = duration_ns;
+                                    ctx.response_status = 500;
+                                    metrics.requestEnd(500, duration_ns);
+                                    if (comptime hooks.hasHook(Handler, "onLog")) {
+                                        const log_entry = serval_core.log.LogEntry{
+                                            .timestamp_s = time.nanosToSecondsI128(ctx.start_time_ns),
+                                            .start_time_ns = ctx.start_time_ns,
+                                            .duration_ns = duration_ns,
+                                            .method = parser.request.method,
+                                            .path = parser.request.path,
+                                            .request_bytes = @intCast(parser.headers_end),
+                                            .status = 500,
+                                            .response_bytes = 0,
+                                            .upstream = null,
+                                            .upstream_duration_ns = 0,
+                                            .error_phase = null,
+                                            .error_name = @errorName(err),
+                                            .connection_reused = false,
+                                            .keepalive = false,
+                                            .parse_duration_ns = ctx.parse_duration_ns,
+                                            .connection_id = ctx.connection_id,
+                                            .request_number = ctx.request_number,
+                                            .client_addr = ctx.client_addr,
+                                        };
+                                        handler.onLog(&ctx, log_entry);
+                                    }
+                                    tracer.setIntAttribute(span_handle, "http.response.status_code", 500);
+                                    tracer.endSpan(span_handle, @errorName(err));
+                                    return;
+                                };
+
+                                const initial_client_bytes = if (buffer_len > buffer_offset + parser.headers_end)
+                                    recv_buf[buffer_offset + parser.headers_end .. buffer_len]
+                                else
+                                    &[_]u8{};
+
+                                var ws_session = websocket_server.WebSocketSession.init(
+                                    transport,
+                                    accept_cfg,
+                                    accept_cfg.subprotocol,
+                                    initial_client_bytes,
+                                );
+                                var websocket_error_name: ?[]const u8 = null;
+
+                                handler.handleWebSocket(&ctx, &parser.request, &ws_session) catch |err| {
+                                    websocket_error_name = @errorName(err);
+                                    if (ws_session.state() == .open) {
+                                        ws_session.close(serval_websocket.close_internal_error, "") catch |close_err| {
+                                            if (websocket_error_name == null) websocket_error_name = @errorName(close_err);
+                                        };
+                                    }
+                                };
+
+                                if (ws_session.state() == .open) {
+                                    ws_session.close(serval_websocket.close_normal_closure, "") catch |err| {
+                                        if (websocket_error_name == null) websocket_error_name = @errorName(err);
+                                    };
+                                }
+                                if (ws_session.state() == .close_sent) {
+                                    ws_session.finishCloseHandshake() catch |err| {
+                                        if (websocket_error_name == null) websocket_error_name = @errorName(err);
+                                    };
+                                }
+
+                                const websocket_duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
+                                const websocket_stats = ws_session.stats();
+                                ctx.duration_ns = websocket_duration_ns;
+                                ctx.response_status = 101;
+                                ctx.bytes_received = @as(u64, @intCast(parser.headers_end)) + websocket_stats.bytes_received;
+                                ctx.bytes_sent = handshake_bytes + websocket_stats.bytes_sent;
+
+                                handleNativeWebSocketCompleteImpl(
+                                    handler,
+                                    metrics,
+                                    &ctx,
+                                    &parser.request,
+                                    ctx.bytes_sent,
+                                    websocket_duration_ns,
+                                    websocket_error_name,
+                                );
+                                tracer.setIntAttribute(span_handle, "http.response.status_code", 101);
+                                tracer.endSpan(span_handle, websocket_error_name);
+                                return;
+                            },
+                        }
+                    }
+                }
+
                 // Select upstream and forward (or reject if handler returns action)
                 const action_result = handler.selectUpstream(&ctx, &parser.request);
 
@@ -938,6 +1095,38 @@ pub fn Server(
                 };
                 ctx.upstream = upstream;
 
+                if (websocket_candidate) {
+                    const initial_client_bytes = if (buffer_len > buffer_offset + parser.headers_end)
+                        recv_buf[buffer_offset + parser.headers_end .. buffer_len]
+                    else
+                        &[_]u8{};
+
+                    const websocket_result = forwarder.forwardWebSocket(
+                        io,
+                        stream,
+                        maybe_tls_ptr,
+                        &parser.request,
+                        &upstream,
+                        initial_client_bytes,
+                        span_handle,
+                        ctx.rewritten_path,
+                    );
+
+                    const websocket_duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
+                    ctx.duration_ns = websocket_duration_ns;
+
+                    if (websocket_result) |fwd_result| {
+                        handleForwardSuccessImpl(handler, metrics, &ctx, &parser.request, fwd_result, websocket_duration_ns, false);
+                        tracer.setIntAttribute(span_handle, "http.response.status_code", @intCast(fwd_result.status));
+                        tracer.endSpan(span_handle, null);
+                    } else |err| {
+                        handleForwardErrorImpl(handler, metrics, maybe_tls_ptr, &io_mut, stream, &ctx, &parser.request, upstream, err, websocket_duration_ns);
+                        tracer.setIntAttribute(span_handle, "http.response.status_code", 502);
+                        tracer.endSpan(span_handle, @errorName(err));
+                    }
+                    return;
+                }
+
                 // Extract body info and forward
                 // Pass ctx.rewritten_path for path rewriting support (e.g., strip_prefix in router)
                 const body_info = buildBodyInfo(&parser, &recv_buf, buffer_offset, buffer_len);
@@ -952,7 +1141,7 @@ pub fn Server(
 
                 // Process result and determine connection state
                 const result: ProcessResult = if (forward_result) |fwd_result| blk: {
-                    handleForwardSuccessImpl(handler, metrics, &ctx, &parser.request, fwd_result, duration_ns);
+                    handleForwardSuccessImpl(handler, metrics, &ctx, &parser.request, fwd_result, duration_ns, true);
                     tracer.setIntAttribute(span_handle, "http.response.status_code", @intCast(fwd_result.status));
                     tracer.endSpan(span_handle, null);
 
@@ -973,6 +1162,49 @@ pub fn Server(
             }
         }
 
+        /// Handle completed native WebSocket session: update metrics and call onLog hook.
+        /// TigerStyle: HTTP status stays 101 for the full upgraded session lifetime.
+        fn handleNativeWebSocketCompleteImpl(
+            handler: *Handler,
+            metrics: *Metrics,
+            ctx: *Context,
+            request: *const Request,
+            response_bytes: u64,
+            duration_ns: u64,
+            error_name: ?[]const u8,
+        ) void {
+            assert(@intFromPtr(handler) != 0);
+            assert(@intFromPtr(metrics) != 0);
+
+            ctx.response_status = 101;
+            ctx.bytes_sent = response_bytes;
+            metrics.requestEnd(101, duration_ns);
+
+            if (comptime hooks.hasHook(Handler, "onLog")) {
+                const log_entry = serval_core.log.LogEntry{
+                    .timestamp_s = time.nanosToSecondsI128(ctx.start_time_ns),
+                    .start_time_ns = ctx.start_time_ns,
+                    .duration_ns = duration_ns,
+                    .method = request.method,
+                    .path = request.path,
+                    .request_bytes = ctx.bytes_received,
+                    .status = 101,
+                    .response_bytes = response_bytes,
+                    .upstream = null,
+                    .upstream_duration_ns = 0,
+                    .error_phase = null,
+                    .error_name = error_name,
+                    .connection_reused = false,
+                    .keepalive = false,
+                    .parse_duration_ns = ctx.parse_duration_ns,
+                    .connection_id = ctx.connection_id,
+                    .request_number = ctx.request_number,
+                    .client_addr = ctx.client_addr,
+                };
+                handler.onLog(ctx, log_entry);
+            }
+        }
+
         /// Handle successful forward: update metrics and call onLog hook.
         /// TigerStyle: Standalone function with explicit dependencies.
         fn handleForwardSuccessImpl(
@@ -982,6 +1214,7 @@ pub fn Server(
             request: *const Request,
             result: forwarder_mod.ForwardResult,
             duration_ns: u64,
+            keepalive: bool,
         ) void {
             assert(@intFromPtr(handler) != 0);
             assert(@intFromPtr(metrics) != 0);
@@ -1015,7 +1248,7 @@ pub fn Server(
                     .error_phase = null,
                     .error_name = null,
                     .connection_reused = result.connection_reused,
-                    .keepalive = true,
+                    .keepalive = keepalive,
                     .parse_duration_ns = ctx.parse_duration_ns,
                     .connect_duration_ns = result.tcp_connect_duration_ns,
                     .send_duration_ns = result.send_duration_ns,

@@ -28,6 +28,7 @@ serval (umbrella - re-exports all modules)
 ├── serval-net      # DNS resolution, TCP helpers (TCP_NODELAY, keepalive)
 ├── serval-socket   # Unified socket abstraction (plain TCP + TLS)
 ├── serval-http     # HTTP/1.1 parser
+├── serval-websocket # RFC 6455 handshake, frame, close, and subprotocol helpers
 ├── serval-tls      # TLS termination and origination (OpenSSL)
 ├── serval-pool     # Connection pooling
 ├── serval-client   # HTTP/1.1 client (connect, send, receive)
@@ -94,6 +95,8 @@ Layer 1 (Protocol):                                                │
        │                                                           │
   serval-http ─────────────────────────────────────────────────────┤
                                                                    │
+  serval-websocket ────────────────────────────────────────────────┤
+                                                                   │
   serval-tls ──────────────────────────────────────────────────────┤
                                                                    │
 Layer 2 (Infrastructure):                                          │
@@ -137,6 +140,7 @@ Standalone:
 | serval-net | DNS resolution, TCP configuration utilities | `DnsResolver`, `set_tcp_no_delay`, `set_tcp_keep_alive` |
 | serval-socket | Unified socket abstraction (plain TCP + TLS) | `Socket`, `SocketError`, `PlainSocket` |
 | serval-http | HTTP/1.1 parsing | `Parser` |
+| serval-websocket | RFC 6455 handshake + framing helpers | `validateClientRequest`, `computeAcceptKey`, `parseFrameHeader`, `buildClosePayload` |
 | serval-pool | Connection reuse (wraps Socket) | `SimplePool`, `NoPool`, `Connection` |
 | serval-client | HTTP/1.1 client for upstream requests | `Client`, `ClientError`, `ResponseHeaders`, `sendRequest`, `readResponseHeaders` |
 | serval-health | Backend health tracking | `HealthState`, `UpstreamIndex`, `MAX_UPSTREAMS` |
@@ -366,6 +370,22 @@ Client                                                     Upstream
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+### WebSocket Upgrade Flow
+
+When a request contains `Upgrade: websocket`, the HTTP/1.1 server takes an explicit
+upgrade path instead of the normal request/response forwarding path:
+
+1. `serval-websocket` validates the client handshake (`GET`, `Connection: Upgrade`, `Upgrade: websocket`, valid `Sec-WebSocket-Key`, version `13`, no HTTP body framing)
+2. If the handler implements native endpoint hooks, `serval-server/websocket` asks `selectWebSocket()` whether to:
+   - `.accept` and terminate locally in Serval
+   - `.decline` and continue to proxy/upstream handling
+   - `.reject` and send an HTTP error response
+3. For native `.accept`, `serval-server/websocket/accept.zig` sends `101 Switching Protocols` and `serval-server/websocket/session.zig` switches the connection into a message-oriented RFC 6455 session loop
+4. For proxy fallback, `serval-proxy/h1/websocket.zig` builds a canonical upstream upgrade request while preserving end-to-end WebSocket headers
+5. Upstream response headers are read once and validated before any `101` is forwarded to the client
+6. If upstream returns a non-`101` response, it is forwarded as plain HTTP and the connection closes
+7. If upstream returns a valid `101 Switching Protocols`, `serval-proxy/tunnel.zig` switches to bidirectional byte relay and the upgraded upstream connection is never returned to the HTTP pool
 
 ### Async I/O and Zero-Copy Body Transfer
 
@@ -768,6 +788,8 @@ pub const WeightedHandler = struct {
 | CLI argument parsing | serval-cli | Comptime-generic with custom options |
 | Protocol abstraction | serval-proxy | h1/ subdirectory, Protocol enum ready for h2 |
 | Chunked transfer encoding | serval-http, serval-proxy, serval-server | Parsing, forwarding, and direct response |
+| WebSocket proxy tunneling | serval-websocket, serval-proxy, serval-server | RFC 6455 handshake validation, HTTP/1.1 upgrade forwarding, bidirectional relay |
+| Native WebSocket endpoint serving | serval-websocket, serval-server | RFC 6455 handshake acceptance, frame parsing, message-oriented server sessions |
 | TLS termination | serval-tls, serval-server | Client TLS (server-side), upstream TLS (client-side) |
 | kTLS kernel offload | serval-tls | OpenSSL native + BoringSSL manual, automatic fallback |
 | HTTP/1.1 client | serval-client | DNS, TCP, TLS, request/response |
@@ -790,14 +812,14 @@ pub const WeightedHandler = struct {
 
 ### Build & Test
 
-Requires **Zig 0.16.0-dev.1859** or later.
+Requires **Zig 0.16.0-dev.2565+684032671** or later.
 
 ```bash
 # Build all
 zig build
 
 # Run serval library tests
-zig build test-serval
+zig build test
 
 # Run load balancer tests
 zig build test-lb

@@ -32,6 +32,7 @@ No business logic, only protocol implementation. Sits alongside serval-http and 
   - `init()`, `createClientCtx()`, `createServerCtx()`
   - Low-level SSL function bindings
   - Error handling utilities
+  - `SSL_pending()` binding for userspace TLS buffered-read inspection
 
 - `TLSStream` - Unified TLS stream interface
   - `initServer()` - Server-side TLS termination (accepts client connections)

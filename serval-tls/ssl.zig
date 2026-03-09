@@ -80,6 +80,7 @@ pub extern fn SSL_read(ssl: *SSL, buf: [*]u8, num: c_int) c_int;
 pub extern fn SSL_write(ssl: *SSL, buf: [*]const u8, num: c_int) c_int;
 pub extern fn SSL_shutdown(ssl: *SSL) c_int;
 pub extern fn SSL_get_error(ssl: *const SSL, ret: c_int) c_int;
+pub extern fn SSL_pending(ssl: *const SSL) c_int;
 pub extern fn SSL_get_version(ssl: *const SSL) ?[*:0]const u8;
 pub extern fn SSL_get_current_cipher(ssl: *const SSL) ?*const SSL_CIPHER;
 
