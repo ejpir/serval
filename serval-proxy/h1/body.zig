@@ -22,6 +22,7 @@ const chunked_transfer = @import("chunked.zig");
 const forwardChunkedBody = chunked_transfer.forwardChunkedBody;
 
 const core = @import("serval-core");
+const serval_time = core.time;
 const SPLICE_CHUNK_SIZE_BYTES = core.config.SPLICE_CHUNK_SIZE_BYTES;
 const COPY_CHUNK_SIZE_BYTES = core.config.COPY_CHUNK_SIZE_BYTES;
 
@@ -40,6 +41,13 @@ const SPLICE_F_MOVE: u32 = 1;
 
 /// SPLICE_F_MORE: More data will be coming (enables TCP cork optimization).
 const SPLICE_F_MORE: u32 = 4;
+
+/// Retry sleep after EAGAIN in splice loops.
+const SPLICE_RETRY_SLEEP_NS: u64 = serval_time.ns_per_ms;
+/// Max no-progress interval before failing splice loops.
+const SPLICE_STALL_TIMEOUT_NS: u64 = 120 * serval_time.ns_per_s;
+/// Explicit bound on EAGAIN retries in splice loops.
+const SPLICE_MAX_RETRY_COUNT: u32 = 240_000;
 
 // =============================================================================
 // Platform-Specific Body Forwarding
@@ -98,6 +106,12 @@ fn spliceSyscall(fd_in: i32, fd_out: i32, len: usize, flags: u32) isize {
     ));
 }
 
+fn isLinuxErrno(result: isize, errno_code: std.os.linux.E) bool {
+    assert(result < 0);
+    const errno_value: isize = @intCast(@intFromEnum(errno_code));
+    return result == -errno_value;
+}
+
 /// Forward body using Linux splice syscall for zero-copy transfer.
 /// TigerStyle: Bounded loops, assertion on fd validity.
 fn forwardBodySplice(upstream_fd: i32, client_fd: i32, length_bytes: u64) ForwardError!u64 {
@@ -117,10 +131,11 @@ fn forwardBodySplice(upstream_fd: i32, client_fd: i32, length_bytes: u64) Forwar
     }
 
     var forwarded_bytes: u64 = 0;
-    // TigerStyle: Derive iteration bound from content length - supports arbitrarily large files.
-    // Each iteration transfers up to SPLICE_CHUNK_SIZE_BYTES, plus margin for partial transfers.
-    const max_iterations: u64 = (length_bytes / SPLICE_CHUNK_SIZE_BYTES) + 1024;
+    // TigerStyle: explicit worst-case bound (1 byte forward progress per iteration).
+    const max_iterations: u64 = length_bytes +| 1024;
     var iterations: u64 = 0;
+    var retry_count: u32 = 0;
+    var last_progress_ns: u64 = serval_time.monotonicNanos();
 
     while (forwarded_bytes < length_bytes and iterations < max_iterations) : (iterations += 1) {
         const remaining_bytes = length_bytes - forwarded_bytes;
@@ -130,13 +145,32 @@ fn forwardBodySplice(upstream_fd: i32, client_fd: i32, length_bytes: u64) Forwar
         const to_pipe = spliceSyscall(upstream_fd, pipe_fds[1], chunk_size, SPLICE_F_MOVE | SPLICE_F_MORE);
 
         if (to_pipe == 0) break;
-        if (to_pipe < 0) return ForwardError.SpliceFailed;
+        if (to_pipe < 0) {
+            if (isLinuxErrno(to_pipe, .INTR)) continue;
+            if (isLinuxErrno(to_pipe, .AGAIN)) {
+                retry_count += 1;
+                const now_ns = serval_time.monotonicNanos();
+                if (retry_count >= SPLICE_MAX_RETRY_COUNT or
+                    now_ns -| last_progress_ns >= SPLICE_STALL_TIMEOUT_NS)
+                {
+                    return ForwardError.SpliceFailed;
+                }
+                serval_time.sleep(SPLICE_RETRY_SLEEP_NS);
+                continue;
+            }
+            return ForwardError.SpliceFailed;
+        }
+
+        retry_count = 0;
+        last_progress_ns = serval_time.monotonicNanos();
 
         // Splice from pipe to client
         var pipe_sent_bytes: u64 = 0;
-        var pipe_iterations: u64 = 0;
-        const max_pipe_iterations: u64 = 1024;
         const to_pipe_bytes: u64 = @intCast(to_pipe);
+        var pipe_iterations: u64 = 0;
+        const max_pipe_iterations: u64 = to_pipe_bytes +| 1024;
+        var pipe_retry_count: u32 = 0;
+        var pipe_last_progress_ns: u64 = last_progress_ns;
 
         // Check if this is the last chunk - don't set SPLICE_F_MORE on final write
         // to avoid TCP cork delay. SPLICE_F_MORE tells kernel to expect more data,
@@ -147,11 +181,33 @@ fn forwardBodySplice(upstream_fd: i32, client_fd: i32, length_bytes: u64) Forwar
         while (pipe_sent_bytes < to_pipe_bytes and pipe_iterations < max_pipe_iterations) : (pipe_iterations += 1) {
             const from_pipe = spliceSyscall(pipe_fds[0], client_fd, @intCast(to_pipe_bytes - pipe_sent_bytes), splice_flags);
             if (from_pipe == 0) return ForwardError.SendFailed;
-            if (from_pipe < 0) return ForwardError.SpliceFailed;
+            if (from_pipe < 0) {
+                if (isLinuxErrno(from_pipe, .INTR)) continue;
+                if (isLinuxErrno(from_pipe, .AGAIN)) {
+                    pipe_retry_count += 1;
+                    const now_ns = serval_time.monotonicNanos();
+                    if (pipe_retry_count >= SPLICE_MAX_RETRY_COUNT or
+                        now_ns -| pipe_last_progress_ns >= SPLICE_STALL_TIMEOUT_NS)
+                    {
+                        return ForwardError.SpliceFailed;
+                    }
+                    serval_time.sleep(SPLICE_RETRY_SLEEP_NS);
+                    continue;
+                }
+                return ForwardError.SpliceFailed;
+            }
+
+            pipe_retry_count = 0;
+            pipe_last_progress_ns = serval_time.monotonicNanos();
             pipe_sent_bytes += @intCast(from_pipe);
         }
 
+        if (pipe_sent_bytes != to_pipe_bytes) return ForwardError.SendFailed;
         forwarded_bytes += to_pipe_bytes;
+    }
+
+    if (forwarded_bytes < length_bytes and iterations >= max_iterations) {
+        return ForwardError.SpliceFailed;
     }
 
     assert(forwarded_bytes <= length_bytes);
@@ -171,9 +227,8 @@ fn forwardBodyCopy(upstream: *Socket, client: *Socket, length_bytes: u64) Forwar
 
     var buffer: [COPY_CHUNK_SIZE_BYTES]u8 = std.mem.zeroes([COPY_CHUNK_SIZE_BYTES]u8);
     var forwarded_bytes: u64 = 0;
-    // TigerStyle: Derive iteration bound from content length - supports arbitrarily large files.
-    // Each iteration transfers up to COPY_CHUNK_SIZE_BYTES, plus margin for partial reads.
-    const max_iterations: u64 = (length_bytes / COPY_CHUNK_SIZE_BYTES) + 1024;
+    // TigerStyle: explicit worst-case bound (1 byte forward progress per iteration).
+    const max_iterations: u64 = length_bytes +| 1024;
     var iterations: u64 = 0;
 
     while (forwarded_bytes < length_bytes and iterations < max_iterations) : (iterations += 1) {
@@ -259,6 +314,7 @@ fn streamContentLengthBody(
     assert(client.get_fd() >= 0);
     assert(upstream.get_fd() >= 0);
     assert(bytes_already_read <= content_length);
+    assert(initial_body.len == @as(usize, @intCast(bytes_already_read)));
 
     var total_sent: u64 = 0;
 
@@ -268,16 +324,17 @@ fn streamContentLengthBody(
         total_sent += initial_body.len;
     }
 
-    // Stream remaining bytes using Socket abstraction.
+    // Stream remaining bytes using zero-copy when possible.
     const remaining = content_length - bytes_already_read;
     if (remaining > 0) {
-        // Forward using Socket abstraction (handles TLS transparently).
-        total_sent += try forwardBodyCopy(client, upstream, remaining);
+        // Direction is client -> upstream for request bodies.
+        const forwarded = try forwardBody(client, upstream, remaining);
+        if (forwarded != remaining) return ForwardError.RecvFailed;
+        total_sent += forwarded;
     }
 
-    // Postcondition: sent at most content_length bytes.
-    // May be less if upstream closed early, client disconnected, or network error.
-    assert(total_sent <= content_length);
+    // Postcondition: content-length bodies must be forwarded exactly.
+    assert(total_sent == content_length);
     return total_sent;
 }
 

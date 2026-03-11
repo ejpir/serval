@@ -1,6 +1,6 @@
 # serval
 
-HTTP/1.1 reverse proxy server library.
+HTTP/1.1 reverse proxy server library with initial gRPC-over-h2c proxy support.
 
 ## Purpose
 
@@ -13,6 +13,8 @@ serval (this module)
 ├── serval-core     # Types, config, errors, context
 ├── serval-http     # HTTP/1.1 parser
 ├── serval-websocket # RFC 6455 handshake + frame helpers
+├── serval-h2       # HTTP/2 / h2c frame, control, settings, flow-control, stream, and upgrade helpers
+├── serval-grpc     # gRPC metadata + message envelope helpers
 ├── serval-pool     # Connection pooling
 ├── serval-proxy    # Upstream forwarding
 ├── serval-metrics  # Request metrics
@@ -56,7 +58,7 @@ You can access types two ways:
 - `serval.http.Parser` — explicit module origin
 
 ### From serval-core
-- Types: `Request`, `Response`, `Upstream`, `HeaderMap`, `Method`, `Version`, `Action`
+- Types: `Request`, `Response`, `Upstream`, `HttpProtocol`, `HeaderMap`, `Method`, `Version`, `Action`
 - Config: `Config`, `MAX_HEADERS`, `MAX_HEADER_SIZE_BYTES`, etc.
 - Errors: `ParseError`, `ConnectionError`, `RequestError`, `ErrorContext`, `LogEntry`
 - Context: `Context`
@@ -80,6 +82,20 @@ You can access types two ways:
 - `buildWebSocketClosePayload`
 - `validateWebSocketSubprotocolSelection`
 
+### From serval-h2
+- `H2FrameType`, `H2FrameHeader`, `H2ErrorCode`, `H2GoAway`, `H2HeaderField`
+- `parseH2FrameHeader`, `buildH2FrameHeader`
+- `decodeH2HeaderBlock`, `decodeH2RequestHeaderBlock`, `encodeH2LiteralHeaderWithoutIndexing`
+- `buildH2SettingsAckFrame`, `buildH2PingFrame`, `buildH2GoAwayFrame`
+- `parseInitialH2Request`, `looksLikeH2ClientPreface`
+- `looksLikeH2cUpgradeRequest`, `validateH2cUpgradeRequest`, `buildH2cUpgradeResponse`
+
+### From serval-grpc
+- `GrpcMessagePrefix`
+- `GrpcWireError`, `GrpcMetadataError`
+- `buildGrpcMessage`, `parseGrpcMessage`
+- `validateGrpcRequest`
+
 ### From serval-pool
 - `Connection`, `SimplePool`, `NoPool`, `verifyPool`
 
@@ -95,8 +111,10 @@ You can access types two ways:
 ### Local
 - `Server` - Generic HTTP/1.1 server
 - `MinimalServer` - Server with SimplePool + NoopMetrics + NoopTracer
+- `servePlainH2Connection` - Early terminated HTTP/2 plain-connection loop
 - `WebSocketRouteAction`, `WebSocketAccept`, `WebSocketSession`
 - `WebSocketMessage`, `WebSocketMessageKind`, `WebSocketSessionStats`
+- `H2ResponseWriter` - Streaming response writer for terminated HTTP/2 callbacks
 - `verifyHandler`, `hasHook` - Handler interface utilities
 
 ## Server Generic Parameters
@@ -143,11 +161,13 @@ calls `handleWebSocket()` with a message-oriented session API.
 | Upstream forwarding | Complete |
 | WebSocket proxy tunneling | Complete |
 | Native WebSocket endpoint serving | Complete |
+| gRPC over h2c proxying (prior knowledge) | Initial slice complete |
 | Connection pooling | Complete |
 | Zero-copy (splice) | Complete |
 | Metrics collection | Complete |
 | Handler hooks | Complete |
-| HTTP/2 | Not implemented |
+| gRPC over h2c proxying (prior knowledge) | Initial slice complete |
+| HTTP/2 full stream-aware stack | Not implemented |
 | TLS termination | Complete |
 | Request body forwarding | Complete |
 | Chunked encoding | Complete |

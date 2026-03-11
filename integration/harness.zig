@@ -88,6 +88,29 @@ const TESTCLIENT_MAX_READS: u32 = 100;
 /// Maximum POST request buffer size (headers + body).
 const POST_REQUEST_MAX_BYTES: u32 = 8192;
 
+/// Socket timeout for large POST upload/download operations.
+const POST_LARGE_IO_TIMEOUT_S: i64 = 5;
+
+/// Chunk size for large POST body writes.
+/// Why: bounds each send() call so upload progress cannot block on a huge write.
+const POST_LARGE_SEND_CHUNK_SIZE_BYTES: u32 = 256 * 1024;
+
+/// Maximum send-side stall duration with no forward progress.
+/// Large (>4GB) loopback transfers can legitimately backpressure for minutes.
+const POST_LARGE_SEND_STALL_TIMEOUT_NS: u64 = 900 * std.time.ns_per_s;
+
+/// Maximum receive-side stall duration with no forward progress.
+const POST_LARGE_RECV_STALL_TIMEOUT_NS: u64 = 120 * std.time.ns_per_s;
+
+/// Maximum recv() loop iterations for large POST responses.
+const POST_LARGE_MAX_READS: u32 = 20_000;
+
+/// Maximum WouldBlock retries for large POST body writes.
+const POST_LARGE_MAX_SEND_WOULDBLOCK: u32 = 120_000;
+
+/// Sleep interval after WouldBlock in large POST loops.
+const POST_LARGE_RETRY_SLEEP_NS: u64 = 1_000_000;
+
 /// Maximum chunks for chunked transfer encoding decoding (bounded loop).
 /// TigerStyle C1: Named constant for loop bound.
 const MAX_CHUNKS: u32 = 100;
@@ -365,6 +388,11 @@ pub const ProcessManager = struct {
         });
 
         try waitForPort(port, SERVER_READY_TIMEOUT_MS);
+
+        // Give the backend one poll interval to settle after readiness probing.
+        // Why: waitForPort() uses a bare TCP connect probe; this avoids racing
+        // the first real test request against probe-connection teardown.
+        posix.nanosleep(0, READY_POLL_INTERVAL_MS * std.time.ns_per_ms);
     }
 
     /// Start load balancer with given backends.
@@ -951,8 +979,8 @@ pub const TestClient = struct {
         const sock = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
         defer posix.close(sock);
 
-        // Longer timeout for large payloads (100MB+ needs time)
-        const timeout = posix.timeval{ .sec = 120, .usec = 0 };
+        // Large transfers use bounded per-syscall timeout + retry loops.
+        const timeout = posix.timeval{ .sec = POST_LARGE_IO_TIMEOUT_S, .usec = 0 };
         try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout));
         try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&timeout));
 
@@ -980,21 +1008,33 @@ pub const TestClient = struct {
         }
         std.debug.print("[DEBUG postLarge] headers sent\n", .{});
 
-        // Send body in chunks (handle WouldBlock for large transfers)
+        // Send body in bounded chunks (handle WouldBlock for large transfers)
         sent = 0;
         var last_progress: usize = 0;
+        var send_wouldblock_count: u32 = 0;
+        var last_send_progress_ns: u64 = monotonic_now_ns();
         while (sent < body.len) {
-            const n = posix.send(sock, body[sent..], 0) catch |err| {
+            const chunk_len = @min(body.len - sent, POST_LARGE_SEND_CHUNK_SIZE_BYTES);
+            const n = posix.send(sock, body[sent .. sent + chunk_len], 0) catch |err| {
                 if (err == error.Interrupted) continue;
                 if (err == error.WouldBlock) {
-                    // Socket buffer full - wait briefly and retry
-                    posix.nanosleep(0, 1_000_000); // 1ms
+                    send_wouldblock_count += 1;
+                    const now_ns = monotonic_now_ns();
+                    if (send_wouldblock_count >= POST_LARGE_MAX_SEND_WOULDBLOCK or
+                        now_ns -| last_send_progress_ns >= POST_LARGE_SEND_STALL_TIMEOUT_NS)
+                    {
+                        return error.SendTimeout;
+                    }
+                    // Socket buffer full - wait briefly and retry.
+                    posix.nanosleep(0, POST_LARGE_RETRY_SLEEP_NS);
                     continue;
                 }
                 return err;
             };
             if (n == 0) return error.ConnectionReset;
+            send_wouldblock_count = 0;
             sent += n;
+            last_send_progress_ns = monotonic_now_ns();
             // Progress every 100MB
             if (sent - last_progress >= 100 * 1024 * 1024) {
                 std.debug.print("[DEBUG postLarge] sent {d} MB / {d} MB\n", .{ sent / (1024 * 1024), body.len / (1024 * 1024) });
@@ -1003,47 +1043,163 @@ pub const TestClient = struct {
         }
         std.debug.print("[DEBUG postLarge] body fully sent ({d} bytes)\n", .{sent});
 
-        // Read response - allocate buffer dynamically based on expected size
-        // Assume response is roughly same size as request body + headers
-        const expected_size = body.len + 1024;
+        return self.readPostLargeResponse(sock, "postLarge");
+    }
+
+    /// Make HTTP POST request with generated body bytes (no full payload allocation).
+    /// Sends `body_size_bytes` bytes using a fixed-size chunk buffer filled with `fill_byte`.
+    /// TigerStyle: bounded loops, no unbounded allocations for large body tests.
+    pub fn postLargeGenerated(
+        self: *TestClient,
+        port: u16,
+        path: []const u8,
+        body_size_bytes: u64,
+        fill_byte: u8,
+        content_type: []const u8,
+    ) !Response {
+        assert(port > 0);
+        assert(path.len > 0);
+        assert(content_type.len > 0);
+
+        const sock = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
+        defer posix.close(sock);
+
+        const timeout = posix.timeval{ .sec = POST_LARGE_IO_TIMEOUT_S, .usec = 0 };
+        try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout));
+        try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&timeout));
+
+        const addr: posix.sockaddr.in = .{
+            .port = std.mem.nativeToBig(u16, port),
+            .addr = std.mem.nativeToBig(u32, LOOPBACK_IPV4_BE),
+        };
+
+        try posix.connect(sock, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
+        std.debug.print("[DEBUG postLargeGenerated] connected to port {d}, body size: {d}\n", .{ port, body_size_bytes });
+
+        var header_buf: [512]u8 = undefined;
+        const headers = std.fmt.bufPrint(
+            &header_buf,
+            "POST {s} HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+            .{ path, port, content_type, body_size_bytes },
+        ) catch return error.BufferTooSmall;
+
+        var header_sent: usize = 0;
+        while (header_sent < headers.len) {
+            const n = posix.send(sock, headers[header_sent..], 0) catch |err| {
+                if (err == error.Interrupted) continue;
+                return err;
+            };
+            if (n == 0) return error.ConnectionReset;
+            header_sent += n;
+        }
+        std.debug.print("[DEBUG postLargeGenerated] headers sent\n", .{});
+
+        var chunk_buf: [POST_LARGE_SEND_CHUNK_SIZE_BYTES]u8 = undefined;
+        @memset(&chunk_buf, fill_byte);
+
+        var sent_bytes: u64 = 0;
+        var last_progress_bytes: u64 = 0;
+        var send_wouldblock_count: u32 = 0;
+        var last_send_progress_ns: u64 = monotonic_now_ns();
+
+        while (sent_bytes < body_size_bytes) {
+            const remaining_bytes: u64 = body_size_bytes - sent_bytes;
+            const chunk_len_u64: u64 = @min(remaining_bytes, @as(u64, POST_LARGE_SEND_CHUNK_SIZE_BYTES));
+            const chunk_len: usize = @intCast(chunk_len_u64);
+
+            const n = posix.send(sock, chunk_buf[0..chunk_len], 0) catch |err| {
+                if (err == error.Interrupted) continue;
+                if (err == error.WouldBlock) {
+                    send_wouldblock_count += 1;
+                    const now_ns = monotonic_now_ns();
+                    if (send_wouldblock_count >= POST_LARGE_MAX_SEND_WOULDBLOCK or
+                        now_ns -| last_send_progress_ns >= POST_LARGE_SEND_STALL_TIMEOUT_NS)
+                    {
+                        return error.SendTimeout;
+                    }
+                    posix.nanosleep(0, POST_LARGE_RETRY_SLEEP_NS);
+                    continue;
+                }
+                return err;
+            };
+            if (n == 0) return error.ConnectionReset;
+
+            send_wouldblock_count = 0;
+            sent_bytes += @intCast(n);
+            last_send_progress_ns = monotonic_now_ns();
+
+            if (sent_bytes - last_progress_bytes >= 100 * 1024 * 1024) {
+                std.debug.print(
+                    "[DEBUG postLargeGenerated] sent {d} MB / {d} MB\n",
+                    .{ sent_bytes / (1024 * 1024), body_size_bytes / (1024 * 1024) },
+                );
+                last_progress_bytes = sent_bytes;
+            }
+        }
+
+        std.debug.print("[DEBUG postLargeGenerated] body fully sent ({d} bytes)\n", .{sent_bytes});
+        return self.readPostLargeResponse(sock, "postLargeGenerated");
+    }
+
+    fn readPostLargeResponse(self: *TestClient, sock: posix.socket_t, comptime debug_label: []const u8) !Response {
         var resp_data: std.ArrayList(u8) = .empty;
         defer resp_data.deinit(self.allocator);
 
         var read_buf: [8192]u8 = undefined;
         var read_count: u32 = 0;
-        const max_reads: u32 = 20000; // Allow many reads for 100MB+ responses
         var wouldblock_count: u32 = 0;
-        const max_wouldblock: u32 = 60000; // 60 seconds max wait (1ms per iteration)
+        var last_recv_progress_ns: u64 = monotonic_now_ns();
+        var headers_end: ?usize = null;
+        var expected_total_len: ?usize = null;
 
-        std.debug.print("[DEBUG postLarge] waiting for response...\n", .{});
-        while (read_count < max_reads) : (read_count += 1) {
+        std.debug.print("[DEBUG {s}] waiting for response...\n", .{debug_label});
+        while (read_count < POST_LARGE_MAX_READS) : (read_count += 1) {
             const n = posix.recv(sock, &read_buf, 0) catch |err| {
                 if (err == error.Interrupted) continue;
                 if (err == error.WouldBlock) {
-                    // No data yet - wait and retry (needed for large uploads)
                     wouldblock_count += 1;
-                    if (wouldblock_count % 1000 == 0) {
-                        std.debug.print("[DEBUG postLarge] WouldBlock count: {d}\n", .{wouldblock_count});
+                    const now_ns = monotonic_now_ns();
+                    if (wouldblock_count % 10 == 0) {
+                        std.debug.print("[DEBUG {s}] WouldBlock count: {d}\n", .{ debug_label, wouldblock_count });
                     }
-                    if (wouldblock_count >= max_wouldblock) break;
-                    posix.nanosleep(0, 1_000_000); // 1ms
+                    if (now_ns -| last_recv_progress_ns >= POST_LARGE_RECV_STALL_TIMEOUT_NS) {
+                        return error.ReceiveTimeout;
+                    }
+                    posix.nanosleep(0, POST_LARGE_RETRY_SLEEP_NS);
                     continue;
                 }
-                std.debug.print("[DEBUG postLarge] recv error: {s}\n", .{@errorName(err)});
-                break;
+                std.debug.print("[DEBUG {s}] recv error: {s}\n", .{ debug_label, @errorName(err) });
+                return err;
             };
             if (n == 0) {
-                std.debug.print("[DEBUG postLarge] recv returned 0 (EOF)\n", .{});
+                std.debug.print("[DEBUG {s}] recv returned 0 (EOF)\n", .{debug_label});
                 break;
             }
-            wouldblock_count = 0; // Reset on successful read
+
+            wouldblock_count = 0;
+            last_recv_progress_ns = monotonic_now_ns();
             try resp_data.appendSlice(self.allocator, read_buf[0..n]);
 
-            // Check if we have complete response
-            if (resp_data.items.len > expected_size) break;
+            if (headers_end == null) {
+                if (std.mem.indexOf(u8, resp_data.items, "\r\n\r\n")) |idx| {
+                    headers_end = idx + 4;
+                    const header_slice = resp_data.items[0..idx];
+                    if (std.mem.indexOf(u8, header_slice, "Content-Length: ")) |cl_start| {
+                        const value_start = cl_start + "Content-Length: ".len;
+                        if (std.mem.indexOfPos(u8, header_slice, value_start, "\r\n")) |value_end| {
+                            const content_length = std.fmt.parseInt(usize, header_slice[value_start..value_end], 10) catch 0;
+                            expected_total_len = headers_end.? + content_length;
+                        }
+                    }
+                }
+            }
+
+            if (expected_total_len) |need_len| {
+                if (resp_data.items.len >= need_len) break;
+            }
         }
 
-        std.debug.print("[DEBUG postLarge] response received: {d} bytes\n", .{resp_data.items.len});
+        std.debug.print("[DEBUG {s}] response received: {d} bytes\n", .{ debug_label, resp_data.items.len });
         if (resp_data.items.len == 0) return error.EmptyResponse;
 
         const data = resp_data.items;

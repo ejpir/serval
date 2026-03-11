@@ -15,6 +15,7 @@ Handles request forwarding to backend servers using async `Io.net.Stream` I/O in
 - `Protocol` - Wire protocol enum (h1, h2)
 - `TunnelStats` - WebSocket tunnel relay statistics
 - `TunnelTermination` - Tunnel shutdown reason
+- `H2StreamBridge` - Stream-aware h2 downstream↔upstream binding and action mapping helper
 
 ## Usage
 
@@ -87,6 +88,9 @@ Timing fields default to 0 for backward compatibility. Use these for detailed Pi
 | `h1/body.zig` | HTTP/1.1 splice/copy body streaming |
 | `h1/chunked.zig` | Chunked transfer encoding forwarding |
 | `h1/websocket.zig` | Dedicated HTTP/1.1 WebSocket upgrade request/response handling |
+| `h2/mod.zig` | HTTP/2 proxy primitive exports |
+| `h2/bindings.zig` | Fixed-capacity downstream↔upstream stream binding table |
+| `h2/bridge.zig` | Initial stream-aware bridge using `serval-client` h2 upstream sessions |
 | `tunnel.zig` | Bidirectional byte relay after successful upgrade |
 
 ## Dependencies
@@ -97,13 +101,23 @@ Timing fields default to 0 for backward compatibility. Use these for detailed Pi
 - `serval-tracing` - Distributed tracing interface
 - `serval-http` - HTTP/1.1 parser
 - `serval-websocket` - RFC 6455 handshake validation helpers
+- `serval-h2` - HTTP/2 / h2c frame and initial-request helpers
+- `serval-grpc` - gRPC metadata and message-envelope helpers
 - `serval-tls` - TLS termination/origination
 - `serval-client` - HTTP/1.1 client request building (shared implementation)
 
 **Protocol Abstraction:** HTTP/1.1 specific code is isolated in `h1/` subdirectory.
-When HTTP/2 is implemented, it will go in `h2/`. The `forwarder.zig` dispatches
-based on the protocol negotiated at connection time (via ALPN for TLS, preface
-detection for cleartext).
+Current h2c support is split by upstream protocol:
+- cleartext h2c upstreams now use the stream-aware `h2/bridge.zig` path for both
+  prior-knowledge and inbound `Upgrade: h2c` entry (bounded downstream↔upstream
+  stream bindings, upstream-session reuse, mapped response/reset actions)
+- non-h2c upstreams continue to use the legacy translation+tunnel behavior
+
+Full stream-aware h2/ support remains in progress. The repository now includes
+bounded `h2/` primitives for that migration:
+- `h2/bindings.zig` fixed-capacity downstream-stream ↔ upstream-stream ids
+- `h2/bridge.zig` stream-aware bridge that opens/reuses upstream h2 sessions
+  through `serval-client` and maps upstream receive actions back to downstream ids
 
 ## Features
 
@@ -113,12 +127,15 @@ detection for cleartext).
 - Connection pooling integration
 - Stale connection retry (Pingora-style)
 - Zero-copy with splice() when available (plaintext only, extracts raw fd from stream)
+- splice forwarding now uses bounded EAGAIN/EINTR retries with stall timeouts and exact pipe-drain verification before counting bytes forwarded
 - Userspace copy for TLS paths (both client and upstream)
 - Content-Length body forwarding
 - Response streaming to client
 - WebSocket upgrade forwarding with RFC 6455 handshake validation
 - Bidirectional tunnel relay after `101 Switching Protocols`
-- Upgraded connections are closed instead of being returned to the HTTP pool
+- gRPC over h2c stream-aware bridging for prior-knowledge and `Upgrade: h2c` entry (cleartext h2c upstreams), including fail-closed invalid responses (`grpc-status` required), GOAWAY `last_stream_id`-aware active-stream handling, and session-generation-aware binding across upstream rollover
+- gRPC over h2c legacy translation+tunnel fallback for non-h2c upstream targets
+- Upgraded/tunneled connections are closed instead of being returned to the HTTP pool
 
 ## Implementation Status
 
@@ -135,7 +152,9 @@ detection for cleartext).
 | Client TLS responses | Complete |
 | Upstream TLS | Complete |
 | WebSocket proxy tunnel | Complete |
-| HTTP/2 upstream | Not implemented |
+| gRPC over h2c proxying | Stream-aware bridge active for both prior-knowledge and inbound upgrade when upstream is cleartext h2c, including GOAWAY `last_stream_id`-aware active-stream handling |
+| HTTP/2 stream-aware bridge primitives (`h2/bindings` + `h2/bridge`) | Initial slice complete |
+| HTTP/2 full stream-aware upstream support | In progress |
 
 ## TigerStyle Compliance
 

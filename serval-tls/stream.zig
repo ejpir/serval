@@ -171,6 +171,7 @@ pub const TLSStream = struct {
         sni_z: [*:0]const u8,
         allocator: Allocator,
         enable_ktls: bool,
+        desired_alpn: ?[]const u8,
     ) !TLSStream {
         // S1: preconditions
         assert(@intFromPtr(ctx) != 0); // S1: precondition - ctx is valid pointer
@@ -184,6 +185,10 @@ pub const TLSStream = struct {
         const should_enable_ktls: bool = enable_ktls and ktls.isKtlsRuntimeAvailable();
         // Set SNI (caller provides null-terminated string - no allocation)
         if (ssl.SSL_set_tlsext_host_name(ssl_conn, sni_z) != 1) return error.SslSetSni;
+
+        if (desired_alpn) |protocol| {
+            try ssl.setClientAlpnProtocol(ssl_conn, protocol);
+        }
 
         ssl.SSL_set_connect_state(ssl_conn);
 

@@ -2,7 +2,7 @@
 
 HTTP/1.1 server implementation for serval. Like Pingora's `server` + `apps` modules.
 
-Provides generic HTTP server infrastructure with protocol-specific implementations organized by version (h1/ for HTTP/1.1, h2/ for HTTP/2 in the future).
+Provides generic HTTP server infrastructure with protocol-specific implementations organized by version (h1/ today, initial h2c prior-knowledge + `Upgrade: h2c` gRPC proxy handoff, and an early `h2/` connection/runtime submodule for future stream-aware transport).
 
 ## Module Structure
 
@@ -16,6 +16,11 @@ lib/serval-server/
 │   ├── connection.zig # Connection state (ID generation, keep-alive detection)
 │   ├── response.zig   # Response writing utilities (status text, response sending)
 │   └── reader.zig     # Request reading utilities (header accumulation, body length)
+├── h2/                # Early HTTP/2 connection/runtime primitives
+│   ├── mod.zig        # H2 module exports
+│   ├── connection.zig # Bounded peer/local settings, stream table, flow windows
+│   ├── runtime.zig    # Per-frame inbound HTTP/2 runtime actions
+│   └── server.zig     # Plain-fd terminating HTTP/2 connection driver with streaming callbacks
 └── websocket/         # Native WebSocket endpoint support
     ├── mod.zig        # Public WebSocket server exports + hook verification
     ├── accept.zig     # `101 Switching Protocols` response builder
@@ -27,8 +32,11 @@ lib/serval-server/
 
 Generic HTTP server parameterized by Handler, Pool, Metrics, and Tracer types.
 Handles accept loop, connection lifecycle, request parsing, HTTP forwarding orchestration,
-WebSocket upgrade handoff to the proxy tunnel path, and native WebSocket endpoint
-termination with a message-oriented session API.
+WebSocket upgrade handoff to the proxy tunnel path, native WebSocket endpoint
+termination with a message-oriented session API, initial gRPC-over-h2c prior-knowledge
+or `Upgrade: h2c` connection detection plus proxy handoff, and cleartext HTTP/2
+dispatch into the early terminated `h2/server.zig` driver for both prior-knowledge
+and upgrade paths when the handler implements explicit HTTP/2 callbacks.
 
 Protocol implementations are isolated in subdirectories (h1/, h2/) to prepare for multi-protocol support while maintaining backwards-compatible top-level exports.
 
@@ -129,7 +137,12 @@ The h1/ subdirectory structure follows TigerStyle modular design principles:
 | `WebSocketAccept` | Native WebSocket accept configuration |
 | `WebSocketSession` | Message-oriented native WebSocket session API |
 | `WebSocketMessage` | Text/binary message returned by `readMessage()` |
+| `H2ConnectionState` | Bounded inbound HTTP/2 connection bookkeeping |
+| `H2Runtime` | Per-frame inbound HTTP/2 runtime primitive |
+| `H2ResponseWriter` | Streaming response writer for terminated HTTP/2 callbacks |
+| `servePlainH2Connection` | Plain-fd terminating HTTP/2 connection loop |
 | `h1` | HTTP/1.1 implementation module (re-exports Server, MinimalServer) |
+| `h2` | Early HTTP/2 server primitive module |
 | `websocket` | Native WebSocket server module |
 
 ## Usage
@@ -166,6 +179,8 @@ Main Server generic parameterized by Handler, Pool, Metrics, Tracer types. Imple
 - WebSocket upgrade detection and fail-closed validation
 - Native WebSocket routing (`selectWebSocket`) and session handoff (`handleWebSocket`)
 - Proxy fallback for declined WebSocket upgrades
+- h2c prior-knowledge detection for terminated handler dispatch or gRPC proxy connections
+- h2c HTTP/1.1 upgrade validation plus terminated-handler or proxy handoff for gRPC connections
 - Response sending via response utilities
 - Keep-alive detection and connection lifecycle
 
@@ -211,9 +226,28 @@ Message-oriented native session API:
 - auto-pong handling
 - close-handshake timeout enforcement
 
-## Future: HTTP/2 Structure
+## Current h2c Slice + Future HTTP/2 Structure
 
-When HTTP/2 support is added, an h2/ subdirectory will mirror the h1/ organization:
+Current support now has four cleartext HTTP/2 inbound behaviors:
+- **prior knowledge + terminated handler**: when the handler implements `handleH2Headers` + `handleH2Data`, `Server` detects the client preface on a plain connection and dispatches the accepted socket into `h2/server.zig`
+- **prior knowledge + proxy bridge/tunnel**: for cleartext h2c upstreams, Serval now routes through a bounded stream-aware bridge (downstream stream ↔ upstream stream mapping, response frame mapping, upstream reset fail-closed downstream reset, missing `grpc-status` fail-closed as downstream `RST_STREAM(PROTOCOL_ERROR)`, and `GOAWAY(NO_ERROR,last_stream_id>=active_stream)` no longer aborting that active stream); prior-knowledge detection now emits server SETTINGS as soon as the client preface is complete (before waiting for first HEADERS) to interoperate with grpc-go/grpcurl clients that wait for server SETTINGS before sending RPC headers; for non-h2c upstreams it still falls back to transparent byte tunneling
+- **`Upgrade: h2c` + terminated handler**: on cleartext connections with explicit h2 handler callbacks, Serval sends `101 Switching Protocols`, replays the upgraded request into stream 1 in the terminated runtime, accepts an optional post-101 client preface, then continues in full HTTP/2 frame mode
+- **`Upgrade: h2c` + proxy bridge/tunnel**: Serval validates `HTTP2-Settings`, selects an upstream, and for cleartext h2c upstreams enters the bounded stream-aware bridge path (including stream-1 bootstrap from the HTTP/1.1 request) with the same fail-closed gRPC semantics (`grpc-status` required, else downstream `RST_STREAM(PROTOCOL_ERROR)`); non-h2c upstreams continue to use the translation+tunnel fallback
+
+For terminated HTTP/2 handlers, `h2/server.zig` now also supports optional per-stream lifecycle callbacks:
+- `handleH2StreamOpen(stream_id, request)` when a new inbound request stream is first observed
+- `handleH2StreamClose(summary)` when a stream ends via local END_STREAM, peer reset, local reset, or connection close
+
+`summary` carries bounded per-stream accounting (`request_data_bytes`, `response_data_bytes`), status, duration, and close reason/error code to support stream-scoped metrics/tracing/logging hooks without heap allocation.
+In main `h1/server.zig` terminated-h2 dispatch paths (prior-knowledge and upgrade), these callbacks are now wrapped to emit per-stream metrics (`requestStart`/`requestEnd`), per-stream tracer spans, and per-stream `onLog` entries while still forwarding handler-defined H2 lifecycle hooks.
+
+The repository now includes the first Phase-B `h2/` building blocks:
+- `connection.zig` for bounded peer/local settings, GOAWAY bookkeeping, stream tables, and flow windows
+- `runtime.zig` for per-frame inbound HTTP/2 actions (`send_settings_ack`, request HEADERS/DATA dispatch, bounded HEADERS+CONTINUATION request-header reassembly, bounded HPACK dynamic-table/Huffman decode, ping ack, RST_STREAM, GOAWAY) with `server.zig` now replenishing connection+stream flow-control windows via WINDOW_UPDATE on inbound DATA
+- `server.zig` for a terminating plain-fd HTTP/2 driver that wires those runtime actions into a real frame loop with streaming callbacks, supports upgraded stream-1 bootstrap + optional post-101 client preface, uses bounded nonblocking control-frame write retries for deterministic GOAWAY/RST emission under backpressure, and can now be reached from the main cleartext accept loop for both prior-knowledge and `Upgrade: h2c` cleartext paths
+
+Full stream-aware HTTP/2 support will continue expanding that `h2/` subdirectory toward
+this target organization:
 
 ```
 └── h2/               # HTTP/2 implementation (future)
@@ -233,6 +267,8 @@ The mod.zig would dispatch based on negotiated protocol (via ALPN or h2c preface
 - serval-net: socket utilities
 - serval-http: HTTP parser
 - serval-websocket: WebSocket handshake, frame, close, and subprotocol helpers
+- serval-h2: HTTP/2 frame, preface, HPACK, and initial-request helpers
+- serval-grpc: gRPC metadata and message-envelope validation helpers
 - serval-pool: connection pooling
 - serval-proxy: upstream forwarding
 - serval-metrics: metrics interface
@@ -253,7 +289,8 @@ The mod.zig would dispatch based on negotiated protocol (via ALPN or h2c preface
 | TLS response forwarding | ✅ Complete |
 | WebSocket upgrade proxy handoff | ✅ Complete |
 | Native WebSocket endpoint serving | ✅ Complete |
-| HTTP/2 | ⏳ Planned (h2/ structure) |
+| gRPC over h2c proxy handoff (prior knowledge + inbound upgrade) | ✅ Stream-aware bridge active for cleartext h2c upstreams in both entry paths, including GOAWAY `last_stream_id`-aware active-stream handling and fail-closed `grpc-status` enforcement; legacy tunnel fallback remains for non-h2c targets |
+| HTTP/2 full stream-aware stack | ⏳ Planned (early Phase-B h2/server.zig driver now present) |
 | Daemon mode | ❌ Not implemented |
 | Hot reload | ❌ Not implemented |
 

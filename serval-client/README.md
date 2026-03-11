@@ -1,10 +1,18 @@
 # serval-client
 
-HTTP/1.1 client library for making requests to upstream servers.
+HTTP/1.1 client library for making requests to upstream servers, with bounded HTTP/2 client session/runtime primitives for stream-aware h2c upstream support.
 
 ## Overview
 
 serval-client provides the client-side complement to serval-server. It handles DNS resolution, TCP connection, optional TLS handshake, request serialization, and response header parsing.
+
+Current code also includes an `h2/` subdirectory with bounded outbound HTTP/2 primitives:
+- `H2SessionState` for per-connection settings/flow-control/stream tables
+- `H2Runtime` for frame-level actions (client preface+SETTINGS emission, request HEADERS/DATA frame building, response HEADERS/DATA/trailer parsing with bounded HEADERS+CONTINUATION reassembly and bounded HPACK dynamic-table/Huffman decode, and GOAWAY/RST/WINDOW_UPDATE handling)
+- `H2ClientConnection` as a fixed-buffer socket driver over `H2Runtime` for prior-knowledge h2c sessions
+- `H2UpstreamSessionPool` as a fixed-capacity per-upstream cache that owns connected `H2ClientConnection` sessions, supports GOAWAY rollover (active + draining session), and reuses sessions until stale/invalid state
+
+`H2Runtime` remains socket-agnostic; `H2ClientConnection` is the concrete socket-owning driver. `H2UpstreamSessionPool` is the first reusable higher-level lifecycle wrapper that connects, handshakes, caches, and returns stream-capable upstream sessions.
 
 **Layer:** 2 (Infrastructure) - alongside serval-pool, serval-prober, serval-health
 
@@ -208,6 +216,45 @@ pub const ClientError = error{
     ConnectionClosed,
 };
 ```
+
+### H2 Session/Runtime Primitives
+
+```zig
+pub const H2SessionState = serval_client.H2SessionState;
+pub const H2Runtime = serval_client.H2Runtime;
+pub const H2ClientConnection = serval_client.H2ClientConnection;
+pub const H2UpstreamSessionPool = serval_client.H2UpstreamSessionPool;
+
+// Session state only (settings, windows, stream table)
+var session = try H2SessionState.init();
+
+// Frame-level runtime (no socket ownership)
+var runtime = try H2Runtime.init();
+
+// Socket-owning prior-knowledge h2c driver
+var h2_conn = try H2ClientConnection.init(&socket);
+
+// Fixed-capacity per-upstream reusable session pool
+var h2_pool = H2UpstreamSessionPool.init();
+defer h2_pool.deinit();
+```
+
+`H2Runtime` currently provides bounded helpers for:
+- client preface + initial SETTINGS emission
+- outbound request HEADERS/DATA frame construction on opened streams
+- inbound response HEADERS/DATA/trailer decoding, including bounded HEADERS+CONTINUATION reassembly and bounded HPACK dynamic-table/Huffman decode
+- SETTINGS ACK, PING ACK, WINDOW_UPDATE, RST_STREAM, and GOAWAY handling
+
+`H2ClientConnection` adds fixed-buffer socket I/O around that runtime:
+- `completeHandshake()` for prior-knowledge preface + SETTINGS synchronization
+- `sendRequestHeaders()` / `sendRequestData()` on multiplexed stream ids
+- `receiveAction()` / `receiveActionHandlingControl()` for inbound frame dispatch
+
+`H2UpstreamSessionPool` adds bounded session lifecycle management above the driver:
+- `acquireOrConnect()` validates `.http_protocol = .h2c`, opens a fresh upstream session on miss, or returns a healthy cached session on hit
+- GOAWAY-aware rollover: keep one draining session for in-flight streams while opening a fresh active session for new streams
+- reconnect-on-demand when cached sessions are stale, exhausted (`H2_CLIENT_MAX_FRAME_COUNT`), or otherwise unusable
+- `close()` / `closeAll()` for deterministic upstream session teardown
 
 ### BodyReader
 

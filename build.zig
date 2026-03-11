@@ -77,6 +77,22 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // HTTP/2 / h2c protocol helpers - depends on core (Layer 1 - Protocol)
+    const serval_h2_module = b.addModule("serval-h2", .{
+        .root_source_file = b.path("serval-h2/mod.zig"),
+        .imports = &.{
+            .{ .name = "serval-core", .module = serval_core_module },
+        },
+    });
+
+    // gRPC protocol helpers - depends on core (Layer 2 - Infrastructure)
+    const serval_grpc_module = b.addModule("serval-grpc", .{
+        .root_source_file = b.path("serval-grpc/mod.zig"),
+        .imports = &.{
+            .{ .name = "serval-core", .module = serval_core_module },
+        },
+    });
+
     // Metrics module - depends on core
     const serval_metrics_module = b.addModule("serval-metrics", .{
         .root_source_file = b.path("serval-metrics/mod.zig"),
@@ -101,8 +117,8 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // Client module - depends on core, http, net, socket, pool, tls (Layer 3 - Mechanics)
-    // HTTP/1.1 client for making requests to upstream servers
+    // Client module - depends on core, http, net, socket, pool, tls, h2 (Layer 3 - Mechanics)
+    // HTTP/1.1 client plus bounded HTTP/2 client primitives for upstream sessions
     const serval_client_module = b.addModule("serval-client", .{
         .root_source_file = b.path("serval-client/mod.zig"),
         .imports = &.{
@@ -112,6 +128,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "serval-socket", .module = serval_socket_module },
             .{ .name = "serval-pool", .module = serval_pool_module },
             .{ .name = "serval-tls", .module = serval_tls_module },
+            .{ .name = "serval-h2", .module = serval_h2_module },
         },
     });
 
@@ -130,7 +147,7 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // Proxy module - depends on core, net, socket, pool, tracing, http, websocket, tls, client
+    // Proxy module - depends on core, net, socket, pool, tracing, http, websocket, h2, grpc, tls, client
     const serval_proxy_module = b.addModule("serval-proxy", .{
         .root_source_file = b.path("serval-proxy/mod.zig"),
         .imports = &.{
@@ -141,12 +158,14 @@ pub fn build(b: *std.Build) void {
             .{ .name = "serval-tracing", .module = serval_tracing_module },
             .{ .name = "serval-http", .module = serval_http_module },
             .{ .name = "serval-websocket", .module = serval_websocket_module },
+            .{ .name = "serval-h2", .module = serval_h2_module },
+            .{ .name = "serval-grpc", .module = serval_grpc_module },
             .{ .name = "serval-tls", .module = serval_tls_module },
             .{ .name = "serval-client", .module = serval_client_module },
         },
     });
 
-    // Server module - composes core, net, socket, http, websocket, pool, proxy, metrics, tracing, tls
+    // Server module - composes core, net, socket, http, websocket, h2, grpc, pool, proxy, client, metrics, tracing, tls
     const serval_server_module = b.addModule("serval-server", .{
         .root_source_file = b.path("serval-server/mod.zig"),
         .imports = &.{
@@ -155,8 +174,11 @@ pub fn build(b: *std.Build) void {
             .{ .name = "serval-socket", .module = serval_socket_module },
             .{ .name = "serval-http", .module = serval_http_module },
             .{ .name = "serval-websocket", .module = serval_websocket_module },
+            .{ .name = "serval-h2", .module = serval_h2_module },
+            .{ .name = "serval-grpc", .module = serval_grpc_module },
             .{ .name = "serval-pool", .module = serval_pool_module },
             .{ .name = "serval-proxy", .module = serval_proxy_module },
+            .{ .name = "serval-client", .module = serval_client_module },
             .{ .name = "serval-metrics", .module = serval_metrics_module },
             .{ .name = "serval-tracing", .module = serval_tracing_module },
             .{ .name = "serval-tls", .module = serval_tls_module },
@@ -224,6 +246,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "serval-socket", .module = serval_socket_module },
             .{ .name = "serval-http", .module = serval_http_module },
             .{ .name = "serval-websocket", .module = serval_websocket_module },
+            .{ .name = "serval-h2", .module = serval_h2_module },
+            .{ .name = "serval-grpc", .module = serval_grpc_module },
             .{ .name = "serval-pool", .module = serval_pool_module },
             .{ .name = "serval-proxy", .module = serval_proxy_module },
             .{ .name = "serval-metrics", .module = serval_metrics_module },
@@ -253,6 +277,8 @@ pub fn build(b: *std.Build) void {
     serval_tests_mod.addImport("serval-socket", serval_socket_module);
     serval_tests_mod.addImport("serval-http", serval_http_module);
     serval_tests_mod.addImport("serval-websocket", serval_websocket_module);
+    serval_tests_mod.addImport("serval-h2", serval_h2_module);
+    serval_tests_mod.addImport("serval-grpc", serval_grpc_module);
     serval_tests_mod.addImport("serval-pool", serval_pool_module);
     serval_tests_mod.addImport("serval-proxy", serval_proxy_module);
     serval_tests_mod.addImport("serval-metrics", serval_metrics_module);
@@ -435,6 +461,85 @@ pub fn build(b: *std.Build) void {
     const websocket_test_step = b.step("test-websocket", "Run serval-websocket library tests");
     websocket_test_step.dependOn(&run_websocket_tests.step);
 
+    // HTTP/2 / h2c protocol module tests
+    const h2_tests_mod = b.createModule(.{
+        .root_source_file = b.path("serval-h2/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    h2_tests_mod.addImport("serval-core", serval_core_module);
+    const h2_tests = b.addTest(.{
+        .name = "h2_tests",
+        .root_module = h2_tests_mod,
+    });
+    force_llvm_lld(h2_tests);
+    const run_h2_tests = b.addRunArtifact(h2_tests);
+
+    const h2_test_step = b.step("test-h2", "Run serval-h2 library tests");
+    h2_test_step.dependOn(&run_h2_tests.step);
+
+    // gRPC protocol module tests
+    const grpc_tests_mod = b.createModule(.{
+        .root_source_file = b.path("serval-grpc/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    grpc_tests_mod.addImport("serval-core", serval_core_module);
+    const grpc_tests = b.addTest(.{
+        .name = "grpc_tests",
+        .root_module = grpc_tests_mod,
+    });
+    force_llvm_lld(grpc_tests);
+    const run_grpc_tests = b.addRunArtifact(grpc_tests);
+
+    const grpc_test_step = b.step("test-grpc", "Run serval-grpc library tests");
+    grpc_test_step.dependOn(&run_grpc_tests.step);
+
+    // Client h2 primitive tests
+    const client_h2_tests_mod = b.createModule(.{
+        .root_source_file = b.path("serval-client/h2/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    client_h2_tests_mod.linkSystemLibrary("ssl", .{});
+    client_h2_tests_mod.linkSystemLibrary("crypto", .{});
+    client_h2_tests_mod.addImport("serval-core", serval_core_module);
+    client_h2_tests_mod.addImport("serval-h2", serval_h2_module);
+    client_h2_tests_mod.addImport("serval-socket", serval_socket_module);
+    const client_h2_tests = b.addTest(.{
+        .name = "client_h2_tests",
+        .root_module = client_h2_tests_mod,
+    });
+    force_llvm_lld(client_h2_tests);
+    const run_client_h2_tests = b.addRunArtifact(client_h2_tests);
+
+    const client_test_step = b.step("test-client", "Run serval-client h2 primitive tests");
+    client_test_step.dependOn(&run_client_h2_tests.step);
+
+    // Proxy h2 primitive tests
+    const proxy_h2_tests_mod = b.createModule(.{
+        .root_source_file = b.path("serval-proxy/h2/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    proxy_h2_tests_mod.linkSystemLibrary("ssl", .{});
+    proxy_h2_tests_mod.linkSystemLibrary("crypto", .{});
+    proxy_h2_tests_mod.addImport("serval-core", serval_core_module);
+    proxy_h2_tests_mod.addImport("serval-client", serval_client_module);
+    proxy_h2_tests_mod.addImport("serval-h2", serval_h2_module);
+    proxy_h2_tests_mod.addImport("serval-net", serval_net_module);
+    const proxy_h2_tests = b.addTest(.{
+        .name = "proxy_h2_tests",
+        .root_module = proxy_h2_tests_mod,
+    });
+    force_llvm_lld(proxy_h2_tests);
+    const run_proxy_h2_tests = b.addRunArtifact(proxy_h2_tests);
+
+    const proxy_test_step = b.step("test-proxy", "Run serval-proxy h2 primitive tests");
+    proxy_test_step.dependOn(&run_proxy_h2_tests.step);
+
     // Server module tests
     const server_tests_mod = b.createModule(.{
         .root_source_file = b.path("serval-server/mod.zig"),
@@ -449,8 +554,11 @@ pub fn build(b: *std.Build) void {
     server_tests_mod.addImport("serval-socket", serval_socket_module);
     server_tests_mod.addImport("serval-http", serval_http_module);
     server_tests_mod.addImport("serval-websocket", serval_websocket_module);
+    server_tests_mod.addImport("serval-h2", serval_h2_module);
+    server_tests_mod.addImport("serval-grpc", serval_grpc_module);
     server_tests_mod.addImport("serval-pool", serval_pool_module);
     server_tests_mod.addImport("serval-proxy", serval_proxy_module);
+    server_tests_mod.addImport("serval-client", serval_client_module);
     server_tests_mod.addImport("serval-metrics", serval_metrics_module);
     server_tests_mod.addImport("serval-tracing", serval_tracing_module);
     server_tests_mod.addImport("serval-tls", serval_tls_module);
@@ -505,32 +613,6 @@ pub fn build(b: *std.Build) void {
     const otel_test_step = b.step("test-otel", "Run serval-otel library tests");
     otel_test_step.dependOn(&run_otel_tests.step);
 
-    // Client module tests
-    // Note: Links SSL libraries since serval-client depends on serval-tls
-    const client_tests_mod = b.createModule(.{
-        .root_source_file = b.path("serval-client/mod.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    client_tests_mod.linkSystemLibrary("ssl", .{});
-    client_tests_mod.linkSystemLibrary("crypto", .{});
-    client_tests_mod.addImport("serval-core", serval_core_module);
-    client_tests_mod.addImport("serval-http", serval_http_module);
-    client_tests_mod.addImport("serval-net", serval_net_module);
-    client_tests_mod.addImport("serval-socket", serval_socket_module);
-    client_tests_mod.addImport("serval-pool", serval_pool_module);
-    client_tests_mod.addImport("serval-tls", serval_tls_module);
-    const client_tests = b.addTest(.{
-        .name = "client_tests",
-        .root_module = client_tests_mod,
-    });
-    force_llvm_lld(client_tests);
-    const run_client_tests = b.addRunArtifact(client_tests);
-
-    const client_test_step = b.step("test-client", "Run serval-client library tests");
-    client_test_step.dependOn(&run_client_tests.step);
-
     // Integration tests (end-to-end tests using subprocesses and in-process native WS servers)
     // Links serval modules for native WebSocket endpoint coverage.
     const integration_tests_mod = b.createModule(.{
@@ -543,6 +625,10 @@ pub fn build(b: *std.Build) void {
     integration_tests_mod.linkSystemLibrary("crypto", .{});
     integration_tests_mod.addImport("serval", serval_module);
     integration_tests_mod.addImport("serval-net", serval_net_module);
+    integration_tests_mod.addImport("serval-h2", serval_h2_module);
+    integration_tests_mod.addImport("serval-grpc", serval_grpc_module);
+    integration_tests_mod.addImport("serval-client", serval_client_module);
+    integration_tests_mod.addImport("serval-tls", serval_tls_module);
     const integration_tests = b.addTest(.{
         .name = "integration_tests",
         .root_module = integration_tests_mod,

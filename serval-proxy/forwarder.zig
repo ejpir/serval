@@ -43,6 +43,8 @@ const forwardUpgradeResponse = h1.forwardUpgradeResponse;
 const tunnel_mod = @import("tunnel.zig");
 
 const serval_websocket = @import("serval-websocket");
+const serval_h2 = @import("serval-h2");
+const serval_grpc = @import("serval-grpc");
 
 const serval_tls = @import("serval-tls");
 const TLSStream = serval_tls.TLSStream;
@@ -554,6 +556,333 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             result.response_bytes += tunnel_stats.upstream_to_client_bytes;
             result.recv_duration_ns += tunnel_stats.duration_ns;
             return result;
+        }
+
+        /// Forward a gRPC HTTP/2 connection by selecting an upstream from the
+        /// first request and then tunneling the full HTTP/2 byte stream
+        /// transparently.
+        ///
+        /// Supported upstream protocol combinations:
+        /// - `.h2c` + plaintext
+        /// - `.h2` + TLS
+        ///
+        /// TigerStyle: Bounded upfront parsing happens in serval-server; this
+        /// path performs raw relay only and never returns the upstream
+        /// connection to the pool.
+        pub fn forwardGrpcH2c(
+            self: *Self,
+            io: Io,
+            client_stream: Io.net.Stream,
+            client_tls: ?*TLSStream,
+            request: *const Request,
+            upstream: *const Upstream,
+            initial_client_bytes: []const u8,
+            parent_span: SpanHandle,
+        ) ForwardError!ForwardResult {
+            assert(initial_client_bytes.len > 0);
+            assert(upstream.port > 0);
+
+            const supports_h2c_plain = upstream.http_protocol == .h2c and !upstream.tls;
+            const supports_h2_tls = upstream.http_protocol == .h2 and upstream.tls;
+            if (!supports_h2c_plain and !supports_h2_tls) return ForwardError.UnsupportedProtocol;
+
+            serval_grpc.validateRequest(request) catch return ForwardError.UnsupportedProtocol;
+            _ = serval_h2.looksLikeClientConnectionPreface(initial_client_bytes);
+
+            const forward_span = self.tracer.startSpan("forward_grpc_h2", parent_span);
+            errdefer self.tracer.endSpan(forward_span, "forward_error");
+
+            const connect_span = self.tracer.startSpan("connect_upstream", forward_span);
+            const connect_cfg = ConnectConfig{
+                .timeout_ns = config.CONNECT_TIMEOUT_NS,
+                .verify_upstream_tls = self.verify_upstream_tls,
+                .client_ctx = self.client_ctx,
+            };
+            const connect_result = connectUpstream(
+                upstream,
+                io,
+                connect_cfg,
+                &self.dns_resolver,
+            ) catch |err| {
+                self.tracer.endSpan(connect_span, @errorName(err));
+                return err;
+            };
+            self.tracer.setIntAttribute(connect_span, "dns_duration_ns", @intCast(connect_result.dns_duration_ns));
+            self.tracer.setIntAttribute(connect_span, "tcp_connect_duration_ns", @intCast(connect_result.tcp_connect_duration_ns));
+            self.tracer.endSpan(connect_span, null);
+
+            var upstream_socket = connect_result.socket;
+            defer upstream_socket.close();
+            var client_socket = if (client_tls) |tls|
+                Socket{ .tls = .{ .fd = client_stream.socket.handle, .stream = tls.* } }
+            else
+                Socket.Plain.init_client(client_stream.socket.handle);
+
+            const tunnel_span = self.tracer.startSpan("grpc_h2_tunnel", forward_span);
+            const tunnel_stats = tunnel_mod.relayWithConfig(
+                &client_socket,
+                &upstream_socket,
+                initial_client_bytes,
+                &[_]u8{},
+                config.H2C_TUNNEL_IDLE_TIMEOUT_NS,
+                config.H2C_TUNNEL_POLL_TIMEOUT_MS,
+            );
+            self.tracer.setIntAttribute(tunnel_span, "duration_ns", @intCast(tunnel_stats.duration_ns));
+            self.tracer.setIntAttribute(tunnel_span, "client_to_upstream_bytes", @intCast(tunnel_stats.client_to_upstream_bytes));
+            self.tracer.setIntAttribute(tunnel_span, "upstream_to_client_bytes", @intCast(tunnel_stats.upstream_to_client_bytes));
+            self.tracer.setStringAttribute(tunnel_span, "termination", @tagName(tunnel_stats.termination));
+            self.tracer.endSpan(tunnel_span, null);
+            self.tracer.endSpan(forward_span, null);
+
+            debugLog("grpc h2 tunnel complete termination={s} up_bytes={d} down_bytes={d}", .{
+                @tagName(tunnel_stats.termination),
+                tunnel_stats.client_to_upstream_bytes,
+                tunnel_stats.upstream_to_client_bytes,
+            });
+
+            return .{
+                .status = 200,
+                .response_bytes = tunnel_stats.upstream_to_client_bytes,
+                .connection_reused = false,
+                .dns_duration_ns = connect_result.dns_duration_ns,
+                .tcp_connect_duration_ns = connect_result.tcp_connect_duration_ns,
+                .send_duration_ns = 0,
+                .recv_duration_ns = tunnel_stats.duration_ns,
+                .pool_wait_ns = 0,
+                .upstream_local_port = connect_result.local_port,
+            };
+        }
+
+        const H2C_UPGRADE_STREAM_ID: u32 = 1;
+        const H2C_UPGRADE_PREAMBLE_BUFFER_SIZE_BYTES: usize =
+            serval_h2.client_connection_preface.len +
+            (2 * serval_h2.frame_header_size_bytes) +
+            config.H2_MAX_FRAME_SIZE_BYTES +
+            config.H2_MAX_HEADER_BLOCK_SIZE_BYTES;
+
+        /// Forward an HTTP/1.1 `Upgrade: h2c` gRPC request by translating the
+        /// upgrade exchange into an upstream prior-knowledge h2c session.
+        /// After the initial request is translated, all further HTTP/2 bytes are
+        /// tunneled transparently end-to-end.
+        pub fn forwardGrpcH2cUpgrade(
+            self: *Self,
+            io: Io,
+            client_stream: Io.net.Stream,
+            client_tls: ?*TLSStream,
+            request: *const Request,
+            upstream: *const Upstream,
+            body_info: BodyInfo,
+            initial_client_bytes_after_body: []const u8,
+            decoded_settings_payload: []const u8,
+            parent_span: SpanHandle,
+            effective_path: ?[]const u8,
+        ) ForwardError!ForwardResult {
+            assert(upstream.port > 0);
+            assert(decoded_settings_payload.len <= config.H2_MAX_FRAME_SIZE_BYTES);
+
+            if (client_tls != null) return ForwardError.UnsupportedProtocol;
+            if (upstream.http_protocol != .h2c) return ForwardError.UnsupportedProtocol;
+            if (upstream.tls) return ForwardError.UnsupportedProtocol;
+            if (body_info.framing == .chunked) return ForwardError.UnsupportedProtocol;
+            serval_grpc.validateRequest(request) catch return ForwardError.UnsupportedProtocol;
+
+            const forward_span = self.tracer.startSpan("forward_grpc_h2c_upgrade", parent_span);
+            errdefer self.tracer.endSpan(forward_span, "forward_error");
+
+            const connect_span = self.tracer.startSpan("connect_upstream", forward_span);
+            const connect_cfg = ConnectConfig{
+                .timeout_ns = config.CONNECT_TIMEOUT_NS,
+                .verify_upstream_tls = self.verify_upstream_tls,
+                .client_ctx = self.client_ctx,
+            };
+            const connect_result = connectUpstream(
+                upstream,
+                io,
+                connect_cfg,
+                &self.dns_resolver,
+            ) catch |err| {
+                self.tracer.endSpan(connect_span, @errorName(err));
+                return err;
+            };
+            self.tracer.setIntAttribute(connect_span, "dns_duration_ns", @intCast(connect_result.dns_duration_ns));
+            self.tracer.setIntAttribute(connect_span, "tcp_connect_duration_ns", @intCast(connect_result.tcp_connect_duration_ns));
+            self.tracer.endSpan(connect_span, null);
+
+            var upstream_socket = connect_result.socket;
+            defer upstream_socket.close();
+            var client_socket = Socket.Plain.init_client(client_stream.socket.handle);
+
+            const content_length = body_info.getContentLength() orelse 0;
+            assert(body_info.bytes_already_read <= content_length);
+            const remaining_body_bytes = content_length - body_info.bytes_already_read;
+            const has_request_body = content_length > 0;
+
+            var preamble_buf: [H2C_UPGRADE_PREAMBLE_BUFFER_SIZE_BYTES]u8 = undefined;
+            const preamble = serval_h2.buildPriorKnowledgePreambleFromUpgrade(
+                &preamble_buf,
+                request,
+                effective_path,
+                decoded_settings_payload,
+                !has_request_body,
+            ) catch return ForwardError.UnsupportedProtocol;
+            upstream_socket.write_all(preamble) catch return ForwardError.SendFailed;
+
+            if (body_info.initial_body.len > 0) {
+                sendH2DataFrames(
+                    &upstream_socket,
+                    body_info.initial_body,
+                    remaining_body_bytes == 0,
+                ) catch return ForwardError.SendFailed;
+            }
+
+            client_socket.write_all(serval_h2.h2c_upgrade_response) catch return ForwardError.SendFailed;
+
+            const tunnel_span = self.tracer.startSpan("grpc_h2c_upgrade_tunnel", forward_span);
+            const tunnel_stats = relayGrpcH2cUpgradeSession(
+                &client_socket,
+                &upstream_socket,
+                remaining_body_bytes,
+                initial_client_bytes_after_body,
+            );
+            self.tracer.setIntAttribute(tunnel_span, "duration_ns", @intCast(tunnel_stats.duration_ns));
+            self.tracer.setIntAttribute(tunnel_span, "client_to_upstream_bytes", @intCast(tunnel_stats.client_to_upstream_bytes));
+            self.tracer.setIntAttribute(tunnel_span, "upstream_to_client_bytes", @intCast(tunnel_stats.upstream_to_client_bytes));
+            self.tracer.setStringAttribute(tunnel_span, "termination", @tagName(tunnel_stats.termination));
+            self.tracer.endSpan(tunnel_span, null);
+            self.tracer.endSpan(forward_span, null);
+
+            debugLog("grpc h2c upgrade tunnel complete termination={s} up_bytes={d} down_bytes={d}", .{
+                @tagName(tunnel_stats.termination),
+                tunnel_stats.client_to_upstream_bytes,
+                tunnel_stats.upstream_to_client_bytes,
+            });
+
+            return .{
+                .status = 101,
+                .response_bytes = serval_h2.h2c_upgrade_response.len + tunnel_stats.upstream_to_client_bytes,
+                .connection_reused = false,
+                .dns_duration_ns = connect_result.dns_duration_ns,
+                .tcp_connect_duration_ns = connect_result.tcp_connect_duration_ns,
+                .send_duration_ns = 0,
+                .recv_duration_ns = tunnel_stats.duration_ns,
+                .pool_wait_ns = 0,
+                .upstream_local_port = connect_result.local_port,
+            };
+        }
+
+        fn relayGrpcH2cUpgradeSession(
+            client_socket: *Socket,
+            upstream_socket: *Socket,
+            remaining_body_bytes: u64,
+            initial_client_bytes_after_body: []const u8,
+        ) tunnel_mod.TunnelStats {
+            const start_ns = time.monotonicNanos();
+            var stats = tunnel_mod.TunnelStats{};
+
+            if (remaining_body_bytes > 0) {
+                if (streamGrpcH2cUpgradeBody(client_socket, upstream_socket, remaining_body_bytes, &stats.client_to_upstream_bytes)) |termination| {
+                    stats.duration_ns = @intCast(time.elapsedNanos(start_ns, time.monotonicNanos()));
+                    stats.termination = termination;
+                    return stats;
+                }
+            }
+
+            const tunnel_stats = tunnel_mod.relayWithConfig(
+                client_socket,
+                upstream_socket,
+                initial_client_bytes_after_body,
+                &[_]u8{},
+                config.H2C_TUNNEL_IDLE_TIMEOUT_NS,
+                config.H2C_TUNNEL_POLL_TIMEOUT_MS,
+            );
+            stats.client_to_upstream_bytes += tunnel_stats.client_to_upstream_bytes;
+            stats.upstream_to_client_bytes += tunnel_stats.upstream_to_client_bytes;
+            stats.duration_ns = @intCast(time.elapsedNanos(start_ns, time.monotonicNanos()));
+            stats.termination = tunnel_stats.termination;
+            return stats;
+        }
+
+        fn streamGrpcH2cUpgradeBody(
+            client_socket: *Socket,
+            upstream_socket: *Socket,
+            remaining_body_bytes: u64,
+            counter_bytes: *u64,
+        ) ?tunnel_mod.Termination {
+            assert(remaining_body_bytes > 0);
+
+            var body_buf: [config.H2_MAX_FRAME_SIZE_BYTES]u8 = undefined;
+            var remaining = remaining_body_bytes;
+
+            while (remaining > 0) {
+                const to_read: usize = @intCast(@min(remaining, config.H2_MAX_FRAME_SIZE_BYTES));
+                const bytes_read = client_socket.read(body_buf[0..to_read]) catch |err| {
+                    return mapClientReadTermination(err);
+                };
+                if (bytes_read == 0) return .client_closed;
+
+                const end_stream = remaining == bytes_read;
+                sendH2DataFrames(upstream_socket, body_buf[0..bytes_read], end_stream) catch |err| {
+                    return mapUpstreamWriteTermination(err);
+                };
+                counter_bytes.* += bytes_read;
+                remaining -= bytes_read;
+            }
+
+            return null;
+        }
+
+        fn sendH2DataFrames(
+            upstream_socket: *Socket,
+            payload: []const u8,
+            end_stream: bool,
+        ) serval_socket.SocketError!void {
+            if (payload.len == 0) {
+                if (end_stream) try sendH2Frame(upstream_socket, .data, serval_h2.flags_end_stream, H2C_UPGRADE_STREAM_ID, &[_]u8{});
+                return;
+            }
+
+            var cursor: usize = 0;
+            while (cursor < payload.len) {
+                const remaining = payload.len - cursor;
+                const chunk_len: usize = @intCast(@min(remaining, config.H2_MAX_FRAME_SIZE_BYTES));
+                const chunk = payload[cursor .. cursor + chunk_len];
+                const is_last_chunk = cursor + chunk_len == payload.len;
+                const flags: u8 = if (end_stream and is_last_chunk) serval_h2.flags_end_stream else 0;
+                try sendH2Frame(upstream_socket, .data, flags, H2C_UPGRADE_STREAM_ID, chunk);
+                cursor += chunk_len;
+            }
+        }
+
+        fn sendH2Frame(
+            upstream_socket: *Socket,
+            frame_type: serval_h2.FrameType,
+            flags: u8,
+            stream_id: u32,
+            payload: []const u8,
+        ) serval_socket.SocketError!void {
+            var header_buf: [serval_h2.frame_header_size_bytes]u8 = undefined;
+            const header = serval_h2.buildFrameHeader(&header_buf, .{
+                .length = @intCast(payload.len),
+                .frame_type = frame_type,
+                .flags = flags,
+                .stream_id = stream_id,
+            }) catch return serval_socket.SocketError.Unexpected;
+            try upstream_socket.write_all(header);
+            if (payload.len > 0) try upstream_socket.write_all(payload);
+        }
+
+        fn mapClientReadTermination(err: serval_socket.SocketError) tunnel_mod.Termination {
+            return switch (err) {
+                error.ConnectionClosed => .client_closed,
+                else => .client_error,
+            };
+        }
+
+        fn mapUpstreamWriteTermination(err: serval_socket.SocketError) tunnel_mod.Termination {
+            return switch (err) {
+                error.ConnectionClosed => .upstream_closed,
+                else => .upstream_error,
+            };
         }
 
         /// Forward request using an established upstream connection.

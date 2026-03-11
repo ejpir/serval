@@ -108,8 +108,18 @@ pub const Response = struct {
 };
 
 // =============================================================================
-// Upstream
+// HTTP Protocol / Upstream
 // =============================================================================
+
+/// Application HTTP protocol spoken by an upstream.
+/// TigerStyle: Explicit enum avoids overloading TLS booleans with protocol semantics.
+pub const HttpProtocol = enum {
+    h1,
+    /// Cleartext HTTP/2 prior-knowledge.
+    h2c,
+    /// TLS HTTP/2 negotiated via ALPN (`h2`).
+    h2,
+};
 
 pub const Upstream = struct {
     host: []const u8,
@@ -120,6 +130,10 @@ pub const Upstream = struct {
     /// Enable TLS for connections to this upstream.
     /// TigerStyle: Explicit boolean, false means plaintext TCP.
     tls: bool = false,
+    /// HTTP application protocol for this upstream.
+    /// `.h2c` means cleartext HTTP/2 prior-knowledge.
+    /// `.h2` means HTTP/2 over TLS negotiated via ALPN.
+    http_protocol: HttpProtocol = .h1,
 };
 
 // =============================================================================

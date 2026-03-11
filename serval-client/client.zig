@@ -236,15 +236,37 @@ pub const Client = struct {
                 upstream.host[0 .. upstream.host.len - 1]
             else
                 upstream.host;
-            const tls_socket = Socket.TLS.TLSSocket.init_client(
+
+            const desired_alpn: ?[]const u8 = switch (upstream.http_protocol) {
+                .h1 => "http/1.1",
+                .h2 => "h2",
+                .h2c => null,
+            };
+
+            var tls_socket = Socket.TLS.TLSSocket.init_client(
                 fd,
                 ctx,
                 sni_host,
                 self.enable_ktls,
+                desired_alpn,
             ) catch {
                 posix.close(fd);
                 return ClientError.TlsHandshakeFailed;
             };
+
+            if (upstream.http_protocol == .h2) {
+                const negotiated = switch (tls_socket) {
+                    .tls => |tls_conn| tls_conn.stream.info.alpn(),
+                    .plain => null,
+                } orelse {
+                    tls_socket.close();
+                    return ClientError.TlsHandshakeFailed;
+                };
+                if (!std.mem.eql(u8, negotiated, "h2")) {
+                    tls_socket.close();
+                    return ClientError.TlsHandshakeFailed;
+                }
+            }
 
             break :blk tls_socket;
         } else blk: {

@@ -56,6 +56,19 @@ const custom = headers.get("X-Custom");    // ?[]const u8
 - `MAX_BODY_SIZE_BYTES` - 10GB
 - `STREAM_WRITE_BUFFER_SIZE_BYTES` - 4096
 - `STREAM_READ_BUFFER_SIZE_BYTES` - 4096
+- `H2C_INITIAL_READ_BUFFER_SIZE_BYTES` - 16KiB initial h2c request inspection buffer
+- `H2_MAX_FRAME_SIZE_BYTES` - 16,384-byte HTTP/2 default frame size
+- `H2_MAX_HEADER_BLOCK_SIZE_BYTES` - 8KiB first-request HPACK block bound
+- `H2_MAX_INITIAL_PARSE_FRAMES` - 16 frames inspected before routing h2c connection
+- `H2_MAX_SETTINGS_PER_FRAME` - 32 SETTINGS entries per frame in bounded parsers
+- `H2_MAX_CONCURRENT_STREAMS` - 128 tracked active streams per connection
+- `H2_INITIAL_WINDOW_SIZE_BYTES` - 65,535-byte per-stream HTTP/2 window default
+- `H2_CONNECTION_WINDOW_SIZE_BYTES` - 65,535-byte connection HTTP/2 window default
+- `H2_MAX_WINDOW_SIZE_BYTES` - 2^31-1 maximum legal HTTP/2 window size
+- `H2_SERVER_MAX_FRAME_COUNT` - 1,048,576-frame bound for terminated HTTP/2 server loops
+- `H2C_TUNNEL_IDLE_TIMEOUT_NS` - 1 hour idle timeout for tunneled h2c/gRPC relay
+- `H2C_TUNNEL_POLL_TIMEOUT_MS` - 1000ms poll interval for h2c tunnel timeout checks
+- `GRPC_MAX_MESSAGE_SIZE_BYTES` - 4MiB helper limit for gRPC message envelopes
 - `WEBSOCKET_TUNNEL_IDLE_TIMEOUT_NS` - 1 hour idle timeout for upgraded tunnel relay
 - `WEBSOCKET_TUNNEL_POLL_TIMEOUT_MS` - 1000ms poll interval for tunnel timeout checks
 - `WEBSOCKET_MAX_MESSAGE_SIZE_BYTES` - 1MiB max native WebSocket message size

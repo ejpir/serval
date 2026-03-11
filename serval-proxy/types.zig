@@ -6,6 +6,7 @@
 
 const core = @import("serval-core");
 const BodyFraming = core.BodyFraming;
+const HttpProtocol = core.HttpProtocol;
 
 // =============================================================================
 // Forward Errors
@@ -32,6 +33,8 @@ pub const ForwardError = error{
     DnsResolutionFailed,
     /// Request body exceeds maximum allowed size
     RequestBodyTooLarge,
+    /// Selected upstream protocol does not match request requirements
+    UnsupportedProtocol,
 };
 
 // =============================================================================
@@ -99,12 +102,7 @@ pub const BodyInfo = struct {
 /// Wire protocol for upstream connection.
 /// Determined by ALPN (TLS) or preface detection (cleartext).
 /// TigerStyle: Explicit enum, not bool, for future protocol additions.
-pub const Protocol = enum {
-    /// HTTP/1.1 - text-based, one request per connection (without pipelining)
-    h1,
-    /// HTTP/2 - binary framing, multiplexed streams (future)
-    h2,
-};
+pub const Protocol = HttpProtocol;
 
 // =============================================================================
 // Tests
@@ -128,6 +126,7 @@ test "CRITICAL: ForwardError covers all failure modes" {
         ForwardError.InvalidAddress,
         ForwardError.DnsResolutionFailed,
         ForwardError.RequestBodyTooLarge,
+        ForwardError.UnsupportedProtocol,
     };
 
     // If this fails to compile, you added an error but didn't list it above
@@ -263,6 +262,8 @@ test "CRITICAL: Timing fields use nanoseconds (consistent units)" {
 test "Protocol: enum has expected variants" {
     // Document protocol variants
     try testing.expectEqual(Protocol.h1, Protocol.h1);
+    try testing.expectEqual(Protocol.h2c, Protocol.h2c);
     try testing.expectEqual(Protocol.h2, Protocol.h2);
-    try testing.expect(Protocol.h1 != Protocol.h2);
+    try testing.expect(Protocol.h1 != Protocol.h2c);
+    try testing.expect(Protocol.h2 != Protocol.h2c);
 }

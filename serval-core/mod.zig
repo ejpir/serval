@@ -10,6 +10,7 @@ pub const types = @import("types.zig");
 pub const Request = types.Request;
 pub const Response = types.Response;
 pub const Upstream = types.Upstream;
+pub const HttpProtocol = types.HttpProtocol;
 pub const Action = types.Action;
 pub const BodyAction = types.BodyAction;
 pub const ErrorAction = types.ErrorAction;

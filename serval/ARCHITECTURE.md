@@ -1,6 +1,6 @@
 # Serval Architecture
 
-Serval is a modular HTTP/1.1 reverse proxy library written in Zig, following TigerStyle principles.
+Serval is a modular HTTP reverse proxy library written in Zig, following TigerStyle principles. Current transport support is HTTP/1.1 plus an initial gRPC-over-h2c proxy slice.
 
 ## Philosophy
 
@@ -29,12 +29,14 @@ serval (umbrella - re-exports all modules)
 ├── serval-socket   # Unified socket abstraction (plain TCP + TLS)
 ├── serval-http     # HTTP/1.1 parser
 ├── serval-websocket # RFC 6455 handshake, frame, close, and subprotocol helpers
+├── serval-h2       # Minimal HTTP/2 / h2c frame, control, preface, HPACK, and initial-request helpers
+├── serval-grpc     # gRPC metadata and message envelope helpers
 ├── serval-tls      # TLS termination and origination (OpenSSL)
 ├── serval-pool     # Connection pooling
-├── serval-client   # HTTP/1.1 client (connect, send, receive)
+├── serval-client   # HTTP/1.1 client + bounded outbound h2 session/runtime primitives
 ├── serval-health   # Backend health tracking (atomic bitmap, thresholds)
 ├── serval-prober   # Background health probing
-├── serval-proxy    # Upstream forwarding (h1/ subdirectory)
+├── serval-proxy    # Upstream forwarding (h1/ + initial h2 stream-bridge primitives)
 ├── serval-metrics  # Request metrics (real-time + Prometheus)
 ├── serval-tracing  # Distributed tracing interface
 ├── serval-otel     # OpenTelemetry implementation
@@ -97,9 +99,13 @@ Layer 1 (Protocol):                                                │
                                                                    │
   serval-websocket ────────────────────────────────────────────────┤
                                                                    │
+  serval-h2 ───────────────────────────────────────────────────────┤
+                                                                   │
   serval-tls ──────────────────────────────────────────────────────┤
                                                                    │
 Layer 2 (Infrastructure):                                          │
+  serval-grpc (depends on core, h2) ───────────────────────────────┤
+                                                                   │
   serval-socket (unified TCP/TLS socket) ←─────────────────┐       │
                                                            │       │
   serval-pool (depends on socket) ←────────────────────────┤       │
@@ -141,15 +147,17 @@ Standalone:
 | serval-socket | Unified socket abstraction (plain TCP + TLS) | `Socket`, `SocketError`, `PlainSocket` |
 | serval-http | HTTP/1.1 parsing | `Parser` |
 | serval-websocket | RFC 6455 handshake + framing helpers | `validateClientRequest`, `computeAcceptKey`, `parseFrameHeader`, `buildClosePayload` |
+| serval-h2 | Minimal HTTP/2 / h2c protocol helpers | `parseFrameHeader`, `buildFrameHeader`, `parseInitialRequest`, `parseSettingsPayload`, `buildGoAwayFrame`, `StreamTable`, `Window` |
+| serval-grpc | gRPC metadata + envelope helpers | `validateRequest`, `buildMessage`, `parseMessage` |
 | serval-pool | Connection reuse (wraps Socket) | `SimplePool`, `NoPool`, `Connection` |
-| serval-client | HTTP/1.1 client for upstream requests | `Client`, `ClientError`, `ResponseHeaders`, `sendRequest`, `readResponseHeaders` |
+| serval-client | HTTP/1.1 client for upstream requests + bounded outbound h2 session/runtime primitives | `Client`, `ClientError`, `ResponseHeaders`, `sendRequest`, `readResponseHeaders`, `H2SessionState`, `H2Runtime`, `H2ClientConnection`, `H2UpstreamSessionPool` |
 | serval-health | Backend health tracking | `HealthState`, `UpstreamIndex`, `MAX_UPSTREAMS` |
 | serval-prober | Background health probing (HTTP/HTTPS) | `ProberContext`, `probeLoop` |
-| serval-proxy | Request forwarding | `Forwarder`, `ForwardResult`, `BodyInfo`, `Protocol` |
+| serval-proxy | Request forwarding + initial stream-aware h2 bridge primitives | `Forwarder`, `ForwardResult`, `BodyInfo`, `Protocol`, `H2StreamBridge` |
 | serval-metrics | Observability | `NoopMetrics`, `PrometheusMetrics`, `RealTimeMetrics` |
 | serval-tracing | Distributed tracing interface | `NoopTracer`, `SpanHandle` |
 | serval-otel | OpenTelemetry tracing | `Tracer`, `Span`, `OTLPExporter`, `BatchingProcessor` |
-| serval-server | HTTP/1.1 server | `Server`, `MinimalServer` |
+| serval-server | HTTP/1.1 server + early terminated HTTP/2 prior-knowledge dispatch | `Server`, `MinimalServer`, `servePlainH2Connection` |
 | serval-lb | Load balancing | `LbHandler` (health-aware round-robin with background probing) |
 | serval-router | Content-based routing | `Router`, `Route`, `RouteMatcher`, `PathMatch`, `PoolConfig` |
 | serval-k8s-gateway | Gateway API types + translation | `GatewayConfig`, `HTTPRoute`, `translateToJson` |
@@ -386,6 +394,61 @@ upgrade path instead of the normal request/response forwarding path:
 5. Upstream response headers are read once and validated before any `101` is forwarded to the client
 6. If upstream returns a non-`101` response, it is forwarded as plain HTTP and the connection closes
 7. If upstream returns a valid `101 Switching Protocols`, `serval-proxy/tunnel.zig` switches to bidirectional byte relay and the upgraded upstream connection is never returned to the HTTP pool
+
+### gRPC over h2c Prior-Knowledge + Upgrade Flow
+
+The current gRPC slice supports two **cleartext HTTP/2** inbound entry paths with an explicit,
+fail-closed handoff.
+
+Separately, for non-proxy terminated handlers, `serval-server` can now dispatch cleartext
+HTTP/2 into `servePlainH2Connection()` for both prior-knowledge and `Upgrade: h2c` entry
+paths when the handler implements `handleH2Headers()` and `handleH2Data()`. The upgrade
+path now includes stream-1 bootstrap from the HTTP/1.1 request plus optional post-101
+client preface consumption before normal frame handling. The terminated runtime now also
+tracks bounded per-stream lifecycle state and can emit optional `handleH2StreamOpen()` /
+`handleH2StreamClose(summary)` callbacks for stream-scoped metrics/tracing/logging, and the
+main cleartext server path now wires those callbacks into per-stream metrics, tracing span,
+and `onLog` emission for both prior-knowledge and upgrade terminated sessions. Integration
+coverage also includes fail-closed GOAWAY behavior for invalid DATA-before-HEADERS ordering
+in post-101 upgrade streams. This terminated path remains intentionally narrow today: it is
+cleartext-only and still early-phase.
+
+The proxy flow is:
+
+#### Prior knowledge
+
+1. `serval-server` reads the start of a new cleartext connection
+2. `serval-h2` detects the client connection preface (`PRI * HTTP/2.0...`)
+3. `serval-h2.parseInitialRequest()` parses the first HEADERS block using bounded HPACK decode (including dynamic-table references and Huffman strings)
+4. `serval-grpc.validateRequest()` checks `POST`, `content-type: application/grpc*`, and `te: trailers`
+5. The normal handler `selectUpstream()` runs against a synthetic `Request` built from the first h2c stream
+6. If the selected upstream has `http_protocol = .h2c` and cleartext transport, `serval-server` enters the stream-aware h2 bridge path and `serval-proxy/h2/bridge.zig` acquires or reuses a bounded upstream h2 session
+7. The bridge maps downstream stream ids to upstream stream ids, forwards HEADERS/DATA per stream, and drains upstream receive actions back to downstream HEADERS/DATA/trailers
+8. gRPC responses are validated for mandatory `grpc-status`; missing/invalid status fails closed as downstream `RST_STREAM(PROTOCOL_ERROR)`
+9. Upstream stream resets now fail-closed as downstream `RST_STREAM(CANCEL)` for the affected stream; non-h2c upstreams continue to use the legacy connection tunnel path
+
+#### HTTP/1.1 `Upgrade: h2c`
+
+1. `serval-server` parses the HTTP/1.1 request and detects `Upgrade: h2c`
+2. `serval-h2.validateUpgradeRequest()` validates `Connection`, `Upgrade`, and `HTTP2-Settings`
+3. `serval-grpc.validateRequest()` validates gRPC request metadata on the HTTP/1.1 request view
+4. The normal handler `selectUpstream()` chooses an upstream
+5. For cleartext h2c upstreams, Serval sends `101 Switching Protocols` and enters `h2/server.zig`
+   upgraded mode with stream-1 bootstrap from the HTTP/1.1 request (headers + body)
+6. The same stream-aware bridge handler used for prior-knowledge then maps downstream
+   stream ids to upstream stream ids, forwards per-stream HEADERS/DATA, and maps
+   upstream response/reset actions back downstream
+7. For non-h2c upstreams, Serval keeps the legacy translation+tunnel fallback
+
+The cleartext h2c proxy path is now stream-aware for both prior-knowledge and inbound
+`Upgrade: h2c` entry when the selected upstream is cleartext h2c. Upstream `GOAWAY`
+now respects `last_stream_id` for active streams (`NO_ERROR` GOAWAY no longer forces
+an immediate reset when the active stream id is still allowed), with upstream
+session rollover support (one active + one draining session per upstream index)
+and bounded HEADERS+CONTINUATION reassembly plus bounded HPACK
+dynamic-table/Huffman decode in initial parse and runtime paths.
+Routing is still decided from the first request on the connection, and broader
+control-frame propagation remains future work.
 
 ### Async I/O and Zero-Copy Body Transfer
 
@@ -790,6 +853,8 @@ pub const WeightedHandler = struct {
 | Chunked transfer encoding | serval-http, serval-proxy, serval-server | Parsing, forwarding, and direct response |
 | WebSocket proxy tunneling | serval-websocket, serval-proxy, serval-server | RFC 6455 handshake validation, HTTP/1.1 upgrade forwarding, bidirectional relay |
 | Native WebSocket endpoint serving | serval-websocket, serval-server | RFC 6455 handshake acceptance, frame parsing, message-oriented server sessions |
+| gRPC over h2c proxying (prior knowledge + inbound upgrade) | serval-h2, serval-grpc, serval-proxy, serval-server | Cleartext h2c upstreams now use a bounded stream-aware bridge in both entry paths (stream mapping + reused upstream sessions + reset mapping + GOAWAY `last_stream_id`-aware active-stream handling + fail-closed `grpc-status` enforcement); non-h2c targets use legacy tunnel fallback |
+| Terminated HTTP/2 connection runtime primitives | serval-h2, serval-server | Bounded SETTINGS/ACK/PING/RST_STREAM/GOAWAY handling plus streaming HEADERS/DATA callbacks on a plain connection, including DATA-driven connection+stream WINDOW_UPDATE replenishment and main accept-loop dispatch for both prior-knowledge and `Upgrade: h2c` cleartext entry paths |
 | TLS termination | serval-tls, serval-server | Client TLS (server-side), upstream TLS (client-side) |
 | kTLS kernel offload | serval-tls | OpenSSL native + BoringSSL manual, automatic fallback |
 | HTTP/1.1 client | serval-client | DNS, TCP, TLS, request/response |
@@ -805,7 +870,8 @@ pub const WeightedHandler = struct {
 
 | Feature | Module | Complexity |
 |---------|--------|------------|
-| HTTP/2 | serval-proxy/h2 | High |
+| HTTP/2 full stream-aware stack | serval-proxy/h2 | High |
+| Native gRPC endpoints | serval-server, serval-grpc | High |
 | Weighted round-robin | serval-lb | Low |
 | Least connections LB | serval-lb | Low |
 | W3C Trace Context propagation | serval-otel | Low |
@@ -821,6 +887,10 @@ zig build
 # Run serval library tests
 zig build test
 
+# Run h2 / gRPC protocol tests
+zig build test-h2
+zig build test-grpc
+
 # Run load balancer tests
 zig build test-lb
 
@@ -832,6 +902,9 @@ zig build test-health
 
 # Run router tests
 zig build test-router
+
+# Run integration tests
+zig build test-integration
 
 # Run load balancer example
 zig build run-lb-example -- --port 8080 --backends 127.0.0.1:9001,127.0.0.1:9002

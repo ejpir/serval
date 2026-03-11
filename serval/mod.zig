@@ -30,6 +30,7 @@ pub const types = core.types;
 pub const Request = core.Request;
 pub const Response = core.Response;
 pub const Upstream = core.Upstream;
+pub const HttpProtocol = core.HttpProtocol;
 pub const Action = core.Action;
 pub const Method = core.Method;
 pub const Version = core.Version;
@@ -110,6 +111,51 @@ pub const buildWebSocketClosePayload = websocket.buildClosePayload;
 pub const validateWebSocketSubprotocolSelection = websocket.validateSubprotocolSelection;
 
 // =============================================================================
+// HTTP/2 / h2c Helpers (from serval-h2)
+// =============================================================================
+
+pub const h2 = @import("serval-h2");
+pub const H2FrameType = h2.FrameType;
+pub const H2FrameHeader = h2.FrameHeader;
+pub const H2FrameError = h2.FrameError;
+pub const H2ErrorCode = h2.ErrorCode;
+pub const H2GoAway = h2.GoAway;
+pub const H2HeaderField = h2.HeaderField;
+pub const H2RequestHead = h2.RequestHead;
+pub const H2InitialRequest = h2.InitialRequest;
+pub const parseH2FrameHeader = h2.parseFrameHeader;
+pub const buildH2FrameHeader = h2.buildFrameHeader;
+pub const decodeH2HeaderBlock = h2.decodeHeaderBlock;
+pub const decodeH2RequestHeaderBlock = h2.decodeRequestHeaderBlock;
+pub const encodeH2LiteralHeaderWithoutIndexing = h2.encodeLiteralHeaderWithoutIndexing;
+pub const buildH2SettingsAckFrame = h2.buildSettingsAckFrame;
+pub const parseH2PingFrame = h2.parsePingFrame;
+pub const buildH2PingFrame = h2.buildPingFrame;
+pub const parseH2WindowUpdateFrame = h2.parseWindowUpdateFrame;
+pub const buildH2WindowUpdateFrame = h2.buildWindowUpdateFrame;
+pub const parseH2RstStreamFrame = h2.parseRstStreamFrame;
+pub const buildH2RstStreamFrame = h2.buildRstStreamFrame;
+pub const parseH2GoAwayFrame = h2.parseGoAwayFrame;
+pub const buildH2GoAwayFrame = h2.buildGoAwayFrame;
+pub const parseInitialH2Request = h2.parseInitialRequest;
+pub const looksLikeH2ClientPreface = h2.looksLikeClientConnectionPreface;
+pub const looksLikeH2cUpgradeRequest = h2.looksLikeUpgradeRequest;
+pub const validateH2cUpgradeRequest = h2.validateUpgradeRequest;
+pub const buildH2cUpgradeResponse = h2.buildUpgradeResponse;
+
+// =============================================================================
+// gRPC Helpers (from serval-grpc)
+// =============================================================================
+
+pub const grpc = @import("serval-grpc");
+pub const GrpcMessagePrefix = grpc.MessagePrefix;
+pub const GrpcWireError = grpc.WireError;
+pub const GrpcMetadataError = grpc.MetadataError;
+pub const buildGrpcMessage = grpc.buildMessage;
+pub const parseGrpcMessage = grpc.parseMessage;
+pub const validateGrpcRequest = grpc.validateRequest;
+
+// =============================================================================
 // Connection Pooling (from serval-pool)
 // =============================================================================
 
@@ -161,6 +207,10 @@ pub const WebSocketSession = server.WebSocketSession;
 pub const WebSocketSessionError = server.WebSocketSessionError;
 pub const WebSocketSessionState = server.WebSocketSessionState;
 pub const WebSocketSessionStats = server.WebSocketSessionStats;
+pub const H2ResponseHeader = server.H2ResponseHeader;
+pub const H2ResponseWriter = server.H2ResponseWriter;
+pub const H2ServerError = server.H2ServerError;
+pub const servePlainH2Connection = server.servePlainH2Connection;
 
 // =============================================================================
 // Router (from serval-router)
@@ -183,6 +233,8 @@ test {
     _ = @import("serval-socket");
     _ = @import("serval-http");
     _ = @import("serval-websocket");
+    _ = @import("serval-h2");
+    _ = @import("serval-grpc");
     _ = @import("serval-pool");
     _ = @import("serval-proxy");
     _ = @import("serval-metrics");

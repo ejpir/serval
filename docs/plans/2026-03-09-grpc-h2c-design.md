@@ -18,6 +18,9 @@ The implementation must be:
 - composable with existing serval routing/proxy modules
 - testable with deterministic unit, integration, fuzz, and interop coverage
 
+Detailed next-phase execution planning for the stream-aware proxy transport lives in:
+- `docs/plans/2026-03-10-stream-aware-h2-proxy-plan.md`
+
 ## Specifications
 
 The implementation must follow these documents directly:

@@ -44,6 +44,7 @@ pub const TLSSocket = struct {
         ctx: *ssl.SSL_CTX,
         host: []const u8,
         enable_ktls: bool,
+        desired_alpn: ?[]const u8,
     ) SocketError!Socket {
         // S1: preconditions
         assert(fd >= 0); // S1: valid fd
@@ -68,6 +69,7 @@ pub const TLSSocket = struct {
             sni_z,
             std.heap.page_allocator,
             enable_ktls,
+            desired_alpn,
         ) catch |err| {
             return map_tls_error(err);
         };
@@ -202,6 +204,8 @@ fn map_tls_error(err: anyerror) SocketError {
         error.SslNew => SocketError.TLSError,
         error.SslSetFd => SocketError.TLSError,
         error.SslSetSni => SocketError.TLSError,
+        error.SslSetAlpn => SocketError.TLSError,
+        error.InvalidAlpnProtocol => SocketError.TLSError,
         error.HandshakeFailed => SocketError.TLSError,
         error.SslRead => SocketError.TLSError,
         error.SslWrite => SocketError.TLSError,
@@ -233,6 +237,8 @@ test "map_tls_error maps known errors to TLSError" {
     try std.testing.expectEqual(SocketError.TLSError, map_tls_error(error.SslNew));
     try std.testing.expectEqual(SocketError.TLSError, map_tls_error(error.SslSetFd));
     try std.testing.expectEqual(SocketError.TLSError, map_tls_error(error.SslSetSni));
+    try std.testing.expectEqual(SocketError.TLSError, map_tls_error(error.SslSetAlpn));
+    try std.testing.expectEqual(SocketError.TLSError, map_tls_error(error.InvalidAlpnProtocol));
     try std.testing.expectEqual(SocketError.TLSError, map_tls_error(error.HandshakeFailed));
     try std.testing.expectEqual(SocketError.TLSError, map_tls_error(error.SslRead));
     try std.testing.expectEqual(SocketError.TLSError, map_tls_error(error.SslWrite));

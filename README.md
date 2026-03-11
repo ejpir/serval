@@ -11,8 +11,9 @@ High-performance HTTP infrastructure for Zig — reverse proxies, load balancers
 - **Zero-copy forwarding** — Linux splice() for body transfer (including kTLS)
 - **WebSocket proxying** — RFC 6455 upgrade validation and bidirectional tunnel relay
 - **Native WebSocket serving** — Accept WebSocket endpoints directly in Serval handlers with message-oriented session API
+- **gRPC over h2c proxying** — Inbound prior-knowledge or `Upgrade: h2c` routing plus transparent gRPC byte-stream tunneling to cleartext h2c upstreams
 - **Connection pooling** — Reuse upstream connections across requests
-- **Pluggable components** — Custom handlers, metrics, and tracing implementations
+- **Pluggable components** — Custom handlers, metrics, tracing, and explicit upstream protocol selection (`.h1`, `.h2c`)
 - **No runtime allocation** — All memory allocated at startup
 
 ## Performance
@@ -92,8 +93,10 @@ exe.root_module.addImport("serval-lb", serval.module("serval-lb"));
 | `serval-core` | Types, config, errors, context |
 | `serval-http` | HTTP/1.1 request parser |
 | `serval-websocket` | RFC 6455 handshake, frame, close, and subprotocol helpers |
+| `serval-h2` | Minimal HTTP/2 / h2c frame, control, preface, upgrade, HPACK, and initial-request helpers |
+| `serval-grpc` | gRPC metadata and message-envelope helpers |
 | `serval-net` | DNS resolution with TTL caching, TCP socket utilities |
-| `serval-client` | HTTP/1.1 client library for upstream connections |
+| `serval-client` | HTTP/1.1 client library with early bounded HTTP/2 session primitives |
 | `serval-tls` | TLS termination/origination with kTLS offload |
 | `serval-pool` | Connection pooling |
 | `serval-proxy` | Upstream forwarding |
@@ -169,7 +172,11 @@ zig build run-echo-backend      # Run echo backend
 zig build build-gateway-example # Build K8s gateway controller
 zig build test                  # Run umbrella tests
 zig build test-server           # Run serval-server tests
+zig build test-client           # Run serval-client h2 primitive tests
+zig build test-proxy            # Run serval-proxy h2 primitive tests
 zig build test-websocket        # Run serval-websocket tests
+zig build test-h2               # Run serval-h2 tests
+zig build test-grpc             # Run serval-grpc tests
 zig build test-integration      # Run end-to-end integration tests
 ```
 
@@ -468,12 +475,13 @@ zig build run-echo-backend -- --help
 | Chunked encoding | Complete |
 | WebSocket proxy tunneling | Complete |
 | Native WebSocket endpoint serving | Complete |
+| gRPC over h2c proxying (prior knowledge + inbound upgrade) | Initial slice complete |
 | Content-based routing | Complete |
 | Path rewriting | Complete |
 | K8s Gateway API types | Complete |
 | Rate limiting | Planned |
 | WAF | Planned |
-| HTTP/2 | Not implemented |
+| HTTP/2 full stream-aware proxy/server stack | Not implemented |
 
 ## License
 

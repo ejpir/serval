@@ -28,8 +28,14 @@ const serval_http = @import("serval-http");
 const parser_mod = serval_http.parser;
 const parseContentLengthValue = serval_http.parseContentLengthValue;
 const serval_websocket = @import("serval-websocket");
+const serval_h2 = @import("serval-h2");
+const serval_grpc = @import("serval-grpc");
 const websocket_server = @import("../websocket/mod.zig");
-const forwarder_mod = @import("serval-proxy").forwarder;
+const h2_server = @import("../h2/server.zig");
+const h2_runtime = @import("../h2/runtime.zig");
+const serval_proxy = @import("serval-proxy");
+const forwarder_mod = serval_proxy.forwarder;
+const serval_client = @import("serval-client");
 const serval_tls = @import("serval-tls");
 const ssl = serval_tls.ssl;
 const TLSStream = serval_tls.TLSStream;
@@ -67,8 +73,20 @@ const ConnectionInfo = types.ConnectionInfo;
 
 // Buffer sizes from centralized config
 const REQUEST_BUFFER_SIZE_BYTES = config.REQUEST_BUFFER_SIZE_BYTES;
+const H2C_INITIAL_READ_BUFFER_SIZE_BYTES = config.H2C_INITIAL_READ_BUFFER_SIZE_BYTES;
+const CONNECTION_RECV_BUFFER_SIZE_BYTES = if (REQUEST_BUFFER_SIZE_BYTES > H2C_INITIAL_READ_BUFFER_SIZE_BYTES)
+    REQUEST_BUFFER_SIZE_BYTES
+else
+    H2C_INITIAL_READ_BUFFER_SIZE_BYTES;
 const DIRECT_RESPONSE_BUFFER_SIZE_BYTES = config.DIRECT_RESPONSE_BUFFER_SIZE_BYTES;
 const DIRECT_REQUEST_BODY_SIZE_BYTES = config.DIRECT_REQUEST_BODY_SIZE_BYTES;
+
+/// Retry sleep for non-blocking plain-socket reads.
+const CONNECTION_READ_RETRY_SLEEP_NS: u64 = time.ns_per_ms;
+/// Maximum plain-socket read stall before failing the connection read.
+const CONNECTION_READ_STALL_TIMEOUT_NS: u64 = 120 * time.ns_per_s;
+/// Explicit bound on WouldBlock retry attempts in plain-socket reads.
+const CONNECTION_READ_MAX_WOULDBLOCK_RETRIES: u32 = 240_000;
 
 // =============================================================================
 // Server
@@ -291,14 +309,34 @@ pub fn Server(
                 };
                 return n;
             } else {
-                // Plain socket read - direct recv() with no buffering.
-                // TigerStyle: No hidden state, reads exactly what's requested.
-                const n = std.posix.read(stream.socket.handle, buf) catch |err| {
-                    log.debug("server: conn={d} recv error: {s}", .{ conn_id, @errorName(err) });
-                    return null;
-                };
-                if (n == 0) return null; // EOF
-                return n;
+                // Plain socket read on non-blocking fd.
+                // TigerStyle: bounded retry loop for WouldBlock to avoid flaky early aborts.
+                var retry_count: u32 = 0;
+                const start_wait_ns: u64 = time.monotonicNanos();
+
+                while (retry_count < CONNECTION_READ_MAX_WOULDBLOCK_RETRIES) : (retry_count += 1) {
+                    const n = std.posix.read(stream.socket.handle, buf) catch |err| switch (err) {
+                        error.WouldBlock => {
+                            const now_ns = time.monotonicNanos();
+                            if (now_ns -| start_wait_ns >= CONNECTION_READ_STALL_TIMEOUT_NS) {
+                                log.debug("server: conn={d} recv stall timeout", .{conn_id});
+                                return null;
+                            }
+                            time.sleep(CONNECTION_READ_RETRY_SLEEP_NS);
+                            continue;
+                        },
+                        else => {
+                            log.debug("server: conn={d} recv error: {s}", .{ conn_id, @errorName(err) });
+                            return null;
+                        },
+                    };
+
+                    if (n == 0) return null; // EOF
+                    return n;
+                }
+
+                log.debug("server: conn={d} recv retry limit reached", .{conn_id});
+                return null;
             }
         }
 
@@ -356,7 +394,7 @@ pub fn Server(
             maybe_tls: ?*const TLSStream,
             io: *Io,
             stream: Io.net.Stream,
-            recv_buf: *[REQUEST_BUFFER_SIZE_BYTES]u8,
+            recv_buf: []u8,
             buffer_offset: usize,
             buffer_len: *usize,
             conn_id: u64,
@@ -539,6 +577,1182 @@ pub fn Server(
             };
         }
 
+        const H2_ERROR_PROTOCOL: u32 = 0x1;
+        const H2_ERROR_INTERNAL: u32 = 0x2;
+
+        fn sendH2GoAway(
+            maybe_tls: ?*const TLSStream,
+            io: *Io,
+            stream: Io.net.Stream,
+            last_stream_id: u32,
+            error_code: u32,
+        ) void {
+            assert(last_stream_id <= 0x7fff_ffff);
+
+            var frame_buf: [serval_h2.frame_header_size_bytes + 8]u8 = undefined;
+            const header = serval_h2.buildFrameHeader(frame_buf[0..serval_h2.frame_header_size_bytes], .{
+                .length = 8,
+                .frame_type = .goaway,
+                .flags = 0,
+                .stream_id = 0,
+            }) catch return;
+            std.mem.writeInt(u32, frame_buf[header.len..][0..4], last_stream_id, .big);
+            std.mem.writeInt(u32, frame_buf[header.len + 4 ..][0..4], error_code, .big);
+            connectionWrite(maybe_tls, io, stream, frame_buf[0 .. header.len + 8]) catch return;
+        }
+
+        fn sendH2InitialSettings(
+            maybe_tls: ?*const TLSStream,
+            io: *Io,
+            stream: Io.net.Stream,
+        ) bool {
+            assert(@intFromPtr(io) != 0);
+            assert(stream.socket.handle >= 0);
+
+            var runtime = h2_runtime.Runtime.init() catch return false;
+            var settings_buf: [serval_h2.frame_header_size_bytes + (4 * serval_h2.setting_size_bytes)]u8 = undefined;
+            const settings_frame = runtime.writeInitialSettingsFrame(&settings_buf) catch return false;
+            connectionWrite(maybe_tls, io, stream, settings_frame) catch return false;
+            return true;
+        }
+
+        const H2_STREAM_METRICS_FALLBACK_STATUS: u16 = 500;
+        const H2_STREAM_CLIENT_CLOSED_STATUS: u16 = 499;
+        const H2_STREAM_SLOT_TABLE_CAPACITY: usize = config.H2_MAX_CONCURRENT_STREAMS;
+        /// Fixed-capacity path snapshot for stream-scoped onLog entries.
+        /// Long paths are truncated to preserve bounded memory per connection.
+        const H2_STREAM_LOG_PATH_BUFFER_SIZE_BYTES: usize = @intCast(config.OTEL_MAX_NAME_LEN);
+
+        const H2StreamSlot = struct {
+            used: bool = false,
+            stream_id: u32 = 0,
+            span_handle: SpanHandle = .{},
+            method: types.Method = .GET,
+            path_len: u16 = 0,
+            path_buf: [H2_STREAM_LOG_PATH_BUFFER_SIZE_BYTES]u8 = std.mem.zeroes([H2_STREAM_LOG_PATH_BUFFER_SIZE_BYTES]u8),
+            start_time_ns: i128 = 0,
+            request_number: u32 = 0,
+        };
+
+        const TerminatedH2TelemetryAdapter = struct {
+            inner: *Handler,
+            metrics: *Metrics,
+            tracer: *Tracer,
+            parent_span: ?SpanHandle,
+            emit_stream_metrics: bool,
+            connection_id: u64,
+            connection_start_ns: i128,
+            client_addr: [46]u8,
+            client_port: u16,
+            next_request_number: u32,
+            stream_slots: [H2_STREAM_SLOT_TABLE_CAPACITY]H2StreamSlot = [_]H2StreamSlot{.{}} ** H2_STREAM_SLOT_TABLE_CAPACITY,
+
+            fn init(
+                inner: *Handler,
+                metrics: *Metrics,
+                tracer: *Tracer,
+                connection_ctx: *const Context,
+                parent_span: ?SpanHandle,
+                emit_stream_metrics: bool,
+            ) @This() {
+                assert(@intFromPtr(inner) != 0);
+                assert(@intFromPtr(metrics) != 0);
+                assert(@intFromPtr(tracer) != 0);
+                assert(@intFromPtr(connection_ctx) != 0);
+
+                const normalized_parent_span: ?SpanHandle = if (parent_span) |span|
+                    if (span.isValid()) span else null
+                else
+                    null;
+
+                return .{
+                    .inner = inner,
+                    .metrics = metrics,
+                    .tracer = tracer,
+                    .parent_span = normalized_parent_span,
+                    .emit_stream_metrics = emit_stream_metrics,
+                    .connection_id = connection_ctx.connection_id,
+                    .connection_start_ns = connection_ctx.connection_start_ns,
+                    .client_addr = connection_ctx.client_addr,
+                    .client_port = connection_ctx.client_port,
+                    .next_request_number = connection_ctx.request_number,
+                };
+            }
+
+            pub fn handleH2Headers(
+                self: *@This(),
+                stream_id: u32,
+                request: *const Request,
+                end_stream: bool,
+                writer: *h2_server.ResponseWriter,
+            ) !void {
+                return self.inner.handleH2Headers(stream_id, request, end_stream, writer);
+            }
+
+            pub fn handleH2Data(
+                self: *@This(),
+                stream_id: u32,
+                payload: []const u8,
+                end_stream: bool,
+                writer: *h2_server.ResponseWriter,
+            ) !void {
+                return self.inner.handleH2Data(stream_id, payload, end_stream, writer);
+            }
+
+            pub fn handleH2StreamReset(self: *@This(), stream_id: u32, error_code_raw: u32) void {
+                if (comptime @hasDecl(Handler, "handleH2StreamReset")) {
+                    self.inner.handleH2StreamReset(stream_id, error_code_raw);
+                }
+            }
+
+            pub fn handleH2ConnectionClose(self: *@This(), goaway: serval_h2.GoAway) void {
+                if (comptime @hasDecl(Handler, "handleH2ConnectionClose")) {
+                    self.inner.handleH2ConnectionClose(goaway);
+                }
+            }
+
+            pub fn handleH2StreamOpen(self: *@This(), stream_id: u32, request: *const Request) void {
+                if (self.emit_stream_metrics) {
+                    self.metrics.requestStart();
+                }
+
+                var span_name_buf: [config.OTEL_MAX_NAME_LEN]u8 = std.mem.zeroes([config.OTEL_MAX_NAME_LEN]u8);
+                const span_name = buildSpanName(request.method, request.path, &span_name_buf);
+                const span_handle = self.tracer.startSpan(span_name, self.parent_span);
+                const stream_start_ns = time.realtimeNanos();
+                const request_number = self.nextRequestNumber();
+                self.upsertStream(
+                    stream_id,
+                    span_handle,
+                    request.method,
+                    request.path,
+                    stream_start_ns,
+                    request_number,
+                );
+
+                if (span_handle.isValid()) {
+                    if (comptime @hasDecl(Tracer, "setStringAttribute")) {
+                        self.tracer.setStringAttribute(span_handle, "http.request.method", @tagName(request.method));
+                        self.tracer.setStringAttribute(span_handle, "url.path", request.path);
+                    }
+                    if (comptime @hasDecl(Tracer, "setIntAttribute")) {
+                        self.tracer.setIntAttribute(span_handle, "h2.stream_id", @intCast(stream_id));
+                    }
+                }
+
+                if (comptime @hasDecl(Handler, "handleH2StreamOpen")) {
+                    self.inner.handleH2StreamOpen(stream_id, request);
+                }
+            }
+
+            pub fn handleH2StreamClose(self: *@This(), summary: h2_server.StreamSummary) void {
+                const status = streamSummaryStatus(summary);
+                if (self.emit_stream_metrics) {
+                    self.metrics.requestEnd(status, summary.duration_ns);
+                }
+
+                const stream_error_name = streamSummaryError(summary);
+                const stream_slot = self.popStream(summary.stream_id);
+                if (stream_slot) |slot| {
+                    if (slot.span_handle.isValid()) {
+                        if (comptime @hasDecl(Tracer, "setIntAttribute")) {
+                            self.tracer.setIntAttribute(slot.span_handle, "http.response.status_code", @intCast(status));
+                            self.tracer.setIntAttribute(slot.span_handle, "h2.stream_id", @intCast(summary.stream_id));
+                            self.tracer.setIntAttribute(slot.span_handle, "h2.request_data_bytes", saturatingI64(summary.request_data_bytes));
+                            self.tracer.setIntAttribute(slot.span_handle, "h2.response_data_bytes", saturatingI64(summary.response_data_bytes));
+                        }
+                        self.tracer.endSpan(slot.span_handle, stream_error_name);
+                    }
+
+                    if (comptime hooks.hasHook(Handler, "onLog")) {
+                        const path_len: usize = @intCast(slot.path_len);
+                        const stream_path = slot.path_buf[0..path_len];
+
+                        var stream_ctx = Context.init();
+                        stream_ctx.start_time_ns = slot.start_time_ns;
+                        stream_ctx.connection_id = self.connection_id;
+                        stream_ctx.connection_start_ns = self.connection_start_ns;
+                        stream_ctx.client_addr = self.client_addr;
+                        stream_ctx.client_port = self.client_port;
+                        stream_ctx.request_number = slot.request_number;
+                        stream_ctx.bytes_received = summary.request_data_bytes;
+                        stream_ctx.bytes_sent = summary.response_data_bytes;
+                        stream_ctx.response_status = status;
+                        stream_ctx.duration_ns = summary.duration_ns;
+                        stream_ctx.error_name = stream_error_name;
+
+                        const log_entry = serval_core.log.LogEntry{
+                            .timestamp_s = time.nanosToSecondsI128(slot.start_time_ns),
+                            .start_time_ns = slot.start_time_ns,
+                            .duration_ns = summary.duration_ns,
+                            .method = slot.method,
+                            .path = stream_path,
+                            .request_bytes = summary.request_data_bytes,
+                            .status = status,
+                            .response_bytes = summary.response_data_bytes,
+                            .upstream = null,
+                            .upstream_duration_ns = 0,
+                            .error_phase = streamSummaryErrorPhase(summary),
+                            .error_name = stream_error_name,
+                            .connection_reused = false,
+                            .keepalive = false,
+                            .parse_duration_ns = 0,
+                            .connection_id = self.connection_id,
+                            .request_number = slot.request_number,
+                            .client_addr = self.client_addr,
+                        };
+                        self.inner.onLog(&stream_ctx, log_entry);
+                    }
+                }
+
+                if (comptime @hasDecl(Handler, "handleH2StreamClose")) {
+                    self.inner.handleH2StreamClose(summary);
+                }
+            }
+
+            fn streamSummaryStatus(summary: h2_server.StreamSummary) u16 {
+                if (summary.response_status >= 100 and summary.response_status <= 599) {
+                    return summary.response_status;
+                }
+
+                return switch (summary.close_reason) {
+                    .local_reset => H2_STREAM_METRICS_FALLBACK_STATUS,
+                    .peer_reset => H2_STREAM_CLIENT_CLOSED_STATUS,
+                    .connection_close => if (summary.reset_error_code_raw == @intFromEnum(serval_h2.ErrorCode.no_error))
+                        H2_STREAM_CLIENT_CLOSED_STATUS
+                    else
+                        H2_STREAM_METRICS_FALLBACK_STATUS,
+                    .local_end_stream => H2_STREAM_METRICS_FALLBACK_STATUS,
+                };
+            }
+
+            fn streamSummaryError(summary: h2_server.StreamSummary) ?[]const u8 {
+                return switch (summary.close_reason) {
+                    .local_end_stream => if (summary.reset_error_code_raw == @intFromEnum(serval_h2.ErrorCode.no_error))
+                        null
+                    else
+                        "h2_local_end_stream_error",
+                    .peer_reset => "h2_peer_reset",
+                    .local_reset => "h2_local_reset",
+                    .connection_close => if (summary.reset_error_code_raw == @intFromEnum(serval_h2.ErrorCode.no_error))
+                        null
+                    else
+                        "h2_connection_close",
+                };
+            }
+
+            fn streamSummaryErrorPhase(summary: h2_server.StreamSummary) ?errors.ErrorContext.Phase {
+                return switch (summary.close_reason) {
+                    .local_end_stream => if (summary.reset_error_code_raw == @intFromEnum(serval_h2.ErrorCode.no_error))
+                        null
+                    else
+                        .handler_response,
+                    .peer_reset => .recv,
+                    .local_reset => .handler_response,
+                    .connection_close => if (summary.reset_error_code_raw == @intFromEnum(serval_h2.ErrorCode.no_error))
+                        null
+                    else
+                        .recv,
+                };
+            }
+
+            fn findStreamSlot(self: *@This(), stream_id: u32) ?*H2StreamSlot {
+                assert(stream_id > 0);
+
+                for (self.stream_slots[0..]) |*slot| {
+                    if (!slot.used) continue;
+                    if (slot.stream_id == stream_id) return slot;
+                }
+                return null;
+            }
+
+            fn upsertStream(
+                self: *@This(),
+                stream_id: u32,
+                span_handle: SpanHandle,
+                method: types.Method,
+                path: []const u8,
+                start_time_ns: i128,
+                request_number: u32,
+            ) void {
+                assert(stream_id > 0);
+                assert(start_time_ns > 0);
+
+                const copy_len: usize = @min(path.len, H2_STREAM_LOG_PATH_BUFFER_SIZE_BYTES);
+                assert(copy_len <= std.math.maxInt(u16));
+
+                if (self.findStreamSlot(stream_id)) |slot| {
+                    slot.span_handle = span_handle;
+                    slot.method = method;
+                    slot.start_time_ns = start_time_ns;
+                    slot.request_number = request_number;
+                    slot.path_len = @intCast(copy_len);
+                    if (copy_len > 0) {
+                        @memcpy(slot.path_buf[0..copy_len], path[0..copy_len]);
+                    }
+                    return;
+                }
+
+                for (self.stream_slots[0..]) |*slot| {
+                    if (slot.used) continue;
+                    slot.* = .{
+                        .used = true,
+                        .stream_id = stream_id,
+                        .span_handle = span_handle,
+                        .method = method,
+                        .path_len = @intCast(copy_len),
+                        .start_time_ns = start_time_ns,
+                        .request_number = request_number,
+                    };
+                    if (copy_len > 0) {
+                        @memcpy(slot.path_buf[0..copy_len], path[0..copy_len]);
+                    }
+                    return;
+                }
+            }
+
+            fn popStream(self: *@This(), stream_id: u32) ?H2StreamSlot {
+                assert(stream_id > 0);
+
+                for (self.stream_slots[0..]) |*slot| {
+                    if (!slot.used) continue;
+                    if (slot.stream_id != stream_id) continue;
+                    const stream_slot = slot.*;
+                    slot.* = .{};
+                    return stream_slot;
+                }
+                return null;
+            }
+
+            fn nextRequestNumber(self: *@This()) u32 {
+                const request_number = self.next_request_number;
+                if (self.next_request_number < std.math.maxInt(u32)) {
+                    self.next_request_number += 1;
+                }
+                return request_number;
+            }
+
+            fn saturatingI64(value: u64) i64 {
+                const i64_max_as_u64: u64 = @intCast(std.math.maxInt(i64));
+                if (value >= i64_max_as_u64) return std.math.maxInt(i64);
+                return @intCast(value);
+            }
+        };
+
+        const GrpcH2cBridgeHandler = struct {
+            const pending_reset_capacity: usize = @intCast(config.H2_MAX_CONCURRENT_STREAMS);
+
+            const PendingReset = struct {
+                used: bool = false,
+                downstream_stream_id: u32 = 0,
+                error_code_raw: u32 = @intFromEnum(serval_h2.ErrorCode.cancel),
+            };
+
+            inner: *Handler,
+            io: Io,
+            bridge: serval_proxy.H2StreamBridge,
+            connection_ctx: *Context,
+            response_status: u16 = 200,
+            response_bytes: u64 = 0,
+            connection_reused: bool = false,
+            dns_duration_ns: u64 = 0,
+            tcp_connect_duration_ns: u64 = 0,
+            upstream_local_port: u16 = 0,
+            pending_resets: [pending_reset_capacity]PendingReset = [_]PendingReset{.{}} ** pending_reset_capacity,
+
+            const BridgeError = error{
+                InvalidGrpcRequest,
+                UpstreamRejected,
+                UnsupportedProtocol,
+                MissingBinding,
+                UpstreamConnectionClosing,
+                FrameLimitExceeded,
+                MissingGrpcStatus,
+                InvalidGrpcStatus,
+            } || serval_proxy.H2StreamBridgeError || h2_server.Error;
+
+            fn init(
+                inner: *Handler,
+                io: Io,
+                bridge_client: *serval_client.Client,
+                bridge_sessions: *serval_client.H2UpstreamSessionPool,
+                connection_ctx: *Context,
+            ) @This() {
+                assert(@intFromPtr(inner) != 0);
+                assert(@intFromPtr(bridge_client) != 0);
+                assert(@intFromPtr(bridge_sessions) != 0);
+                assert(@intFromPtr(connection_ctx) != 0);
+
+                return .{
+                    .inner = inner,
+                    .io = io,
+                    .bridge = serval_proxy.H2StreamBridge.init(bridge_client, bridge_sessions),
+                    .connection_ctx = connection_ctx,
+                };
+            }
+
+            fn deinit(self: *@This()) void {
+                assert(@intFromPtr(self) != 0);
+                self.bridge.deinit();
+            }
+
+            fn notePendingReset(self: *@This(), downstream_stream_id: u32, error_code_raw: u32) void {
+                assert(@intFromPtr(self) != 0);
+                assert(downstream_stream_id > 0);
+
+                var first_free_index: ?usize = null;
+                var index: usize = 0;
+                while (index < self.pending_resets.len) : (index += 1) {
+                    const entry = self.pending_resets[index];
+                    if (!entry.used) {
+                        if (first_free_index == null) first_free_index = index;
+                        continue;
+                    }
+                    if (entry.downstream_stream_id == downstream_stream_id) {
+                        self.pending_resets[index].error_code_raw = error_code_raw;
+                        return;
+                    }
+                }
+
+                if (first_free_index) |slot_index| {
+                    self.pending_resets[slot_index] = .{
+                        .used = true,
+                        .downstream_stream_id = downstream_stream_id,
+                        .error_code_raw = error_code_raw,
+                    };
+                    return;
+                }
+
+                const capacity_u32: u32 = @intCast(self.pending_resets.len);
+                assert(capacity_u32 > 0);
+                const fallback_slot: usize = @intCast(downstream_stream_id % capacity_u32);
+                self.pending_resets[fallback_slot] = .{
+                    .used = true,
+                    .downstream_stream_id = downstream_stream_id,
+                    .error_code_raw = error_code_raw,
+                };
+            }
+
+            fn takePendingReset(self: *@This(), downstream_stream_id: u32) ?u32 {
+                assert(@intFromPtr(self) != 0);
+                assert(downstream_stream_id > 0);
+
+                var index: usize = 0;
+                while (index < self.pending_resets.len) : (index += 1) {
+                    const entry = self.pending_resets[index];
+                    if (!entry.used) continue;
+                    if (entry.downstream_stream_id != downstream_stream_id) continue;
+
+                    self.pending_resets[index] = .{};
+                    return entry.error_code_raw;
+                }
+
+                return null;
+            }
+
+            pub fn handleH2Headers(
+                self: *@This(),
+                stream_id: u32,
+                request: *const Request,
+                end_stream: bool,
+                writer: *h2_server.ResponseWriter,
+            ) BridgeError!void {
+                assert(@intFromPtr(self) != 0);
+                assert(stream_id > 0);
+
+                if (self.takePendingReset(stream_id)) |error_code_raw| {
+                    _ = error_code_raw;
+                    return error.UpstreamConnectionClosing;
+                }
+
+                serval_grpc.validateRequest(request) catch {
+                    return error.InvalidGrpcRequest;
+                };
+
+                const upstream = try self.selectUpstream(request);
+                if (!supportsGrpcBridgeUpstream(upstream)) return error.UnsupportedProtocol;
+
+                const opened = try self.bridge.openDownstreamStream(
+                    self.io,
+                    upstream,
+                    stream_id,
+                    request,
+                    null,
+                    end_stream,
+                );
+                self.connection_reused = self.connection_reused or opened.connect.reused;
+                self.dns_duration_ns +|= opened.connect.dns_duration_ns;
+                self.tcp_connect_duration_ns +|= opened.connect.tcp_connect_duration_ns;
+                if (self.upstream_local_port == 0 and opened.connect.local_port > 0) {
+                    self.upstream_local_port = opened.connect.local_port;
+                }
+
+                if (end_stream) {
+                    try self.drainUntilTargetCompletes(stream_id, writer);
+                }
+            }
+
+            pub fn handleH2Data(
+                self: *@This(),
+                stream_id: u32,
+                payload: []const u8,
+                end_stream: bool,
+                writer: *h2_server.ResponseWriter,
+            ) BridgeError!void {
+                assert(@intFromPtr(self) != 0);
+                assert(stream_id > 0);
+
+                if (self.takePendingReset(stream_id)) |error_code_raw| {
+                    _ = error_code_raw;
+                    return error.UpstreamConnectionClosing;
+                }
+
+                _ = self.bridge.bindingForDownstream(stream_id) orelse return error.MissingBinding;
+                try self.bridge.sendDownstreamData(stream_id, payload, end_stream);
+
+                if (end_stream) {
+                    try self.drainUntilTargetCompletes(stream_id, writer);
+                }
+            }
+
+            pub fn handleH2StreamReset(self: *@This(), stream_id: u32, error_code_raw: u32) void {
+                assert(@intFromPtr(self) != 0);
+                if (stream_id == 0) return;
+
+                _ = self.takePendingReset(stream_id);
+                self.bridge.cancelDownstreamStream(stream_id, error_code_raw) catch |err| switch (err) {
+                    error.BindingNotFound,
+                    error.StreamNotFound,
+                    error.SessionNotFound,
+                    => {},
+                    else => {},
+                };
+            }
+
+            fn selectUpstream(self: *@This(), request: *const Request) BridgeError!types.Upstream {
+                assert(@intFromPtr(self) != 0);
+                assert(@intFromPtr(request) != 0);
+
+                var stream_ctx = Context.init();
+                stream_ctx.connection_id = self.connection_ctx.connection_id;
+                stream_ctx.connection_start_ns = self.connection_ctx.connection_start_ns;
+                stream_ctx.client_addr = self.connection_ctx.client_addr;
+                stream_ctx.client_port = self.connection_ctx.client_port;
+                stream_ctx.start_time_ns = self.connection_ctx.start_time_ns;
+
+                const action_result = self.inner.selectUpstream(&stream_ctx, request);
+                if (comptime hooks.hasUpstreamAction(Handler)) {
+                    return switch (action_result) {
+                        .forward => |upstream| upstream,
+                        .reject => error.UpstreamRejected,
+                    };
+                }
+
+                return action_result;
+            }
+
+            fn drainUntilTargetCompletes(
+                self: *@This(),
+                target_downstream_stream_id: u32,
+                writer_template: *h2_server.ResponseWriter,
+            ) BridgeError!void {
+                assert(@intFromPtr(self) != 0);
+                assert(target_downstream_stream_id > 0);
+
+                var actions: u32 = 0;
+                while (actions < config.H2_CLIENT_MAX_FRAME_COUNT) : (actions += 1) {
+                    const action = self.bridge.receiveForDownstream(target_downstream_stream_id) catch |err| switch (err) {
+                        error.ConnectionClosed,
+                        error.ConnectionClosing,
+                        error.ReadFailed,
+                        error.WriteFailed,
+                        => return error.UpstreamConnectionClosing,
+                        else => return err,
+                    };
+                    switch (action) {
+                        .none => continue,
+                        .response_headers => |headers| {
+                            try self.emitResponseHeaders(headers, writer_template);
+                            if (headers.downstream_stream_id == target_downstream_stream_id and headers.end_stream) return;
+                        },
+                        .response_data => |data| {
+                            try self.emitResponseData(data, writer_template);
+                            if (data.downstream_stream_id == target_downstream_stream_id and data.end_stream) return;
+                        },
+                        .response_trailers => |trailers| {
+                            try self.emitResponseTrailers(trailers, writer_template);
+                            if (trailers.downstream_stream_id == target_downstream_stream_id) return;
+                        },
+                        .stream_reset => |reset| {
+                            if (reset.downstream_stream_id == target_downstream_stream_id) {
+                                return error.UpstreamConnectionClosing;
+                            }
+                            self.notePendingReset(reset.downstream_stream_id, reset.error_code_raw);
+                            continue;
+                        },
+                        .connection_close => |connection_close| {
+                            const binding = self.bridge.bindingForDownstream(target_downstream_stream_id) orelse return error.UpstreamConnectionClosing;
+                            if (goawayAffectsActiveTargetStream(binding.upstream_stream_id, connection_close.goaway)) {
+                                return error.UpstreamConnectionClosing;
+                            }
+                            continue;
+                        },
+                    }
+                }
+
+                return error.FrameLimitExceeded;
+            }
+
+            fn emitResponseHeaders(
+                self: *@This(),
+                action: serval_proxy.h2.bridge.ResponseHeadersAction,
+                writer_template: *h2_server.ResponseWriter,
+            ) BridgeError!void {
+                assert(@intFromPtr(self) != 0);
+                assert(action.downstream_stream_id > 0);
+
+                if (action.end_stream) {
+                    try mapGrpcStatusValidationError(serval_grpc.requireGrpcStatus(&action.response.headers));
+                }
+
+                var writer = streamWriterFor(writer_template, action.downstream_stream_id);
+                var headers_buf: [config.MAX_HEADERS]h2_server.Header = undefined;
+                const source_headers = action.response.headers.headers[0..action.response.headers.count];
+                const h2_headers = copyHeaders(source_headers, &headers_buf);
+                try writer.sendHeaders(action.response.status, h2_headers, action.end_stream);
+                self.response_status = action.response.status;
+            }
+
+            fn emitResponseData(
+                self: *@This(),
+                action: serval_proxy.h2.bridge.ResponseDataAction,
+                writer_template: *h2_server.ResponseWriter,
+            ) BridgeError!void {
+                assert(@intFromPtr(self) != 0);
+                assert(action.downstream_stream_id > 0);
+
+                var writer = streamWriterFor(writer_template, action.downstream_stream_id);
+                try writer.sendData(action.payload, action.end_stream);
+                self.response_bytes +|= action.payload.len;
+            }
+
+            fn emitResponseTrailers(
+                self: *@This(),
+                action: serval_proxy.h2.bridge.ResponseTrailersAction,
+                writer_template: *h2_server.ResponseWriter,
+            ) BridgeError!void {
+                assert(@intFromPtr(self) != 0);
+                assert(action.downstream_stream_id > 0);
+
+                try mapGrpcStatusValidationError(serval_grpc.requireGrpcStatus(&action.trailers));
+
+                var writer = streamWriterFor(writer_template, action.downstream_stream_id);
+                var trailers_buf: [config.MAX_HEADERS]h2_server.Header = undefined;
+                const source_trailers = action.trailers.headers[0..action.trailers.count];
+                const h2_trailers = copyHeaders(source_trailers, &trailers_buf);
+                try writer.sendTrailers(h2_trailers);
+            }
+
+            fn mapGrpcStatusValidationError(result: serval_grpc.MetadataError!void) BridgeError!void {
+                result catch |err| switch (err) {
+                    error.MissingGrpcStatus => return error.MissingGrpcStatus,
+                    error.InvalidGrpcStatus => return error.InvalidGrpcStatus,
+                    else => unreachable,
+                };
+            }
+
+            fn supportsGrpcBridgeUpstream(upstream: types.Upstream) bool {
+                const supports_h2c_plain = upstream.http_protocol == .h2c and !upstream.tls;
+                const supports_h2_tls = upstream.http_protocol == .h2 and upstream.tls;
+                return supports_h2c_plain or supports_h2_tls;
+            }
+
+            fn goawayAffectsActiveTargetStream(upstream_stream_id: u32, goaway: serval_h2.GoAway) bool {
+                assert(upstream_stream_id > 0);
+                assert(goaway.last_stream_id <= 0x7fff_ffff);
+
+                if (goaway.error_code_raw != @intFromEnum(serval_h2.ErrorCode.no_error)) return true;
+                return upstream_stream_id > goaway.last_stream_id;
+            }
+
+            fn streamWriterFor(template: *h2_server.ResponseWriter, stream_id: u32) h2_server.ResponseWriter {
+                assert(@intFromPtr(template) != 0);
+                assert(stream_id > 0);
+
+                var writer = template.*;
+                writer.stream_id = stream_id;
+                return writer;
+            }
+
+            fn copyHeaders(
+                source: []const types.Header,
+                out: *[config.MAX_HEADERS]h2_server.Header,
+            ) []const h2_server.Header {
+                assert(source.len <= config.MAX_HEADERS);
+
+                var index: usize = 0;
+                while (index < source.len) : (index += 1) {
+                    out[index] = .{
+                        .name = source[index].name,
+                        .value = source[index].value,
+                    };
+                }
+
+                return out[0..source.len];
+            }
+        };
+
+        fn forwardGrpcH2cWithBridge(
+            handler: *Handler,
+            forwarder: *forwarder_mod.Forwarder(Pool, Tracer),
+            io: Io,
+            stream: Io.net.Stream,
+            ctx: *Context,
+            initial_client_bytes: []const u8,
+            connection_id: u64,
+            local_settings_already_sent: bool,
+        ) forwarder_mod.ForwardError!forwarder_mod.ForwardResult {
+            assert(@intFromPtr(handler) != 0);
+            assert(@intFromPtr(forwarder) != 0);
+            assert(@intFromPtr(ctx) != 0);
+            assert(initial_client_bytes.len > 0);
+
+            var bridge_client = serval_client.Client.init(
+                std.heap.page_allocator,
+                &forwarder.dns_resolver,
+                forwarder.client_ctx,
+                forwarder.verify_upstream_tls,
+            );
+            var bridge_sessions = serval_client.H2UpstreamSessionPool.init();
+            defer bridge_sessions.deinit();
+
+            var bridge_handler = GrpcH2cBridgeHandler.init(
+                handler,
+                io,
+                &bridge_client,
+                &bridge_sessions,
+                ctx,
+            );
+            defer bridge_handler.deinit();
+
+            const start_ns = time.monotonicNanos();
+            h2_server.servePlainConnectionWithInitialBytesOptions(
+                GrpcH2cBridgeHandler,
+                &bridge_handler,
+                @intCast(stream.socket.handle),
+                connection_id,
+                initial_client_bytes,
+                .{ .local_settings_already_sent = local_settings_already_sent },
+            ) catch |err| switch (err) {
+                error.ConnectionClosed => {},
+                error.ReadFailed => return forwarder_mod.ForwardError.RecvFailed,
+                error.WriteFailed => return forwarder_mod.ForwardError.SendFailed,
+                else => return forwarder_mod.ForwardError.InvalidResponse,
+            };
+            const end_ns = time.monotonicNanos();
+
+            return .{
+                .status = bridge_handler.response_status,
+                .response_bytes = bridge_handler.response_bytes,
+                .connection_reused = bridge_handler.connection_reused,
+                .dns_duration_ns = bridge_handler.dns_duration_ns,
+                .tcp_connect_duration_ns = bridge_handler.tcp_connect_duration_ns,
+                .send_duration_ns = 0,
+                .recv_duration_ns = time.elapsedNanos(start_ns, end_ns),
+                .pool_wait_ns = 0,
+                .upstream_local_port = bridge_handler.upstream_local_port,
+            };
+        }
+
+        fn forwardGrpcH2cUpgradeWithBridge(
+            handler: *Handler,
+            forwarder: *forwarder_mod.Forwarder(Pool, Tracer),
+            io: Io,
+            maybe_tls: ?*const TLSStream,
+            stream: Io.net.Stream,
+            parser: *const Parser,
+            recv_buf: []const u8,
+            buffer_offset: usize,
+            buffer_len: usize,
+            settings_payload: []const u8,
+            ctx: *Context,
+            connection_id: u64,
+        ) forwarder_mod.ForwardError!forwarder_mod.ForwardResult {
+            assert(@intFromPtr(handler) != 0);
+            assert(@intFromPtr(forwarder) != 0);
+            assert(@intFromPtr(parser) != 0);
+            assert(@intFromPtr(ctx) != 0);
+            assert(buffer_offset <= buffer_len);
+            assert(settings_payload.len <= config.H2_MAX_FRAME_SIZE_BYTES);
+
+            if (maybe_tls != null) return forwarder_mod.ForwardError.UnsupportedProtocol;
+
+            const body_info = buildBodyInfo(parser, recv_buf, buffer_offset, buffer_len);
+            const content_length = body_info.getContentLength() orelse 0;
+            assert(body_info.bytes_already_read <= content_length);
+            const remaining_body_bytes = content_length - body_info.bytes_already_read;
+
+            const initial_h2_offset = buffer_offset + parser.headers_end + @as(usize, @intCast(body_info.bytes_already_read));
+            assert(initial_h2_offset <= buffer_len);
+            const initial_client_h2_bytes = recv_buf[initial_h2_offset..buffer_len];
+
+            var io_mut = io;
+            connectionWrite(maybe_tls, &io_mut, stream, serval_h2.h2c_upgrade_response) catch {
+                return forwarder_mod.ForwardError.SendFailed;
+            };
+
+            var bridge_client = serval_client.Client.init(
+                std.heap.page_allocator,
+                &forwarder.dns_resolver,
+                forwarder.client_ctx,
+                forwarder.verify_upstream_tls,
+            );
+            var bridge_sessions = serval_client.H2UpstreamSessionPool.init();
+            defer bridge_sessions.deinit();
+
+            var bridge_handler = GrpcH2cBridgeHandler.init(
+                handler,
+                io,
+                &bridge_client,
+                &bridge_sessions,
+                ctx,
+            );
+            defer bridge_handler.deinit();
+
+            const start_ns = time.monotonicNanos();
+            h2_server.serveUpgradedConnection(
+                GrpcH2cBridgeHandler,
+                &bridge_handler,
+                @intCast(stream.socket.handle),
+                connection_id,
+                &parser.request,
+                settings_payload,
+                body_info.initial_body,
+                remaining_body_bytes,
+                initial_client_h2_bytes,
+            ) catch |err| switch (err) {
+                error.ConnectionClosed => {},
+                error.ReadFailed => return forwarder_mod.ForwardError.RecvFailed,
+                error.WriteFailed => return forwarder_mod.ForwardError.SendFailed,
+                else => return forwarder_mod.ForwardError.InvalidResponse,
+            };
+            const end_ns = time.monotonicNanos();
+
+            return .{
+                .status = 101,
+                .response_bytes = @as(u64, @intCast(serval_h2.h2c_upgrade_response.len)) + bridge_handler.response_bytes,
+                .connection_reused = bridge_handler.connection_reused,
+                .dns_duration_ns = bridge_handler.dns_duration_ns,
+                .tcp_connect_duration_ns = bridge_handler.tcp_connect_duration_ns,
+                .send_duration_ns = 0,
+                .recv_duration_ns = time.elapsedNanos(start_ns, end_ns),
+                .pool_wait_ns = 0,
+                .upstream_local_port = bridge_handler.upstream_local_port,
+            };
+        }
+
+        fn tryHandleTerminatedH2PriorKnowledge(
+            handler: *Handler,
+            metrics: *Metrics,
+            tracer: *Tracer,
+            ctx: *const Context,
+            maybe_tls: ?*const TLSStream,
+            stream: Io.net.Stream,
+            recv_buf: []const u8,
+            buffer_len: usize,
+            connection_id: u64,
+        ) bool {
+            assert(@intFromPtr(handler) != 0);
+            assert(@intFromPtr(metrics) != 0);
+            assert(@intFromPtr(tracer) != 0);
+            assert(@intFromPtr(ctx) != 0);
+            assert(recv_buf.len >= H2C_INITIAL_READ_BUFFER_SIZE_BYTES);
+
+            if (maybe_tls != null) return false;
+            if (buffer_len == 0) return false;
+            if (comptime !@hasDecl(Handler, "handleH2Headers")) return false;
+            if (comptime !@hasDecl(Handler, "handleH2Data")) return false;
+            if (!serval_h2.looksLikeClientConnectionPrefacePrefix(recv_buf[0..buffer_len])) return false;
+
+            log.debug("server: conn={d} dispatching prior-knowledge h2c to terminated h2 driver", .{connection_id});
+
+            var telemetry_handler = TerminatedH2TelemetryAdapter.init(
+                handler,
+                metrics,
+                tracer,
+                ctx,
+                null,
+                true,
+            );
+            h2_server.servePlainConnectionWithInitialBytes(
+                @TypeOf(telemetry_handler),
+                &telemetry_handler,
+                @intCast(stream.socket.handle),
+                connection_id,
+                recv_buf[0..buffer_len],
+            ) catch |err| switch (err) {
+                error.ConnectionClosed => {},
+                else => log.warn("server: conn={d} terminated h2 driver failed: {s}", .{ connection_id, @errorName(err) }),
+            };
+            return true;
+        }
+
+        fn tryHandleTerminatedH2Upgrade(
+            handler: *Handler,
+            metrics: *Metrics,
+            tracer: *Tracer,
+            maybe_tls: ?*const TLSStream,
+            io: *Io,
+            stream: Io.net.Stream,
+            ctx: *Context,
+            parser: *const Parser,
+            recv_buf: []const u8,
+            buffer_offset: usize,
+            buffer_len: usize,
+            connection_id: u64,
+            settings_payload: []const u8,
+            span_handle: SpanHandle,
+        ) bool {
+            assert(@intFromPtr(handler) != 0);
+            assert(@intFromPtr(metrics) != 0);
+            assert(@intFromPtr(tracer) != 0);
+            assert(@intFromPtr(ctx) != 0);
+            assert(@intFromPtr(parser) != 0);
+            assert(buffer_offset <= buffer_len);
+            assert(settings_payload.len <= config.H2_MAX_FRAME_SIZE_BYTES);
+
+            if (maybe_tls != null) return false;
+            if (comptime !@hasDecl(Handler, "handleH2Headers")) return false;
+            if (comptime !@hasDecl(Handler, "handleH2Data")) return false;
+
+            const body_info = buildBodyInfo(parser, recv_buf, buffer_offset, buffer_len);
+            const content_length = body_info.getContentLength() orelse 0;
+            assert(body_info.bytes_already_read <= content_length);
+            const remaining_body_bytes = content_length - body_info.bytes_already_read;
+
+            const initial_h2_offset = buffer_offset + parser.headers_end + @as(usize, @intCast(body_info.bytes_already_read));
+            assert(initial_h2_offset <= buffer_len);
+            const initial_client_h2_bytes = recv_buf[initial_h2_offset..buffer_len];
+
+            connectionWrite(maybe_tls, io, stream, serval_h2.h2c_upgrade_response) catch |err| {
+                log.warn("server: conn={d} failed to send terminated h2 upgrade response: {s}", .{ connection_id, @errorName(err) });
+                const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
+                ctx.duration_ns = duration_ns;
+                handleTerminatedH2UpgradeCompleteImpl(
+                    handler,
+                    metrics,
+                    ctx,
+                    &parser.request,
+                    500,
+                    0,
+                    duration_ns,
+                    @errorName(err),
+                );
+                tracer.setIntAttribute(span_handle, "http.response.status_code", 500);
+                tracer.endSpan(span_handle, @errorName(err));
+                return true;
+            };
+
+            var h2_error_name: ?[]const u8 = null;
+            const parent_span: ?SpanHandle = if (span_handle.isValid()) span_handle else null;
+            var telemetry_handler = TerminatedH2TelemetryAdapter.init(
+                handler,
+                metrics,
+                tracer,
+                ctx,
+                parent_span,
+                true,
+            );
+            h2_server.serveUpgradedConnection(
+                @TypeOf(telemetry_handler),
+                &telemetry_handler,
+                @intCast(stream.socket.handle),
+                connection_id,
+                &parser.request,
+                settings_payload,
+                body_info.initial_body,
+                remaining_body_bytes,
+                initial_client_h2_bytes,
+            ) catch |err| switch (err) {
+                error.ConnectionClosed => {},
+                else => {
+                    h2_error_name = @errorName(err);
+                    log.warn("server: conn={d} terminated h2 upgrade driver failed: {s}", .{ connection_id, @errorName(err) });
+                },
+            };
+
+            const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
+            ctx.duration_ns = duration_ns;
+            handleTerminatedH2UpgradeCompleteImpl(
+                handler,
+                metrics,
+                ctx,
+                &parser.request,
+                101,
+                serval_h2.h2c_upgrade_response.len,
+                duration_ns,
+                h2_error_name,
+            );
+            tracer.setIntAttribute(span_handle, "http.response.status_code", 101);
+            tracer.endSpan(span_handle, h2_error_name);
+            return true;
+        }
+
+        fn tryHandleGrpcH2cPriorKnowledge(
+            handler: *Handler,
+            forwarder: *forwarder_mod.Forwarder(Pool, Tracer),
+            metrics: *Metrics,
+            tracer: *Tracer,
+            maybe_tls: ?*TLSStream,
+            io: *Io,
+            stream: Io.net.Stream,
+            ctx: *Context,
+            recv_buf: []u8,
+            buffer_len: *usize,
+            connection_id: u64,
+        ) bool {
+            assert(recv_buf.len >= H2C_INITIAL_READ_BUFFER_SIZE_BYTES);
+
+            if (buffer_len.* == 0) return false;
+            if (!serval_h2.looksLikeClientConnectionPrefacePrefix(recv_buf[0..buffer_len.*])) return false;
+
+            log.debug(
+                "server: conn={d} detected grpc prior-knowledge preface bytes={d} tls_frontend={}",
+                .{ connection_id, buffer_len.*, maybe_tls != null },
+            );
+
+            const parse_start_ns = realtimeNanos();
+            var parsed: serval_h2.InitialRequest = undefined;
+            var local_settings_already_sent = false;
+            while (true) {
+                parsed = serval_h2.parseInitialRequest(recv_buf[0..buffer_len.*]) catch |err| switch (err) {
+                    error.NeedMoreData => {
+                        if (!local_settings_already_sent and
+                            buffer_len.* >= serval_h2.client_connection_preface.len and
+                            serval_h2.looksLikeClientConnectionPreface(recv_buf[0..buffer_len.*]))
+                        {
+                            if (!sendH2InitialSettings(maybe_tls, io, stream)) {
+                                sendH2GoAway(maybe_tls, io, stream, 0, H2_ERROR_INTERNAL);
+                                return true;
+                            }
+                            local_settings_already_sent = true;
+                        }
+
+                        if (buffer_len.* >= recv_buf.len) {
+                            sendH2GoAway(maybe_tls, io, stream, 0, H2_ERROR_PROTOCOL);
+                            return true;
+                        }
+                        const n = connectionRead(maybe_tls, stream, recv_buf[buffer_len.*..], connection_id) orelse return true;
+                        buffer_len.* += n;
+                        continue;
+                    },
+                    else => {
+                        log.warn("server: conn={d} invalid h2c preface/request: {s}", .{ connection_id, @errorName(err) });
+                        sendH2GoAway(maybe_tls, io, stream, 0, H2_ERROR_PROTOCOL);
+                        return true;
+                    },
+                };
+                break;
+            }
+            ctx.parse_duration_ns = @intCast(@max(0, realtimeNanos() - parse_start_ns));
+
+            serval_grpc.validateRequest(&parsed.request) catch |err| {
+                log.warn("server: conn={d} invalid grpc request: {s}", .{ connection_id, @errorName(err) });
+                sendH2GoAway(maybe_tls, io, stream, parsed.stream_id, H2_ERROR_PROTOCOL);
+                return true;
+            };
+
+            metrics.requestStart();
+            ctx.bytes_received = @intCast(buffer_len.*);
+
+            var span_name_buf: [config.OTEL_MAX_NAME_LEN]u8 = std.mem.zeroes([config.OTEL_MAX_NAME_LEN]u8);
+            const span_name = buildSpanName(parsed.request.method, parsed.request.path, &span_name_buf);
+            const span_handle = tracer.startSpan(span_name, null);
+            ctx.span_handle = span_handle;
+            tracer.setStringAttribute(span_handle, "http.request.method", @tagName(parsed.request.method));
+            tracer.setStringAttribute(span_handle, "url.path", parsed.request.path);
+
+            const action_result = handler.selectUpstream(ctx, &parsed.request);
+            const upstream: types.Upstream = blk: {
+                if (comptime hooks.hasUpstreamAction(Handler)) {
+                    switch (action_result) {
+                        .forward => |up| break :blk up,
+                        .reject => |rej| {
+                            const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
+                            metrics.requestEnd(rej.status, duration_ns);
+                            sendH2GoAway(maybe_tls, io, stream, parsed.stream_id, H2_ERROR_PROTOCOL);
+                            tracer.setIntAttribute(span_handle, "http.response.status_code", @intCast(rej.status));
+                            tracer.endSpan(span_handle, "h2c_reject");
+                            return true;
+                        },
+                    }
+                } else {
+                    break :blk action_result;
+                }
+            };
+            ctx.upstream = upstream;
+
+            const supports_h2c_plain = upstream.http_protocol == .h2c and !upstream.tls;
+            const supports_h2_tls = upstream.http_protocol == .h2 and upstream.tls;
+
+            // Use the stream bridge only for plaintext h2c upstreams for now.
+            // TLS+h2 upstreams use raw tunnel forwarding to avoid intermittent
+            // cross-session bridge stalls observed under integration churn.
+            const use_stream_bridge = maybe_tls == null and supports_h2c_plain;
+
+            if (!use_stream_bridge and maybe_tls == null and supports_h2_tls) {
+                log.debug(
+                    "server: conn={d} grpc prior-knowledge using raw tunnel for h2+tls upstream idx={d}",
+                    .{ connection_id, upstream.idx },
+                );
+            }
+
+            const forward_result = if (use_stream_bridge)
+                forwardGrpcH2cWithBridge(
+                    handler,
+                    forwarder,
+                    io.*,
+                    stream,
+                    ctx,
+                    recv_buf[0..buffer_len.*],
+                    connection_id,
+                    local_settings_already_sent,
+                )
+            else
+                forwarder.forwardGrpcH2c(
+                    io.*,
+                    stream,
+                    maybe_tls,
+                    &parsed.request,
+                    &upstream,
+                    recv_buf[0..buffer_len.*],
+                    span_handle,
+                );
+            const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
+            ctx.duration_ns = duration_ns;
+
+            if (forward_result) |result| {
+                handleForwardSuccessImpl(handler, metrics, ctx, &parsed.request, result, duration_ns, false);
+                tracer.setIntAttribute(span_handle, "http.response.status_code", @intCast(result.status));
+                tracer.endSpan(span_handle, null);
+            } else |err| {
+                if (comptime hooks.hasHook(Handler, "onError")) {
+                    const error_ctx = errors.ErrorContext{
+                        .err = forwardErrorToRequestError(err),
+                        .phase = forwardErrorToPhase(err),
+                        .upstream = upstream,
+                        .is_retry = false,
+                    };
+                    handler.onError(ctx, error_ctx);
+                }
+                metrics.requestEnd(502, duration_ns);
+                sendH2GoAway(maybe_tls, io, stream, parsed.stream_id, H2_ERROR_INTERNAL);
+                tracer.setIntAttribute(span_handle, "http.response.status_code", 502);
+                tracer.endSpan(span_handle, @errorName(err));
+            }
+            return true;
+        }
+
         /// Handle HTTP/1.1 connection with keep-alive and pipelining support.
         /// Processes multiple requests until: client sends Connection: close,
         /// max requests reached, or error occurs.
@@ -647,7 +1861,7 @@ pub fn Server(
 
             // Request processing state
             var parser = Parser.init();
-            var recv_buf: [REQUEST_BUFFER_SIZE_BYTES]u8 = std.mem.zeroes([REQUEST_BUFFER_SIZE_BYTES]u8);
+            var recv_buf: [CONNECTION_RECV_BUFFER_SIZE_BYTES]u8 = std.mem.zeroes([CONNECTION_RECV_BUFFER_SIZE_BYTES]u8);
             var request_count: u32 = 0;
             var buffer_offset: usize = 0;
             var buffer_len: usize = 0;
@@ -685,8 +1899,34 @@ pub fn Server(
                     buffer_offset = 0;
                 }
 
+                if (tryHandleTerminatedH2PriorKnowledge(
+                    handler,
+                    metrics,
+                    tracer,
+                    &ctx,
+                    maybe_tls_ptr,
+                    stream,
+                    recv_buf[0..],
+                    buffer_len,
+                    connection_id,
+                )) return;
+
+                if (tryHandleGrpcH2cPriorKnowledge(
+                    handler,
+                    forwarder,
+                    metrics,
+                    tracer,
+                    maybe_tls_ptr,
+                    &io_mut,
+                    stream,
+                    &ctx,
+                    recv_buf[0..],
+                    &buffer_len,
+                    connection_id,
+                )) return;
+
                 // Accumulate reads until complete headers received
-                if (!accumulateHeaders(maybe_tls_ptr, &io_mut, stream, &recv_buf, buffer_offset, &buffer_len, connection_id)) return;
+                if (!accumulateHeaders(maybe_tls_ptr, &io_mut, stream, recv_buf[0..], buffer_offset, &buffer_len, connection_id)) return;
                 const read_elapsed_ns = realtimeNanos() - read_start_ns;
                 const read_duration_us: u64 = if (read_elapsed_ns >= 0) @intCast(@divFloor(read_elapsed_ns, 1000)) else 0;
                 log.debug("server: conn={d} received bytes={d} read_us={d}", .{ connection_id, buffer_len - buffer_offset, read_duration_us });
@@ -696,7 +1936,8 @@ pub fn Server(
 
                 // Parse headers
                 const parse_start = realtimeNanos();
-                parser.parseHeaders(recv_buf[buffer_offset..buffer_len]) catch {
+                const header_len = std.mem.indexOf(u8, recv_buf[buffer_offset..buffer_len], "\r\n\r\n").? + 4;
+                parser.parseHeaders(recv_buf[buffer_offset .. buffer_offset + header_len]) catch {
                     sendErrorResponseTls(maybe_tls_ptr, &io_mut, stream, 400, "Bad Request");
                     metrics.requestEnd(400, @intCast(realtimeNanos() - ctx.start_time_ns));
                     return;
@@ -720,6 +1961,7 @@ pub fn Server(
                 }
 
                 const websocket_candidate = serval_websocket.looksLikeWebSocketUpgradeRequest(&parser.request);
+                const h2c_upgrade_candidate = serval_h2.looksLikeUpgradeRequest(&parser.request);
 
                 // Start a tracing span for this request (child of TLS span if present)
                 var span_name_buf: [config.OTEL_MAX_NAME_LEN]u8 = std.mem.zeroes([config.OTEL_MAX_NAME_LEN]u8);
@@ -834,7 +2076,9 @@ pub fn Server(
                                     const maybe_len = handler.nextChunk(&ctx, response_buf) catch |err| {
                                         // S6: Log error before terminating stream
                                         log.err("streaming response failed at chunk {d}: {s}", .{ chunk_count, @errorName(err) });
-                                        sendFinalChunk(&tls_writer) catch {};
+                                        sendFinalChunk(&tls_writer) catch |final_err| {
+                                            log.warn("streaming response: failed to send final chunk after chunk error: {s}", .{@errorName(final_err)});
+                                        };
                                         stream_error = true;
                                         break;
                                     };
@@ -850,7 +2094,10 @@ pub fn Server(
                                         }
                                     } else {
                                         // null = done
-                                        sendFinalChunk(&tls_writer) catch {};
+                                        sendFinalChunk(&tls_writer) catch |final_err| {
+                                            log.err("streaming response: failed to send final chunk: {s}", .{@errorName(final_err)});
+                                            stream_error = true;
+                                        };
                                         break;
                                     }
                                 }
@@ -858,7 +2105,10 @@ pub fn Server(
                                 // TigerStyle: if we hit max_chunk_count, log and terminate cleanly
                                 if (chunk_count >= max_chunk_count) {
                                     log.warn("streaming response hit max chunk count: {d}", .{max_chunk_count});
-                                    sendFinalChunk(&tls_writer) catch {};
+                                    sendFinalChunk(&tls_writer) catch |final_err| {
+                                        log.warn("streaming response: failed to send final chunk at chunk limit: {s}", .{@errorName(final_err)});
+                                        stream_error = true;
+                                    };
                                 }
 
                                 const final_status: u16 = if (stream_error) 500 else stream_resp.status;
@@ -875,6 +2125,61 @@ pub fn Server(
                             }
                         },
                     }
+                }
+
+                var h2c_upgrade_settings_buf: [config.H2_MAX_FRAME_SIZE_BYTES]u8 = undefined;
+                const h2c_upgrade_settings: ?[]const u8 = if (h2c_upgrade_candidate) blk: {
+                    if (maybe_tls_ptr != null) {
+                        sendErrorResponseTls(maybe_tls_ptr, &io_mut, stream, 400, "Bad h2c Upgrade Request");
+                        const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
+                        metrics.requestEnd(400, duration_ns);
+                        tracer.setIntAttribute(span_handle, "http.response.status_code", 400);
+                        tracer.endSpan(span_handle, "TlsH2cUpgradeNotAllowed");
+                        return;
+                    }
+
+                    const settings_payload = serval_h2.validateUpgradeRequest(
+                        &parser.request,
+                        parser.body_framing,
+                        &h2c_upgrade_settings_buf,
+                    ) catch |err| {
+                        sendErrorResponseTls(maybe_tls_ptr, &io_mut, stream, 400, "Bad h2c Upgrade Request");
+                        const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
+                        metrics.requestEnd(400, duration_ns);
+                        tracer.setIntAttribute(span_handle, "http.response.status_code", 400);
+                        tracer.endSpan(span_handle, @errorName(err));
+                        return;
+                    };
+
+                    serval_grpc.validateRequest(&parser.request) catch |err| {
+                        sendErrorResponseTls(maybe_tls_ptr, &io_mut, stream, 400, "Bad gRPC h2c Request");
+                        const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
+                        metrics.requestEnd(400, duration_ns);
+                        tracer.setIntAttribute(span_handle, "http.response.status_code", 400);
+                        tracer.endSpan(span_handle, @errorName(err));
+                        return;
+                    };
+
+                    break :blk settings_payload;
+                } else null;
+
+                if (h2c_upgrade_settings) |settings_payload| {
+                    if (tryHandleTerminatedH2Upgrade(
+                        handler,
+                        metrics,
+                        tracer,
+                        maybe_tls_ptr,
+                        &io_mut,
+                        stream,
+                        &ctx,
+                        &parser,
+                        recv_buf[0..],
+                        buffer_offset,
+                        buffer_len,
+                        connection_id,
+                        settings_payload,
+                        span_handle,
+                    )) return;
                 }
 
                 if (websocket_candidate) {
@@ -1095,6 +2400,56 @@ pub fn Server(
                 };
                 ctx.upstream = upstream;
 
+                if (h2c_upgrade_settings) |settings_payload| {
+                    const body_info = buildBodyInfo(&parser, &recv_buf, buffer_offset, buffer_len);
+                    const initial_h2_offset = buffer_offset + parser.headers_end + @as(usize, @intCast(body_info.bytes_already_read));
+                    assert(initial_h2_offset <= buffer_len);
+                    const initial_client_bytes_after_body = recv_buf[initial_h2_offset..buffer_len];
+
+                    const h2c_upgrade_result = if (upstream.http_protocol == .h2c and !upstream.tls)
+                        forwardGrpcH2cUpgradeWithBridge(
+                            handler,
+                            forwarder,
+                            io,
+                            maybe_tls_ptr,
+                            stream,
+                            &parser,
+                            recv_buf[0..],
+                            buffer_offset,
+                            buffer_len,
+                            settings_payload,
+                            &ctx,
+                            connection_id,
+                        )
+                    else
+                        forwarder.forwardGrpcH2cUpgrade(
+                            io,
+                            stream,
+                            maybe_tls_ptr,
+                            &parser.request,
+                            &upstream,
+                            body_info,
+                            initial_client_bytes_after_body,
+                            settings_payload,
+                            span_handle,
+                            ctx.rewritten_path,
+                        );
+
+                    const h2c_upgrade_duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
+                    ctx.duration_ns = h2c_upgrade_duration_ns;
+
+                    if (h2c_upgrade_result) |fwd_result| {
+                        handleForwardSuccessImpl(handler, metrics, &ctx, &parser.request, fwd_result, h2c_upgrade_duration_ns, false);
+                        tracer.setIntAttribute(span_handle, "http.response.status_code", @intCast(fwd_result.status));
+                        tracer.endSpan(span_handle, null);
+                    } else |err| {
+                        handleForwardErrorImpl(handler, metrics, maybe_tls_ptr, &io_mut, stream, &ctx, &parser.request, upstream, err, h2c_upgrade_duration_ns);
+                        tracer.setIntAttribute(span_handle, "http.response.status_code", 502);
+                        tracer.endSpan(span_handle, @errorName(err));
+                    }
+                    return;
+                }
+
                 if (websocket_candidate) {
                     const initial_client_bytes = if (buffer_len > buffer_offset + parser.headers_end)
                         recv_buf[buffer_offset + parser.headers_end .. buffer_len]
@@ -1189,6 +2544,49 @@ pub fn Server(
                     .path = request.path,
                     .request_bytes = ctx.bytes_received,
                     .status = 101,
+                    .response_bytes = response_bytes,
+                    .upstream = null,
+                    .upstream_duration_ns = 0,
+                    .error_phase = null,
+                    .error_name = error_name,
+                    .connection_reused = false,
+                    .keepalive = false,
+                    .parse_duration_ns = ctx.parse_duration_ns,
+                    .connection_id = ctx.connection_id,
+                    .request_number = ctx.request_number,
+                    .client_addr = ctx.client_addr,
+                };
+                handler.onLog(ctx, log_entry);
+            }
+        }
+
+        fn handleTerminatedH2UpgradeCompleteImpl(
+            handler: *Handler,
+            metrics: *Metrics,
+            ctx: *Context,
+            request: *const Request,
+            status: u16,
+            response_bytes: u64,
+            duration_ns: u64,
+            error_name: ?[]const u8,
+        ) void {
+            assert(@intFromPtr(handler) != 0);
+            assert(@intFromPtr(metrics) != 0);
+            assert(status >= 100);
+
+            ctx.response_status = status;
+            ctx.bytes_sent = response_bytes;
+            metrics.requestEnd(status, duration_ns);
+
+            if (comptime hooks.hasHook(Handler, "onLog")) {
+                const log_entry = serval_core.log.LogEntry{
+                    .timestamp_s = time.nanosToSecondsI128(ctx.start_time_ns),
+                    .start_time_ns = ctx.start_time_ns,
+                    .duration_ns = duration_ns,
+                    .method = request.method,
+                    .path = request.path,
+                    .request_bytes = ctx.bytes_received,
+                    .status = status,
                     .response_bytes = response_bytes,
                     .upstream = null,
                     .upstream_duration_ns = 0,
@@ -1340,6 +2738,7 @@ pub fn Server(
                 forwarder_mod.ForwardError.StaleConnection,
                 forwarder_mod.ForwardError.RequestBodyTooLarge,
                 => .send,
+                forwarder_mod.ForwardError.UnsupportedProtocol => .handler_request,
                 forwarder_mod.ForwardError.RecvFailed,
                 forwarder_mod.ForwardError.HeadersTooLarge,
                 forwarder_mod.ForwardError.InvalidResponse,
@@ -1357,6 +2756,7 @@ pub fn Server(
                 forwarder_mod.ForwardError.SendFailed => error.SendFailed,
                 forwarder_mod.ForwardError.StaleConnection => error.StaleConnection,
                 forwarder_mod.ForwardError.RequestBodyTooLarge => error.BodyTooLarge,
+                forwarder_mod.ForwardError.UnsupportedProtocol => error.InvalidResponse,
                 forwarder_mod.ForwardError.RecvFailed => error.RecvFailed,
                 forwarder_mod.ForwardError.HeadersTooLarge => error.InvalidResponse,
                 forwarder_mod.ForwardError.InvalidResponse => error.InvalidResponse,

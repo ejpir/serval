@@ -178,6 +178,24 @@ pub extern fn SSL_export_keying_material(
 // Session resumption
 pub extern fn SSL_session_reused(ssl: *const SSL) c_int;
 
+// ALPN helpers
+// OpenSSL wire format: concatenated [len][proto-bytes] entries.
+// Example for ["h2", "http/1.1"]:
+//   0x02 'h' '2' 0x08 'h' 't' 't' 'p' '/' '1' '.' '1'
+pub extern fn SSL_CTX_set_alpn_protos(ctx: *SSL_CTX, protos: [*]const u8, protos_len: c_uint) c_int;
+pub extern fn SSL_set_alpn_protos(ssl: *SSL, protos: [*]const u8, protos_len: c_uint) c_int;
+
+pub const AlpnSelectCallback = *const fn (
+    ssl: *SSL,
+    out: *?[*]const u8,
+    outlen: *u8,
+    in: [*]const u8,
+    inlen: c_uint,
+    arg: ?*anyopaque,
+) callconv(.c) c_int;
+
+pub extern fn SSL_CTX_set_alpn_select_cb(ctx: *SSL_CTX, cb: AlpnSelectCallback, arg: ?*anyopaque) void;
+
 // ALPN - returns pointer to selected protocol and length
 // Note: data is set to NULL if no ALPN was negotiated
 pub extern fn SSL_get0_alpn_selected(ssl: *const SSL, data: *?[*]const u8, len: *c_uint) void;
@@ -215,7 +233,73 @@ pub fn createServerCtx() !*SSL_CTX {
     // NOTE: SSL_CTX_set_min_proto_version is BoringSSL-specific, not in OpenSSL
     // TODO: Use OpenSSL-compatible SSL_CTX_set_options with SSL_OP_NO_TLSv1 etc
     // _ = SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    configureServerAlpn(ctx);
     return ctx;
+}
+
+pub const SSL_TLSEXT_ERR_OK: c_int = 0;
+pub const SSL_TLSEXT_ERR_NOACK: c_int = 3;
+
+const alpn_protocol_h2: []const u8 = "h2";
+const alpn_protocol_http11: []const u8 = "http/1.1";
+
+fn serverAlpnSelectCb(
+    ssl_conn: *SSL,
+    out: *?[*]const u8,
+    outlen: *u8,
+    in: [*]const u8,
+    inlen: c_uint,
+    arg: ?*anyopaque,
+) callconv(.c) c_int {
+    _ = ssl_conn;
+    _ = arg;
+
+    const client_len: usize = @intCast(inlen);
+    var pos: usize = 0;
+    var supports_http11 = false;
+
+    while (pos < client_len) {
+        const proto_len: usize = in[pos];
+        pos += 1;
+
+        if (proto_len == 0) return SSL_TLSEXT_ERR_NOACK;
+        if (pos + proto_len > client_len) return SSL_TLSEXT_ERR_NOACK;
+
+        const proto = in[pos .. pos + proto_len];
+        if (std.mem.eql(u8, proto, alpn_protocol_h2)) {
+            out.* = @ptrCast(alpn_protocol_h2.ptr);
+            outlen.* = @intCast(alpn_protocol_h2.len);
+            return SSL_TLSEXT_ERR_OK;
+        }
+        if (std.mem.eql(u8, proto, alpn_protocol_http11)) {
+            supports_http11 = true;
+        }
+
+        pos += proto_len;
+    }
+
+    if (!supports_http11) return SSL_TLSEXT_ERR_NOACK;
+    out.* = @ptrCast(alpn_protocol_http11.ptr);
+    outlen.* = @intCast(alpn_protocol_http11.len);
+    return SSL_TLSEXT_ERR_OK;
+}
+
+pub fn configureServerAlpn(ctx: *SSL_CTX) void {
+    SSL_CTX_set_alpn_select_cb(ctx, serverAlpnSelectCb, null);
+}
+
+pub fn setClientAlpnProtocol(ssl_conn: *SSL, protocol: []const u8) !void {
+    if (protocol.len == 0) return error.InvalidAlpnProtocol;
+    if (protocol.len > 255) return error.InvalidAlpnProtocol;
+
+    var wire_buf: [256]u8 = undefined;
+    wire_buf[0] = @intCast(protocol.len);
+    @memcpy(wire_buf[1 .. 1 + protocol.len], protocol);
+
+    const wire_len: c_uint = @intCast(1 + protocol.len);
+    if (SSL_set_alpn_protos(ssl_conn, &wire_buf, wire_len) != 0) {
+        return error.SslSetAlpn;
+    }
 }
 
 pub fn createSsl(ctx: *SSL_CTX) !*SSL {

@@ -67,11 +67,7 @@ pub const PlainSocket = struct {
         assert(data.len > 0); // S1: precondition
         assert(data.len <= std.math.maxInt(u32)); // S2: data fits in u32
 
-        const file: std.Io.File = .{
-            .handle = self.fd,
-            .flags = .{ .nonblocking = true },
-        };
-        const n = file.writeStreaming(std.Options.debug_io, &.{}, &.{data}, 1) catch |err| {
+        const n = posixSendCompat(self.fd, data) catch |err| {
             return map_posix_error(err);
         };
 
@@ -314,6 +310,28 @@ pub const Socket = union(enum) {
 // =============================================================================
 // Error Mapping
 // =============================================================================
+
+fn posixSendCompat(fd: i32, data: []const u8) anyerror!usize {
+    assert(fd >= 0);
+    assert(data.len > 0);
+
+    if (@hasDecl(posix, "send")) {
+        return posix.send(fd, data, 0);
+    }
+
+    while (true) {
+        const rc = std.c.send(fd, data.ptr, data.len, 0);
+        switch (std.c.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .PIPE => return error.BrokenPipe,
+            .CONNRESET => return error.ConnectionResetByPeer,
+            .TIMEDOUT => return error.ConnectionTimedOut,
+            else => return error.Unexpected,
+        }
+    }
+}
 
 /// Map posix errors to SocketError.
 /// TigerStyle S6: Explicit error handling, no catch {}.

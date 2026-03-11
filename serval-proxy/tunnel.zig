@@ -101,8 +101,28 @@ pub fn relay(
     initial_client_to_upstream: []const u8,
     initial_upstream_to_client: []const u8,
 ) TunnelStats {
+    return relayWithConfig(
+        client_socket,
+        upstream_socket,
+        initial_client_to_upstream,
+        initial_upstream_to_client,
+        config.WEBSOCKET_TUNNEL_IDLE_TIMEOUT_NS,
+        config.WEBSOCKET_TUNNEL_POLL_TIMEOUT_MS,
+    );
+}
+
+pub fn relayWithConfig(
+    client_socket: *Socket,
+    upstream_socket: *Socket,
+    initial_client_to_upstream: []const u8,
+    initial_upstream_to_client: []const u8,
+    idle_timeout_ns: u64,
+    poll_timeout_ms: i32,
+) TunnelStats {
     assert(@intFromPtr(client_socket) != 0);
     assert(@intFromPtr(upstream_socket) != 0);
+    assert(idle_timeout_ns > 0);
+    assert(poll_timeout_ms > 0);
 
     const start_ns = time.monotonicNanos();
     var stats = TunnelStats{};
@@ -129,7 +149,7 @@ pub fn relay(
         }
 
         const now_ns = time.monotonicNanos();
-        if (time.elapsedNanos(last_progress_ns, now_ns) > config.WEBSOCKET_TUNNEL_IDLE_TIMEOUT_NS) {
+        if (time.elapsedNanos(last_progress_ns, now_ns) > idle_timeout_ns) {
             return finalizeStats(start_ns, &stats, .idle_timeout);
         }
 
@@ -163,6 +183,7 @@ pub fn relay(
             &client_read_open,
             &upstream_read_open,
             &first_close,
+            poll_timeout_ms,
         );
         if (poll_result.progress) {
             last_progress_ns = time.monotonicNanos();
@@ -184,6 +205,7 @@ fn pollAndTransfer(
     client_read_open: *bool,
     upstream_read_open: *bool,
     first_close: *?Termination,
+    poll_timeout_ms: i32,
 ) IoOutcome {
     var poll_fds = [_]std.posix.pollfd{
         .{ .fd = client_socket.get_fd(), .events = 0, .revents = 0 },
@@ -205,7 +227,7 @@ fn pollAndTransfer(
 
     const poll_count = std.posix.poll(
         &poll_fds,
-        config.WEBSOCKET_TUNNEL_POLL_TIMEOUT_MS,
+        poll_timeout_ms,
     ) catch |err| {
         log.warn("poll failed: {s}", .{@errorName(err)});
         return .{ .progress = false, .termination = .client_error };
