@@ -5,9 +5,32 @@ fn force_llvm_lld(compile_step: *std.Build.Step.Compile) void {
     compile_step.use_lld = true;
 }
 
+fn apply_optional_openssl_paths(
+    module: *std.Build.Module,
+    openssl_include_dir: ?[]const u8,
+    openssl_lib_dir: ?[]const u8,
+) void {
+    if (openssl_include_dir) |include_dir| {
+        module.addSystemIncludePath(.{ .cwd_relative = include_dir });
+    }
+    if (openssl_lib_dir) |lib_dir| {
+        module.addLibraryPath(.{ .cwd_relative = lib_dir });
+    }
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const openssl_include_dir = b.option(
+        []const u8,
+        "openssl-include-dir",
+        "Optional OpenSSL include directory (for cross builds)",
+    );
+    const openssl_lib_dir = b.option(
+        []const u8,
+        "openssl-lib-dir",
+        "Optional OpenSSL library directory (for cross builds)",
+    );
 
     // =========================================================================
     // Serval Library Modules
@@ -28,6 +51,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "serval-core", .module = serval_core_module },
         },
     });
+    apply_optional_openssl_paths(serval_tls_module, openssl_include_dir, openssl_lib_dir);
 
     // Network utilities - DNS + TCP helpers (Layer 1 - Protocol)
     // Note: Socket abstraction moved to serval-socket (Layer 2)
@@ -93,6 +117,16 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // ACME certificate automation primitives - depends on core (Layer 2 - Infrastructure)
+    const serval_acme_module = b.addModule("serval-acme", .{
+        .root_source_file = b.path("serval-acme/mod.zig"),
+        .imports = &.{
+            .{ .name = "serval-core", .module = serval_core_module },
+            .{ .name = "serval-http", .module = serval_http_module },
+            .{ .name = "serval-socket", .module = serval_socket_module },
+        },
+    });
+
     // Metrics module - depends on core
     const serval_metrics_module = b.addModule("serval-metrics", .{
         .root_source_file = b.path("serval-metrics/mod.zig"),
@@ -131,6 +165,9 @@ pub fn build(b: *std.Build) void {
             .{ .name = "serval-h2", .module = serval_h2_module },
         },
     });
+
+    // ACME transport adapter depends on serval-client for wire execution.
+    serval_acme_module.addImport("serval-client", serval_client_module);
 
     // OpenTelemetry module - depends on core, tracing, client, net, socket, tls, pool
     // Uses serval-client for HTTP export with proper K8s DNS resolution
@@ -248,6 +285,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "serval-websocket", .module = serval_websocket_module },
             .{ .name = "serval-h2", .module = serval_h2_module },
             .{ .name = "serval-grpc", .module = serval_grpc_module },
+            .{ .name = "serval-acme", .module = serval_acme_module },
             .{ .name = "serval-pool", .module = serval_pool_module },
             .{ .name = "serval-proxy", .module = serval_proxy_module },
             .{ .name = "serval-metrics", .module = serval_metrics_module },
@@ -279,6 +317,7 @@ pub fn build(b: *std.Build) void {
     serval_tests_mod.addImport("serval-websocket", serval_websocket_module);
     serval_tests_mod.addImport("serval-h2", serval_h2_module);
     serval_tests_mod.addImport("serval-grpc", serval_grpc_module);
+    serval_tests_mod.addImport("serval-acme", serval_acme_module);
     serval_tests_mod.addImport("serval-pool", serval_pool_module);
     serval_tests_mod.addImport("serval-proxy", serval_proxy_module);
     serval_tests_mod.addImport("serval-metrics", serval_metrics_module);
@@ -417,6 +456,7 @@ pub fn build(b: *std.Build) void {
     });
     tls_tests_mod.linkSystemLibrary("ssl", .{});
     tls_tests_mod.linkSystemLibrary("crypto", .{});
+    tls_tests_mod.addImport("serval-core", serval_core_module);
     const tls_tests = b.addTest(.{
         .name = "tls_tests",
         .root_module = tls_tests_mod,
@@ -494,6 +534,29 @@ pub fn build(b: *std.Build) void {
 
     const grpc_test_step = b.step("test-grpc", "Run serval-grpc library tests");
     grpc_test_step.dependOn(&run_grpc_tests.step);
+
+    // ACME module tests
+    const acme_tests_mod = b.createModule(.{
+        .root_source_file = b.path("serval-acme/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    acme_tests_mod.linkSystemLibrary("ssl", .{});
+    acme_tests_mod.linkSystemLibrary("crypto", .{});
+    acme_tests_mod.addImport("serval-core", serval_core_module);
+    acme_tests_mod.addImport("serval-http", serval_http_module);
+    acme_tests_mod.addImport("serval-socket", serval_socket_module);
+    acme_tests_mod.addImport("serval-client", serval_client_module);
+    const acme_tests = b.addTest(.{
+        .name = "acme_tests",
+        .root_module = acme_tests_mod,
+    });
+    force_llvm_lld(acme_tests);
+    const run_acme_tests = b.addRunArtifact(acme_tests);
+
+    const acme_test_step = b.step("test-acme", "Run serval-acme library tests");
+    acme_test_step.dependOn(&run_acme_tests.step);
 
     // Client h2 primitive tests
     const client_h2_tests_mod = b.createModule(.{
@@ -722,6 +785,39 @@ pub fn build(b: *std.Build) void {
     const run_router_example_step = b.step("run-router-example", "Run router example");
     run_router_example_step.dependOn(&run_router_example.step);
 
+    // NetBird reverse-proxy example
+    // Note: Links SSL libraries since serval depends on serval-server which depends on serval-tls
+    const netbird_proxy_mod = b.createModule(.{
+        .root_source_file = b.path("examples/netbird_proxy.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    netbird_proxy_mod.linkSystemLibrary("ssl", .{ .needed = true });
+    netbird_proxy_mod.linkSystemLibrary("crypto", .{ .needed = true });
+    apply_optional_openssl_paths(netbird_proxy_mod, openssl_include_dir, openssl_lib_dir);
+    netbird_proxy_mod.addImport("serval", serval_module);
+    netbird_proxy_mod.addImport("serval-cli", serval_cli_module);
+    netbird_proxy_mod.addImport("serval-tls", serval_tls_module);
+    const netbird_proxy = b.addExecutable(.{
+        .name = "netbird_proxy",
+        .root_module = netbird_proxy_mod,
+        .linkage = .dynamic,
+    });
+    force_llvm_lld(netbird_proxy);
+    const build_netbird_proxy = b.addInstallArtifact(netbird_proxy, .{});
+    const run_netbird_proxy = b.addRunArtifact(netbird_proxy);
+
+    if (b.args) |args| {
+        run_netbird_proxy.addArgs(args);
+    }
+
+    const build_netbird_proxy_step = b.step("build-netbird-proxy", "Build NetBird reverse-proxy example");
+    build_netbird_proxy_step.dependOn(&build_netbird_proxy.step);
+
+    const run_netbird_proxy_step = b.step("run-netbird-proxy", "Run NetBird reverse-proxy example");
+    run_netbird_proxy_step.dependOn(&run_netbird_proxy.step);
+
     // Gateway example (Kubernetes Gateway API controller)
     // Note: Links SSL libraries since serval-k8s-gateway depends on serval-server which depends on serval-tls
     const gateway_example_mod = b.createModule(.{
@@ -791,6 +887,36 @@ pub fn build(b: *std.Build) void {
 
     const run_echo_backend_step = b.step("run-echo-backend", "Run echo backend example");
     run_echo_backend_step.dependOn(&run_echo_backend.step);
+
+    // HTTP/2 conformance target server (terminated h2 callbacks + optional TLS)
+    const h2_conformance_server_mod = b.createModule(.{
+        .root_source_file = b.path("examples/h2_conformance_server.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    h2_conformance_server_mod.linkSystemLibrary("ssl", .{});
+    h2_conformance_server_mod.linkSystemLibrary("crypto", .{});
+    h2_conformance_server_mod.addImport("serval", serval_module);
+    h2_conformance_server_mod.addImport("serval-net", serval_net_module);
+    h2_conformance_server_mod.addImport("serval-cli", serval_cli_module);
+    const h2_conformance_server = b.addExecutable(.{
+        .name = "h2_conformance_server",
+        .root_module = h2_conformance_server_mod,
+    });
+    force_llvm_lld(h2_conformance_server);
+    const build_h2_conformance_server = b.addInstallArtifact(h2_conformance_server, .{});
+    const run_h2_conformance_server = b.addRunArtifact(h2_conformance_server);
+
+    const build_h2_conformance_server_step = b.step("build-h2-conformance-server", "Build HTTP/2 conformance target server");
+    build_h2_conformance_server_step.dependOn(&build_h2_conformance_server.step);
+
+    if (b.args) |args| {
+        run_h2_conformance_server.addArgs(args);
+    }
+
+    const run_h2_conformance_server_step = b.step("run-h2-conformance-server", "Run HTTP/2 conformance target server");
+    run_h2_conformance_server_step.dependOn(&run_h2_conformance_server.step);
 
     // OTLP test example
     // Note: Links SSL libraries since serval-otel uses serval-client which uses serval-tls
@@ -871,8 +997,10 @@ pub fn build(b: *std.Build) void {
     // Default step - build all examples
     b.default_step.dependOn(&build_lb_example.step);
     b.default_step.dependOn(&build_router_example.step);
+    b.default_step.dependOn(&build_netbird_proxy.step);
     b.default_step.dependOn(&build_gateway_example.step);
     b.default_step.dependOn(&build_echo_backend.step);
+    b.default_step.dependOn(&build_h2_conformance_server.step);
     b.default_step.dependOn(&build_otel_test.step);
     b.default_step.dependOn(&build_llm_streaming.step);
 }
