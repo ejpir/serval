@@ -47,8 +47,11 @@ const custom = headers.get("X-Custom");    // ?[]const u8
 **Why**: HTTP proxies check these headers on every request. Caching their indices avoids repeated O(n) scans at high throughput.
 
 ### Configuration
-- `Config` - Server configuration (port, timeouts, limits)
+- `Config` - Server configuration (port, timeouts, limits, h2 frontend + ALPN policies)
 - `TlsConfig` - TLS configuration (cert paths, verification, timeouts)
+- `TlsH2FrontendMode` - TLS frontend h2 dispatch mode (`disabled`, `terminated_only`, `generic`)
+- `AlpnMixedOfferPolicy` - Mixed-offer ALPN selection policy (`prefer_http11`, `prefer_h2`)
+- `AcmeConfig` - ACME certificate automation settings (directory/contact/domains/backoff)
 - `DEBUG_LOGGING` - Comptime flag (true in Debug builds)
 - `MAX_HEADERS` - 64
 - `MAX_HEADER_SIZE_BYTES` - 8192
@@ -77,6 +80,16 @@ const custom = headers.get("X-Custom");    // ?[]const u8
 - `WEBSOCKET_CLOSE_TIMEOUT_NS` - 5s close-handshake timeout
 - `WEBSOCKET_SESSION_POLL_TIMEOUT_MS` - 1000ms native session poll interval
 - `WEBSOCKET_MAX_CONTROL_PAYLOAD_SIZE_BYTES` - 125-byte RFC 6455 control-frame limit
+- `TLS_RELOADABLE_CTX_SLOT_COUNT` - 5 bounded SSL_CTX generation slots for hot reload
+- `ACME_MAX_DOMAINS_PER_CERT` - 16 SANs maximum per managed certificate
+- `ACME_MAX_ACTIVE_CHALLENGES` - 64 active HTTP-01 tokens in fixed store
+- `ACME_MAX_NONCE_BYTES` - 512-byte replay-nonce bound
+- `ACME_MAX_DIRECTORY_RESPONSE_BYTES` - 64KiB directory JSON parse bound
+- `ACME_MAX_ACCOUNT_RESPONSE_BYTES` - 64KiB account JSON parse bound
+- `ACME_MAX_ORDER_RESPONSE_BYTES` - 128KiB order JSON parse bound
+- `ACME_MAX_JWS_BODY_BYTES` - 64KiB ACME payload serializer bound
+- `ACME_MAX_JWS_SIGNATURE_BYTES` - 512-byte JWS signature input bound
+- `ACME_DEFAULT_RENEW_BEFORE_NS` - 30-day renewal lead time
 
 ### Logging
 - `debugLog` - Comptime-conditional debug logging (zero overhead in release)

@@ -29,7 +29,7 @@ No business logic, only protocol implementation. Sits alongside serval-http and 
 
 - `ssl` - OpenSSL/BoringSSL bindings module
   - `SSL_CTX`, `SSL` opaque types
-  - `init()`, `createClientCtx()`, `createServerCtx()`
+  - `init()`, `createClientCtx()`, `createServerCtx()`, `createServerCtxFromPemFiles()`
   - Low-level SSL function bindings
   - Error handling utilities
   - `SSL_pending()` binding for userspace TLS buffered-read inspection
@@ -42,6 +42,12 @@ No business logic, only protocol implementation. Sits alongside serval-http and 
   - `close()` - Graceful TLS shutdown (sends close_notify)
   - `isKtls()` - Check if kTLS kernel offload is active (zero overhead)
   - `queryKtlsStatus()` - Get detailed kTLS TX/RX status (for diagnostics)
+
+- `ReloadableServerCtx` - Bounded SSL_CTX generation manager
+  - `init(initial_ctx)` - Start generation 1 from loaded SSL_CTX
+  - `acquire()/release()` - Handshake-time lease management
+  - `activate(new_ctx)` - Atomically switch active generation
+  - `activateFromPemFiles(cert_path, key_path)` - Build + activate new generation from PEM paths
 
 - `ktls` - kTLS kernel offload module
   - `tryEnableKtls()` - Attempt kTLS setup after handshake (BoringSSL path)
@@ -77,10 +83,12 @@ No business logic, only protocol implementation. Sits alongside serval-http and 
 - [x] HandshakeInfo.ktls_enabled status tracking
 - [x] TLSStream.isKtls() / queryKtlsStatus() for runtime checks
 
-### Phase 3 (Future)
+### Phase 3 (In Progress)
 - [ ] Session resumption
-- [ ] ALPN negotiation (for HTTP/2)
-- [ ] Certificate reload without restart
+- [x] ALPN negotiation (for HTTP/2)
+- [~] Certificate reload groundwork (`ReloadableServerCtx` generation/refcount manager)
+- [~] Certificate activation API skeleton (`createServerCtxFromPemFiles` + `activateFromPemFiles`)
+- [ ] Certificate file watcher / control-plane trigger
 - [ ] OCSP stapling
 
 ## Configuration

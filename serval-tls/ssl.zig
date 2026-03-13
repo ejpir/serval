@@ -6,7 +6,10 @@
 //! Based on validated POC in experiments/tls-poc/.
 
 const std = @import("std");
-const log = @import("serval-core").log.scoped(.tls);
+const assert = std.debug.assert;
+const serval_core = @import("serval-core");
+const log = serval_core.log.scoped(.tls);
+const config = serval_core.config;
 
 // Opaque types
 pub const SSL_CTX = opaque {};
@@ -237,11 +240,80 @@ pub fn createServerCtx() !*SSL_CTX {
     return ctx;
 }
 
+/// Errors returned by `createServerCtxFromPemFiles()`.
+pub const CreateServerCtxFromPemFilesError = error{
+    InvalidCertPath,
+    InvalidKeyPath,
+    NoTlsMethod,
+    SslCtxNew,
+    LoadCertFailed,
+    LoadKeyFailed,
+    OutOfMemory,
+};
+
+/// Create a server SSL context and load certificate/key PEM files.
+///
+/// Used by initial TLS bootstrap and future hot-activation paths.
+pub fn createServerCtxFromPemFiles(
+    cert_path: []const u8,
+    key_path: []const u8,
+) CreateServerCtxFromPemFilesError!*SSL_CTX {
+    if (cert_path.len == 0) return error.InvalidCertPath;
+    if (key_path.len == 0) return error.InvalidKeyPath;
+    assert(cert_path.len > 0);
+    assert(key_path.len > 0);
+
+    init();
+
+    const ctx = try createServerCtx();
+    errdefer SSL_CTX_free(ctx);
+
+    const allocator = std.heap.c_allocator;
+
+    const cert_path_z = try allocator.dupeZ(u8, cert_path);
+    defer allocator.free(cert_path_z);
+    if (SSL_CTX_use_certificate_chain_file(ctx, cert_path_z) != 1) {
+        printErrors();
+        return error.LoadCertFailed;
+    }
+
+    const key_path_z = try allocator.dupeZ(u8, key_path);
+    defer allocator.free(key_path_z);
+    if (SSL_CTX_use_PrivateKey_file(ctx, key_path_z, SSL_FILETYPE_PEM) != 1) {
+        printErrors();
+        return error.LoadKeyFailed;
+    }
+
+    return ctx;
+}
+
 pub const SSL_TLSEXT_ERR_OK: c_int = 0;
 pub const SSL_TLSEXT_ERR_NOACK: c_int = 3;
 
 const alpn_protocol_h2: []const u8 = "h2";
 const alpn_protocol_http11: []const u8 = "http/1.1";
+
+pub const AlpnMixedOfferPolicy = config.AlpnMixedOfferPolicy;
+
+/// Global mixed-offer ALPN policy used by all server contexts in this process.
+/// TigerStyle: explicit mutable policy for deployment-controlled rollouts.
+var server_alpn_mixed_offer_policy: AlpnMixedOfferPolicy = .prefer_http11;
+
+pub fn setServerAlpnMixedOfferPolicy(policy: AlpnMixedOfferPolicy) void {
+    server_alpn_mixed_offer_policy = policy;
+}
+
+pub fn getServerAlpnMixedOfferPolicy() AlpnMixedOfferPolicy {
+    return server_alpn_mixed_offer_policy;
+}
+
+fn resolveServerAlpnMixedOfferPolicy(arg: ?*anyopaque) AlpnMixedOfferPolicy {
+    if (arg) |raw| {
+        const policy_ptr: *const AlpnMixedOfferPolicy = @ptrCast(@alignCast(raw));
+        return policy_ptr.*;
+    }
+    return server_alpn_mixed_offer_policy;
+}
 
 fn serverAlpnSelectCb(
     ssl_conn: *SSL,
@@ -252,11 +324,12 @@ fn serverAlpnSelectCb(
     arg: ?*anyopaque,
 ) callconv(.c) c_int {
     _ = ssl_conn;
-    _ = arg;
 
+    const alpn_policy = resolveServerAlpnMixedOfferPolicy(arg);
     const client_len: usize = @intCast(inlen);
     var pos: usize = 0;
     var supports_http11 = false;
+    var supports_h2 = false;
 
     while (pos < client_len) {
         const proto_len: usize = in[pos];
@@ -266,26 +339,48 @@ fn serverAlpnSelectCb(
         if (pos + proto_len > client_len) return SSL_TLSEXT_ERR_NOACK;
 
         const proto = in[pos .. pos + proto_len];
-        if (std.mem.eql(u8, proto, alpn_protocol_h2)) {
-            out.* = @ptrCast(alpn_protocol_h2.ptr);
-            outlen.* = @intCast(alpn_protocol_h2.len);
-            return SSL_TLSEXT_ERR_OK;
-        }
         if (std.mem.eql(u8, proto, alpn_protocol_http11)) {
             supports_http11 = true;
+        } else if (std.mem.eql(u8, proto, alpn_protocol_h2)) {
+            supports_h2 = true;
         }
 
         pos += proto_len;
     }
 
-    if (!supports_http11) return SSL_TLSEXT_ERR_NOACK;
-    out.* = @ptrCast(alpn_protocol_http11.ptr);
-    outlen.* = @intCast(alpn_protocol_http11.len);
-    return SSL_TLSEXT_ERR_OK;
+    switch (alpn_policy) {
+        .prefer_http11 => {
+            if (supports_http11) {
+                out.* = @ptrCast(alpn_protocol_http11.ptr);
+                outlen.* = @intCast(alpn_protocol_http11.len);
+                return SSL_TLSEXT_ERR_OK;
+            }
+            if (supports_h2) {
+                out.* = @ptrCast(alpn_protocol_h2.ptr);
+                outlen.* = @intCast(alpn_protocol_h2.len);
+                return SSL_TLSEXT_ERR_OK;
+            }
+        },
+        .prefer_h2 => {
+            if (supports_h2) {
+                out.* = @ptrCast(alpn_protocol_h2.ptr);
+                outlen.* = @intCast(alpn_protocol_h2.len);
+                return SSL_TLSEXT_ERR_OK;
+            }
+            if (supports_http11) {
+                out.* = @ptrCast(alpn_protocol_http11.ptr);
+                outlen.* = @intCast(alpn_protocol_http11.len);
+                return SSL_TLSEXT_ERR_OK;
+            }
+        },
+    }
+
+    return SSL_TLSEXT_ERR_NOACK;
 }
 
 pub fn configureServerAlpn(ctx: *SSL_CTX) void {
-    SSL_CTX_set_alpn_select_cb(ctx, serverAlpnSelectCb, null);
+    const policy_ptr: *AlpnMixedOfferPolicy = &server_alpn_mixed_offer_policy;
+    SSL_CTX_set_alpn_select_cb(ctx, serverAlpnSelectCb, @ptrCast(policy_ptr));
 }
 
 pub fn setClientAlpnProtocol(ssl_conn: *SSL, protocol: []const u8) !void {
@@ -321,4 +416,117 @@ pub fn printErrors() void {
         log.err("SSL: {s}", .{std.mem.sliceTo(&buf, 0)});
         err = ERR_get_error();
     }
+}
+
+test "createServerCtxFromPemFiles rejects empty cert path" {
+    try std.testing.expectError(
+        error.InvalidCertPath,
+        createServerCtxFromPemFiles("", "/tmp/non-empty-key.pem"),
+    );
+}
+
+test "createServerCtxFromPemFiles rejects empty key path" {
+    try std.testing.expectError(
+        error.InvalidKeyPath,
+        createServerCtxFromPemFiles("/tmp/non-empty-cert.pem", ""),
+    );
+}
+
+test "server ALPN callback prefers http/1.1 for mixed protocol offers" {
+    const wire = [_]u8{ 2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1' };
+    var selected_ptr: ?[*]const u8 = null;
+    var selected_len: u8 = 0;
+    var policy: AlpnMixedOfferPolicy = .prefer_http11;
+
+    const rc = serverAlpnSelectCb(
+        @ptrFromInt(1),
+        &selected_ptr,
+        &selected_len,
+        wire[0..].ptr,
+        @intCast(wire.len),
+        @ptrCast(&policy),
+    );
+
+    try std.testing.expectEqual(SSL_TLSEXT_ERR_OK, rc);
+    try std.testing.expect(selected_ptr != null);
+    try std.testing.expectEqual(@as(u8, @intCast(alpn_protocol_http11.len)), selected_len);
+    const selected = selected_ptr.?[0..selected_len];
+    try std.testing.expectEqualStrings(alpn_protocol_http11, selected);
+}
+
+test "server ALPN callback prefers h2 for mixed protocol offers when policy is prefer_h2" {
+    const wire = [_]u8{ 8, 'h', 't', 't', 'p', '/', '1', '.', '1', 2, 'h', '2' };
+    var selected_ptr: ?[*]const u8 = null;
+    var selected_len: u8 = 0;
+    var policy: AlpnMixedOfferPolicy = .prefer_h2;
+
+    const rc = serverAlpnSelectCb(
+        @ptrFromInt(1),
+        &selected_ptr,
+        &selected_len,
+        wire[0..].ptr,
+        @intCast(wire.len),
+        @ptrCast(&policy),
+    );
+
+    try std.testing.expectEqual(SSL_TLSEXT_ERR_OK, rc);
+    try std.testing.expect(selected_ptr != null);
+    try std.testing.expectEqual(@as(u8, @intCast(alpn_protocol_h2.len)), selected_len);
+    const selected = selected_ptr.?[0..selected_len];
+    try std.testing.expectEqualStrings(alpn_protocol_h2, selected);
+}
+
+test "server ALPN callback selects h2 when client does not offer http/1.1" {
+    const wire = [_]u8{ 2, 'h', '2' };
+    var selected_ptr: ?[*]const u8 = null;
+    var selected_len: u8 = 0;
+    var policy: AlpnMixedOfferPolicy = .prefer_http11;
+
+    const rc = serverAlpnSelectCb(
+        @ptrFromInt(1),
+        &selected_ptr,
+        &selected_len,
+        wire[0..].ptr,
+        @intCast(wire.len),
+        @ptrCast(&policy),
+    );
+
+    try std.testing.expectEqual(SSL_TLSEXT_ERR_OK, rc);
+    try std.testing.expect(selected_ptr != null);
+    try std.testing.expectEqual(@as(u8, @intCast(alpn_protocol_h2.len)), selected_len);
+    const selected = selected_ptr.?[0..selected_len];
+    try std.testing.expectEqualStrings(alpn_protocol_h2, selected);
+}
+
+test "server ALPN callback falls back to http/1.1 when h2 is absent" {
+    const wire = [_]u8{ 8, 'h', 't', 't', 'p', '/', '1', '.', '1' };
+    var selected_ptr: ?[*]const u8 = null;
+    var selected_len: u8 = 0;
+    var policy: AlpnMixedOfferPolicy = .prefer_h2;
+
+    const rc = serverAlpnSelectCb(
+        @ptrFromInt(1),
+        &selected_ptr,
+        &selected_len,
+        wire[0..].ptr,
+        @intCast(wire.len),
+        @ptrCast(&policy),
+    );
+
+    try std.testing.expectEqual(SSL_TLSEXT_ERR_OK, rc);
+    try std.testing.expect(selected_ptr != null);
+    try std.testing.expectEqual(@as(u8, @intCast(alpn_protocol_http11.len)), selected_len);
+    const selected = selected_ptr.?[0..selected_len];
+    try std.testing.expectEqualStrings(alpn_protocol_http11, selected);
+}
+
+test "setServerAlpnMixedOfferPolicy updates global ALPN policy" {
+    const initial = getServerAlpnMixedOfferPolicy();
+    defer setServerAlpnMixedOfferPolicy(initial);
+
+    setServerAlpnMixedOfferPolicy(.prefer_h2);
+    try std.testing.expectEqual(AlpnMixedOfferPolicy.prefer_h2, getServerAlpnMixedOfferPolicy());
+
+    setServerAlpnMixedOfferPolicy(.prefer_http11);
+    try std.testing.expectEqual(AlpnMixedOfferPolicy.prefer_http11, getServerAlpnMixedOfferPolicy());
 }

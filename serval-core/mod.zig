@@ -27,6 +27,7 @@ pub const BodyFraming = types.BodyFraming;
 // Config
 pub const config = @import("config.zig");
 pub const Config = config.Config;
+pub const AcmeConfig = config.AcmeConfig;
 
 // Logging
 pub const log = @import("log.zig");

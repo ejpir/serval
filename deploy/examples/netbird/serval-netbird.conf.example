@@ -1,0 +1,48 @@
+# Serval NetBird reverse-proxy configuration
+#
+# Usage:
+#   zig build run-netbird-proxy -- --config deploy/examples/netbird/serval-netbird.conf.example
+#
+# Frontend listen port. If omitted, CLI --port (default 8080) is used.
+listen_port=443
+
+# Frontend TLS cert/key (self-signed supported)
+# Example self-signed cert generation:
+#   openssl req -x509 -newkey rsa:4096 -sha256 -days 365 \
+#     -nodes -keyout /etc/serval/netbird-selfsigned.key \
+#     -out /etc/serval/netbird-selfsigned.crt \
+#     -subj "/CN=netbird.local"
+cert_path=/etc/serval/netbird-selfsigned.crt
+key_path=/etc/serval/netbird-selfsigned.key
+
+# Verify certificates when upstream specs use TLS schemes (https:// or h2://)
+verify_upstream=false
+
+# TLS frontend HTTP/2 dispatch mode
+#   disabled         -> do not dispatch frontend h2
+#   terminated_only  -> dispatch h2 only to handlers with terminated h2 callbacks
+#   generic          -> reserved for generic frontend h2 orchestration
+# Keep terminated_only for mixed web+gRPC endpoints unless fully validated.
+tls_h2_frontend_mode=terminated_only
+
+# ALPN policy when clients offer both h2 and http/1.1
+#   prefer_http11    -> conservative mixed-traffic behavior
+#   prefer_h2        -> gRPC-first behavior on mixed offers
+# WARNING: prefer_h2 on mixed web+gRPC hostnames may impact non-gRPC routes.
+alpn_mixed_offer_policy=prefer_http11
+
+# Upstream matrix
+#
+# Allowed schemes:
+#   http://host:port   -> HTTP/1.1 plaintext
+#   https://host:port  -> HTTP/1.1 over TLS
+#   h2c://host:port    -> HTTP/2 cleartext (for gRPC paths)
+#   h2://host:port     -> HTTP/2 over TLS (ALPN h2)
+
+signal_grpc=h2c://signal:10000
+management_grpc=h2c://management:80
+signal_http=http://signal:80
+management_http=http://management:80
+relay_http=http://relay:80
+dashboard_http=http://dashboard:80
+zitadel_http=http://zitadel:8080

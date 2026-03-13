@@ -11,9 +11,9 @@ High-performance HTTP infrastructure for Zig — reverse proxies, load balancers
 - **Zero-copy forwarding** — Linux splice() for body transfer (including kTLS)
 - **WebSocket proxying** — RFC 6455 upgrade validation and bidirectional tunnel relay
 - **Native WebSocket serving** — Accept WebSocket endpoints directly in Serval handlers with message-oriented session API
-- **gRPC over h2c proxying** — Inbound prior-knowledge or `Upgrade: h2c` routing plus transparent gRPC byte-stream tunneling to cleartext h2c upstreams
+- **gRPC over h2c/h2 proxying** — Stream-aware gRPC proxy paths for cleartext `.h2c` and TLS `.h2` upstreams, with bounded fallback behavior for non-h2 upstream targets
 - **Connection pooling** — Reuse upstream connections across requests
-- **Pluggable components** — Custom handlers, metrics, tracing, and explicit upstream protocol selection (`.h1`, `.h2c`)
+- **Pluggable components** — Custom handlers, metrics, tracing, and explicit upstream protocol selection (`.h1`, `.h2c`, `.h2`)
 - **No runtime allocation** — All memory allocated at startup
 
 ## Performance
@@ -95,6 +95,7 @@ exe.root_module.addImport("serval-lb", serval.module("serval-lb"));
 | `serval-websocket` | RFC 6455 handshake, frame, close, and subprotocol helpers |
 | `serval-h2` | Minimal HTTP/2 / h2c frame, control, preface, upgrade, HPACK, and initial-request helpers |
 | `serval-grpc` | gRPC metadata and message-envelope helpers |
+| `serval-acme` | ACME certificate automation primitives (state/config/http-01 store + protocol/JWS/wire/orchestration/transport + manager transition runner) |
 | `serval-net` | DNS resolution with TTL caching, TCP socket utilities |
 | `serval-client` | HTTP/1.1 client library with early bounded HTTP/2 session primitives |
 | `serval-tls` | TLS termination/origination with kTLS offload |
@@ -167,6 +168,7 @@ pub fn handleWebSocket(self: *@This(), ctx: *serval.Context, req: *const serval.
 zig build                       # Build all examples
 zig build run-lb-example        # Run load balancer
 zig build run-router-example    # Run content-based router
+zig build run-netbird-proxy     # Run NetBird reverse-proxy example
 zig build run-llm-example       # Run LLM streaming example
 zig build run-echo-backend      # Run echo backend
 zig build build-gateway-example # Build K8s gateway controller
@@ -175,8 +177,10 @@ zig build test-server           # Run serval-server tests
 zig build test-client           # Run serval-client h2 primitive tests
 zig build test-proxy            # Run serval-proxy h2 primitive tests
 zig build test-websocket        # Run serval-websocket tests
+zig build test-tls              # Run serval-tls tests
 zig build test-h2               # Run serval-h2 tests
 zig build test-grpc             # Run serval-grpc tests
+zig build test-acme             # Run serval-acme tests
 zig build test-integration      # Run end-to-end integration tests
 ```
 
@@ -275,6 +279,32 @@ curl http://localhost:8080/other        # -> api-backend (default), path unchang
 The router strips path prefixes before forwarding:
 - `/api/users` → api-pool receives `/users`
 - `/static/image.png` → static-pool receives `/image.png`
+
+### NetBird Reverse Proxy (Self-Signed TLS Supported)
+
+A production-oriented NetBird route matrix example is available as `netbird_proxy`.
+
+```bash
+# 1) Prepare self-signed frontend cert/key (example)
+openssl req -x509 -newkey rsa:4096 -sha256 -days 365 \
+  -nodes -keyout /etc/serval/netbird-selfsigned.key \
+  -out /etc/serval/netbird-selfsigned.crt \
+  -subj "/CN=netbird.local"
+
+# 2) Copy and edit config for your backend topology
+cp deploy/examples/netbird/serval-netbird.conf.example /etc/serval/netbird.conf
+
+# 3) Run Serval NetBird proxy
+zig build run-netbird-proxy -- --config /etc/serval/netbird.conf
+```
+
+OpenWrt deployment guide (ARM/procd/fw4): `deploy/examples/netbird/openwrt/README.md`.
+
+Route contract enforced by the binary:
+- gRPC service paths (`/signalexchange.SignalExchange/*`, `/management.ManagementService/*`, `/management.ProxyService/*`) route to gRPC upstreams (`h2c://` or `h2://`).
+- WebSocket/API/OIDC/UI/dashboard paths route to HTTP/1.1 upstreams (`http://` or `https://`).
+- Mixed protocol backends on the same host:port must be configured as explicit separate entries (example: `management_grpc` + `management_http`).
+- Frontend ALPN policy is configurable in the NetBird config template via `alpn_mixed_offer_policy` and `tls_h2_frontend_mode`.
 
 ### serval-router and serval-k8s-gateway
 
@@ -475,13 +505,14 @@ zig build run-echo-backend -- --help
 | Chunked encoding | Complete |
 | WebSocket proxy tunneling | Complete |
 | Native WebSocket endpoint serving | Complete |
-| gRPC over h2c proxying (prior knowledge + inbound upgrade) | Initial slice complete |
+| gRPC over h2c proxying (prior knowledge + inbound upgrade) | In progress (stream-aware gRPC bridge active for cleartext `.h2c` and TLS `.h2` upstreams) |
 | Content-based routing | Complete |
 | Path rewriting | Complete |
 | K8s Gateway API types | Complete |
 | Rate limiting | Planned |
 | WAF | Planned |
-| HTTP/2 full stream-aware proxy/server stack | Not implemented |
+| HTTP/2 full stream-aware proxy/server stack | In progress (current implementation is gRPC-focused; broader generic h2 stream-aware stack is still pending) |
+| Native gRPC endpoints | Not implemented (high priority) |
 
 ## License
 

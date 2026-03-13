@@ -88,6 +88,7 @@ kubectl rollout restart daemonset/serval-router
 | serval-router | Content-based router (hardcoded config) | Ready |
 | serval-k8s-gateway | K8s Gateway API controller | WIP |
 | echo-backend | Test backend for routing validation | Ready |
+| netbird_proxy (OpenWrt) | NetBird reverse proxy with procd service + fw4 guidance | Ready |
 
 ## Scripts
 
@@ -97,6 +98,7 @@ kubectl rollout restart daemonset/serval-router
 | `examples/k3d/k3d-build-images.sh` | Build Zig binaries, create Docker images, import to k3d |
 | `examples/k3s/deploy-k3s.sh` | Full deployment with prereq checks, status, cleanup (k3s) |
 | `examples/k3s/build-and-load.sh` | Quick rebuild helper for iterating on single component (k3s) |
+| `examples/netbird/openwrt/build-openwrt-netbird-proxy.sh` | Cross-build `netbird_proxy` for OpenWrt ARM with OpenSSL staging paths |
 
 ## k3s Quick Start
 
@@ -115,6 +117,10 @@ curl http://localhost:31588/
 curl http://localhost:31588/api/users
 curl http://localhost:31588/static/image.png
 ```
+
+## OpenWrt NetBird Quick Start
+
+See `deploy/examples/netbird/openwrt/README.md` for end-to-end instructions (cross-build, install, procd, fw4).
 
 ## Build Commands
 

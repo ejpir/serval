@@ -17,6 +17,11 @@ const stream = @import("stream.zig");
 pub const TLSStream = stream.TLSStream;
 pub const HandshakeInfo = stream.HandshakeInfo;
 
+// Reloadable server TLS context generations
+const reloadable_ctx = @import("reloadable_ctx.zig");
+pub const ReloadableServerCtx = reloadable_ctx.ReloadableServerCtx;
+pub const ReloadableServerCtxError = reloadable_ctx.Error;
+
 // kTLS (Kernel TLS) offload - Linux-only optimization
 pub const ktls = @import("ktls.zig");
 
@@ -24,5 +29,6 @@ test {
     _ = @import("ssl.zig");
     _ = @import("stream.zig");
     _ = @import("handshake_info.zig");
+    _ = @import("reloadable_ctx.zig");
     _ = @import("ktls.zig");
 }

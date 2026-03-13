@@ -406,6 +406,20 @@ pub const CONFIG_PUSH_BACKOFF_BASE_MS: u64 = 100;
 pub const MAX_CONFIG_PUSH_BACKOFF_MS: u64 = 5000;
 
 // =============================================================================
+// TLS Reloadable Context
+// =============================================================================
+
+/// Number of server TLS context slots for hot-reload generations.
+/// One active slot + bounded retired generations awaiting in-flight release.
+pub const TLS_RELOADABLE_CTX_SLOT_COUNT: u8 = 5;
+
+comptime {
+    if (TLS_RELOADABLE_CTX_SLOT_COUNT < 2) {
+        @compileError("TLS_RELOADABLE_CTX_SLOT_COUNT must be >= 2");
+    }
+}
+
+// =============================================================================
 // HTTP Client
 // =============================================================================
 
@@ -422,8 +436,138 @@ pub const CLIENT_READ_TIMEOUT_NS: u64 = time.secondsToNanos(30);
 pub const CLIENT_WRITE_TIMEOUT_NS: u64 = time.secondsToNanos(30);
 
 // =============================================================================
+// ACME / Let's Encrypt
+// =============================================================================
+
+/// Maximum domains included in one ACME certificate order.
+/// TigerStyle: Fixed-capacity SAN list bound.
+pub const ACME_MAX_DOMAINS_PER_CERT: u8 = 16;
+
+/// Maximum active HTTP-01 challenges tracked concurrently.
+/// TigerStyle: Bounded challenge table for deterministic memory usage.
+pub const ACME_MAX_ACTIVE_CHALLENGES: u8 = 64;
+
+/// Maximum ACME poll attempts for challenge/order status transitions.
+/// TigerStyle: Bounded polling loop.
+pub const ACME_MAX_POLL_ATTEMPTS: u16 = 120;
+
+/// Maximum state transitions executed in one manager tick.
+/// TigerStyle: Bounded work per scheduler cycle.
+pub const ACME_MAX_TRANSITIONS_PER_TICK: u8 = 32;
+
+/// Maximum ACME directory URL length in bytes.
+pub const ACME_MAX_DIRECTORY_URL_BYTES: u16 = 1024;
+
+/// Maximum contact e-mail length in bytes.
+pub const ACME_MAX_CONTACT_EMAIL_BYTES: u16 = 320;
+
+/// Maximum ACME state directory path length in bytes.
+pub const ACME_MAX_STATE_DIR_PATH_BYTES: u16 = 512;
+
+/// Maximum hostname/domain length in bytes (RFC 1035: 253 octets).
+pub const ACME_MAX_DOMAIN_NAME_LEN: u16 = 253;
+
+/// Maximum HTTP-01 token length in bytes.
+pub const ACME_MAX_HTTP01_TOKEN_BYTES: u16 = 128;
+
+/// Maximum HTTP-01 key-authorization length in bytes.
+pub const ACME_MAX_HTTP01_KEY_AUTHORIZATION_BYTES: u16 = 512;
+
+/// Maximum Replay-Nonce header value length in bytes.
+pub const ACME_MAX_NONCE_BYTES: u16 = 512;
+
+/// Maximum ACME directory response payload in bytes.
+/// TigerStyle: Explicit cap for JSON parsing input.
+pub const ACME_MAX_DIRECTORY_RESPONSE_BYTES: u32 = 64 * 1024;
+
+/// Maximum ACME account response payload in bytes.
+/// TigerStyle: Explicit cap for JSON parsing input.
+pub const ACME_MAX_ACCOUNT_RESPONSE_BYTES: u32 = 64 * 1024;
+
+/// Maximum ACME order response payload in bytes.
+/// TigerStyle: Explicit cap for JSON parsing input.
+pub const ACME_MAX_ORDER_RESPONSE_BYTES: u32 = 128 * 1024;
+
+/// Maximum JSON body bytes emitted in ACME JWS payload encoding.
+/// TigerStyle: Bounded serializer output.
+pub const ACME_MAX_JWS_BODY_BYTES: u32 = 64 * 1024;
+
+/// Maximum detached JWS signature bytes accepted by serializers.
+/// ES256 signatures are 64 bytes; bound leaves room for future algorithms.
+pub const ACME_MAX_JWS_SIGNATURE_BYTES: u16 = 512;
+
+/// Maximum authorization URLs tracked from one order response.
+/// In HTTP-01 flow this should match domain count upper bound.
+pub const ACME_MAX_AUTHORIZATION_URLS_PER_ORDER: u8 = ACME_MAX_DOMAINS_PER_CERT;
+
+/// Minimum renew-before window in nanoseconds (1 day).
+pub const ACME_MIN_RENEW_BEFORE_NS: u64 = time.secondsToNanos(24 * 60 * 60);
+
+/// Maximum renew-before window in nanoseconds (365 days).
+pub const ACME_MAX_RENEW_BEFORE_NS: u64 = time.secondsToNanos(365 * 24 * 60 * 60);
+
+/// Default renew-before window in nanoseconds (30 days).
+pub const ACME_DEFAULT_RENEW_BEFORE_NS: u64 = time.secondsToNanos(30 * 24 * 60 * 60);
+
+/// Default HTTP-01 listener port.
+pub const ACME_DEFAULT_HTTP01_PORT: u16 = 80;
+
+/// Default ACME poll interval in milliseconds.
+pub const ACME_DEFAULT_POLL_INTERVAL_MS: u32 = 2000;
+
+/// Default minimum failure backoff in milliseconds.
+pub const ACME_DEFAULT_FAIL_BACKOFF_MIN_MS: u32 = 1000;
+
+/// Default maximum failure backoff in milliseconds.
+pub const ACME_DEFAULT_FAIL_BACKOFF_MAX_MS: u32 = 3_600_000;
+
+comptime {
+    if (ACME_MAX_DOMAINS_PER_CERT == 0) {
+        @compileError("ACME_MAX_DOMAINS_PER_CERT must be > 0");
+    }
+    if (ACME_MAX_ACTIVE_CHALLENGES == 0) {
+        @compileError("ACME_MAX_ACTIVE_CHALLENGES must be > 0");
+    }
+    if (ACME_MAX_POLL_ATTEMPTS == 0) {
+        @compileError("ACME_MAX_POLL_ATTEMPTS must be > 0");
+    }
+    if (ACME_MAX_NONCE_BYTES == 0) {
+        @compileError("ACME_MAX_NONCE_BYTES must be > 0");
+    }
+    if (ACME_MAX_DIRECTORY_RESPONSE_BYTES == 0) {
+        @compileError("ACME_MAX_DIRECTORY_RESPONSE_BYTES must be > 0");
+    }
+    if (ACME_MAX_ORDER_RESPONSE_BYTES == 0) {
+        @compileError("ACME_MAX_ORDER_RESPONSE_BYTES must be > 0");
+    }
+    if (ACME_MAX_JWS_BODY_BYTES == 0) {
+        @compileError("ACME_MAX_JWS_BODY_BYTES must be > 0");
+    }
+    if (ACME_MAX_JWS_SIGNATURE_BYTES == 0) {
+        @compileError("ACME_MAX_JWS_SIGNATURE_BYTES must be > 0");
+    }
+}
+
+// =============================================================================
 // Runtime Configuration
 // =============================================================================
+
+/// TLS frontend HTTP/2 dispatch mode.
+/// - disabled: ignore ALPN h2 and stay on HTTP/1.1 request loop
+/// - terminated_only: dispatch ALPN h2 only when handler implements terminated h2 hooks
+/// - generic: reserved for full generic h2 frontend orchestration
+pub const TlsH2FrontendMode = enum {
+    disabled,
+    terminated_only,
+    generic,
+};
+
+/// ALPN policy when client offers both `h2` and `http/1.1`.
+/// TigerStyle: explicit deployment policy, no hidden defaults.
+pub const AlpnMixedOfferPolicy = enum {
+    prefer_http11,
+    prefer_h2,
+};
 
 pub const Config = struct {
     /// Port to listen on
@@ -446,6 +590,56 @@ pub const Config = struct {
 
     /// TLS configuration (optional - null means plaintext HTTP)
     tls: ?TlsConfig = null,
+
+    /// When true, plaintext listeners only accept HTTP/2 prior-knowledge preface.
+    /// Non-h2c bytes are closed without HTTP/1.1 parsing.
+    h2c_prior_knowledge_only: bool = false,
+
+    /// Frontend TLS ALPN h2 dispatch mode.
+    /// Default keeps current terminated-only behavior for handlers with explicit h2 callbacks.
+    tls_h2_frontend_mode: TlsH2FrontendMode = .terminated_only,
+
+    /// ALPN mixed-offer selection policy.
+    /// Default is conservative for mixed traffic until full generic h2 rollout is complete.
+    alpn_mixed_offer_policy: AlpnMixedOfferPolicy = .prefer_http11,
+
+    /// ACME certificate automation configuration.
+    /// Null disables automatic issuance/renewal.
+    acme: ?AcmeConfig = null,
+};
+
+/// ACME / Let's Encrypt runtime configuration.
+/// TigerStyle: Explicit defaults + bounded behavior knobs.
+pub const AcmeConfig = struct {
+    /// Enable ACME manager for automatic certificate lifecycle.
+    enabled: bool = false,
+
+    /// ACME directory URL (staging or production endpoint).
+    directory_url: []const u8 = "",
+
+    /// Contact e-mail for ACME account registration.
+    contact_email: []const u8 = "",
+
+    /// Directory for persisted account/cert/journal state.
+    state_dir_path: []const u8 = "",
+
+    /// HTTP port that serves HTTP-01 challenge tokens.
+    challenge_bind_port: u16 = ACME_DEFAULT_HTTP01_PORT,
+
+    /// Start renewal when not_after - renew_before_ns is reached.
+    renew_before_ns: u64 = ACME_DEFAULT_RENEW_BEFORE_NS,
+
+    /// Poll interval for authorization/order state checks.
+    poll_interval_ms: u32 = ACME_DEFAULT_POLL_INTERVAL_MS,
+
+    /// Minimum retry backoff for transient failures.
+    fail_backoff_min_ms: u32 = ACME_DEFAULT_FAIL_BACKOFF_MIN_MS,
+
+    /// Maximum retry backoff for transient failures.
+    fail_backoff_max_ms: u32 = ACME_DEFAULT_FAIL_BACKOFF_MAX_MS,
+
+    /// Requested certificate SAN domains.
+    domains: []const []const u8 = &.{},
 };
 
 /// TLS configuration for client termination and upstream origination.
@@ -477,6 +671,20 @@ test "Config has sensible defaults" {
     const cfg = Config{};
     try std.testing.expectEqual(@as(u16, 8080), cfg.port);
     try std.testing.expectEqual(@as(u32, 15_000), cfg.keepalive_timeout_ms);
+    try std.testing.expect(cfg.tls == null);
+    try std.testing.expect(!cfg.h2c_prior_knowledge_only);
+    try std.testing.expectEqual(TlsH2FrontendMode.terminated_only, cfg.tls_h2_frontend_mode);
+    try std.testing.expectEqual(AlpnMixedOfferPolicy.prefer_http11, cfg.alpn_mixed_offer_policy);
+    try std.testing.expect(cfg.acme == null);
+}
+
+test "AcmeConfig has sensible defaults" {
+    const cfg = AcmeConfig{};
+    try std.testing.expect(!cfg.enabled);
+    try std.testing.expectEqual(@as(u16, 80), cfg.challenge_bind_port);
+    try std.testing.expectEqual(ACME_DEFAULT_RENEW_BEFORE_NS, cfg.renew_before_ns);
+    try std.testing.expectEqual(ACME_DEFAULT_POLL_INTERVAL_MS, cfg.poll_interval_ms);
+    try std.testing.expectEqual(@as(usize, 0), cfg.domains.len);
 }
 
 test "Limits are sensible" {

@@ -1,0 +1,35 @@
+#!/bin/sh /etc/rc.common
+
+START=95
+STOP=10
+USE_PROCD=1
+
+SERVICE_NAME="serval-netbird-proxy"
+PROG="/usr/sbin/netbird_proxy"
+CONF_FILE="/etc/serval/netbird.conf"
+
+start_service() {
+    if [ ! -x "$PROG" ]; then
+        logger -t "$SERVICE_NAME" "binary missing: $PROG"
+        return 1
+    fi
+
+    if [ ! -f "$CONF_FILE" ]; then
+        logger -t "$SERVICE_NAME" "config missing: $CONF_FILE"
+        return 1
+    fi
+
+    procd_open_instance
+    procd_set_param command "$PROG" --config "$CONF_FILE"
+    # Restart policy: if 5 crashes within 3600s, stop respawning for 5s.
+    procd_set_param respawn 3600 5 5
+    procd_set_param limits nofile="65535 65535"
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+}
+
+reload_service() {
+    stop
+    start
+}
