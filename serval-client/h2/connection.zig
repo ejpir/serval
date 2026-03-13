@@ -23,7 +23,8 @@ const preface_settings_buffer_size_bytes: usize =
     h2.client_connection_preface.len +
     h2.frame_header_size_bytes +
     (4 * h2.setting_size_bytes);
-const request_headers_frame_buffer_size_bytes: usize = h2.frame_header_size_bytes + config.H2_MAX_HEADER_BLOCK_SIZE_BYTES;
+const request_headers_frame_overhead_bytes: usize = h2.frame_header_size_bytes * (@as(usize, config.H2_MAX_CONTINUATION_FRAMES) + 1);
+const request_headers_frame_buffer_size_bytes: usize = config.H2_MAX_HEADER_BLOCK_SIZE_BYTES + request_headers_frame_overhead_bytes;
 const data_frame_buffer_size_bytes: usize = h2.frame_header_size_bytes + config.H2_MAX_FRAME_SIZE_BYTES;
 
 pub const Error = error{

@@ -1,6 +1,7 @@
-//! HTTP/2 Plain Connection Driver
+//! HTTP/2 Connection Driver
 //!
-//! Runs a bounded terminating HTTP/2 connection over a plain file descriptor.
+//! Runs a bounded terminating HTTP/2 connection over plain file descriptors
+//! or TLS streams.
 //! This is the first server-side runtime driver for Phase B: it owns the
 //! connection loop, emits server SETTINGS / ACK / PING / GOAWAY / RST_STREAM,
 //! and dispatches request HEADERS / DATA frames to a streaming handler.
@@ -15,11 +16,14 @@ const types = @import("serval-core").types;
 const time = @import("serval-core").time;
 const h2 = @import("serval-h2");
 const runtime_mod = @import("runtime.zig");
+const TLSStream = @import("serval-tls").TLSStream;
 
 const Request = types.Request;
 
 const read_buffer_size_bytes: usize = h2.client_connection_preface.len + h2.frame_header_size_bytes + config.H2_MAX_FRAME_SIZE_BYTES;
 const frame_buffer_size_bytes: usize = h2.frame_header_size_bytes + config.H2_MAX_FRAME_SIZE_BYTES;
+const header_block_frame_overhead_bytes: usize = h2.frame_header_size_bytes * (@as(usize, config.H2_MAX_CONTINUATION_FRAMES) + 1);
+const header_block_frame_buffer_size_bytes: usize = config.H2_MAX_HEADER_BLOCK_SIZE_BYTES + header_block_frame_overhead_bytes;
 const response_table_capacity: usize = config.H2_MAX_CONCURRENT_STREAMS;
 const upgrade_preamble_size_bytes: usize =
     h2.client_connection_preface.len +
@@ -29,6 +33,22 @@ const upgrade_preamble_size_bytes: usize =
 const write_retry_sleep_ns: u64 = time.ns_per_ms;
 const write_stall_timeout_ns: u64 = 30 * time.ns_per_s;
 const write_max_retry_count: u32 = 30_000;
+const response_send_chunk_size_bytes: usize = 1;
+
+const ConnectionIo = union(enum) {
+    plain_fd: i32,
+    tls_stream: *TLSStream,
+
+    fn initPlain(fd: i32) ConnectionIo {
+        assert(fd >= 0);
+        return .{ .plain_fd = fd };
+    }
+
+    fn initTls(tls_stream: *TLSStream) ConnectionIo {
+        assert(@intFromPtr(tls_stream) != 0);
+        return .{ .tls_stream = tls_stream };
+    }
+};
 
 pub const Header = struct {
     name: []const u8,
@@ -57,6 +77,7 @@ pub const Error = error{
     InvalidPreface,
     ReadFailed,
     WriteFailed,
+    WouldBlock,
     ConnectionClosed,
     HeadersAlreadySent,
     HeadersNotSent,
@@ -68,6 +89,8 @@ pub const Error = error{
     InvalidStatusCode,
     InvalidFrame,
     HeaderBlockTooLarge,
+    ResponsePayloadTooLarge,
+    PendingResponseData,
     FrameLimitExceeded,
 } || runtime_mod.Error || h2.FrameError || h2.HpackError || h2.H2cUpgradeError;
 
@@ -76,6 +99,10 @@ const ResponseState = struct {
     stream_id: u32 = 0,
     headers_sent: bool = false,
     closed: bool = false,
+    pending_payload_len: u32 = 0,
+    pending_payload_sent: u32 = 0,
+    pending_end_stream: bool = false,
+    pending_payload_buf: [config.H2_MAX_FRAME_SIZE_BYTES]u8 = undefined,
 };
 
 const ResponseStateTable = struct {
@@ -268,7 +295,7 @@ const StreamTrackerTable = struct {
 };
 
 pub const ResponseWriter = struct {
-    fd: i32,
+    io_conn: *ConnectionIo,
     connection_id: u64,
     stream_id: u32,
     runtime: *runtime_mod.Runtime,
@@ -286,11 +313,18 @@ pub const ResponseWriter = struct {
 
         var block_buf: [config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
         const block = try buildResponseHeaderBlock(status, headers, &block_buf);
+        const peer_max_frame_size_bytes = responsePeerMaxFrameSizeBytes(self.runtime);
+        const max_payload_size_bytes: usize = @min(@as(usize, config.H2_MAX_FRAME_SIZE_BYTES), peer_max_frame_size_bytes);
 
-        var frame_buf: [frame_buffer_size_bytes]u8 = undefined;
-        const flags: u8 = h2.flags_end_headers | if (end_stream) h2.flags_end_stream else 0;
-        const frame = try appendFrame(&frame_buf, .headers, flags, self.stream_id, block);
-        try writeAll(self.fd, frame);
+        var frame_buf: [header_block_frame_buffer_size_bytes]u8 = undefined;
+        const frame = try appendHeaderBlockFrames(
+            &frame_buf,
+            self.stream_id,
+            block,
+            end_stream,
+            max_payload_size_bytes,
+        );
+        try writeAll(self.io_conn, frame);
 
         state.headers_sent = true;
         try self.stream_trackers.markResponseHeaders(self.stream_id, status, end_stream);
@@ -301,37 +335,32 @@ pub const ResponseWriter = struct {
         assert(@intFromPtr(self) != 0);
         assert(self.stream_id > 0);
 
-        const state = self.states.get(self.stream_id) orelse return error.ResponseStateNotFound;
+        var state = self.states.get(self.stream_id) orelse return error.ResponseStateNotFound;
         if (!state.headers_sent) return error.HeadersNotSent;
         if (state.closed) return error.ResponseClosed;
+
+        if (state.pending_payload_len > state.pending_payload_sent) return error.PendingResponseData;
 
         if (payload.len == 0) {
             if (end_stream) {
                 var empty_frame_buf: [frame_buffer_size_bytes]u8 = undefined;
                 const empty_frame = try appendFrame(&empty_frame_buf, .data, h2.flags_end_stream, self.stream_id, &[_]u8{});
-                try writeAll(self.fd, empty_frame);
+                try writeAll(self.io_conn, empty_frame);
                 try self.stream_trackers.markResponseData(self.stream_id, 0, true);
                 try self.finishStream(state);
             }
             return;
         }
 
-        const max_payload_size_bytes: usize = config.H2_MAX_FRAME_SIZE_BYTES;
-        var cursor: usize = 0;
-        while (cursor < payload.len) {
-            const remaining = payload.len - cursor;
-            const chunk_len = @min(remaining, max_payload_size_bytes);
-            const is_last_chunk = cursor + chunk_len == payload.len;
-            const flags: u8 = if (end_stream and is_last_chunk) h2.flags_end_stream else 0;
+        if (payload.len > config.H2_MAX_FRAME_SIZE_BYTES) return error.ResponsePayloadTooLarge;
 
-            var frame_buf: [frame_buffer_size_bytes]u8 = undefined;
-            const frame = try appendFrame(&frame_buf, .data, flags, self.stream_id, payload[cursor .. cursor + chunk_len]);
-            try writeAll(self.fd, frame);
-            cursor += chunk_len;
-        }
+        @memcpy(state.pending_payload_buf[0..payload.len], payload);
+        state.pending_payload_len = @intCast(payload.len);
+        state.pending_payload_sent = 0;
+        state.pending_end_stream = end_stream;
 
-        try self.stream_trackers.markResponseData(self.stream_id, payload.len, end_stream);
-        if (end_stream) try self.finishStream(state);
+        const ended_stream = try flushResponseStatePendingData(self.io_conn, self.runtime, state, self.stream_trackers);
+        if (ended_stream) try self.finishStream(state);
     }
 
     pub fn sendTrailers(self: *ResponseWriter, trailers: []const Header) Error!void {
@@ -344,10 +373,18 @@ pub const ResponseWriter = struct {
 
         var block_buf: [config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
         const block = try buildHeaderBlock(trailers, false, 0, &block_buf);
+        const peer_max_frame_size_bytes = responsePeerMaxFrameSizeBytes(self.runtime);
+        const max_payload_size_bytes: usize = @min(@as(usize, config.H2_MAX_FRAME_SIZE_BYTES), peer_max_frame_size_bytes);
 
-        var frame_buf: [frame_buffer_size_bytes]u8 = undefined;
-        const frame = try appendFrame(&frame_buf, .headers, h2.flags_end_headers | h2.flags_end_stream, self.stream_id, block);
-        try writeAll(self.fd, frame);
+        var frame_buf: [header_block_frame_buffer_size_bytes]u8 = undefined;
+        const frame = try appendHeaderBlockFrames(
+            &frame_buf,
+            self.stream_id,
+            block,
+            true,
+            max_payload_size_bytes,
+        );
+        try writeAll(self.io_conn, frame);
         try self.stream_trackers.markResponseEnd(self.stream_id);
         try self.finishStream(state);
     }
@@ -361,6 +398,79 @@ pub const ResponseWriter = struct {
         self.states.remove(self.stream_id);
     }
 };
+
+fn flushResponseStatePendingData(
+    io_conn: *ConnectionIo,
+    runtime: *runtime_mod.Runtime,
+    state: *ResponseState,
+    stream_trackers: *StreamTrackerTable,
+) Error!bool {
+    assert(@intFromPtr(io_conn) != 0);
+    assert(@intFromPtr(runtime) != 0);
+    assert(@intFromPtr(state) != 0);
+    assert(@intFromPtr(stream_trackers) != 0);
+
+    if (state.pending_payload_len == 0) return false;
+    if (state.pending_payload_sent >= state.pending_payload_len) return false;
+
+    const stream = runtime.state.getStream(state.stream_id) orelse return false;
+    if (!stream.localCanSend()) return false;
+
+    const conn_window_bytes: usize = runtime.state.flow.send_window.available_bytes;
+    const stream_window_bytes: usize = stream.send_window.available_bytes;
+    const peer_max_frame_size_bytes = responsePeerMaxFrameSizeBytes(runtime);
+    const pending_remaining_bytes: usize = @intCast(state.pending_payload_len - state.pending_payload_sent);
+
+    const allowed_bytes = @min(
+        @min(conn_window_bytes, stream_window_bytes),
+        @min(peer_max_frame_size_bytes, pending_remaining_bytes),
+    );
+    if (allowed_bytes == 0) return false;
+
+    const small_window_mode = stream_window_bytes <= 3 or conn_window_bytes <= 3;
+    const chunk_len = if (small_window_mode)
+        @min(allowed_bytes, response_send_chunk_size_bytes)
+    else
+        allowed_bytes;
+    const start: usize = @intCast(state.pending_payload_sent);
+    const end = start + chunk_len;
+    const finished_payload = end == state.pending_payload_len;
+    const send_end_stream = finished_payload and state.pending_end_stream;
+
+    var frame_buf: [frame_buffer_size_bytes]u8 = undefined;
+    const frame = try appendFrame(
+        &frame_buf,
+        .data,
+        if (send_end_stream) h2.flags_end_stream else 0,
+        state.stream_id,
+        state.pending_payload_buf[start..end],
+    );
+    try writeAll(io_conn, frame);
+
+    const sent_u32: u32 = @intCast(chunk_len);
+    try runtime.state.consumeSendWindow(sent_u32);
+    try runtime.state.consumeStreamSendWindow(state.stream_id, sent_u32);
+    state.pending_payload_sent += sent_u32;
+
+    try stream_trackers.markResponseData(state.stream_id, chunk_len, send_end_stream);
+
+    if (finished_payload) {
+        state.pending_payload_len = 0;
+        state.pending_payload_sent = 0;
+        state.pending_end_stream = false;
+    }
+
+    return send_end_stream;
+}
+
+fn responsePeerMaxFrameSizeBytes(runtime: *const runtime_mod.Runtime) usize {
+    assert(@intFromPtr(runtime) != 0);
+
+    const peer_max_frame_size_bytes: u32 = runtime.state.peer_settings.max_frame_size_bytes;
+    assert(peer_max_frame_size_bytes >= h2.settings.min_max_frame_size_bytes);
+    assert(peer_max_frame_size_bytes <= h2.settings.max_max_frame_size_bytes);
+    return @intCast(peer_max_frame_size_bytes);
+}
 
 pub fn verifyHandler(comptime Handler: type) void {
     if (!@hasDecl(Handler, "handleH2Headers")) {
@@ -408,6 +518,10 @@ pub fn servePlainConnection(comptime Handler: type, handler: *Handler, fd: i32, 
     return servePlainConnectionWithInitialBytes(Handler, handler, fd, connection_id, &[_]u8{});
 }
 
+pub fn serveTlsConnection(comptime Handler: type, handler: *Handler, tls_stream: *TLSStream, connection_id: u64) Error!void {
+    return serveTlsConnectionWithInitialBytes(Handler, handler, tls_stream, connection_id, &[_]u8{});
+}
+
 pub const PlainConnectionOptions = struct {
     /// Caller has already sent server SETTINGS for this connection.
     /// Runtime still expects an ACK and will validate it.
@@ -431,6 +545,23 @@ pub fn servePlainConnectionWithInitialBytes(
     );
 }
 
+pub fn serveTlsConnectionWithInitialBytes(
+    comptime Handler: type,
+    handler: *Handler,
+    tls_stream: *TLSStream,
+    connection_id: u64,
+    initial_bytes: []const u8,
+) Error!void {
+    return serveTlsConnectionWithInitialBytesOptions(
+        Handler,
+        handler,
+        tls_stream,
+        connection_id,
+        initial_bytes,
+        .{},
+    );
+}
+
 pub fn servePlainConnectionWithInitialBytesOptions(
     comptime Handler: type,
     handler: *Handler,
@@ -439,10 +570,50 @@ pub fn servePlainConnectionWithInitialBytesOptions(
     initial_bytes: []const u8,
     options: PlainConnectionOptions,
 ) Error!void {
+    assert(fd >= 0);
+    var io_conn = ConnectionIo.initPlain(fd);
+    return serveConnectionWithInitialBytesOptions(
+        Handler,
+        handler,
+        &io_conn,
+        connection_id,
+        initial_bytes,
+        options,
+    );
+}
+
+pub fn serveTlsConnectionWithInitialBytesOptions(
+    comptime Handler: type,
+    handler: *Handler,
+    tls_stream: *TLSStream,
+    connection_id: u64,
+    initial_bytes: []const u8,
+    options: PlainConnectionOptions,
+) Error!void {
+    assert(@intFromPtr(tls_stream) != 0);
+    var io_conn = ConnectionIo.initTls(tls_stream);
+    return serveConnectionWithInitialBytesOptions(
+        Handler,
+        handler,
+        &io_conn,
+        connection_id,
+        initial_bytes,
+        options,
+    );
+}
+
+fn serveConnectionWithInitialBytesOptions(
+    comptime Handler: type,
+    handler: *Handler,
+    io_conn: *ConnectionIo,
+    connection_id: u64,
+    initial_bytes: []const u8,
+    options: PlainConnectionOptions,
+) Error!void {
     comptime verifyHandler(Handler);
 
     assert(@intFromPtr(handler) != 0);
-    assert(fd >= 0);
+    assert(@intFromPtr(io_conn) != 0);
     assert(initial_bytes.len <= read_buffer_size_bytes);
 
     var runtime = try runtime_mod.Runtime.init();
@@ -454,7 +625,7 @@ pub fn servePlainConnectionWithInitialBytesOptions(
     } else {
         var settings_buf: [h2.frame_header_size_bytes + (4 * h2.setting_size_bytes)]u8 = undefined;
         const initial_settings = try runtime.writeInitialSettingsFrame(&settings_buf);
-        try writeAll(fd, initial_settings);
+        try writeAll(io_conn, initial_settings);
     }
 
     var recv_buf: [read_buffer_size_bytes]u8 = undefined;
@@ -464,25 +635,63 @@ pub fn servePlainConnectionWithInitialBytesOptions(
         buffer_len = initial_bytes.len;
     }
 
-    try fillBuffer(fd, &recv_buf, &buffer_len, h2.client_connection_preface.len);
+    try fillBuffer(io_conn, &recv_buf, &buffer_len, h2.client_connection_preface.len);
     if (!h2.looksLikeClientConnectionPreface(recv_buf[0..buffer_len])) return error.InvalidPreface;
     try runtime.receiveClientPreface();
     discardPrefix(&recv_buf, &buffer_len, h2.client_connection_preface.len);
 
     var frame_count: u32 = 0;
     while (frame_count < config.H2_SERVER_MAX_FRAME_COUNT) : (frame_count += 1) {
-        if (!try ensureFrame(fd, &recv_buf, &buffer_len)) {
+        const have_frame = ensureFrame(io_conn, &recv_buf, &buffer_len) catch |err| {
+            try sendRuntimeErrorGoAway(&runtime, io_conn, runtime.state.local_goaway_last_stream_id, err);
+            closeAllTrackedStreams(
+                Handler,
+                handler,
+                connection_id,
+                &stream_trackers,
+                .connection_close,
+                @intFromEnum(mapGoAwayError(err)),
+            );
+            return err;
+        };
+        if (!have_frame) {
             closeAllTrackedStreams(Handler, handler, connection_id, &stream_trackers, .connection_close, 0);
             return;
         }
 
-        const header = try h2.parseFrameHeader(recv_buf[0..h2.frame_header_size_bytes]);
+        const header = h2.parseFrameHeader(recv_buf[0..h2.frame_header_size_bytes]) catch |err| {
+            try sendRuntimeErrorGoAway(&runtime, io_conn, runtime.state.local_goaway_last_stream_id, err);
+            closeAllTrackedStreams(
+                Handler,
+                handler,
+                connection_id,
+                &stream_trackers,
+                .connection_close,
+                @intFromEnum(mapGoAwayError(err)),
+            );
+            return err;
+        };
         const frame_len: usize = h2.frame_header_size_bytes + header.length;
-        try fillBuffer(fd, &recv_buf, &buffer_len, frame_len);
+        try fillBuffer(io_conn, &recv_buf, &buffer_len, frame_len);
 
         const payload = recv_buf[h2.frame_header_size_bytes..frame_len];
         const action = runtime.receiveFrame(header, payload) catch |err| {
-            try sendRuntimeErrorGoAway(&runtime, fd, header.stream_id, err);
+            if (try tryHandleRecoverableStreamError(
+                Handler,
+                handler,
+                io_conn,
+                connection_id,
+                &runtime,
+                &response_states,
+                &stream_trackers,
+                header,
+                err,
+            )) {
+                discardPrefix(&recv_buf, &buffer_len, frame_len);
+                continue;
+            }
+
+            try sendRuntimeErrorGoAway(&runtime, io_conn, header.stream_id, err);
             closeAllTrackedStreams(
                 Handler,
                 handler,
@@ -493,7 +702,7 @@ pub fn servePlainConnectionWithInitialBytesOptions(
             );
             return err;
         };
-        handleAction(Handler, handler, fd, connection_id, &runtime, &response_states, &stream_trackers, action) catch |err| {
+        handleAction(Handler, handler, io_conn, connection_id, &runtime, &response_states, &stream_trackers, action) catch |err| {
             closeAllTrackedStreams(
                 Handler,
                 handler,
@@ -504,6 +713,20 @@ pub fn servePlainConnectionWithInitialBytesOptions(
             );
             return err;
         };
+
+        flushPendingResponseData(&runtime, io_conn, &response_states, &stream_trackers) catch |err| {
+            closeAllTrackedStreams(
+                Handler,
+                handler,
+                connection_id,
+                &stream_trackers,
+                .connection_close,
+                @intFromEnum(mapGoAwayError(err)),
+            );
+            return err;
+        };
+        closeCompletedStreams(Handler, handler, connection_id, &stream_trackers);
+
         discardPrefix(&recv_buf, &buffer_len, frame_len);
 
         if (action == .connection_close) return;
@@ -515,7 +738,7 @@ pub fn servePlainConnectionWithInitialBytesOptions(
         .error_code_raw = @intFromEnum(h2.ErrorCode.enhance_your_calm),
         .debug_data = "frame_limit",
     });
-    writeAll(fd, goaway) catch |write_err| switch (write_err) {
+    writeAll(io_conn, goaway) catch |write_err| switch (write_err) {
         error.ConnectionClosed => {},
         else => {},
     };
@@ -549,13 +772,15 @@ pub fn serveUpgradedConnection(
     assert(settings_payload.len <= config.H2_MAX_FRAME_SIZE_BYTES);
     assert(initial_client_h2_bytes.len <= read_buffer_size_bytes);
 
+    var io_conn = ConnectionIo.initPlain(fd);
+
     var runtime = try runtime_mod.Runtime.init();
     var response_states = ResponseStateTable{};
     var stream_trackers = StreamTrackerTable{};
 
     var settings_buf: [h2.frame_header_size_bytes + (4 * h2.setting_size_bytes)]u8 = undefined;
     const initial_settings = try runtime.writeInitialSettingsFrame(&settings_buf);
-    try writeAll(fd, initial_settings);
+    try writeAll(&io_conn, initial_settings);
 
     try runtime.receiveClientPreface();
 
@@ -566,7 +791,7 @@ pub fn serveUpgradedConnection(
         .stream_id = 0,
     };
     const peer_settings_action = runtime.receiveFrame(peer_settings_header, settings_payload) catch |err| {
-        try sendRuntimeErrorGoAway(&runtime, fd, 0, err);
+        try sendRuntimeErrorGoAway(&runtime, &io_conn, 0, err);
         closeAllTrackedStreams(
             Handler,
             handler,
@@ -577,7 +802,7 @@ pub fn serveUpgradedConnection(
         );
         return err;
     };
-    handleAction(Handler, handler, fd, connection_id, &runtime, &response_states, &stream_trackers, peer_settings_action) catch |err| {
+    handleAction(Handler, handler, &io_conn, connection_id, &runtime, &response_states, &stream_trackers, peer_settings_action) catch |err| {
         closeAllTrackedStreams(
             Handler,
             handler,
@@ -588,6 +813,8 @@ pub fn serveUpgradedConnection(
         );
         return err;
     };
+    try flushPendingResponseData(&runtime, &io_conn, &response_states, &stream_trackers);
+    closeCompletedStreams(Handler, handler, connection_id, &stream_trackers);
 
     const total_body_bytes: u64 = @as(u64, @intCast(initial_body.len)) + remaining_body_bytes;
     var preamble_buf: [upgrade_preamble_size_bytes]u8 = undefined;
@@ -613,7 +840,7 @@ pub fn serveUpgradedConnection(
     if (headers_payload_end > preamble.len) return error.InvalidFrame;
 
     const headers_action = runtime.receiveFrame(headers_header, preamble[headers_payload_start..headers_payload_end]) catch |err| {
-        try sendRuntimeErrorGoAway(&runtime, fd, headers_header.stream_id, err);
+        try sendRuntimeErrorGoAway(&runtime, &io_conn, headers_header.stream_id, err);
         closeAllTrackedStreams(
             Handler,
             handler,
@@ -624,7 +851,7 @@ pub fn serveUpgradedConnection(
         );
         return err;
     };
-    handleAction(Handler, handler, fd, connection_id, &runtime, &response_states, &stream_trackers, headers_action) catch |err| {
+    handleAction(Handler, handler, &io_conn, connection_id, &runtime, &response_states, &stream_trackers, headers_action) catch |err| {
         closeAllTrackedStreams(
             Handler,
             handler,
@@ -635,11 +862,13 @@ pub fn serveUpgradedConnection(
         );
         return err;
     };
+    try flushPendingResponseData(&runtime, &io_conn, &response_states, &stream_trackers);
+    closeCompletedStreams(Handler, handler, connection_id, &stream_trackers);
 
     processUpgradeBody(
         Handler,
         handler,
-        fd,
+        &io_conn,
         connection_id,
         &runtime,
         &response_states,
@@ -665,26 +894,64 @@ pub fn serveUpgradedConnection(
         buffer_len = initial_client_h2_bytes.len;
     }
 
-    consumeOptionalUpgradeClientPreface(fd, &recv_buf, &buffer_len) catch |err| {
-        try sendRuntimeErrorGoAway(&runtime, fd, 0, err);
+    consumeOptionalUpgradeClientPreface(&io_conn, &recv_buf, &buffer_len) catch |err| {
+        try sendRuntimeErrorGoAway(&runtime, &io_conn, 0, err);
         closeAllTrackedStreams(Handler, handler, connection_id, &stream_trackers, .connection_close, @intFromEnum(mapGoAwayError(err)));
         return err;
     };
 
     var frame_count: u32 = 0;
     while (frame_count < config.H2_SERVER_MAX_FRAME_COUNT) : (frame_count += 1) {
-        if (!try ensureFrame(fd, &recv_buf, &buffer_len)) {
+        const have_frame = ensureFrame(&io_conn, &recv_buf, &buffer_len) catch |err| {
+            try sendRuntimeErrorGoAway(&runtime, &io_conn, runtime.state.local_goaway_last_stream_id, err);
+            closeAllTrackedStreams(
+                Handler,
+                handler,
+                connection_id,
+                &stream_trackers,
+                .connection_close,
+                @intFromEnum(mapGoAwayError(err)),
+            );
+            return err;
+        };
+        if (!have_frame) {
             closeAllTrackedStreams(Handler, handler, connection_id, &stream_trackers, .connection_close, 0);
             return;
         }
 
-        const header = try h2.parseFrameHeader(recv_buf[0..h2.frame_header_size_bytes]);
+        const header = h2.parseFrameHeader(recv_buf[0..h2.frame_header_size_bytes]) catch |err| {
+            try sendRuntimeErrorGoAway(&runtime, &io_conn, runtime.state.local_goaway_last_stream_id, err);
+            closeAllTrackedStreams(
+                Handler,
+                handler,
+                connection_id,
+                &stream_trackers,
+                .connection_close,
+                @intFromEnum(mapGoAwayError(err)),
+            );
+            return err;
+        };
         const frame_len: usize = h2.frame_header_size_bytes + header.length;
-        try fillBuffer(fd, &recv_buf, &buffer_len, frame_len);
+        try fillBuffer(&io_conn, &recv_buf, &buffer_len, frame_len);
 
         const payload = recv_buf[h2.frame_header_size_bytes..frame_len];
         const action = runtime.receiveFrame(header, payload) catch |err| {
-            try sendRuntimeErrorGoAway(&runtime, fd, header.stream_id, err);
+            if (try tryHandleRecoverableStreamError(
+                Handler,
+                handler,
+                &io_conn,
+                connection_id,
+                &runtime,
+                &response_states,
+                &stream_trackers,
+                header,
+                err,
+            )) {
+                discardPrefix(&recv_buf, &buffer_len, frame_len);
+                continue;
+            }
+
+            try sendRuntimeErrorGoAway(&runtime, &io_conn, header.stream_id, err);
             closeAllTrackedStreams(
                 Handler,
                 handler,
@@ -695,7 +962,7 @@ pub fn serveUpgradedConnection(
             );
             return err;
         };
-        handleAction(Handler, handler, fd, connection_id, &runtime, &response_states, &stream_trackers, action) catch |err| {
+        handleAction(Handler, handler, &io_conn, connection_id, &runtime, &response_states, &stream_trackers, action) catch |err| {
             closeAllTrackedStreams(
                 Handler,
                 handler,
@@ -706,6 +973,20 @@ pub fn serveUpgradedConnection(
             );
             return err;
         };
+
+        flushPendingResponseData(&runtime, &io_conn, &response_states, &stream_trackers) catch |err| {
+            closeAllTrackedStreams(
+                Handler,
+                handler,
+                connection_id,
+                &stream_trackers,
+                .connection_close,
+                @intFromEnum(mapGoAwayError(err)),
+            );
+            return err;
+        };
+        closeCompletedStreams(Handler, handler, connection_id, &stream_trackers);
+
         discardPrefix(&recv_buf, &buffer_len, frame_len);
 
         if (action == .connection_close) return;
@@ -717,7 +998,7 @@ pub fn serveUpgradedConnection(
         .error_code_raw = @intFromEnum(h2.ErrorCode.enhance_your_calm),
         .debug_data = "frame_limit",
     });
-    writeAll(fd, goaway) catch |write_err| switch (write_err) {
+    writeAll(&io_conn, goaway) catch |write_err| switch (write_err) {
         error.ConnectionClosed => {},
         else => {},
     };
@@ -735,7 +1016,7 @@ pub fn serveUpgradedConnection(
 fn handleAction(
     comptime Handler: type,
     handler: *Handler,
-    fd: i32,
+    io_conn: *ConnectionIo,
     connection_id: u64,
     runtime: *runtime_mod.Runtime,
     response_states: *ResponseStateTable,
@@ -743,7 +1024,7 @@ fn handleAction(
     action: runtime_mod.ReceiveAction,
 ) Error!void {
     assert(@intFromPtr(handler) != 0);
-    assert(fd >= 0);
+    assert(@intFromPtr(io_conn) != 0);
     assert(@intFromPtr(stream_trackers) != 0);
 
     switch (action) {
@@ -751,12 +1032,12 @@ fn handleAction(
         .send_settings_ack => {
             var ack_buf: [h2.frame_header_size_bytes]u8 = undefined;
             const ack = try runtime.writePendingSettingsAck(&ack_buf);
-            try writeAll(fd, ack);
+            try writeAll(io_conn, ack);
         },
         .send_ping_ack => |opaque_data| {
             var ack_buf: [h2.frame_header_size_bytes + h2.control.ping_payload_size_bytes]u8 = undefined;
             const ack = try runtime_mod.Runtime.writePingAckFrame(&ack_buf, opaque_data);
-            try writeAll(fd, ack);
+            try writeAll(io_conn, ack);
         },
         .request_headers => |headers| {
             const opened = try stream_trackers.markRequestHeaders(headers.stream_id, headers.end_stream);
@@ -767,7 +1048,7 @@ fn handleAction(
             }
 
             var writer = ResponseWriter{
-                .fd = fd,
+                .io_conn = io_conn,
                 .connection_id = connection_id,
                 .stream_id = headers.stream_id,
                 .runtime = runtime,
@@ -786,16 +1067,16 @@ fn handleAction(
                     .local_reset,
                     reset_error_code_raw,
                 );
-                try sendErrorReset(fd, runtime, headers.stream_id, reset_error_code_raw);
+                try sendErrorReset(io_conn, runtime, headers.stream_id, reset_error_code_raw);
             };
             closeCompletedStreams(Handler, handler, connection_id, stream_trackers);
         },
         .request_data => |data| {
             try stream_trackers.markRequestData(data.stream_id, data.payload.len, data.end_stream);
-            try replenishReceiveWindows(fd, runtime, data.stream_id, data.payload.len);
+            try replenishReceiveWindows(io_conn, runtime, data.stream_id, data.payload.len);
 
             var writer = ResponseWriter{
-                .fd = fd,
+                .io_conn = io_conn,
                 .connection_id = connection_id,
                 .stream_id = data.stream_id,
                 .runtime = runtime,
@@ -814,7 +1095,7 @@ fn handleAction(
                     .local_reset,
                     reset_error_code_raw,
                 );
-                try sendErrorReset(fd, runtime, data.stream_id, reset_error_code_raw);
+                try sendErrorReset(io_conn, runtime, data.stream_id, reset_error_code_raw);
             };
             closeCompletedStreams(Handler, handler, connection_id, stream_trackers);
         },
@@ -846,6 +1127,33 @@ fn handleAction(
                 handler.handleH2ConnectionClose(goaway);
             }
         },
+    }
+}
+
+fn flushPendingResponseData(
+    runtime: *runtime_mod.Runtime,
+    io_conn: *ConnectionIo,
+    response_states: *ResponseStateTable,
+    stream_trackers: *StreamTrackerTable,
+) Error!void {
+    assert(@intFromPtr(runtime) != 0);
+    assert(@intFromPtr(io_conn) != 0);
+    assert(@intFromPtr(response_states) != 0);
+    assert(@intFromPtr(stream_trackers) != 0);
+
+    var index: usize = 0;
+    while (index < response_states.slots.len) : (index += 1) {
+        var state = &response_states.slots[index];
+        if (!state.used) continue;
+        if (state.closed) continue;
+
+        const ended_stream = try flushResponseStatePendingData(io_conn, runtime, state, stream_trackers);
+        if (!ended_stream) continue;
+
+        const stream_id = state.stream_id;
+        try runtime.state.endLocalStream(stream_id);
+        state.closed = true;
+        response_states.remove(stream_id);
     }
 }
 
@@ -926,7 +1234,7 @@ fn emitStreamCloseHook(
 fn processUpgradeBody(
     comptime Handler: type,
     handler: *Handler,
-    fd: i32,
+    io_conn: *ConnectionIo,
     connection_id: u64,
     runtime: *runtime_mod.Runtime,
     response_states: *ResponseStateTable,
@@ -935,7 +1243,7 @@ fn processUpgradeBody(
     remaining_body_bytes: u64,
 ) Error!void {
     assert(@intFromPtr(handler) != 0);
-    assert(fd >= 0);
+    assert(@intFromPtr(io_conn) != 0);
 
     var initial_cursor: usize = 0;
     var remaining: u64 = remaining_body_bytes;
@@ -947,7 +1255,7 @@ fn processUpgradeBody(
         try processUpgradeBodyChunk(
             Handler,
             handler,
-            fd,
+            io_conn,
             connection_id,
             runtime,
             response_states,
@@ -963,10 +1271,7 @@ fn processUpgradeBody(
     var body_buf: [config.H2_MAX_FRAME_SIZE_BYTES]u8 = undefined;
     while (remaining > 0) {
         const max_read: usize = @intCast(@min(remaining, config.H2_MAX_FRAME_SIZE_BYTES));
-        const n = posix.read(fd, body_buf[0..max_read]) catch |err| switch (err) {
-            error.ConnectionResetByPeer => return error.ConnectionClosed,
-            else => return error.ReadFailed,
-        };
+        const n = try readSome(io_conn, body_buf[0..max_read]);
         if (n == 0) return error.ConnectionClosed;
 
         const read_bytes: u64 = @intCast(n);
@@ -976,7 +1281,7 @@ fn processUpgradeBody(
         try processUpgradeBodyChunk(
             Handler,
             handler,
-            fd,
+            io_conn,
             connection_id,
             runtime,
             response_states,
@@ -990,7 +1295,7 @@ fn processUpgradeBody(
 fn processUpgradeBodyChunk(
     comptime Handler: type,
     handler: *Handler,
-    fd: i32,
+    io_conn: *ConnectionIo,
     connection_id: u64,
     runtime: *runtime_mod.Runtime,
     response_states: *ResponseStateTable,
@@ -1009,7 +1314,21 @@ fn processUpgradeBodyChunk(
     };
 
     const action = runtime.receiveFrame(data_header, payload) catch |err| {
-        try sendRuntimeErrorGoAway(runtime, fd, 1, err);
+        if (try tryHandleRecoverableStreamError(
+            Handler,
+            handler,
+            io_conn,
+            connection_id,
+            runtime,
+            response_states,
+            stream_trackers,
+            data_header,
+            err,
+        )) {
+            return;
+        }
+
+        try sendRuntimeErrorGoAway(runtime, io_conn, 1, err);
         closeAllTrackedStreams(
             Handler,
             handler,
@@ -1020,7 +1339,7 @@ fn processUpgradeBodyChunk(
         );
         return err;
     };
-    handleAction(Handler, handler, fd, connection_id, runtime, response_states, stream_trackers, action) catch |err| {
+    handleAction(Handler, handler, io_conn, connection_id, runtime, response_states, stream_trackers, action) catch |err| {
         closeAllTrackedStreams(
             Handler,
             handler,
@@ -1031,10 +1350,13 @@ fn processUpgradeBodyChunk(
         );
         return err;
     };
+
+    try flushPendingResponseData(runtime, io_conn, response_states, stream_trackers);
+    closeCompletedStreams(Handler, handler, connection_id, stream_trackers);
 }
 
-fn replenishReceiveWindows(fd: i32, runtime: *runtime_mod.Runtime, stream_id: u32, consumed_bytes: usize) Error!void {
-    assert(fd >= 0);
+fn replenishReceiveWindows(io_conn: *ConnectionIo, runtime: *runtime_mod.Runtime, stream_id: u32, consumed_bytes: usize) Error!void {
+    assert(@intFromPtr(io_conn) != 0);
     assert(@intFromPtr(runtime) != 0);
     assert(stream_id > 0);
     assert(consumed_bytes <= config.H2_MAX_FRAME_SIZE_BYTES);
@@ -1047,15 +1369,15 @@ fn replenishReceiveWindows(fd: i32, runtime: *runtime_mod.Runtime, stream_id: u3
 
     var conn_update_buf: [h2.frame_header_size_bytes + h2.control.window_update_payload_size_bytes]u8 = undefined;
     const conn_update = try h2.buildWindowUpdateFrame(&conn_update_buf, 0, increment_bytes);
-    try writeAll(fd, conn_update);
+    try writeAll(io_conn, conn_update);
 
     var stream_update_buf: [h2.frame_header_size_bytes + h2.control.window_update_payload_size_bytes]u8 = undefined;
     const stream_update = try h2.buildWindowUpdateFrame(&stream_update_buf, stream_id, increment_bytes);
-    try writeAll(fd, stream_update);
+    try writeAll(io_conn, stream_update);
 }
 
-fn sendErrorReset(fd: i32, runtime: *runtime_mod.Runtime, stream_id: u32, error_code_raw: u32) Error!void {
-    assert(fd >= 0);
+fn sendErrorReset(io_conn: *ConnectionIo, runtime: *runtime_mod.Runtime, stream_id: u32, error_code_raw: u32) Error!void {
+    assert(@intFromPtr(io_conn) != 0);
     assert(stream_id > 0);
 
     var rst_buf: [h2.frame_header_size_bytes + h2.control.rst_stream_payload_size_bytes]u8 = undefined;
@@ -1063,7 +1385,7 @@ fn sendErrorReset(fd: i32, runtime: *runtime_mod.Runtime, stream_id: u32, error_
         .stream_id = stream_id,
         .error_code_raw = error_code_raw,
     });
-    try writeAll(fd, rst);
+    try writeAll(io_conn, rst);
 }
 
 fn mapHandlerErrorToResetCodeRaw(err: anyerror) u32 {
@@ -1081,9 +1403,54 @@ fn mapHandlerErrorToResetCodeRaw(err: anyerror) u32 {
     };
 }
 
-fn sendRuntimeErrorGoAway(runtime: *runtime_mod.Runtime, fd: i32, stream_id: u32, err: anyerror) Error!void {
+fn tryHandleRecoverableStreamError(
+    comptime Handler: type,
+    handler: *Handler,
+    io_conn: *ConnectionIo,
+    connection_id: u64,
+    runtime: *runtime_mod.Runtime,
+    response_states: *ResponseStateTable,
+    stream_trackers: *StreamTrackerTable,
+    header: h2.FrameHeader,
+    err: anyerror,
+) Error!bool {
+    assert(@intFromPtr(handler) != 0);
+    assert(@intFromPtr(io_conn) != 0);
     assert(@intFromPtr(runtime) != 0);
-    assert(fd >= 0);
+    assert(@intFromPtr(response_states) != 0);
+    assert(@intFromPtr(stream_trackers) != 0);
+
+    if (header.stream_id == 0) return false;
+
+    const reset_error_code_raw: u32 = switch (err) {
+        error.StreamProtocolError => @intFromEnum(h2.ErrorCode.protocol_error),
+        error.StreamRefused => @intFromEnum(h2.ErrorCode.refused_stream),
+        error.StreamFlowControlError => @intFromEnum(h2.ErrorCode.flow_control_error),
+        error.StreamClosedError => @intFromEnum(h2.ErrorCode.stream_closed),
+        else => return false,
+    };
+
+    response_states.remove(header.stream_id);
+    closeStreamWithReason(
+        Handler,
+        handler,
+        connection_id,
+        stream_trackers,
+        header.stream_id,
+        .local_reset,
+        reset_error_code_raw,
+    );
+    sendErrorReset(io_conn, runtime, header.stream_id, reset_error_code_raw) catch |write_err| switch (write_err) {
+        error.ConnectionClosed => {},
+        else => return write_err,
+    };
+
+    return true;
+}
+
+fn sendRuntimeErrorGoAway(runtime: *runtime_mod.Runtime, io_conn: *ConnectionIo, stream_id: u32, err: anyerror) Error!void {
+    assert(@intFromPtr(runtime) != 0);
+    assert(@intFromPtr(io_conn) != 0);
     assert(stream_id <= 0x7fff_ffff);
 
     var goaway_buf: [frame_buffer_size_bytes]u8 = undefined;
@@ -1092,19 +1459,21 @@ fn sendRuntimeErrorGoAway(runtime: *runtime_mod.Runtime, fd: i32, stream_id: u32
         .error_code_raw = @intFromEnum(mapGoAwayError(err)),
         .debug_data = @errorName(err),
     });
-    try writeAll(fd, goaway);
+    try writeAll(io_conn, goaway);
 }
 
 fn mapGoAwayError(err: anyerror) h2.ErrorCode {
     return switch (err) {
+        error.FrameTooLarge => .frame_size_error,
         error.WindowOverflow,
         error.WindowUnderflow,
         error.InvalidIncrement,
         => .flow_control_error,
+        error.ConnectionStreamClosedError => .stream_closed,
+        error.ConnectionProtocolError,
         error.ConnectionClosing,
         error.InvalidDataStream,
         error.UnsupportedContinuation,
-        error.UnsupportedPadding,
         error.UnsupportedPriority,
         error.UnsupportedPushPromise,
         error.InvalidFrame,
@@ -1125,19 +1494,19 @@ fn mapGoAwayError(err: anyerror) h2.ErrorCode {
     };
 }
 
-fn consumeOptionalUpgradeClientPreface(fd: i32, recv_buf: *[read_buffer_size_bytes]u8, buffer_len: *usize) Error!void {
-    assert(fd >= 0);
+fn consumeOptionalUpgradeClientPreface(io_conn: *ConnectionIo, recv_buf: *[read_buffer_size_bytes]u8, buffer_len: *usize) Error!void {
+    assert(@intFromPtr(io_conn) != 0);
     assert(buffer_len.* <= recv_buf.len);
 
     if (buffer_len.* == 0) {
-        const n = try readIntoBuffer(fd, recv_buf, buffer_len);
+        const n = try readIntoBuffer(io_conn, recv_buf, buffer_len);
         if (n == 0) return;
     }
 
     if (buffer_len.* == 0) return;
     if (!h2.looksLikeClientConnectionPrefacePrefix(recv_buf[0..1])) return;
 
-    fillBuffer(fd, recv_buf, buffer_len, h2.client_connection_preface.len) catch |err| switch (err) {
+    fillBuffer(io_conn, recv_buf, buffer_len, h2.client_connection_preface.len) catch |err| switch (err) {
         error.ConnectionClosed => return error.InvalidPreface,
         else => return err,
     };
@@ -1146,43 +1515,40 @@ fn consumeOptionalUpgradeClientPreface(fd: i32, recv_buf: *[read_buffer_size_byt
     discardPrefix(recv_buf, buffer_len, h2.client_connection_preface.len);
 }
 
-fn ensureFrame(fd: i32, recv_buf: *[read_buffer_size_bytes]u8, buffer_len: *usize) Error!bool {
-    assert(fd >= 0);
+fn ensureFrame(io_conn: *ConnectionIo, recv_buf: *[read_buffer_size_bytes]u8, buffer_len: *usize) Error!bool {
+    assert(@intFromPtr(io_conn) != 0);
     assert(@intFromPtr(recv_buf) != 0);
 
     if (buffer_len.* == 0) {
-        const n = try readIntoBuffer(fd, recv_buf, buffer_len);
+        const n = try readIntoBuffer(io_conn, recv_buf, buffer_len);
         if (n == 0) return false;
     }
 
-    try fillBuffer(fd, recv_buf, buffer_len, h2.frame_header_size_bytes);
+    try fillBuffer(io_conn, recv_buf, buffer_len, h2.frame_header_size_bytes);
     const header = try h2.parseFrameHeader(recv_buf[0..h2.frame_header_size_bytes]);
     const frame_len: usize = h2.frame_header_size_bytes + header.length;
-    try fillBuffer(fd, recv_buf, buffer_len, frame_len);
+    try fillBuffer(io_conn, recv_buf, buffer_len, frame_len);
     return true;
 }
 
-fn fillBuffer(fd: i32, recv_buf: *[read_buffer_size_bytes]u8, buffer_len: *usize, needed_len: usize) Error!void {
-    assert(fd >= 0);
+fn fillBuffer(io_conn: *ConnectionIo, recv_buf: *[read_buffer_size_bytes]u8, buffer_len: *usize, needed_len: usize) Error!void {
+    assert(@intFromPtr(io_conn) != 0);
     assert(needed_len <= recv_buf.len);
 
     var reads: usize = 0;
     while (buffer_len.* < needed_len and reads < recv_buf.len) : (reads += 1) {
-        const n = try readIntoBuffer(fd, recv_buf, buffer_len);
+        const n = try readIntoBuffer(io_conn, recv_buf, buffer_len);
         if (n == 0) return error.ConnectionClosed;
     }
 
     if (buffer_len.* < needed_len) return error.ReadFailed;
 }
 
-fn readIntoBuffer(fd: i32, recv_buf: *[read_buffer_size_bytes]u8, buffer_len: *usize) Error!usize {
-    assert(fd >= 0);
+fn readIntoBuffer(io_conn: *ConnectionIo, recv_buf: *[read_buffer_size_bytes]u8, buffer_len: *usize) Error!usize {
+    assert(@intFromPtr(io_conn) != 0);
     assert(buffer_len.* <= recv_buf.len);
 
-    const n = posix.read(fd, recv_buf[buffer_len.*..]) catch |err| switch (err) {
-        error.ConnectionResetByPeer => return error.ConnectionClosed,
-        else => return error.ReadFailed,
-    };
+    const n = try readSome(io_conn, recv_buf[buffer_len.*..]);
     buffer_len.* += n;
     return n;
 }
@@ -1199,8 +1565,49 @@ fn discardPrefix(recv_buf: *[read_buffer_size_bytes]u8, buffer_len: *usize, pref
     buffer_len.* -= prefix_len;
 }
 
-fn writeAll(fd: i32, data: []const u8) Error!void {
-    assert(fd >= 0);
+fn readSome(io_conn: *ConnectionIo, out: []u8) Error!usize {
+    assert(@intFromPtr(io_conn) != 0);
+
+    return switch (io_conn.*) {
+        .plain_fd => |fd| posix.read(fd, out) catch |err| switch (err) {
+            error.ConnectionResetByPeer => return error.ConnectionClosed,
+            else => return error.ReadFailed,
+        },
+        .tls_stream => |tls_stream| blk: {
+            const n: u32 = tls_stream.read(out) catch |err| switch (err) {
+                error.ConnectionReset => return error.ConnectionClosed,
+                else => return error.ReadFailed,
+            };
+            break :blk @intCast(n);
+        },
+    };
+}
+
+fn writeSome(io_conn: *ConnectionIo, out: []const u8) Error!usize {
+    assert(@intFromPtr(io_conn) != 0);
+
+    return switch (io_conn.*) {
+        .plain_fd => |fd| blk: {
+            const rc = std.c.write(fd, out.ptr, out.len);
+            switch (std.c.errno(rc)) {
+                .SUCCESS => break :blk @intCast(rc),
+                .INTR, .AGAIN => return error.WouldBlock,
+                .PIPE, .CONNRESET => return error.ConnectionClosed,
+                else => return error.WriteFailed,
+            }
+        },
+        .tls_stream => |tls_stream| blk: {
+            const n: u32 = tls_stream.write(out) catch |err| switch (err) {
+                error.ConnectionReset => return error.ConnectionClosed,
+                else => return error.WriteFailed,
+            };
+            break :blk @intCast(n);
+        },
+    };
+}
+
+fn writeAll(io_conn: *ConnectionIo, data: []const u8) Error!void {
+    assert(@intFromPtr(io_conn) != 0);
 
     if (data.len == 0) return;
 
@@ -1211,12 +1618,7 @@ fn writeAll(fd: i32, data: []const u8) Error!void {
     var last_progress_ns: u64 = time.monotonicNanos();
 
     while (written < data.len and writes < max_writes) : (writes += 1) {
-        const file: std.Io.File = .{
-            .handle = fd,
-            .flags = .{ .nonblocking = true },
-        };
-        const n = file.writeStreaming(std.Options.debug_io, &.{}, &.{data[written..]}, 1) catch |err| switch (err) {
-            error.BrokenPipe => return error.ConnectionClosed,
+        const n = writeSome(io_conn, data[written..]) catch |err| switch (err) {
             error.WouldBlock => {
                 retry_count += 1;
                 const now_ns = time.monotonicNanos();
@@ -1228,11 +1630,11 @@ fn writeAll(fd: i32, data: []const u8) Error!void {
                 time.sleep(write_retry_sleep_ns);
                 continue;
             },
-            else => return error.WriteFailed,
+            else => return err,
         };
-        if (n == 0) return error.ConnectionClosed;
 
-        written += @intCast(n);
+        if (n == 0) return error.ConnectionClosed;
+        written += n;
         retry_count = 0;
         last_progress_ns = time.monotonicNanos();
     }
@@ -1269,6 +1671,62 @@ fn buildHeaderBlock(headers: []const Header, include_status: bool, status: u16, 
     return out[0..cursor];
 }
 
+fn appendHeaderBlockFrames(
+    out: []u8,
+    stream_id: u32,
+    header_block: []const u8,
+    end_stream: bool,
+    max_payload_size_bytes: usize,
+) Error![]const u8 {
+    assert(stream_id > 0);
+    assert(max_payload_size_bytes > 0);
+
+    var cursor: usize = 0;
+    var block_cursor: usize = 0;
+
+    const first_chunk_len: usize = @min(header_block.len, max_payload_size_bytes);
+    const first_end_headers = first_chunk_len == header_block.len;
+    const first_flags: u8 =
+        (if (first_end_headers) h2.flags_end_headers else 0) |
+        (if (end_stream) h2.flags_end_stream else 0);
+
+    const first_frame_len: usize = h2.frame_header_size_bytes + first_chunk_len;
+    if (cursor + first_frame_len > out.len) return error.FrameLimitExceeded;
+    _ = try appendFrame(
+        out[cursor .. cursor + first_frame_len],
+        .headers,
+        first_flags,
+        stream_id,
+        header_block[0..first_chunk_len],
+    );
+    cursor += first_frame_len;
+    block_cursor = first_chunk_len;
+
+    var continuation_frames: u8 = 0;
+    while (block_cursor < header_block.len) {
+        if (continuation_frames >= config.H2_MAX_CONTINUATION_FRAMES) return error.FrameLimitExceeded;
+
+        const chunk_len: usize = @min(header_block.len - block_cursor, max_payload_size_bytes);
+        const is_last_chunk = block_cursor + chunk_len == header_block.len;
+        const flags: u8 = if (is_last_chunk) h2.flags_end_headers else 0;
+
+        const frame_len: usize = h2.frame_header_size_bytes + chunk_len;
+        if (cursor + frame_len > out.len) return error.FrameLimitExceeded;
+        _ = try appendFrame(
+            out[cursor .. cursor + frame_len],
+            .continuation,
+            flags,
+            stream_id,
+            header_block[block_cursor .. block_cursor + chunk_len],
+        );
+        cursor += frame_len;
+        block_cursor += chunk_len;
+        continuation_frames += 1;
+    }
+
+    return out[0..cursor];
+}
+
 fn appendFrame(out: []u8, frame_type: h2.FrameType, flags: u8, stream_id: u32, payload: []const u8) Error![]const u8 {
     assert(out.len >= h2.frame_header_size_bytes);
     assert(payload.len <= config.H2_MAX_FRAME_SIZE_BYTES);
@@ -1293,6 +1751,49 @@ test "buildResponseHeaderBlock encodes :status and application headers" {
     try std.testing.expectEqualStrings("200", fields[0].value);
     try std.testing.expectEqualStrings("content-type", fields[1].name);
     try std.testing.expectEqualStrings("application/grpc", fields[1].value);
+}
+
+test "appendHeaderBlockFrames emits HEADERS plus CONTINUATION fragments" {
+    const header_block = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+    var out: [header_block_frame_buffer_size_bytes]u8 = undefined;
+    const frames = try appendHeaderBlockFrames(
+        &out,
+        1,
+        header_block,
+        true,
+        16,
+    );
+
+    var cursor: usize = 0;
+    var frame_count: u8 = 0;
+    var saw_continuation = false;
+    var last_flags: u8 = 0;
+    while (cursor < frames.len) {
+        try std.testing.expect(frame_count < config.H2_MAX_CONTINUATION_FRAMES + 1);
+        const header = try h2.parseFrameHeader(frames[cursor .. cursor + h2.frame_header_size_bytes]);
+        const frame_len: usize = h2.frame_header_size_bytes + header.length;
+        try std.testing.expect(cursor + frame_len <= frames.len);
+        try std.testing.expectEqual(@as(u32, 1), header.stream_id);
+
+        if (frame_count == 0) {
+            try std.testing.expectEqual(h2.FrameType.headers, header.frame_type);
+            try std.testing.expect((header.flags & h2.flags_end_stream) != 0);
+            try std.testing.expect((header.flags & h2.flags_end_headers) == 0);
+        } else {
+            saw_continuation = true;
+            try std.testing.expectEqual(h2.FrameType.continuation, header.frame_type);
+            try std.testing.expect((header.flags & h2.flags_end_stream) == 0);
+        }
+
+        last_flags = header.flags;
+        cursor += frame_len;
+        frame_count += 1;
+    }
+
+    try std.testing.expect(saw_continuation);
+    try std.testing.expectEqual(frames.len, cursor);
+    try std.testing.expect((last_flags & h2.flags_end_headers) != 0);
 }
 
 test "ResponseStateTable inserts and removes response state" {

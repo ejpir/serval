@@ -181,20 +181,23 @@ pub const Runtime = struct {
         assert(path.len > 0);
         const authority = request.headers.getHost() orelse return error.MissingAuthority;
 
-        const header_block = try buildRequestHeaderBlock(request, path, authority, out[h2.frame_header_size_bytes..]);
-        const stream = try self.state.openRequestStream(end_stream);
-        const flags: u8 = h2.flags_end_headers | if (end_stream) h2.flags_end_stream else 0;
+        var header_block_buf: [config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+        const header_block = try buildRequestHeaderBlock(request, path, authority, &header_block_buf);
 
-        _ = try h2.buildFrameHeader(out[0..h2.frame_header_size_bytes], .{
-            .length = @intCast(header_block.len),
-            .frame_type = .headers,
-            .flags = flags,
-            .stream_id = stream.id,
-        });
+        const stream = try self.state.openRequestStream(end_stream);
+        const peer_max_frame_size_bytes: usize = @intCast(self.state.peer_settings.max_frame_size_bytes);
+        const max_payload_size_bytes: usize = @min(@as(usize, config.H2_MAX_FRAME_SIZE_BYTES), peer_max_frame_size_bytes);
+        const frame = try appendHeaderBlockFrames(
+            out,
+            stream.id,
+            header_block,
+            end_stream,
+            max_payload_size_bytes,
+        );
 
         return .{
             .stream_id = stream.id,
-            .frame = out[0 .. h2.frame_header_size_bytes + header_block.len],
+            .frame = frame,
         };
     }
 
@@ -249,6 +252,7 @@ pub const Runtime = struct {
             .continuation => try handleContinuation(self, header, payload),
             .priority => error.UnsupportedPriority,
             .push_promise => error.UnsupportedPushPromise,
+            .extension => .none,
         };
     }
 };
@@ -576,6 +580,7 @@ fn buildRequestHeaderBlock(
     var cursor: usize = 0;
     cursor += (try h2.encodeLiteralHeaderWithoutIndexing(out[cursor..], ":method", methodToken(request.method))).len;
     cursor += (try h2.encodeLiteralHeaderWithoutIndexing(out[cursor..], ":path", path)).len;
+    cursor += (try h2.encodeLiteralHeaderWithoutIndexing(out[cursor..], ":scheme", requestScheme(request))).len;
     cursor += (try h2.encodeLiteralHeaderWithoutIndexing(out[cursor..], ":authority", authority)).len;
 
     for (request.headers.headers[0..request.headers.count]) |header| {
@@ -606,6 +611,14 @@ fn skipRequestHeaderForH2(name: []const u8, value: []const u8) bool {
 
 fn trimAsciiWhitespace(value: []const u8) []const u8 {
     return std.mem.trim(u8, value, " \t");
+}
+
+fn requestScheme(request: *const Request) []const u8 {
+    if (request.headers.get("x-forwarded-proto")) |proto| {
+        const trimmed = trimAsciiWhitespace(proto);
+        if (std.ascii.eqlIgnoreCase(trimmed, "https")) return "https";
+    }
+    return "http";
 }
 
 fn methodToken(method: Method) []const u8 {
@@ -688,6 +701,62 @@ fn parseStatusCode(token: []const u8) Error!u16 {
     };
     if (status < 100 or status > 599) return error.InvalidStatus;
     return status;
+}
+
+fn appendHeaderBlockFrames(
+    out: []u8,
+    stream_id: u32,
+    header_block: []const u8,
+    end_stream: bool,
+    max_payload_size_bytes: usize,
+) Error![]const u8 {
+    assert(stream_id > 0);
+    assert(max_payload_size_bytes > 0);
+
+    var cursor: usize = 0;
+    var block_cursor: usize = 0;
+
+    const first_chunk_len: usize = @min(header_block.len, max_payload_size_bytes);
+    const first_end_headers = first_chunk_len == header_block.len;
+    const first_flags: u8 =
+        (if (first_end_headers) h2.flags_end_headers else 0) |
+        (if (end_stream) h2.flags_end_stream else 0);
+
+    const first_frame_len: usize = h2.frame_header_size_bytes + first_chunk_len;
+    if (cursor + first_frame_len > out.len) return error.HeaderBlockTooLarge;
+    _ = try appendFrame(
+        out[cursor .. cursor + first_frame_len],
+        .headers,
+        first_flags,
+        stream_id,
+        header_block[0..first_chunk_len],
+    );
+    cursor += first_frame_len;
+    block_cursor = first_chunk_len;
+
+    var continuation_frames: u8 = 0;
+    while (block_cursor < header_block.len) {
+        if (continuation_frames >= config.H2_MAX_CONTINUATION_FRAMES) return error.HeaderBlockTooLarge;
+
+        const chunk_len: usize = @min(header_block.len - block_cursor, max_payload_size_bytes);
+        const is_last_chunk = block_cursor + chunk_len == header_block.len;
+        const flags: u8 = if (is_last_chunk) h2.flags_end_headers else 0;
+
+        const frame_len: usize = h2.frame_header_size_bytes + chunk_len;
+        if (cursor + frame_len > out.len) return error.HeaderBlockTooLarge;
+        _ = try appendFrame(
+            out[cursor .. cursor + frame_len],
+            .continuation,
+            flags,
+            stream_id,
+            header_block[block_cursor .. block_cursor + chunk_len],
+        );
+        cursor += frame_len;
+        block_cursor += chunk_len;
+        continuation_frames += 1;
+    }
+
+    return out[0..cursor];
 }
 
 fn appendFrame(out: []u8, frame_type: h2.FrameType, flags: u8, stream_id: u32, payload: []const u8) Error![]const u8 {
@@ -855,6 +924,50 @@ test "Runtime writes request HEADERS and DATA with stream lifecycle" {
     try std.testing.expectEqual(h2.FrameType.data, data_header.frame_type);
     try std.testing.expect((data_header.flags & h2.flags_end_stream) != 0);
     try std.testing.expect(!runtime.state.getStream(headers_write.stream_id).?.localCanSend());
+}
+
+test "Runtime fragments outbound request HEADERS with CONTINUATION when peer max frame is reduced" {
+    var runtime = try initRuntimeReadyForStreams();
+    runtime.state.peer_settings.max_frame_size_bytes = 64;
+
+    var request = try makeGrpcRequest("/grpc.test.Echo/Unary");
+    try request.headers.put("x-long-header", "abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789");
+
+    const frame_overhead_bytes: usize = h2.frame_header_size_bytes * (@as(usize, config.H2_MAX_CONTINUATION_FRAMES) + 1);
+    var headers_buf: [config.H2_MAX_HEADER_BLOCK_SIZE_BYTES + frame_overhead_bytes]u8 = undefined;
+    const headers_write = try runtime.writeRequestHeadersFrame(&headers_buf, &request, null, true);
+
+    var cursor: usize = 0;
+    var frame_count: u8 = 0;
+    var saw_continuation = false;
+    var last_flags: u8 = 0;
+
+    while (cursor < headers_write.frame.len) {
+        try std.testing.expect(frame_count < config.H2_MAX_CONTINUATION_FRAMES + 1);
+
+        const header = try h2.parseFrameHeader(headers_write.frame[cursor .. cursor + h2.frame_header_size_bytes]);
+        const frame_len: usize = h2.frame_header_size_bytes + header.length;
+        try std.testing.expect(cursor + frame_len <= headers_write.frame.len);
+        try std.testing.expectEqual(headers_write.stream_id, header.stream_id);
+
+        if (frame_count == 0) {
+            try std.testing.expectEqual(h2.FrameType.headers, header.frame_type);
+            try std.testing.expect((header.flags & h2.flags_end_stream) != 0);
+            try std.testing.expect((header.flags & h2.flags_end_headers) == 0);
+        } else {
+            saw_continuation = true;
+            try std.testing.expectEqual(h2.FrameType.continuation, header.frame_type);
+            try std.testing.expect((header.flags & h2.flags_end_stream) == 0);
+        }
+
+        last_flags = header.flags;
+        cursor += frame_len;
+        frame_count += 1;
+    }
+
+    try std.testing.expect(saw_continuation);
+    try std.testing.expectEqual(headers_write.frame.len, cursor);
+    try std.testing.expect((last_flags & h2.flags_end_headers) != 0);
 }
 
 test "Runtime decodes response HEADERS, DATA, and trailers" {

@@ -51,6 +51,27 @@ Example grpcurl install:
 GOBIN="$HOME/.local/bin" go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest
 ```
 
+### HTTP/2 Conformance Tools (Optional, recommended)
+
+For RFC-focused protocol conformance runs:
+- `h2spec`
+- `nghttp` (from nghttp2)
+
+Use the runner script:
+
+```bash
+integration/h2_conformance_runner.sh --host 127.0.0.1 --h2c-port 8080 --tls-port 8443 --h2spec-timeout 1 --allow-missing
+```
+
+Or start target servers + run the full gate in one command:
+
+```bash
+integration/h2_conformance_ci.sh --h2spec-timeout 1
+```
+
+- `--h2spec-timeout` controls h2spec per-case timeout seconds (default: `1` for faster feedback).
+- Without `--allow-missing`, missing tools are treated as failures.
+
 ### TLS Tests: kTLS Kernel Module (Optional)
 
 TLS tests do **not** require kTLS. If the Linux `tls` kernel module is unavailable, the stack automatically falls back to userspace TLS.
@@ -133,6 +154,26 @@ These are for testing only. Use `--insecure-skip-verify` with self-signed certif
 | `serval-client h2 connection driver interoperates with terminated h2 server` | Outbound `serval-client/h2/connection` prior-knowledge driver performs SETTINGS sync and unary request/response+trailers against terminated runtime |
 | `serval-client h2 upstream session pool reuses connected session` | `serval-client/h2/upstream_pool` acquires+handshakes a fresh upstream h2c session, then reuses the same socket/session for another unary stream |
 | `serval-proxy h2 stream bridge binds downstream to upstream streams` | `serval-proxy/h2/bridge` maps downstream stream ids to reused upstream h2 streams while preserving unary gRPC response headers/data/trailers |
+| `netbird route matrix enforces grpc h2c only for service paths` | End-to-end NetBird-style path/protocol split on one backend host:port: gRPC paths use `.h2c` upstream entries, WebSocket/API/OAuth/OIDC/UI/`.well-known`/catch-all use `.h1` |
+
+### NetBird Route Contract (locked)
+
+Use this matrix as the single source of truth for NetBird-style proxying:
+
+| Path Pattern | Protocol | Notes |
+|---|---|---|
+| `/signalexchange.SignalExchange/*` | gRPC over h2c | explicit gRPC route |
+| `/management.ManagementService/*` | gRPC over h2c | explicit gRPC route |
+| `/management.ProxyService/*` | gRPC over h2c | optional reverse-proxy feature route |
+| `/relay*`, `/ws-proxy/signal*`, `/ws-proxy/management*` | WebSocket over HTTP/1.1 upgrade | not gRPC |
+| `/api/*`, `/oauth2/*`, `/ui/*`, `/oidc/*`, `/oauth/*`, `/.well-known/*`, `/*` | HTTP | not gRPC |
+
+`h2c://` in reverse-proxy configs means cleartext HTTP/2 transport. It does **not**
+turn non-gRPC paths into gRPC APIs.
+
+For validation strategy:
+- `lb_example` remains a smoke binary (single strategy, no path routing)
+- NetBird acceptance coverage lives in integration tests (path routing + mixed protocol split)
 
 ### TLS Tests (kTLS Optional; userspace fallback supported)
 

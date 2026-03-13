@@ -70,7 +70,15 @@ pub const ConnectionState = struct {
             return;
         }
 
+        const old_initial_window_size_bytes = self.peer_settings.initial_window_size_bytes;
         try h2.applySettings(&self.peer_settings, parsed);
+
+        const new_initial_window_size_bytes = self.peer_settings.initial_window_size_bytes;
+        if (new_initial_window_size_bytes != old_initial_window_size_bytes) {
+            const delta_i64: i64 = @as(i64, new_initial_window_size_bytes) - @as(i64, old_initial_window_size_bytes);
+            self.streams.adjustAllSendWindows(delta_i64);
+        }
+
         self.peer_settings_received = true;
         self.peer_settings_ack_pending = true;
     }
@@ -134,6 +142,17 @@ pub const ConnectionState = struct {
         assert(@intFromPtr(self) != 0);
         assert(stream_id > 0);
         try self.streams.incrementRecvWindow(stream_id, delta_bytes);
+    }
+
+    pub fn consumeSendWindow(self: *ConnectionState, bytes: u32) Error!void {
+        assert(@intFromPtr(self) != 0);
+        try self.flow.send_window.consume(bytes);
+    }
+
+    pub fn consumeStreamSendWindow(self: *ConnectionState, stream_id: u32, bytes: u32) Error!void {
+        assert(@intFromPtr(self) != 0);
+        assert(stream_id > 0);
+        try self.streams.consumeSendWindow(stream_id, bytes);
     }
 
     pub fn incrementSendWindow(self: *ConnectionState, delta_bytes: u32) Error!void {

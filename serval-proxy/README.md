@@ -107,13 +107,15 @@ Timing fields default to 0 for backward compatibility. Use these for detailed Pi
 - `serval-client` - HTTP/1.1 client request building (shared implementation)
 
 **Protocol Abstraction:** HTTP/1.1 specific code is isolated in `h1/` subdirectory.
-Current h2c support is split by upstream protocol:
-- cleartext h2c upstreams now use the stream-aware `h2/bridge.zig` path for both
-  prior-knowledge and inbound `Upgrade: h2c` entry (bounded downstream↔upstream
-  stream bindings, upstream-session reuse, mapped response/reset actions)
-- non-h2c upstreams continue to use the legacy translation+tunnel behavior
+Current gRPC h2 support is split by upstream protocol:
+- `.h2c` + `tls=false` and `.h2` + `tls=true` use the stream-aware
+  `h2/bridge.zig` path for both prior-knowledge and inbound `Upgrade: h2c`
+  entry (bounded downstream↔upstream stream bindings, upstream-session reuse,
+  mapped response/reset actions)
+- non-h2 upstream targets continue to use existing fallback behavior
+  (legacy translation+tunnel path where applicable)
 
-Full stream-aware h2/ support remains in progress. The repository now includes
+Full stream-aware h2 support remains in progress. The repository now includes
 bounded `h2/` primitives for that migration:
 - `h2/bindings.zig` fixed-capacity downstream-stream ↔ upstream-stream ids
 - `h2/bridge.zig` stream-aware bridge that opens/reuses upstream h2 sessions
@@ -133,8 +135,8 @@ bounded `h2/` primitives for that migration:
 - Response streaming to client
 - WebSocket upgrade forwarding with RFC 6455 handshake validation
 - Bidirectional tunnel relay after `101 Switching Protocols`
-- gRPC over h2c stream-aware bridging for prior-knowledge and `Upgrade: h2c` entry (cleartext h2c upstreams), including fail-closed invalid responses (`grpc-status` required), GOAWAY `last_stream_id`-aware active-stream handling, and session-generation-aware binding across upstream rollover
-- gRPC over h2c legacy translation+tunnel fallback for non-h2c upstream targets
+- gRPC over h2 stream-aware bridging for prior-knowledge and `Upgrade: h2c` entry when upstream protocol is `.h2c` (cleartext) or `.h2` (TLS), including fail-closed invalid responses (`grpc-status` required), GOAWAY `last_stream_id`-aware active-stream handling, and session-generation-aware binding across upstream rollover
+- Legacy translation+tunnel fallback for non-h2 upstream targets where full stream-aware proxying does not apply
 - Upgraded/tunneled connections are closed instead of being returned to the HTTP pool
 
 ## Implementation Status
@@ -152,9 +154,9 @@ bounded `h2/` primitives for that migration:
 | Client TLS responses | Complete |
 | Upstream TLS | Complete |
 | WebSocket proxy tunnel | Complete |
-| gRPC over h2c proxying | Stream-aware bridge active for both prior-knowledge and inbound upgrade when upstream is cleartext h2c, including GOAWAY `last_stream_id`-aware active-stream handling |
+| gRPC over h2 proxying | Stream-aware bridge active for both prior-knowledge and inbound upgrade when upstream is `.h2c` (cleartext) or `.h2` (TLS), including GOAWAY `last_stream_id`-aware active-stream handling |
 | HTTP/2 stream-aware bridge primitives (`h2/bindings` + `h2/bridge`) | Initial slice complete |
-| HTTP/2 full stream-aware upstream support | In progress |
+| HTTP/2 full stream-aware upstream support | In progress (current implementation is gRPC-focused; broader generic h2 upstream support is still pending) |
 
 ## TigerStyle Compliance
 

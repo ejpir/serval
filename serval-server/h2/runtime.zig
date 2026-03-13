@@ -17,12 +17,17 @@ pub const Error = error{
     PrefaceNotReceived,
     MissingInitialSettings,
     UnsupportedContinuation,
-    UnsupportedPadding,
     UnsupportedPriority,
     UnsupportedPushPromise,
     InvalidDataStream,
     ConnectionClosing,
-} || connection.Error || h2.InitialRequestError || h2.ControlError || h2.FlowControlError;
+    StreamProtocolError,
+    StreamRefused,
+    StreamFlowControlError,
+    StreamClosedError,
+    ConnectionProtocolError,
+    ConnectionStreamClosedError,
+} || connection.Error || h2.InitialRequestError || h2.ControlError || h2.FlowControlError || h2.FrameError;
 
 pub const RequestHeadersAction = struct {
     stream_id: u32,
@@ -60,10 +65,23 @@ const PendingRequestHeaders = struct {
     block_buf: [config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined,
 };
 
+const request_body_tracker_capacity: usize = config.H2_MAX_CONCURRENT_STREAMS;
+
+const RequestBodyTracker = struct {
+    used: bool = false,
+    stream_id: u32 = 0,
+    expected_content_length: ?u64 = null,
+    received_data_bytes: u64 = 0,
+};
+
+const priority_field_size_bytes: usize = 5;
+
 pub const Runtime = struct {
     state: connection.ConnectionState,
     header_decoder: h2.HpackDecoder = h2.HpackDecoder.init(),
     pending_request_headers: PendingRequestHeaders = .{},
+    request_body_trackers: [request_body_tracker_capacity]RequestBodyTracker = [_]RequestBodyTracker{.{}} ** request_body_tracker_capacity,
+    last_peer_reset_stream_id: u32 = 0,
 
     pub fn init() Error!Runtime {
         return .{
@@ -131,6 +149,7 @@ pub const Runtime = struct {
         assert(@intFromPtr(self) != 0);
         assert(header.length == payload.len);
 
+        if (header.length > self.state.local_settings.max_frame_size_bytes) return error.FrameTooLarge;
         try ensureConnectionReady(self, header.frame_type);
 
         if (self.pending_request_headers.active and header.frame_type != .continuation) {
@@ -146,8 +165,9 @@ pub const Runtime = struct {
             .rst_stream => try handleRstStream(self, header, payload),
             .goaway => try handleGoAway(self, header, payload),
             .continuation => try handleContinuation(self, header, payload),
-            .priority => error.UnsupportedPriority,
+            .priority => try handlePriority(header, payload),
             .push_promise => error.UnsupportedPushPromise,
+            .extension => .none,
         };
     }
 };
@@ -180,22 +200,89 @@ fn handleHeaders(self: *Runtime, header: h2.FrameHeader, payload: []const u8) Er
     assert(header.length == payload.len);
 
     if (header.stream_id == 0) return error.InvalidStreamId;
-    if ((header.flags & h2.flags_padded) != 0) return error.UnsupportedPadding;
-    if ((header.flags & h2.flags_priority) != 0) return error.UnsupportedPriority;
     if (!self.state.canAcceptRemoteStream(header.stream_id)) return error.ConnectionClosing;
 
+    var header_payload = payload;
+    if ((header.flags & h2.flags_padded) != 0) {
+        header_payload = try trimPaddedPayload(payload);
+    }
+
+    var header_block = header_payload;
+    if ((header.flags & h2.flags_priority) != 0) {
+        if (header_payload.len < priority_field_size_bytes) return error.InvalidFrame;
+
+        const dependency_stream_id = parsePriorityDependency(header_payload[0..priority_field_size_bytes]);
+        if (dependency_stream_id == header.stream_id) return error.StreamProtocolError;
+        header_block = header_payload[priority_field_size_bytes..];
+    }
+
     const end_stream = (header.flags & h2.flags_end_stream) != 0;
+
+    if (self.state.getStream(header.stream_id)) |stream| {
+        if (!stream.remoteCanSend()) return error.StreamClosedError;
+        if ((header.flags & h2.flags_end_headers) == 0) return error.StreamProtocolError;
+        if (!end_stream) return error.StreamProtocolError;
+
+        try validateTrailerHeaderBlock(self, header_block);
+        try finalizeRequestBodyOnEndStream(self, header.stream_id);
+        try self.state.endRemoteStream(header.stream_id);
+
+        return .{ .request_data = .{
+            .stream_id = header.stream_id,
+            .end_stream = true,
+            .payload = &[_]u8{},
+        } };
+    }
+
+    const last_remote_stream_id = self.state.streams.last_remote_stream_id;
+    if (header.stream_id <= last_remote_stream_id) {
+        if (header.stream_id == self.last_peer_reset_stream_id) return error.StreamClosedError;
+        if (header.stream_id == last_remote_stream_id) return error.ConnectionStreamClosedError;
+        return error.ConnectionProtocolError;
+    }
+
     if ((header.flags & h2.flags_end_headers) == 0) {
-        try startHeaderBlockContinuation(self, header.stream_id, end_stream, payload);
+        try startHeaderBlockContinuation(self, header.stream_id, end_stream, header_block);
         return .none;
     }
 
-    const request_head = try h2.decodeRequestHeaderBlockWithDecoder(
+    const request_head = h2.decodeRequestHeaderBlockWithDecoder(
         &self.header_decoder,
-        payload,
+        header_block,
         header.stream_id,
-    );
-    _ = try self.state.openRemoteStream(header.stream_id, end_stream);
+    ) catch |err| switch (err) {
+        error.MissingMethod,
+        error.MissingPath,
+        error.MissingScheme,
+        error.MissingAuthority,
+        error.InvalidMethod,
+        error.InvalidTe,
+        error.InvalidHeaderName,
+        error.UnexpectedPseudoHeader,
+        error.PseudoHeaderAfterRegularHeader,
+        error.DuplicatePseudoHeader,
+        error.ConnectionSpecificHeader,
+        error.ConnectPathNotAllowed,
+        error.ConnectSchemeNotAllowed,
+        error.AuthorityHostMismatch,
+        error.TooManyHeaders,
+        error.DuplicateContentLength,
+        => return error.StreamProtocolError,
+        else => return err,
+    };
+
+    _ = self.state.openRemoteStream(header.stream_id, end_stream) catch |err| switch (err) {
+        error.StreamTableFull => return error.StreamRefused,
+        error.StreamAlreadyExists => return error.StreamClosedError,
+        error.WrongStreamParity,
+        error.StreamIdRegression,
+        error.InvalidTransition,
+        => return error.ConnectionProtocolError,
+        else => return err,
+    };
+
+    try startRequestBodyTracking(self, header.stream_id, &request_head.request, end_stream);
+
     return .{ .request_headers = .{
         .stream_id = request_head.stream_id,
         .end_stream = end_stream,
@@ -264,15 +351,69 @@ fn finishPendingRequestHeaders(self: *Runtime) Error!ReceiveAction {
     const block_len: usize = @intCast(self.pending_request_headers.block_len);
     const stream_id = self.pending_request_headers.stream_id;
     const end_stream = self.pending_request_headers.end_stream;
-    errdefer resetPendingRequestHeaders(self);
 
-    const request_head = try h2.decodeRequestHeaderBlockWithDecoder(
+    if (self.state.getStream(stream_id) != null) {
+        resetPendingRequestHeaders(self);
+        return error.StreamClosedError;
+    }
+
+    const last_remote_stream_id = self.state.streams.last_remote_stream_id;
+    if (stream_id <= last_remote_stream_id) {
+        resetPendingRequestHeaders(self);
+        if (stream_id == self.last_peer_reset_stream_id) return error.StreamClosedError;
+        if (stream_id == last_remote_stream_id) return error.ConnectionStreamClosedError;
+        return error.ConnectionProtocolError;
+    }
+
+    const request_head = h2.decodeRequestHeaderBlockWithDecoder(
         &self.header_decoder,
         self.pending_request_headers.block_buf[0..block_len],
         stream_id,
-    );
-    _ = try self.state.openRemoteStream(stream_id, end_stream);
+    ) catch |err| switch (err) {
+        error.MissingMethod,
+        error.MissingPath,
+        error.MissingScheme,
+        error.MissingAuthority,
+        error.InvalidMethod,
+        error.InvalidTe,
+        error.InvalidHeaderName,
+        error.UnexpectedPseudoHeader,
+        error.PseudoHeaderAfterRegularHeader,
+        error.DuplicatePseudoHeader,
+        error.ConnectionSpecificHeader,
+        error.ConnectPathNotAllowed,
+        error.ConnectSchemeNotAllowed,
+        error.AuthorityHostMismatch,
+        error.TooManyHeaders,
+        error.DuplicateContentLength,
+        => {
+            resetPendingRequestHeaders(self);
+            return error.StreamProtocolError;
+        },
+        else => return err,
+    };
+
+    _ = self.state.openRemoteStream(stream_id, end_stream) catch |err| switch (err) {
+        error.StreamTableFull => {
+            resetPendingRequestHeaders(self);
+            return error.StreamRefused;
+        },
+        error.StreamAlreadyExists => {
+            resetPendingRequestHeaders(self);
+            return error.StreamClosedError;
+        },
+        error.StreamIdRegression,
+        error.WrongStreamParity,
+        error.InvalidTransition,
+        => {
+            resetPendingRequestHeaders(self);
+            return error.ConnectionProtocolError;
+        },
+        else => return err,
+    };
+
     resetPendingRequestHeaders(self);
+    try startRequestBodyTracking(self, stream_id, &request_head.request, end_stream);
 
     return .{ .request_headers = .{
         .stream_id = request_head.stream_id,
@@ -291,6 +432,131 @@ fn resetPendingRequestHeaders(self: *Runtime) void {
     self.pending_request_headers.block_len = 0;
 }
 
+fn trimPaddedPayload(payload: []const u8) Error![]const u8 {
+    if (payload.len == 0) return error.InvalidFrame;
+
+    const pad_len: usize = payload[0];
+    if (pad_len + 1 > payload.len) return error.InvalidFrame;
+
+    return payload[1 .. payload.len - pad_len];
+}
+
+fn parsePriorityDependency(priority_payload: []const u8) u32 {
+    assert(priority_payload.len == priority_field_size_bytes);
+
+    const raw_dependency = std.mem.readInt(u32, priority_payload[0..4], .big);
+    return raw_dependency & 0x7fff_ffff;
+}
+
+fn startRequestBodyTracking(self: *Runtime, stream_id: u32, request: *const types.Request, end_stream: bool) Error!void {
+    assert(@intFromPtr(self) != 0);
+    assert(stream_id > 0);
+    assert(@intFromPtr(request) != 0);
+
+    const expected_content_length = try parseExpectedContentLength(request);
+
+    var tracker = getOrInsertRequestBodyTracker(self, stream_id);
+    tracker.expected_content_length = expected_content_length;
+    tracker.received_data_bytes = 0;
+
+    if (end_stream) {
+        if (expected_content_length) |expected| {
+            if (expected != 0) return error.StreamProtocolError;
+        }
+        removeRequestBodyTracker(self, stream_id);
+    }
+}
+
+fn noteRequestData(self: *Runtime, stream_id: u32, data_len: usize, end_stream: bool) Error!void {
+    assert(@intFromPtr(self) != 0);
+    assert(stream_id > 0);
+
+    var tracker = getOrInsertRequestBodyTracker(self, stream_id);
+    const data_len_u64: u64 = @intCast(data_len);
+    const next_bytes = tracker.received_data_bytes +| data_len_u64;
+    if (next_bytes < tracker.received_data_bytes) return error.StreamProtocolError;
+    tracker.received_data_bytes = next_bytes;
+
+    if (tracker.expected_content_length) |expected| {
+        if (tracker.received_data_bytes > expected) return error.StreamProtocolError;
+        if (end_stream and tracker.received_data_bytes != expected) return error.StreamProtocolError;
+    }
+
+    if (end_stream) removeRequestBodyTracker(self, stream_id);
+}
+
+fn finalizeRequestBodyOnEndStream(self: *Runtime, stream_id: u32) Error!void {
+    assert(@intFromPtr(self) != 0);
+    assert(stream_id > 0);
+
+    if (getRequestBodyTracker(self, stream_id)) |tracker| {
+        if (tracker.expected_content_length) |expected| {
+            if (tracker.received_data_bytes != expected) return error.StreamProtocolError;
+        }
+    }
+    removeRequestBodyTracker(self, stream_id);
+}
+
+fn parseExpectedContentLength(request: *const types.Request) Error!?u64 {
+    assert(@intFromPtr(request) != 0);
+
+    const raw = request.headers.get("content-length") orelse return null;
+    const parsed = std.fmt.parseInt(u64, raw, 10) catch return error.StreamProtocolError;
+    return parsed;
+}
+
+fn validateTrailerHeaderBlock(self: *Runtime, header_block: []const u8) Error!void {
+    assert(@intFromPtr(self) != 0);
+
+    var fields_buf: [config.MAX_HEADERS]h2.HeaderField = undefined;
+    const fields = try h2.decodeHeaderBlockWithDecoder(&self.header_decoder, header_block, &fields_buf);
+    for (fields) |field| {
+        if (field.name.len == 0) return error.StreamProtocolError;
+        if (field.name[0] == ':') return error.StreamProtocolError;
+    }
+}
+
+fn getRequestBodyTracker(self: *Runtime, stream_id: u32) ?*RequestBodyTracker {
+    assert(@intFromPtr(self) != 0);
+    assert(stream_id > 0);
+
+    for (self.request_body_trackers[0..]) |*tracker| {
+        if (!tracker.used) continue;
+        if (tracker.stream_id != stream_id) continue;
+        return tracker;
+    }
+    return null;
+}
+
+fn getOrInsertRequestBodyTracker(self: *Runtime, stream_id: u32) *RequestBodyTracker {
+    assert(@intFromPtr(self) != 0);
+    assert(stream_id > 0);
+
+    if (getRequestBodyTracker(self, stream_id)) |tracker| return tracker;
+
+    for (self.request_body_trackers[0..]) |*tracker| {
+        if (tracker.used) continue;
+        tracker.* = .{ .used = true, .stream_id = stream_id };
+        return tracker;
+    }
+
+    const idx: usize = @intCast(stream_id % @as(u32, request_body_tracker_capacity));
+    self.request_body_trackers[idx] = .{ .used = true, .stream_id = stream_id };
+    return &self.request_body_trackers[idx];
+}
+
+fn removeRequestBodyTracker(self: *Runtime, stream_id: u32) void {
+    assert(@intFromPtr(self) != 0);
+    assert(stream_id > 0);
+
+    for (self.request_body_trackers[0..]) |*tracker| {
+        if (!tracker.used) continue;
+        if (tracker.stream_id != stream_id) continue;
+        tracker.* = .{};
+        return;
+    }
+}
+
 fn handleData(self: *Runtime, header: h2.FrameHeader, payload: []const u8) Error!ReceiveAction {
     assert(@intFromPtr(self) != 0);
     assert(header.frame_type == .data);
@@ -300,13 +566,19 @@ fn handleData(self: *Runtime, header: h2.FrameHeader, payload: []const u8) Error
     const stream = self.state.getStream(header.stream_id) orelse return error.StreamNotFound;
     if (!stream.remoteCanSend()) return error.InvalidDataStream;
 
+    const data_payload = if ((header.flags & h2.flags_padded) != 0)
+        try trimPaddedPayload(payload)
+    else
+        payload;
+
     const payload_len: u32 = @intCast(payload.len);
     try self.state.consumeRecvWindow(payload_len);
     try self.state.consumeStreamRecvWindow(header.stream_id, payload_len);
 
     const end_stream = (header.flags & h2.flags_end_stream) != 0;
+    try noteRequestData(self, header.stream_id, data_payload.len, end_stream);
     if (end_stream) try self.state.endRemoteStream(header.stream_id);
-    return .{ .request_data = .{ .stream_id = header.stream_id, .end_stream = end_stream, .payload = payload } };
+    return .{ .request_data = .{ .stream_id = header.stream_id, .end_stream = end_stream, .payload = data_payload } };
 }
 
 fn handlePing(header: h2.FrameHeader, payload: []const u8) Error!ReceiveAction {
@@ -320,12 +592,41 @@ fn handleWindowUpdate(self: *Runtime, header: h2.FrameHeader, payload: []const u
     assert(@intFromPtr(self) != 0);
     assert(header.frame_type == .window_update);
 
-    const increment = try h2.parseWindowUpdateFrame(header, payload);
+    const increment = h2.parseWindowUpdateFrame(header, payload) catch |err| switch (err) {
+        error.InvalidIncrement => {
+            if (header.stream_id == 0) return error.InvalidIncrement;
+            return error.StreamProtocolError;
+        },
+        else => return err,
+    };
+
     if (header.stream_id == 0) {
         try self.state.incrementSendWindow(increment);
     } else {
-        try self.state.incrementStreamSendWindow(header.stream_id, increment);
+        self.state.incrementStreamSendWindow(header.stream_id, increment) catch |err| switch (err) {
+            error.StreamNotFound => {
+                if (header.stream_id > self.state.streams.last_remote_stream_id) {
+                    return error.ConnectionProtocolError;
+                }
+                return .none;
+            },
+            error.WindowOverflow => return error.StreamFlowControlError,
+            else => return err,
+        };
     }
+    return .none;
+}
+
+fn handlePriority(header: h2.FrameHeader, payload: []const u8) Error!ReceiveAction {
+    assert(header.frame_type == .priority);
+    assert(header.length == payload.len);
+
+    if (header.stream_id == 0) return error.InvalidStreamId;
+    if (payload.len != priority_field_size_bytes) return error.InvalidFrame;
+
+    const dependency_stream_id = parsePriorityDependency(payload);
+    if (dependency_stream_id == header.stream_id) return error.StreamProtocolError;
+
     return .none;
 }
 
@@ -334,7 +635,20 @@ fn handleRstStream(self: *Runtime, header: h2.FrameHeader, payload: []const u8) 
     assert(header.frame_type == .rst_stream);
 
     const error_code_raw = try h2.parseRstStreamFrame(header, payload);
+
+    if (self.state.getStream(header.stream_id) == null) {
+        if (header.stream_id > self.state.streams.last_remote_stream_id) {
+            return error.ConnectionProtocolError;
+        }
+
+        removeRequestBodyTracker(self, header.stream_id);
+        self.last_peer_reset_stream_id = header.stream_id;
+        return .none;
+    }
+
     try self.state.resetStream(header.stream_id);
+    removeRequestBodyTracker(self, header.stream_id);
+    self.last_peer_reset_stream_id = header.stream_id;
     return .{ .stream_reset = .{ .stream_id = header.stream_id, .error_code_raw = error_code_raw } };
 }
 
@@ -344,7 +658,7 @@ fn handleGoAway(self: *Runtime, header: h2.FrameHeader, payload: []const u8) Err
 
     const goaway = try h2.parseGoAwayFrame(header, payload);
     self.state.markGoAwayReceived(goaway.last_stream_id);
-    return .{ .connection_close = goaway };
+    return .none;
 }
 
 fn buildLocalSettingsPayload(local_settings: h2.Settings, out: []u8) Error![]const u8 {
@@ -363,6 +677,7 @@ fn buildHeaderBlock(path: []const u8, out: []u8) ![]const u8 {
     const fields = [_]struct { name: []const u8, value: []const u8 }{
         .{ .name = ":method", .value = "POST" },
         .{ .name = ":path", .value = path },
+        .{ .name = ":scheme", .value = "http" },
         .{ .name = ":authority", .value = "127.0.0.1:8080" },
         .{ .name = "content-type", .value = "application/grpc" },
         .{ .name = "te", .value = "trailers" },
@@ -466,6 +781,149 @@ test "Runtime decodes request headers and data on one stream" {
     }
 
     try std.testing.expect(!runtime.state.getStream(1).?.remoteCanSend());
+}
+
+test "Runtime ignores PRIORITY frame after initial settings" {
+    var runtime = try Runtime.init();
+    var settings_out: [h2.frame_header_size_bytes + (4 * h2.setting_size_bytes)]u8 = undefined;
+    _ = try runtime.writeInitialSettingsFrame(&settings_out);
+    try runtime.receiveClientPreface();
+
+    const settings_header = h2.FrameHeader{ .length = 0, .frame_type = .settings, .flags = 0, .stream_id = 0 };
+    _ = try runtime.receiveFrame(settings_header, &[_]u8{});
+
+    var priority_frame_buf: [h2.frame_header_size_bytes + priority_field_size_bytes]u8 = undefined;
+    const priority_frame = try appendFrame(
+        &priority_frame_buf,
+        .priority,
+        0,
+        3,
+        &[_]u8{ 0, 0, 0, 0, 15 },
+    );
+    const priority_header = try h2.parseFrameHeader(priority_frame);
+
+    const action = try runtime.receiveFrame(
+        priority_header,
+        priority_frame[h2.frame_header_size_bytes .. h2.frame_header_size_bytes + priority_header.length],
+    );
+    try std.testing.expect(action == .none);
+}
+
+test "Runtime decodes HEADERS with PRIORITY flag" {
+    var runtime = try Runtime.init();
+    var settings_out: [h2.frame_header_size_bytes + (4 * h2.setting_size_bytes)]u8 = undefined;
+    _ = try runtime.writeInitialSettingsFrame(&settings_out);
+    try runtime.receiveClientPreface();
+
+    const settings_header = h2.FrameHeader{ .length = 0, .frame_type = .settings, .flags = 0, .stream_id = 0 };
+    _ = try runtime.receiveFrame(settings_header, &[_]u8{});
+
+    var header_block_buf: [256]u8 = undefined;
+    const header_block = try buildHeaderBlock("/grpc.test.Echo/HeadersPriority", &header_block_buf);
+
+    var payload_buf: [priority_field_size_bytes + 256]u8 = undefined;
+    @memcpy(payload_buf[0..priority_field_size_bytes], &[_]u8{ 0, 0, 0, 0, 9 });
+    @memcpy(payload_buf[priority_field_size_bytes .. priority_field_size_bytes + header_block.len], header_block);
+    const payload = payload_buf[0 .. priority_field_size_bytes + header_block.len];
+
+    var headers_frame_buf: [h2.frame_header_size_bytes + priority_field_size_bytes + 256]u8 = undefined;
+    const headers_frame = try appendFrame(
+        &headers_frame_buf,
+        .headers,
+        h2.flags_end_headers | h2.flags_priority,
+        1,
+        payload,
+    );
+    const headers_header = try h2.parseFrameHeader(headers_frame);
+    const action = try runtime.receiveFrame(
+        headers_header,
+        headers_frame[h2.frame_header_size_bytes .. h2.frame_header_size_bytes + headers_header.length],
+    );
+
+    switch (action) {
+        .request_headers => |req| {
+            try std.testing.expectEqual(@as(u32, 1), req.stream_id);
+            try std.testing.expectEqualStrings("/grpc.test.Echo/HeadersPriority", req.request.path);
+        },
+        else => return error.InvalidFrame,
+    }
+}
+
+test "Runtime decodes padded HEADERS" {
+    var runtime = try Runtime.init();
+    var settings_out: [h2.frame_header_size_bytes + (4 * h2.setting_size_bytes)]u8 = undefined;
+    _ = try runtime.writeInitialSettingsFrame(&settings_out);
+    try runtime.receiveClientPreface();
+
+    const settings_header = h2.FrameHeader{ .length = 0, .frame_type = .settings, .flags = 0, .stream_id = 0 };
+    _ = try runtime.receiveFrame(settings_header, &[_]u8{});
+
+    var header_block_buf: [256]u8 = undefined;
+    const header_block = try buildHeaderBlock("/grpc.test.Echo/PaddedHeaders", &header_block_buf);
+
+    const pad_len: usize = 2;
+    var payload_buf: [1 + 256 + pad_len]u8 = undefined;
+    payload_buf[0] = @intCast(pad_len);
+    @memcpy(payload_buf[1 .. 1 + header_block.len], header_block);
+    @memset(payload_buf[1 + header_block.len .. 1 + header_block.len + pad_len], 0);
+
+    var frame_buf: [h2.frame_header_size_bytes + 1 + 256 + pad_len]u8 = undefined;
+    const frame = try appendFrame(
+        &frame_buf,
+        .headers,
+        h2.flags_end_headers | h2.flags_padded,
+        1,
+        payload_buf[0 .. 1 + header_block.len + pad_len],
+    );
+    const header = try h2.parseFrameHeader(frame);
+    const action = try runtime.receiveFrame(
+        header,
+        frame[h2.frame_header_size_bytes .. h2.frame_header_size_bytes + header.length],
+    );
+
+    switch (action) {
+        .request_headers => |req| try std.testing.expectEqualStrings("/grpc.test.Echo/PaddedHeaders", req.request.path),
+        else => return error.InvalidFrame,
+    }
+}
+
+test "Runtime rejects self-dependent PRIORITY as stream protocol error" {
+    var runtime = try Runtime.init();
+    var settings_out: [h2.frame_header_size_bytes + (4 * h2.setting_size_bytes)]u8 = undefined;
+    _ = try runtime.writeInitialSettingsFrame(&settings_out);
+    try runtime.receiveClientPreface();
+
+    const settings_header = h2.FrameHeader{ .length = 0, .frame_type = .settings, .flags = 0, .stream_id = 0 };
+    _ = try runtime.receiveFrame(settings_header, &[_]u8{});
+
+    const priority_payload = [_]u8{ 0x00, 0x00, 0x00, 0x01, 16 };
+    const priority_header = h2.FrameHeader{
+        .length = priority_payload.len,
+        .frame_type = .priority,
+        .flags = 0,
+        .stream_id = 1,
+    };
+
+    try std.testing.expectError(error.StreamProtocolError, runtime.receiveFrame(priority_header, &priority_payload));
+}
+
+test "Runtime rejects idle RST_STREAM as connection protocol error" {
+    var runtime = try Runtime.init();
+    var settings_out: [h2.frame_header_size_bytes + (4 * h2.setting_size_bytes)]u8 = undefined;
+    _ = try runtime.writeInitialSettingsFrame(&settings_out);
+    try runtime.receiveClientPreface();
+
+    const settings_header = h2.FrameHeader{ .length = 0, .frame_type = .settings, .flags = 0, .stream_id = 0 };
+    _ = try runtime.receiveFrame(settings_header, &[_]u8{});
+
+    var rst_buf: [h2.frame_header_size_bytes + h2.control.rst_stream_payload_size_bytes]u8 = undefined;
+    const rst_frame = try h2.buildRstStreamFrame(&rst_buf, 1, @intFromEnum(h2.ErrorCode.cancel));
+    const rst_header = try h2.parseFrameHeader(rst_frame);
+
+    try std.testing.expectError(
+        error.ConnectionProtocolError,
+        runtime.receiveFrame(rst_header, rst_frame[h2.frame_header_size_bytes..]),
+    );
 }
 
 test "Runtime reassembles request HEADERS with CONTINUATION" {
@@ -742,10 +1200,9 @@ test "Runtime tracks peer GOAWAY and rejects higher streams" {
     const goaway_frame = try h2.buildGoAwayFrame(&goaway_buf, 1, @intFromEnum(h2.ErrorCode.no_error), &[_]u8{});
     const goaway_header = try h2.parseFrameHeader(goaway_frame);
     const goaway_action = try runtime.receiveFrame(goaway_header, goaway_frame[h2.frame_header_size_bytes..]);
-    switch (goaway_action) {
-        .connection_close => |goaway| try std.testing.expectEqual(@as(u32, 1), goaway.last_stream_id),
-        else => return error.InvalidFrame,
-    }
+    try std.testing.expect(goaway_action == .none);
+    try std.testing.expect(runtime.state.goaway_received);
+    try std.testing.expectEqual(@as(u32, 1), runtime.state.peer_goaway_last_stream_id);
 
     var header_block_buf: [256]u8 = undefined;
     const header_block = try buildHeaderBlock("/grpc.test.Echo/Unary", &header_block_buf);

@@ -29,6 +29,8 @@ pub const InitialRequest = struct {
     consumed_bytes: u32,
 };
 
+const priority_field_size_bytes: usize = 5;
+
 pub const Error = error{
     NeedMoreData,
     InvalidPreface,
@@ -40,8 +42,18 @@ pub const Error = error{
     UnsupportedPriority,
     MissingMethod,
     MissingPath,
+    MissingScheme,
     MissingAuthority,
     InvalidMethod,
+    InvalidTe,
+    InvalidHeaderName,
+    UnexpectedPseudoHeader,
+    PseudoHeaderAfterRegularHeader,
+    DuplicatePseudoHeader,
+    ConnectionSpecificHeader,
+    ConnectPathNotAllowed,
+    ConnectSchemeNotAllowed,
+    AuthorityHostMismatch,
     TooManyFrames,
     TooManyHeaders,
     DuplicateContentLength,
@@ -95,21 +107,30 @@ pub fn parseInitialRequest(input: []const u8) Error!InitialRequest {
             .ping => {
                 if (header.stream_id != 0 or header.length != 8) return error.InvalidFrame;
             },
+            .priority => {
+                if (header.stream_id == 0) return error.InvalidStreamId;
+                if (header.length != priority_field_size_bytes) return error.InvalidFrame;
+            },
             .headers => {
                 if (header.stream_id == 0) return error.InvalidStreamId;
                 if ((header.flags & frame.flags_padded) != 0) return error.UnsupportedPadding;
-                if ((header.flags & frame.flags_priority) != 0) return error.UnsupportedPriority;
+
+                var header_fragment = payload;
+                if ((header.flags & frame.flags_priority) != 0) {
+                    if (payload.len < priority_field_size_bytes) return error.InvalidFrame;
+                    header_fragment = payload[priority_field_size_bytes..];
+                }
 
                 if ((header.flags & frame.flags_end_headers) != 0) {
-                    if (header.length > config.H2_MAX_HEADER_BLOCK_SIZE_BYTES) return error.HeadersTooLarge;
-                    return try buildInitialRequest(payload, header.stream_id, @intCast(payload_end));
+                    if (header_fragment.len > config.H2_MAX_HEADER_BLOCK_SIZE_BYTES) return error.HeadersTooLarge;
+                    return try buildInitialRequest(header_fragment, header.stream_id, @intCast(payload_end));
                 }
 
                 assembling_header_block = true;
                 header_stream_id = header.stream_id;
                 continuation_frames = 0;
                 header_block_len = 0;
-                try appendHeaderFragment(&header_block_buf, &header_block_len, payload);
+                try appendHeaderFragment(&header_block_buf, &header_block_len, header_fragment);
             },
             .continuation => {
                 if (!assembling_header_block) return error.UnsupportedContinuation;
@@ -190,20 +211,57 @@ pub fn decodeRequestHeaderBlockWithDecoder(
 
     var method_found = false;
     var path_found = false;
+    var scheme_found = false;
     var authority_found = false;
+    var regular_headers_seen = false;
+    var connect_method = false;
+    var authority_value: []const u8 = "";
 
     for (fields) |field| {
+        if (!isHeaderNameLowercase(field.name)) return error.InvalidHeaderName;
+
         if (field.name.len > 0 and field.name[0] == ':') {
+            if (regular_headers_seen) return error.PseudoHeaderAfterRegularHeader;
+
             if (std.mem.eql(u8, field.name, ":method")) {
+                if (method_found) return error.DuplicatePseudoHeader;
                 request.method = parseMethod(field.value) orelse return error.InvalidMethod;
                 method_found = true;
+                connect_method = request.method == .CONNECT;
             } else if (std.mem.eql(u8, field.name, ":path")) {
+                if (path_found) return error.DuplicatePseudoHeader;
                 request.path = field.value;
                 path_found = true;
+            } else if (std.mem.eql(u8, field.name, ":scheme")) {
+                if (scheme_found) return error.DuplicatePseudoHeader;
+                if (field.value.len == 0) return error.MissingScheme;
+                scheme_found = true;
+
+                request.headers.put("x-forwarded-proto", field.value) catch |err| switch (err) {
+                    error.TooManyHeaders => return error.TooManyHeaders,
+                    error.DuplicateContentLength => return error.DuplicateContentLength,
+                };
             } else if (std.mem.eql(u8, field.name, ":authority")) {
+                if (authority_found) return error.DuplicatePseudoHeader;
                 try request.headers.put("host", field.value);
                 authority_found = true;
+                authority_value = field.value;
+            } else {
+                return error.UnexpectedPseudoHeader;
             }
+            continue;
+        }
+
+        regular_headers_seen = true;
+
+        if (isConnectionSpecificHeader(field.name)) return error.ConnectionSpecificHeader;
+
+        if (std.mem.eql(u8, field.name, "te") and !isTeTrailersOnly(field.value)) {
+            return error.InvalidTe;
+        }
+
+        if (authority_found and std.mem.eql(u8, field.name, "host")) {
+            if (!std.ascii.eqlIgnoreCase(field.value, authority_value)) return error.AuthorityHostMismatch;
             continue;
         }
 
@@ -214,8 +272,15 @@ pub fn decodeRequestHeaderBlockWithDecoder(
     }
 
     if (!method_found) return error.MissingMethod;
-    if (!path_found) return error.MissingPath;
     if (!authority_found and request.headers.getHost() == null) return error.MissingAuthority;
+
+    if (connect_method) {
+        if (path_found) return error.ConnectPathNotAllowed;
+        if (scheme_found) return error.ConnectSchemeNotAllowed;
+    } else {
+        if (!path_found or request.path.len == 0) return error.MissingPath;
+        if (!scheme_found) return error.MissingScheme;
+    }
 
     return .{ .request = request, .stream_id = stream_id };
 }
@@ -235,6 +300,62 @@ fn parseMethod(token: []const u8) ?Method {
     return map.get(token);
 }
 
+fn isHeaderNameLowercase(name: []const u8) bool {
+    if (name.len == 0) return false;
+
+    var index: usize = 0;
+    while (index < name.len) : (index += 1) {
+        const c = name[index];
+        if (c >= 'A' and c <= 'Z') return false;
+    }
+    return true;
+}
+
+fn isConnectionSpecificHeader(name: []const u8) bool {
+    if (std.mem.eql(u8, name, "connection")) return true;
+    if (std.mem.eql(u8, name, "proxy-connection")) return true;
+    if (std.mem.eql(u8, name, "keep-alive")) return true;
+    if (std.mem.eql(u8, name, "transfer-encoding")) return true;
+    if (std.mem.eql(u8, name, "upgrade")) return true;
+    return false;
+}
+
+fn isTeTrailersOnly(value: []const u8) bool {
+    const trimmed = std.mem.trim(u8, value, " \t");
+    if (trimmed.len == 0) return false;
+
+    var tokens = std.mem.splitScalar(u8, trimmed, ',');
+    var seen_any = false;
+    var token_count: u8 = 0;
+    const token_count_max: u8 = 16;
+
+    while (tokens.next()) |token| {
+        if (token_count >= token_count_max) return false;
+        token_count += 1;
+
+        const token_trimmed = std.mem.trim(u8, token, " \t");
+        if (token_trimmed.len == 0) return false;
+        if (!std.ascii.eqlIgnoreCase(token_trimmed, "trailers")) return false;
+        seen_any = true;
+    }
+
+    return seen_any;
+}
+
+const TestHeaderPair = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+fn encodeHeaderPairs(pairs: []const TestHeaderPair, out: []u8) ![]const u8 {
+    var len: usize = 0;
+    for (pairs) |pair| {
+        const encoded = try hpack.encodeLiteralHeaderWithoutIndexing(out[len..], pair.name, pair.value);
+        len += encoded.len;
+    }
+    return out[0..len];
+}
+
 test "parseInitialRequest parses preface and first HEADERS request" {
     var block_buf: [256]u8 = undefined;
     var block_len: usize = 0;
@@ -242,6 +363,7 @@ test "parseInitialRequest parses preface and first HEADERS request" {
     const pairs = [_]struct { name: []const u8, value: []const u8 }{
         .{ .name = ":method", .value = "POST" },
         .{ .name = ":path", .value = "/grpc.health.v1.Health/Check" },
+        .{ .name = ":scheme", .value = "http" },
         .{ .name = ":authority", .value = "127.0.0.1:8080" },
         .{ .name = "content-type", .value = "application/grpc" },
         .{ .name = "te", .value = "trailers" },
@@ -291,6 +413,7 @@ test "parseInitialRequest reassembles HEADERS and CONTINUATION" {
     const pairs = [_]struct { name: []const u8, value: []const u8 }{
         .{ .name = ":method", .value = "POST" },
         .{ .name = ":path", .value = "/grpc.test.Echo/Continuation" },
+        .{ .name = ":scheme", .value = "http" },
         .{ .name = ":authority", .value = "127.0.0.1:8080" },
         .{ .name = "content-type", .value = "application/grpc" },
         .{ .name = "te", .value = "trailers" },
@@ -347,6 +470,114 @@ test "parseInitialRequest reassembles HEADERS and CONTINUATION" {
     try std.testing.expectEqual(@as(u32, @intCast(pos)), parsed.consumed_bytes);
 }
 
+test "parseInitialRequest accepts PRIORITY frame before request HEADERS" {
+    var block_buf: [256]u8 = undefined;
+    var block_len: usize = 0;
+
+    const pairs = [_]struct { name: []const u8, value: []const u8 }{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/grpc.test.Echo/PriorityFrame" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":authority", .value = "127.0.0.1:8080" },
+        .{ .name = "content-type", .value = "application/grpc" },
+        .{ .name = "te", .value = "trailers" },
+    };
+
+    for (pairs) |pair| {
+        const encoded = try hpack.encodeLiteralHeaderWithoutIndexing(block_buf[block_len..], pair.name, pair.value);
+        block_len += encoded.len;
+    }
+
+    var input_buf: [1024]u8 = undefined;
+    var pos: usize = 0;
+
+    @memcpy(input_buf[pos..][0..preface.client_connection_preface.len], preface.client_connection_preface);
+    pos += preface.client_connection_preface.len;
+
+    const settings_header = try frame.buildFrameHeader(input_buf[pos..][0..frame.frame_header_size_bytes], .{
+        .length = 0,
+        .frame_type = .settings,
+        .flags = 0,
+        .stream_id = 0,
+    });
+    pos += settings_header.len;
+
+    const priority_header = try frame.buildFrameHeader(input_buf[pos..][0..frame.frame_header_size_bytes], .{
+        .length = priority_field_size_bytes,
+        .frame_type = .priority,
+        .flags = 0,
+        .stream_id = 1,
+    });
+    pos += priority_header.len;
+    std.mem.writeInt(u32, input_buf[pos..][0..4], 0, .big);
+    input_buf[pos + 4] = 15;
+    pos += priority_field_size_bytes;
+
+    const headers_header = try frame.buildFrameHeader(input_buf[pos..][0..frame.frame_header_size_bytes], .{
+        .length = @intCast(block_len),
+        .frame_type = .headers,
+        .flags = frame.flags_end_headers,
+        .stream_id = 1,
+    });
+    pos += headers_header.len;
+    @memcpy(input_buf[pos..][0..block_len], block_buf[0..block_len]);
+    pos += block_len;
+
+    const parsed = try parseInitialRequest(input_buf[0..pos]);
+    try std.testing.expectEqualStrings("/grpc.test.Echo/PriorityFrame", parsed.request.path);
+    try std.testing.expectEqual(@as(u32, 1), parsed.stream_id);
+}
+
+test "parseInitialRequest accepts HEADERS with PRIORITY flag" {
+    var block_buf: [256]u8 = undefined;
+    var block_len: usize = 0;
+
+    const pairs = [_]struct { name: []const u8, value: []const u8 }{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/grpc.test.Echo/HeadersPriority" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":authority", .value = "127.0.0.1:8080" },
+        .{ .name = "content-type", .value = "application/grpc" },
+        .{ .name = "te", .value = "trailers" },
+    };
+
+    for (pairs) |pair| {
+        const encoded = try hpack.encodeLiteralHeaderWithoutIndexing(block_buf[block_len..], pair.name, pair.value);
+        block_len += encoded.len;
+    }
+
+    var input_buf: [1024]u8 = undefined;
+    var pos: usize = 0;
+
+    @memcpy(input_buf[pos..][0..preface.client_connection_preface.len], preface.client_connection_preface);
+    pos += preface.client_connection_preface.len;
+
+    const settings_header = try frame.buildFrameHeader(input_buf[pos..][0..frame.frame_header_size_bytes], .{
+        .length = 0,
+        .frame_type = .settings,
+        .flags = 0,
+        .stream_id = 0,
+    });
+    pos += settings_header.len;
+
+    const headers_header = try frame.buildFrameHeader(input_buf[pos..][0..frame.frame_header_size_bytes], .{
+        .length = @intCast(priority_field_size_bytes + block_len),
+        .frame_type = .headers,
+        .flags = frame.flags_end_headers | frame.flags_priority,
+        .stream_id = 1,
+    });
+    pos += headers_header.len;
+    std.mem.writeInt(u32, input_buf[pos..][0..4], 0, .big);
+    input_buf[pos + 4] = 9;
+    pos += priority_field_size_bytes;
+    @memcpy(input_buf[pos..][0..block_len], block_buf[0..block_len]);
+    pos += block_len;
+
+    const parsed = try parseInitialRequest(input_buf[0..pos]);
+    try std.testing.expectEqualStrings("/grpc.test.Echo/HeadersPriority", parsed.request.path);
+    try std.testing.expectEqual(@as(u32, 1), parsed.stream_id);
+}
+
 test "parseInitialRequest rejects interleaved non-continuation while assembling headers" {
     var block_buf: [512]u8 = undefined;
     var block_len: usize = 0;
@@ -354,6 +585,7 @@ test "parseInitialRequest rejects interleaved non-continuation while assembling 
     const pairs = [_]struct { name: []const u8, value: []const u8 }{
         .{ .name = ":method", .value = "POST" },
         .{ .name = ":path", .value = "/grpc.test.Echo/Interleave" },
+        .{ .name = ":scheme", .value = "http" },
         .{ .name = ":authority", .value = "127.0.0.1:8080" },
         .{ .name = "content-type", .value = "application/grpc" },
         .{ .name = "te", .value = "trailers" },
@@ -411,6 +643,7 @@ test "parseInitialRequest rejects continuation stream mismatch" {
     const pairs = [_]struct { name: []const u8, value: []const u8 }{
         .{ .name = ":method", .value = "POST" },
         .{ .name = ":path", .value = "/grpc.test.Echo/Mismatch" },
+        .{ .name = ":scheme", .value = "http" },
         .{ .name = ":authority", .value = "127.0.0.1:8080" },
         .{ .name = "content-type", .value = "application/grpc" },
         .{ .name = "te", .value = "trailers" },
@@ -566,4 +799,78 @@ test "parseInitialRequest enforces continuation frame bound" {
     }
 
     try std.testing.expectError(error.TooManyFrames, parseInitialRequest(input_buf[0..pos]));
+}
+
+test "decodeRequestHeaderBlock rejects pseudo header after regular header" {
+    var block_buf: [256]u8 = undefined;
+    const block = try encodeHeaderPairs(&.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = "te", .value = "trailers" },
+        .{ .name = ":path", .value = "/grpc.test.Echo/Unary" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":authority", .value = "127.0.0.1:8080" },
+    }, &block_buf);
+
+    try std.testing.expectError(error.PseudoHeaderAfterRegularHeader, decodeRequestHeaderBlock(block, 1));
+}
+
+test "decodeRequestHeaderBlock rejects missing scheme" {
+    var block_buf: [256]u8 = undefined;
+    const block = try encodeHeaderPairs(&.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/grpc.test.Echo/Unary" },
+        .{ .name = ":authority", .value = "127.0.0.1:8080" },
+    }, &block_buf);
+
+    try std.testing.expectError(error.MissingScheme, decodeRequestHeaderBlock(block, 1));
+}
+
+test "decodeRequestHeaderBlock rejects empty path" {
+    var block_buf: [256]u8 = undefined;
+    const block = try encodeHeaderPairs(&.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":authority", .value = "127.0.0.1:8080" },
+    }, &block_buf);
+
+    try std.testing.expectError(error.MissingPath, decodeRequestHeaderBlock(block, 1));
+}
+
+test "decodeRequestHeaderBlock rejects connection specific headers" {
+    var block_buf: [256]u8 = undefined;
+    const block = try encodeHeaderPairs(&.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/grpc.test.Echo/Unary" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":authority", .value = "127.0.0.1:8080" },
+        .{ .name = "connection", .value = "keep-alive" },
+    }, &block_buf);
+
+    try std.testing.expectError(error.ConnectionSpecificHeader, decodeRequestHeaderBlock(block, 1));
+}
+
+test "decodeRequestHeaderBlock rejects invalid te token" {
+    var block_buf: [256]u8 = undefined;
+    const block = try encodeHeaderPairs(&.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/grpc.test.Echo/Unary" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":authority", .value = "127.0.0.1:8080" },
+        .{ .name = "te", .value = "gzip" },
+    }, &block_buf);
+
+    try std.testing.expectError(error.InvalidTe, decodeRequestHeaderBlock(block, 1));
+}
+
+test "decodeRequestHeaderBlock rejects CONNECT with :path" {
+    var block_buf: [256]u8 = undefined;
+    const block = try encodeHeaderPairs(&.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":authority", .value = "127.0.0.1:8080" },
+    }, &block_buf);
+
+    try std.testing.expectError(error.ConnectPathNotAllowed, decodeRequestHeaderBlock(block, 1));
 }

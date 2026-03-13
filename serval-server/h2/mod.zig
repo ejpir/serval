@@ -20,6 +20,7 @@ pub const StreamSummary = server.StreamSummary;
 pub const ResponseWriter = server.ResponseWriter;
 pub const ServerError = server.Error;
 pub const servePlainConnection = server.servePlainConnection;
+pub const serveTlsConnection = server.serveTlsConnection;
 pub const verifyServerHandler = server.verifyHandler;
 
 test {

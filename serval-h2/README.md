@@ -16,7 +16,7 @@ This first slice provides bounded helpers for:
 - client connection preface detection
 - `Upgrade: h2c` request detection, validation, and `HTTP2-Settings` decoding
 - bounded HPACK decoding/encoding including static-table and dynamic-table indexed fields, indexed names, literal header blocks, dynamic-table size updates, and Huffman string decoding
-- request-header decoding for stream-aware server/client runtimes
+- request-header decoding for stream-aware server/client runtimes with strict pseudo-header ordering, duplicate detection, CONNECT constraints, connection-specific header rejection, and `te=trailers` enforcement
 - initial request parsing for h2c prior-knowledge connection routing, including bounded HEADERS+CONTINUATION reassembly
 - HTTP/1.1 upgrade-request translation into an upstream prior-knowledge h2c preamble
 

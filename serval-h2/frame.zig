@@ -26,6 +26,7 @@ pub const FrameType = enum(u8) {
     goaway = 0x7,
     window_update = 0x8,
     continuation = 0x9,
+    extension = 0xff,
 };
 
 pub const FrameHeader = struct {
@@ -55,17 +56,17 @@ pub fn parseFrameHeader(raw: []const u8) Error!FrameHeader {
 
     const frame_type: FrameType = switch (raw[3]) {
         0...9 => @enumFromInt(raw[3]),
-        else => return error.InvalidFrameType,
+        else => .extension,
     };
 
     const stream_id_with_reserved = std.mem.readInt(u32, raw[5..9], .big);
-    if ((stream_id_with_reserved & 0x8000_0000) != 0) return error.ReservedBitSet;
+    const stream_id = stream_id_with_reserved & 0x7fff_ffff;
 
     return .{
         .length = length,
         .frame_type = frame_type,
         .flags = raw[4],
-        .stream_id = stream_id_with_reserved,
+        .stream_id = stream_id,
     };
 }
 
@@ -108,7 +109,21 @@ test "buildFrameHeader encodes frame header" {
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0x00, 0x00, 0x08, 0x06, 0x01, 0x00, 0x00, 0x00, 0x00 }, encoded);
 }
 
+test "parseFrameHeader maps unknown frame type to extension" {
+    const raw = [_]u8{ 0x00, 0x00, 0x00, 0xaa, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    const header = try parseFrameHeader(&raw);
+
+    try std.testing.expectEqual(FrameType.extension, header.frame_type);
+    try std.testing.expectEqual(@as(u32, 0), header.length);
+}
+
 test "parseFrameHeader rejects oversized frame" {
     const raw = [_]u8{ 0x01, 0x00, 0x00, 0x01, 0x04, 0x00, 0x00, 0x00, 0x01 };
     try std.testing.expectError(error.FrameTooLarge, parseFrameHeader(&raw));
+}
+
+test "parseFrameHeader ignores reserved stream-id bit" {
+    const raw = [_]u8{ 0x00, 0x00, 0x00, 0x06, 0x00, 0x80, 0x00, 0x00, 0x00 };
+    const header = try parseFrameHeader(&raw);
+    try std.testing.expectEqual(@as(u32, 0), header.stream_id);
 }

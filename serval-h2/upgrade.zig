@@ -171,6 +171,7 @@ fn encodeHeaderBlock(
     var cursor: usize = 0;
     cursor = try appendHeader(out, cursor, ":method", methodToBytes(request.method));
     cursor = try appendHeader(out, cursor, ":path", path);
+    cursor = try appendHeader(out, cursor, ":scheme", "http");
     cursor = try appendHeader(out, cursor, ":authority", authority);
 
     for (request.headers.headers[0..request.headers.count]) |header| {
@@ -179,7 +180,7 @@ fn encodeHeaderBlock(
         if (eqlIgnoreCase(header.name, "te") and !eqlIgnoreCase(std.mem.trim(u8, header.value, " \t"), "trailers")) {
             return error.InvalidTeHeader;
         }
-        cursor = try appendHeader(out, cursor, header.name, header.value);
+        cursor = try appendHeaderLowercaseName(out, cursor, header.name, header.value);
     }
 
     return out[0..cursor];
@@ -198,6 +199,18 @@ fn shouldForwardHeader(name: []const u8, connection: ?[]const u8) bool {
     }
 
     return true;
+}
+
+fn appendHeaderLowercaseName(out: []u8, cursor: usize, name: []const u8, value: []const u8) Error!usize {
+    var lower_name_buf: [256]u8 = undefined;
+    if (name.len > lower_name_buf.len) return error.HeadersTooLarge;
+
+    var index: usize = 0;
+    while (index < name.len) : (index += 1) {
+        lower_name_buf[index] = std.ascii.toLower(name[index]);
+    }
+
+    return appendHeader(out, cursor, lower_name_buf[0..name.len], value);
 }
 
 fn appendHeader(out: []u8, cursor: usize, name: []const u8, value: []const u8) Error!usize {

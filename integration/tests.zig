@@ -1825,6 +1825,7 @@ fn buildGrpcH2StreamFrames(
     const header_block = try buildH2HeaderBlock(&.{
         .{ .name = ":method", .value = "POST" },
         .{ .name = ":path", .value = path },
+        .{ .name = ":scheme", .value = "http" },
         .{ .name = ":authority", .value = authority },
         .{ .name = "content-type", .value = "application/grpc" },
         .{ .name = "te", .value = "trailers" },
@@ -1871,6 +1872,7 @@ fn buildGrpcH2RequestWithExtraHeaders(
     const base_headers = [_]H2HeaderPair{
         .{ .name = ":method", .value = "POST" },
         .{ .name = ":path", .value = path },
+        .{ .name = ":scheme", .value = "http" },
         .{ .name = ":authority", .value = authority },
         .{ .name = "content-type", .value = "application/grpc" },
         .{ .name = "te", .value = "trailers" },
@@ -1974,6 +1976,7 @@ fn buildGrpcH2ResetThenUnaryRequest(
     const reset_header_block = try buildH2HeaderBlock(&.{
         .{ .name = ":method", .value = "POST" },
         .{ .name = ":path", .value = reset_path },
+        .{ .name = ":scheme", .value = "http" },
         .{ .name = ":authority", .value = authority },
         .{ .name = "content-type", .value = "application/grpc" },
         .{ .name = "te", .value = "trailers" },
@@ -1997,6 +2000,7 @@ fn buildH2FlowControlRequest(path: []const u8, authority: []const u8, out: []u8)
     const header_block = try buildH2HeaderBlock(&.{
         .{ .name = ":method", .value = "POST" },
         .{ .name = ":path", .value = path },
+        .{ .name = ":scheme", .value = "http" },
         .{ .name = ":authority", .value = authority },
         .{ .name = "content-type", .value = "application/grpc" },
         .{ .name = "te", .value = "trailers" },
@@ -2047,6 +2051,7 @@ fn buildGrpcH2InterleavedTwoUnaryRequest(
     const first_header_block = try buildH2HeaderBlock(&.{
         .{ .name = ":method", .value = "POST" },
         .{ .name = ":path", .value = first_path },
+        .{ .name = ":scheme", .value = "http" },
         .{ .name = ":authority", .value = authority },
         .{ .name = "content-type", .value = "application/grpc" },
         .{ .name = "te", .value = "trailers" },
@@ -2056,6 +2061,7 @@ fn buildGrpcH2InterleavedTwoUnaryRequest(
     const second_header_block = try buildH2HeaderBlock(&.{
         .{ .name = ":method", .value = "POST" },
         .{ .name = ":path", .value = second_path },
+        .{ .name = ":scheme", .value = "http" },
         .{ .name = ":authority", .value = authority },
         .{ .name = "content-type", .value = "application/grpc" },
         .{ .name = "te", .value = "trailers" },
@@ -2100,6 +2106,7 @@ fn buildGrpcH2InterleavedManyUnaryRequest(
     const header_block = try buildH2HeaderBlock(&.{
         .{ .name = ":method", .value = "POST" },
         .{ .name = ":path", .value = path },
+        .{ .name = ":scheme", .value = "http" },
         .{ .name = ":authority", .value = authority },
         .{ .name = "content-type", .value = "application/grpc" },
         .{ .name = "te", .value = "trailers" },
@@ -3848,6 +3855,623 @@ fn grpcH2ProxyServerMain(shared: *GrpcH2ProxyServerShared, upstream: serval.Upst
     };
 }
 
+const NETBIRD_STARTUP_TIMEOUT_MS: u16 = 2000;
+
+const NetbirdGrpcRoute = enum {
+    none,
+    signal,
+    management,
+};
+
+const NetbirdGrpcRouteSpec = struct {
+    matcher: serval.PathMatch,
+    route: NetbirdGrpcRoute,
+};
+
+const NetbirdHttpResponseSpec = struct {
+    matcher: serval.PathMatch,
+    status: u16,
+    content_type: []const u8,
+    body: []const u8,
+};
+
+const netbird_grpc_route_specs = [_]NetbirdGrpcRouteSpec{
+    .{ .matcher = .{ .prefix = "/signalexchange.SignalExchange/" }, .route = .signal },
+    .{ .matcher = .{ .prefix = "/management.ManagementService/" }, .route = .management },
+    .{ .matcher = .{ .prefix = "/management.ProxyService/" }, .route = .management },
+};
+
+const netbird_websocket_matchers = [_]serval.PathMatch{
+    .{ .prefix = "/relay" },
+    .{ .prefix = "/ws-proxy/" },
+};
+
+const netbird_http_response_specs = [_]NetbirdHttpResponseSpec{
+    .{ .matcher = .{ .prefix = "/api/" }, .status = 401, .content_type = "text/plain", .body = "api-unauthorized" },
+    .{ .matcher = .{ .prefix = "/oauth2/" }, .status = 200, .content_type = "text/plain", .body = "oauth2-ok" },
+    .{ .matcher = .{ .prefix = "/.well-known/" }, .status = 200, .content_type = "application/json", .body = "{\"issuer\":\"https://netbird.local\"}" },
+    .{ .matcher = .{ .prefix = "/ui/" }, .status = 200, .content_type = "text/plain", .body = "zitadel-http-ok" },
+    .{ .matcher = .{ .prefix = "/oidc/" }, .status = 200, .content_type = "text/plain", .body = "zitadel-http-ok" },
+    .{ .matcher = .{ .prefix = "/oauth/" }, .status = 200, .content_type = "text/plain", .body = "zitadel-http-ok" },
+    .{ .matcher = .{ .prefix = "/" }, .status = 200, .content_type = "text/plain", .body = "dashboard-catch-all" },
+};
+
+fn netbirdPathMatches(matcher: serval.PathMatch, path: []const u8) bool {
+    assert(path.len > 0);
+    return matcher.matches(path);
+}
+
+fn netbirdIsWebSocketPath(path: []const u8) bool {
+    for (netbird_websocket_matchers) |matcher| {
+        if (netbirdPathMatches(matcher, path)) return true;
+    }
+    return false;
+}
+
+fn netbirdClassifyGrpcPath(path: []const u8) ?NetbirdGrpcRoute {
+    for (netbird_grpc_route_specs) |spec| {
+        if (!netbirdPathMatches(spec.matcher, path)) continue;
+        return spec.route;
+    }
+    return null;
+}
+
+fn netbirdResolveHttpResponse(path: []const u8) ?NetbirdHttpResponseSpec {
+    for (netbird_http_response_specs) |spec| {
+        if (!netbirdPathMatches(spec.matcher, path)) continue;
+        return spec;
+    }
+    return null;
+}
+
+fn netbirdWriteStaticBody(response_buf: []u8, body: []const u8) []const u8 {
+    assert(body.len <= response_buf.len);
+    @memcpy(response_buf[0..body.len], body);
+    return response_buf[0..body.len];
+}
+
+const NetbirdDualBackendHandler = struct {
+    const max_tracked_streams: u8 = 8;
+
+    pending_stream_ids: [max_tracked_streams]u32 = [_]u32{0} ** max_tracked_streams,
+    pending_stream_routes: [max_tracked_streams]NetbirdGrpcRoute = [_]NetbirdGrpcRoute{.none} ** max_tracked_streams,
+
+    fn trackStreamRoute(self: *@This(), stream_id: u32, route: NetbirdGrpcRoute) !void {
+        assert(stream_id > 0);
+        assert(route != .none);
+
+        var idx: u8 = 0;
+        while (idx < max_tracked_streams) : (idx += 1) {
+            if (self.pending_stream_routes[idx] == .none) continue;
+            if (self.pending_stream_ids[idx] == stream_id) return error.DuplicateStreamId;
+        }
+
+        idx = 0;
+        while (idx < max_tracked_streams) : (idx += 1) {
+            if (self.pending_stream_routes[idx] != .none) continue;
+            self.pending_stream_ids[idx] = stream_id;
+            self.pending_stream_routes[idx] = route;
+            return;
+        }
+
+        return error.StreamTableFull;
+    }
+
+    fn takeStreamRoute(self: *@This(), stream_id: u32) !NetbirdGrpcRoute {
+        assert(stream_id > 0);
+
+        var idx: u8 = 0;
+        while (idx < max_tracked_streams) : (idx += 1) {
+            if (self.pending_stream_routes[idx] == .none) continue;
+            if (self.pending_stream_ids[idx] != stream_id) continue;
+
+            const route = self.pending_stream_routes[idx];
+            self.pending_stream_ids[idx] = 0;
+            self.pending_stream_routes[idx] = .none;
+            return route;
+        }
+
+        return error.UnknownStreamId;
+    }
+
+    pub fn selectUpstream(
+        self: *@This(),
+        ctx: *serval.Context,
+        request: *const serval.Request,
+    ) serval.Upstream {
+        _ = self;
+        _ = ctx;
+        _ = request;
+        @panic("netbird backend should terminate requests directly");
+    }
+
+    pub fn onRequest(
+        self: *@This(),
+        ctx: *serval.Context,
+        request: *serval.Request,
+        response_buf: []u8,
+    ) serval.Action {
+        _ = self;
+        _ = ctx;
+
+        if (netbirdIsWebSocketPath(request.path)) {
+            return .continue_request;
+        }
+
+        const response_spec = netbirdResolveHttpResponse(request.path) orelse {
+            return .{ .reject = .{
+                .status = 500,
+                .reason = "netbird test route missing",
+            } };
+        };
+
+        const body = netbirdWriteStaticBody(response_buf, response_spec.body);
+        return .{ .send_response = .{
+            .status = response_spec.status,
+            .body = body,
+            .content_type = response_spec.content_type,
+        } };
+    }
+
+    pub fn selectWebSocket(
+        self: *@This(),
+        ctx: *serval.Context,
+        request: *const serval.Request,
+    ) serval.WebSocketRouteAction {
+        _ = self;
+        _ = ctx;
+
+        if (netbirdIsWebSocketPath(request.path)) {
+            return .{ .accept = .{} };
+        }
+
+        return .decline;
+    }
+
+    pub fn handleWebSocket(
+        self: *@This(),
+        ctx: *serval.Context,
+        request: *const serval.Request,
+        session: *serval.WebSocketSession,
+    ) !void {
+        _ = self;
+        _ = ctx;
+        _ = request;
+
+        var msg_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+        while (try session.readMessage(&msg_buf)) |message| {
+            switch (message.kind) {
+                .text => try session.sendText(message.payload),
+                .binary => try session.sendBinary(message.payload),
+            }
+        }
+    }
+
+    pub fn handleH2Headers(
+        self: *@This(),
+        stream_id: u32,
+        request: *const serval.Request,
+        end_stream: bool,
+        writer: *serval.server.H2ResponseWriter,
+    ) !void {
+        _ = writer;
+
+        const route = netbirdClassifyGrpcPath(request.path) orelse return error.InvalidPath;
+        try serval_grpc.validateRequest(request);
+        try testing.expect(!end_stream);
+        try self.trackStreamRoute(stream_id, route);
+    }
+
+    pub fn handleH2Data(
+        self: *@This(),
+        stream_id: u32,
+        payload: []const u8,
+        end_stream: bool,
+        writer: *serval.server.H2ResponseWriter,
+    ) !void {
+        try testing.expect(end_stream);
+
+        const route = try self.takeStreamRoute(stream_id);
+        const grpc_payload = try serval_grpc.parseMessage(payload);
+
+        const response_payload = switch (route) {
+            .signal => blk: {
+                try testing.expectEqualStrings("signal-ping", grpc_payload);
+                break :blk "signal-pong";
+            },
+            .management => blk: {
+                try testing.expectEqualStrings("management-ping", grpc_payload);
+                break :blk "management-pong";
+            },
+            .none => return error.InvalidStreamRoute,
+        };
+
+        var grpc_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+        const response_message = try serval_grpc.buildMessage(&grpc_buf, false, response_payload);
+        try writer.sendHeaders(200, &.{.{ .name = "content-type", .value = "application/grpc" }}, false);
+        try writer.sendData(response_message, false);
+        try writer.sendTrailers(&.{.{ .name = "grpc-status", .value = "0" }});
+    }
+};
+
+const NetbirdServerShared = struct {
+    port: u16,
+    shutdown: std.atomic.Value(bool),
+    listener_fd: std.atomic.Value(i32),
+};
+
+const NetbirdDualBackendServer = struct {
+    shared: *NetbirdServerShared,
+    thread: ?std.Thread,
+
+    fn start(port: u16) !NetbirdDualBackendServer {
+        const shared = try std.heap.page_allocator.create(NetbirdServerShared);
+        errdefer std.heap.page_allocator.destroy(shared);
+
+        shared.* = .{
+            .port = port,
+            .shutdown = std.atomic.Value(bool).init(false),
+            .listener_fd = std.atomic.Value(i32).init(-1),
+        };
+
+        var server = NetbirdDualBackendServer{ .shared = shared, .thread = null };
+        server.thread = try std.Thread.spawn(.{}, netbirdDualBackendServerMain, .{shared});
+
+        var waited_ms: u16 = 0;
+        while (waited_ms < NETBIRD_STARTUP_TIMEOUT_MS) : (waited_ms += 1) {
+            if (shared.listener_fd.load(.acquire) >= 0) return server;
+            posix.nanosleep(0, std.time.ns_per_ms);
+        }
+
+        shared.shutdown.store(true, .release);
+        const wake_sock = connectTcp(shared.port) catch null;
+        if (wake_sock) |sock| posix.close(sock);
+        _ = shared.listener_fd.swap(-1, .acq_rel);
+
+        if (server.thread) |thread| {
+            thread.join();
+            server.thread = null;
+        }
+
+        std.heap.page_allocator.destroy(shared);
+        return error.BackendStartupTimeout;
+    }
+
+    fn stop(self: *NetbirdDualBackendServer) void {
+        self.shared.shutdown.store(true, .release);
+        const wake_sock = connectTcp(self.shared.port) catch null;
+        if (wake_sock) |sock| posix.close(sock);
+        _ = self.shared.listener_fd.swap(-1, .acq_rel);
+
+        if (self.thread) |thread| {
+            thread.join();
+            self.thread = null;
+        }
+
+        std.heap.page_allocator.destroy(self.shared);
+    }
+};
+
+fn netbirdDualBackendServerMain(shared: *NetbirdServerShared) void {
+    var handler = NetbirdDualBackendHandler{};
+    var pool = serval.SimplePool.init();
+    var metrics = serval.NoopMetrics{};
+    var tracer = serval.NoopTracer{};
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+
+    const ServerType = serval.Server(
+        NetbirdDualBackendHandler,
+        serval.SimplePool,
+        serval.NoopMetrics,
+        serval.NoopTracer,
+    );
+    var server = ServerType.init(
+        &handler,
+        &pool,
+        &metrics,
+        &tracer,
+        .{ .port = shared.port },
+        null,
+        serval_net.DnsConfig{},
+    );
+
+    server.run(threaded.io(), &shared.shutdown, &shared.listener_fd) catch |err| {
+        std.log.err("netbird backend test server failed: {s}", .{@errorName(err)});
+    };
+}
+
+const NetbirdRouteProxyHandler = struct {
+    signal_upstream: serval.Upstream,
+    management_upstream: serval.Upstream,
+    http_upstream: serval.Upstream,
+
+    pub fn selectUpstream(
+        self: *@This(),
+        ctx: *serval.Context,
+        request: *const serval.Request,
+    ) serval.Upstream {
+        _ = ctx;
+
+        const grpc_route = netbirdClassifyGrpcPath(request.path);
+        if (grpc_route) |route| {
+            return switch (route) {
+                .signal => self.signal_upstream,
+                .management => self.management_upstream,
+                .none => self.http_upstream,
+            };
+        }
+
+        return self.http_upstream;
+    }
+};
+
+const NetbirdRouteProxyConfig = struct {
+    port: u16,
+    signal_upstream: serval.Upstream,
+    management_upstream: serval.Upstream,
+    http_upstream: serval.Upstream,
+};
+
+const NetbirdRouteProxyServer = struct {
+    shared: *NetbirdServerShared,
+    thread: ?std.Thread,
+
+    fn start(config: NetbirdRouteProxyConfig) !NetbirdRouteProxyServer {
+        const shared = try std.heap.page_allocator.create(NetbirdServerShared);
+        errdefer std.heap.page_allocator.destroy(shared);
+
+        shared.* = .{
+            .port = config.port,
+            .shutdown = std.atomic.Value(bool).init(false),
+            .listener_fd = std.atomic.Value(i32).init(-1),
+        };
+
+        var server = NetbirdRouteProxyServer{ .shared = shared, .thread = null };
+        server.thread = try std.Thread.spawn(.{}, netbirdRouteProxyServerMain, .{ shared, config });
+
+        var waited_ms: u16 = 0;
+        while (waited_ms < NETBIRD_STARTUP_TIMEOUT_MS) : (waited_ms += 1) {
+            if (shared.listener_fd.load(.acquire) >= 0) return server;
+            posix.nanosleep(0, std.time.ns_per_ms);
+        }
+
+        shared.shutdown.store(true, .release);
+        const wake_sock = connectTcp(shared.port) catch null;
+        if (wake_sock) |sock| posix.close(sock);
+        _ = shared.listener_fd.swap(-1, .acq_rel);
+
+        if (server.thread) |thread| {
+            thread.join();
+            server.thread = null;
+        }
+
+        std.heap.page_allocator.destroy(shared);
+        return error.ProxyStartupTimeout;
+    }
+
+    fn stop(self: *NetbirdRouteProxyServer) void {
+        self.shared.shutdown.store(true, .release);
+        const wake_sock = connectTcp(self.shared.port) catch null;
+        if (wake_sock) |sock| posix.close(sock);
+        _ = self.shared.listener_fd.swap(-1, .acq_rel);
+
+        if (self.thread) |thread| {
+            thread.join();
+            self.thread = null;
+        }
+
+        std.heap.page_allocator.destroy(self.shared);
+    }
+};
+
+fn netbirdRouteProxyServerMain(shared: *NetbirdServerShared, config: NetbirdRouteProxyConfig) void {
+    var handler = NetbirdRouteProxyHandler{
+        .signal_upstream = config.signal_upstream,
+        .management_upstream = config.management_upstream,
+        .http_upstream = config.http_upstream,
+    };
+    var pool = serval.SimplePool.init();
+    var metrics = serval.NoopMetrics{};
+    var tracer = serval.NoopTracer{};
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+
+    const ServerType = serval.Server(
+        NetbirdRouteProxyHandler,
+        serval.SimplePool,
+        serval.NoopMetrics,
+        serval.NoopTracer,
+    );
+    var server = ServerType.init(
+        &handler,
+        &pool,
+        &metrics,
+        &tracer,
+        .{ .port = config.port },
+        null,
+        serval_net.DnsConfig{},
+    );
+
+    server.run(threaded.io(), &shared.shutdown, &shared.listener_fd) catch |err| {
+        std.log.err("netbird proxy test server failed: {s}", .{@errorName(err)});
+    };
+}
+
+fn expectGrpcUnaryThroughNetbirdProxy(
+    proxy_port: u16,
+    path: []const u8,
+    request_payload: []const u8,
+    expected_response_payload: []const u8,
+) !void {
+    const sock = try connectTcp(proxy_port);
+    defer posix.close(sock);
+
+    var authority_buf: [32]u8 = undefined;
+    const authority = try std.fmt.bufPrint(&authority_buf, "127.0.0.1:{d}", .{proxy_port});
+    var request_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const request = try buildGrpcH2Request(path, authority, request_payload, &request_buf);
+    try sendAllTcp(sock, request);
+
+    var frame_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var initial: []const u8 = &[_]u8{};
+    var payload_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var saw_headers = false;
+    var saw_data = false;
+    var saw_trailers = false;
+    var iterations: u32 = 0;
+
+    while (iterations < H2_MAX_FRAME_READS * 2) : (iterations += 1) {
+        const frame_view = try readH2Frame(sock, initial, &frame_buf);
+        initial = frame_view.remaining;
+
+        switch (frame_view.header.frame_type) {
+            .settings => {
+                if ((frame_view.header.flags & serval_h2.flags_ack) == 0) {
+                    try sendH2SettingsAck(sock);
+                }
+            },
+            .headers => {
+                var fields_buf: [H2_MAX_HEADER_FIELDS]serval_h2.HeaderField = undefined;
+                const fields = try decodeH2Fields(frame_view.payload, &fields_buf);
+                if (!saw_headers) {
+                    saw_headers = true;
+                    try testing.expectEqualStrings(":status", fields[0].name);
+                    try testing.expectEqualStrings("200", fields[0].value);
+                } else {
+                    try expectGrpcStatusTrailer(fields, "0");
+                    saw_trailers = true;
+                }
+            },
+            .data => {
+                const grpc_payload = try readGrpcPayloadFromDataFrame(frame_view, &payload_buf);
+                try testing.expectEqualStrings(expected_response_payload, grpc_payload);
+                saw_data = true;
+            },
+            else => {},
+        }
+
+        if (saw_headers and saw_data and saw_trailers) break;
+    }
+
+    try testing.expect(saw_headers);
+    try testing.expect(saw_data);
+    try testing.expect(saw_trailers);
+}
+
+fn expectWebSocketEchoThroughNetbirdProxy(proxy_port: u16, path: []const u8, payload: []const u8) !void {
+    const sock = try connectTcp(proxy_port);
+    defer posix.close(sock);
+
+    var handshake_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const handshake = try buildClientHandshake(path, proxy_port, &handshake_buf);
+
+    var client_frame_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const client_frame = try buildMaskedClientTextFrame(payload, &client_frame_buf);
+
+    var request_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const request = try std.fmt.bufPrint(&request_buf, "{s}{s}", .{ handshake, client_frame });
+    try sendAllTcp(sock, request);
+
+    var response_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const response_len = try readUntilHeadersComplete(sock, &response_buf);
+    const status = harness.TestClient.parseStatusCode(response_buf[0..response_len]) orelse return error.InvalidResponse;
+    try testing.expectEqual(@as(u16, 101), status);
+
+    const header_end = std.mem.indexOf(u8, response_buf[0..response_len], "\r\n\r\n") orelse return error.InvalidResponse;
+    var frame_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const frame_payload = try readServerTextFrame(sock, response_buf[header_end + 4 .. response_len], &frame_buf);
+    try testing.expectEqualStrings(payload, frame_payload);
+    try performClientCloseHandshake(sock);
+}
+
+test "integration: netbird route matrix enforces grpc h2c only for service paths" {
+    const allocator = testing.allocator;
+    const backend_port = harness.getPort();
+    const proxy_port = harness.getPort();
+
+    var backend = try NetbirdDualBackendServer.start(backend_port);
+    defer backend.stop();
+
+    var proxy = try NetbirdRouteProxyServer.start(.{
+        .port = proxy_port,
+        .signal_upstream = .{
+            .host = "127.0.0.1",
+            .port = backend_port,
+            .idx = 0,
+            .http_protocol = .h2c,
+        },
+        .management_upstream = .{
+            .host = "127.0.0.1",
+            .port = backend_port,
+            .idx = 1,
+            .http_protocol = .h2c,
+        },
+        .http_upstream = .{
+            .host = "127.0.0.1",
+            .port = backend_port,
+            .idx = 2,
+            .http_protocol = .h1,
+        },
+    });
+    defer proxy.stop();
+
+    var client = harness.TestClient.init(allocator);
+    defer client.deinit();
+
+    const api_response = try client.get(proxy_port, "/api/accounts");
+    defer api_response.deinit();
+    try testing.expectEqual(@as(u16, 401), api_response.status);
+    try testing.expect(std.mem.indexOf(u8, api_response.body, "api-unauthorized") != null);
+
+    try expectGrpcUnaryThroughNetbirdProxy(
+        proxy_port,
+        "/signalexchange.SignalExchange/Connect",
+        "signal-ping",
+        "signal-pong",
+    );
+
+    const oauth2_response = try client.get(proxy_port, "/oauth2/authorize");
+    defer oauth2_response.deinit();
+    try testing.expectEqual(@as(u16, 200), oauth2_response.status);
+    try testing.expect(std.mem.indexOf(u8, oauth2_response.body, "oauth2-ok") != null);
+
+    try expectGrpcUnaryThroughNetbirdProxy(
+        proxy_port,
+        "/management.ManagementService/GetServerKey",
+        "management-ping",
+        "management-pong",
+    );
+
+    const well_known_response = try client.get(proxy_port, "/.well-known/openid-configuration");
+    defer well_known_response.deinit();
+    try testing.expectEqual(@as(u16, 200), well_known_response.status);
+    try testing.expect(std.mem.indexOf(u8, well_known_response.body, "\"issuer\":\"https://netbird.local\"") != null);
+
+    const oidc_response = try client.get(proxy_port, "/oidc/v1/userinfo");
+    defer oidc_response.deinit();
+    try testing.expectEqual(@as(u16, 200), oidc_response.status);
+    try testing.expect(std.mem.indexOf(u8, oidc_response.body, "zitadel-http-ok") != null);
+
+    const oauth_response = try client.get(proxy_port, "/oauth/v2/token");
+    defer oauth_response.deinit();
+    try testing.expectEqual(@as(u16, 200), oauth_response.status);
+    try testing.expect(std.mem.indexOf(u8, oauth_response.body, "zitadel-http-ok") != null);
+
+    const ui_response = try client.get(proxy_port, "/ui/index.html");
+    defer ui_response.deinit();
+    try testing.expectEqual(@as(u16, 200), ui_response.status);
+    try testing.expect(std.mem.indexOf(u8, ui_response.body, "zitadel-http-ok") != null);
+
+    const catch_all_response = try client.get(proxy_port, "/dashboard");
+    defer catch_all_response.deinit();
+    try testing.expectEqual(@as(u16, 200), catch_all_response.status);
+    try testing.expect(std.mem.indexOf(u8, catch_all_response.body, "dashboard-catch-all") != null);
+
+    try expectWebSocketEchoThroughNetbirdProxy(proxy_port, "/ws-proxy/signal", "ws-signal-echo");
+    try expectWebSocketEchoThroughNetbirdProxy(proxy_port, "/relay", "ws-relay-echo");
+}
+
 test "integration: terminated h2 server acks settings and ping and serves unary grpc" {
     const server_port = harness.getPort();
 
@@ -5108,7 +5732,6 @@ test "integration: grpc h2c accepts grpc-go and grpcurl style request metadata" 
         authority,
         "ping",
         &.{
-            .{ .name = ":scheme", .value = "http" },
             .{ .name = "user-agent", .value = "grpc-go/1.64.0" },
             .{ .name = "grpc-timeout", .value = "1S" },
             .{ .name = "grpc-accept-encoding", .value = "identity,deflate,gzip" },

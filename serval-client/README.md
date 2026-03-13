@@ -8,7 +8,7 @@ serval-client provides the client-side complement to serval-server. It handles D
 
 Current code also includes an `h2/` subdirectory with bounded outbound HTTP/2 primitives:
 - `H2SessionState` for per-connection settings/flow-control/stream tables
-- `H2Runtime` for frame-level actions (client preface+SETTINGS emission, request HEADERS/DATA frame building, response HEADERS/DATA/trailer parsing with bounded HEADERS+CONTINUATION reassembly and bounded HPACK dynamic-table/Huffman decode, and GOAWAY/RST/WINDOW_UPDATE handling)
+- `H2Runtime` for frame-level actions (client preface+SETTINGS emission, request HEADERS/DATA frame building with bounded outbound HEADERS+CONTINUATION fragmentation honoring peer max-frame limits, response HEADERS/DATA/trailer parsing with bounded HEADERS+CONTINUATION reassembly and bounded HPACK dynamic-table/Huffman decode, and GOAWAY/RST/WINDOW_UPDATE handling)
 - `H2ClientConnection` as a fixed-buffer socket driver over `H2Runtime` for prior-knowledge h2c sessions
 - `H2UpstreamSessionPool` as a fixed-capacity per-upstream cache that owns connected `H2ClientConnection` sessions, supports GOAWAY rollover (active + draining session), and reuses sessions until stale/invalid state
 

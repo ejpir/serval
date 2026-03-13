@@ -138,6 +138,12 @@ pub const Stream = struct {
         try self.recv_window.consume(bytes);
     }
 
+    pub fn consumeSendWindow(self: *Stream, bytes: u32) Error!void {
+        assert(self.id > 0);
+        assert(bytes <= config.H2_MAX_WINDOW_SIZE_BYTES);
+        try self.send_window.consume(bytes);
+    }
+
     pub fn incrementSendWindow(self: *Stream, delta_bytes: u32) Error!void {
         assert(self.id > 0);
         assert(delta_bytes <= config.H2_MAX_WINDOW_SIZE_BYTES);
@@ -221,6 +227,11 @@ pub const StreamTable = struct {
         try self.slots[index].stream.consumeRecvWindow(bytes);
     }
 
+    pub fn consumeSendWindow(self: *StreamTable, stream_id: u32, bytes: u32) Error!void {
+        const index = self.findIndex(stream_id) orelse return error.StreamNotFound;
+        try self.slots[index].stream.consumeSendWindow(bytes);
+    }
+
     pub fn incrementSendWindow(self: *StreamTable, stream_id: u32, delta_bytes: u32) Error!void {
         const index = self.findIndex(stream_id) orelse return error.StreamNotFound;
         try self.slots[index].stream.incrementSendWindow(delta_bytes);
@@ -229,6 +240,30 @@ pub const StreamTable = struct {
     pub fn incrementRecvWindow(self: *StreamTable, stream_id: u32, delta_bytes: u32) Error!void {
         const index = self.findIndex(stream_id) orelse return error.StreamNotFound;
         try self.slots[index].stream.incrementRecvWindow(delta_bytes);
+    }
+
+    pub fn adjustAllSendWindows(self: *StreamTable, delta_bytes: i64) void {
+        for (self.slots[0..]) |*slot| {
+            if (!slot.used) continue;
+
+            if (delta_bytes >= 0) {
+                const delta_u32: u32 = @intCast(delta_bytes);
+                const current: u64 = slot.stream.send_window.available_bytes;
+                const next: u64 = current + delta_u32;
+                slot.stream.send_window.available_bytes = if (next > config.H2_MAX_WINDOW_SIZE_BYTES)
+                    config.H2_MAX_WINDOW_SIZE_BYTES
+                else
+                    @intCast(next);
+            } else {
+                const dec_u64: u64 = @intCast(-delta_bytes);
+                const current: u64 = slot.stream.send_window.available_bytes;
+                if (dec_u64 >= current) {
+                    slot.stream.send_window.available_bytes = 0;
+                } else {
+                    slot.stream.send_window.available_bytes = @intCast(current - dec_u64);
+                }
+            }
+        }
     }
 
     fn findIndex(self: *const StreamTable, stream_id: u32) ?usize {
