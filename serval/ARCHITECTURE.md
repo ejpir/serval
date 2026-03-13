@@ -31,6 +31,7 @@ serval (umbrella - re-exports all modules)
 ├── serval-websocket # RFC 6455 handshake, frame, close, and subprotocol helpers
 ├── serval-h2       # Minimal HTTP/2 / h2c frame, control, preface, HPACK, and initial-request helpers
 ├── serval-grpc     # gRPC metadata and message envelope helpers
+├── serval-acme     # ACME certificate automation primitives (state/config/http-01 + protocol codecs)
 ├── serval-tls      # TLS termination and origination (OpenSSL)
 ├── serval-pool     # Connection pooling
 ├── serval-client   # HTTP/1.1 client + bounded outbound h2 session/runtime primitives
@@ -106,6 +107,8 @@ Layer 1 (Protocol):                                                │
 Layer 2 (Infrastructure):                                          │
   serval-grpc (depends on core, h2) ───────────────────────────────┤
                                                                    │
+  serval-acme (depends on core) ───────────────────────────────────┤
+                                                                   │
   serval-socket (unified TCP/TLS socket) ←─────────────────┐       │
                                                            │       │
   serval-pool (depends on socket) ←────────────────────────┤       │
@@ -149,6 +152,7 @@ Standalone:
 | serval-websocket | RFC 6455 handshake + framing helpers | `validateClientRequest`, `computeAcceptKey`, `parseFrameHeader`, `buildClosePayload` |
 | serval-h2 | Minimal HTTP/2 / h2c protocol helpers | `parseFrameHeader`, `buildFrameHeader`, `parseInitialRequest`, `parseSettingsPayload`, `buildGoAwayFrame`, `StreamTable`, `Window` |
 | serval-grpc | gRPC metadata + envelope helpers | `validateRequest`, `buildMessage`, `parseMessage` |
+| serval-acme | ACME certificate automation primitives | `CertState`, `RuntimeConfig`, `Http01Store`, `AcmeDirectory`, `AcmeNewOrderRequest`, `AcmeJwkP256`, `AcmeWireRequest`, `AcmeFlowContext`, `executeAcmeOperation`, `AcmeManager` |
 | serval-pool | Connection reuse (wraps Socket) | `SimplePool`, `NoPool`, `Connection` |
 | serval-client | HTTP/1.1 client for upstream requests + bounded outbound h2 session/runtime primitives | `Client`, `ClientError`, `ResponseHeaders`, `sendRequest`, `readResponseHeaders`, `H2SessionState`, `H2Runtime`, `H2ClientConnection`, `H2UpstreamSessionPool` |
 | serval-health | Backend health tracking | `HealthState`, `UpstreamIndex`, `MAX_UPSTREAMS` |
@@ -157,7 +161,7 @@ Standalone:
 | serval-metrics | Observability | `NoopMetrics`, `PrometheusMetrics`, `RealTimeMetrics` |
 | serval-tracing | Distributed tracing interface | `NoopTracer`, `SpanHandle` |
 | serval-otel | OpenTelemetry tracing | `Tracer`, `Span`, `OTLPExporter`, `BatchingProcessor` |
-| serval-server | HTTP/1.1 server + early terminated HTTP/2 prior-knowledge dispatch | `Server`, `MinimalServer`, `servePlainH2Connection` |
+| serval-server | HTTP/1.1 server + early HTTP/2 dispatch (h2c + TLS ALPN h2 for terminated handlers and configurable generic frontend adapter) | `Server`, `MinimalServer`, `servePlainH2Connection`, `serveTlsH2Connection` |
 | serval-lb | Load balancing | `LbHandler` (health-aware round-robin with background probing) |
 | serval-router | Content-based routing | `Router`, `Route`, `RouteMatcher`, `PathMatch`, `PoolConfig` |
 | serval-k8s-gateway | Gateway API types + translation | `GatewayConfig`, `HTTPRoute`, `translateToJson` |
@@ -410,8 +414,9 @@ tracks bounded per-stream lifecycle state and can emit optional `handleH2StreamO
 main cleartext server path now wires those callbacks into per-stream metrics, tracing span,
 and `onLog` emission for both prior-knowledge and upgrade terminated sessions. Integration
 coverage also includes fail-closed GOAWAY behavior for invalid DATA-before-HEADERS ordering
-in post-101 upgrade streams. This terminated path remains intentionally narrow today: it is
-cleartext-only and still early-phase.
+in post-101 upgrade streams. This terminated path remains intentionally narrow today: it now supports
+cleartext prior-knowledge/upgrade plus TLS ALPN `h2` dispatch for terminated
+handlers, and is still early-phase.
 
 The proxy flow is:
 
@@ -854,7 +859,7 @@ pub const WeightedHandler = struct {
 | WebSocket proxy tunneling | serval-websocket, serval-proxy, serval-server | RFC 6455 handshake validation, HTTP/1.1 upgrade forwarding, bidirectional relay |
 | Native WebSocket endpoint serving | serval-websocket, serval-server | RFC 6455 handshake acceptance, frame parsing, message-oriented server sessions |
 | gRPC over h2c proxying (prior knowledge + inbound upgrade) | serval-h2, serval-grpc, serval-proxy, serval-server | Cleartext h2c upstreams now use a bounded stream-aware bridge in both entry paths (stream mapping + reused upstream sessions + reset mapping + GOAWAY `last_stream_id`-aware active-stream handling + fail-closed `grpc-status` enforcement); non-h2c targets use legacy tunnel fallback |
-| Terminated HTTP/2 connection runtime primitives | serval-h2, serval-server | Bounded SETTINGS/ACK/PING/RST_STREAM/GOAWAY handling plus streaming HEADERS/DATA callbacks on a plain connection, including DATA-driven connection+stream WINDOW_UPDATE replenishment and main accept-loop dispatch for both prior-knowledge and `Upgrade: h2c` cleartext entry paths |
+| Terminated HTTP/2 connection runtime primitives | serval-h2, serval-server | Bounded SETTINGS/ACK/PING/RST_STREAM/GOAWAY handling plus streaming HEADERS/DATA callbacks on plain and TLS streams, including DATA-driven connection+stream WINDOW_UPDATE replenishment and main accept-loop dispatch for prior-knowledge, `Upgrade: h2c`, and TLS ALPN `h2` terminated entry paths |
 | TLS termination | serval-tls, serval-server | Client TLS (server-side), upstream TLS (client-side) |
 | kTLS kernel offload | serval-tls | OpenSSL native + BoringSSL manual, automatic fallback |
 | HTTP/1.1 client | serval-client | DNS, TCP, TLS, request/response |

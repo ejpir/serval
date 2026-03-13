@@ -31,6 +31,7 @@ const serval_websocket = @import("serval-websocket");
 const serval_h2 = @import("serval-h2");
 const serval_grpc = @import("serval-grpc");
 const websocket_server = @import("../websocket/mod.zig");
+const frontend = @import("../frontend/mod.zig");
 const h2_server = @import("../h2/server.zig");
 const h2_runtime = @import("../h2/runtime.zig");
 const serval_proxy = @import("serval-proxy");
@@ -39,6 +40,8 @@ const serval_client = @import("serval-client");
 const serval_tls = @import("serval-tls");
 const ssl = serval_tls.ssl;
 const TLSStream = serval_tls.TLSStream;
+const ReloadableServerCtx = serval_tls.ReloadableServerCtx;
+const ReloadableServerCtxError = serval_tls.ReloadableServerCtxError;
 const HandshakeInfo = serval_tls.HandshakeInfo;
 
 // Local h1 modules
@@ -88,6 +91,22 @@ const CONNECTION_READ_STALL_TIMEOUT_NS: u64 = 120 * time.ns_per_s;
 /// Explicit bound on WouldBlock retry attempts in plain-socket reads.
 const CONNECTION_READ_MAX_WOULDBLOCK_RETRIES: u32 = 240_000;
 
+/// Maximum attempts when taking TLS reload-control mutex.
+/// TigerStyle: Bounded spin loop for control-plane activation path.
+const TLS_RELOAD_CONTROL_LOCK_MAX_ATTEMPTS: u32 = 1_000_000;
+
+fn lockTlsReloadControlMutex(mutex: *std.atomic.Mutex) void {
+    assert(@intFromPtr(mutex) != 0);
+
+    var attempts: u32 = 0;
+    while (attempts < TLS_RELOAD_CONTROL_LOCK_MAX_ATTEMPTS) : (attempts += 1) {
+        if (mutex.tryLock()) return;
+        std.atomic.spinLoopHint();
+    }
+
+    @panic("Server TLS reload control mutex lock timeout");
+}
+
 // =============================================================================
 // Server
 // =============================================================================
@@ -121,6 +140,71 @@ pub fn Server(
         /// TigerStyle: Caller owns lifecycle via deinit.
         client_ctx: ?*ssl.SSL_CTX,
 
+        /// Protects publish/unpublish of the server TLS manager pointer.
+        /// TigerStyle: Explicit synchronization for control-plane activation path.
+        tls_reload_control_mutex: std.atomic.Mutex = .unlocked,
+
+        /// Pointer to active server TLS generation manager while run() is executing.
+        /// Null when server-side TLS is disabled or run() is not active.
+        tls_ctx_manager_ptr: ?*ReloadableServerCtx = null,
+
+        pub const ReloadServerTlsError = error{
+            TlsReloadUnavailable,
+        } || ReloadableServerCtxError || ssl.CreateServerCtxFromPemFilesError;
+
+        /// Atomically activate a new server TLS context generation from PEM paths.
+        /// Returns the activated generation number.
+        pub fn reloadServerTlsFromPemFiles(
+            self: *Self,
+            cert_path: []const u8,
+            key_path: []const u8,
+        ) ReloadServerTlsError!u32 {
+            assert(@intFromPtr(self) != 0);
+            assert(cert_path.len <= std.math.maxInt(u16));
+            assert(key_path.len <= std.math.maxInt(u16));
+
+            lockTlsReloadControlMutex(&self.tls_reload_control_mutex);
+            defer self.tls_reload_control_mutex.unlock();
+
+            const manager = self.tls_ctx_manager_ptr orelse return error.TlsReloadUnavailable;
+            const generation = try manager.activateFromPemFiles(cert_path, key_path);
+            assert(generation > 0);
+            return generation;
+        }
+
+        /// Read current active server TLS generation.
+        pub fn activeServerTlsGeneration(self: *Self) error{TlsReloadUnavailable}!u32 {
+            assert(@intFromPtr(self) != 0);
+
+            lockTlsReloadControlMutex(&self.tls_reload_control_mutex);
+            defer self.tls_reload_control_mutex.unlock();
+
+            const manager = self.tls_ctx_manager_ptr orelse return error.TlsReloadUnavailable;
+            const generation = manager.activeGeneration();
+            assert(generation > 0);
+            return generation;
+        }
+
+        fn publishTlsCtxManager(self: *Self, manager: *ReloadableServerCtx) void {
+            assert(@intFromPtr(self) != 0);
+            assert(@intFromPtr(manager) != 0);
+
+            lockTlsReloadControlMutex(&self.tls_reload_control_mutex);
+            defer self.tls_reload_control_mutex.unlock();
+
+            assert(self.tls_ctx_manager_ptr == null);
+            self.tls_ctx_manager_ptr = manager;
+        }
+
+        fn unpublishTlsCtxManager(self: *Self) void {
+            assert(@intFromPtr(self) != 0);
+
+            lockTlsReloadControlMutex(&self.tls_reload_control_mutex);
+            defer self.tls_reload_control_mutex.unlock();
+
+            self.tls_ctx_manager_ptr = null;
+        }
+
         pub fn init(
             handler: *Handler,
             pool: *Pool,
@@ -152,8 +236,9 @@ pub fn Server(
         /// Clean up server resources.
         /// TigerStyle: Explicit deinit, pairs with init.
         pub fn deinit(self: *Self) void {
-            // TigerStyle: Client context is owned by caller, not freed here
-            _ = self;
+            // TigerStyle: Client context is owned by caller, not freed here.
+            // Defensive reset of published TLS manager pointer for reuse-after-stop flows.
+            self.unpublishTlsCtxManager();
         }
 
         /// Run the server with concurrent connection handling.
@@ -194,43 +279,43 @@ pub fn Server(
                 tcp_server.deinit(io);
             }
 
-            // TLS: Initialize SSL_CTX if server-side TLS is configured (cert + key)
-            // TigerStyle: C5 - Resource grouping with immediate defer
-            // Note: tls_config may be set just for upstream verification (verify_upstream)
-            // without server-side TLS. Only create SSL_CTX if cert_path is present.
-            const tls_ctx: ?*ssl.SSL_CTX = if (self.config.tls) |tls_cfg| blk: {
-                // Check if server-side TLS is configured (requires cert + key)
+            // TLS ALPN policy is process-global for all server contexts.
+            // Apply configured policy before creating or reloading server contexts.
+            ssl.setServerAlpnMixedOfferPolicy(self.config.alpn_mixed_offer_policy);
+
+            // TLS: Initialize SSL_CTX if server-side TLS is configured (cert + key).
+            // Note: tls_config may be set for upstream verification only; in that case
+            // cert/key are absent and listener stays plaintext.
+            const initial_tls_ctx: ?*ssl.SSL_CTX = if (self.config.tls) |tls_cfg| blk: {
                 const cert_path = tls_cfg.cert_path orelse break :blk null;
                 const key_path = tls_cfg.key_path orelse break :blk null;
 
-                ssl.init();
-                const ctx = try ssl.createServerCtx();
-                // S1: postcondition - ctx is non-null (verified in createServerCtx)
-
-                // TigerStyle: Use c_allocator for long-lived TLS resources (already linking libc)
-                const allocator = std.heap.c_allocator;
-
-                // Load certificate chain
-                const cert_z = try allocator.dupeZ(u8, cert_path);
-                defer allocator.free(cert_z);
-                assert(cert_z.len > 0); // S1: precondition
-                if (ssl.SSL_CTX_use_certificate_chain_file(ctx, cert_z) != 1) {
-                    ssl.printErrors();
-                    return error.LoadCertFailed;
-                }
-
-                // Load private key
-                const key_z = try allocator.dupeZ(u8, key_path);
-                defer allocator.free(key_z);
-                assert(key_z.len > 0); // S1: precondition
-                if (ssl.SSL_CTX_use_PrivateKey_file(ctx, key_z, ssl.SSL_FILETYPE_PEM) != 1) {
-                    ssl.printErrors();
-                    return error.LoadKeyFailed;
-                }
-
+                const ctx = ssl.createServerCtxFromPemFiles(cert_path, key_path) catch |err| switch (err) {
+                    error.InvalidCertPath, error.LoadCertFailed => return error.LoadCertFailed,
+                    error.InvalidKeyPath, error.LoadKeyFailed => return error.LoadKeyFailed,
+                    error.NoTlsMethod => return error.NoTlsMethod,
+                    error.SslCtxNew => return error.SslCtxNew,
+                    error.OutOfMemory => return error.OutOfMemory,
+                };
                 break :blk ctx;
             } else null;
-            defer if (tls_ctx) |ctx| ssl.SSL_CTX_free(ctx);
+
+            var maybe_reloadable_tls_ctx: ?ReloadableServerCtx = if (initial_tls_ctx) |ctx|
+                ReloadableServerCtx.init(ctx)
+            else
+                null;
+            defer if (maybe_reloadable_tls_ctx) |*reloadable_ctx| reloadable_ctx.deinit();
+
+            const tls_ctx_manager: ?*ReloadableServerCtx = if (maybe_reloadable_tls_ctx) |*reloadable_ctx|
+                reloadable_ctx
+            else
+                null;
+
+            self.unpublishTlsCtxManager();
+            if (tls_ctx_manager) |manager| {
+                self.publishTlsCtxManager(manager);
+            }
+            defer self.unpublishTlsCtxManager();
 
             var group: Io.Group = .init;
             defer group.cancel(io);
@@ -253,7 +338,7 @@ pub fn Server(
                     self.metrics,
                     self.tracer,
                     self.config,
-                    tls_ctx,
+                    tls_ctx_manager,
                     io,
                     stream,
                 }) catch |err| {
@@ -960,7 +1045,7 @@ pub fn Server(
             upstream_local_port: u16 = 0,
             pending_resets: [pending_reset_capacity]PendingReset = [_]PendingReset{.{}} ** pending_reset_capacity,
 
-            const BridgeError = error{
+            pub const BridgeError = error{
                 InvalidGrpcRequest,
                 UpstreamRejected,
                 UnsupportedProtocol,
@@ -971,7 +1056,7 @@ pub fn Server(
                 InvalidGrpcStatus,
             } || serval_proxy.H2StreamBridgeError || h2_server.Error;
 
-            fn init(
+            pub fn init(
                 inner: *Handler,
                 io: Io,
                 bridge_client: *serval_client.Client,
@@ -991,7 +1076,7 @@ pub fn Server(
                 };
             }
 
-            fn deinit(self: *@This()) void {
+            pub fn deinit(self: *@This()) void {
                 assert(@intFromPtr(self) != 0);
                 self.bridge.deinit();
             }
@@ -1323,14 +1408,20 @@ pub fn Server(
                 forwarder.client_ctx,
                 forwarder.verify_upstream_tls,
             );
-            var bridge_sessions = serval_client.H2UpstreamSessionPool.init();
-            defer bridge_sessions.deinit();
+            const bridge_sessions = std.heap.page_allocator.create(serval_client.H2UpstreamSessionPool) catch {
+                return forwarder_mod.ForwardError.ConnectFailed;
+            };
+            bridge_sessions.* = serval_client.H2UpstreamSessionPool.init();
+            defer {
+                bridge_sessions.deinit();
+                std.heap.page_allocator.destroy(bridge_sessions);
+            }
 
             var bridge_handler = GrpcH2cBridgeHandler.init(
                 handler,
                 io,
                 &bridge_client,
-                &bridge_sessions,
+                bridge_sessions,
                 ctx,
             );
             defer bridge_handler.deinit();
@@ -1407,14 +1498,20 @@ pub fn Server(
                 forwarder.client_ctx,
                 forwarder.verify_upstream_tls,
             );
-            var bridge_sessions = serval_client.H2UpstreamSessionPool.init();
-            defer bridge_sessions.deinit();
+            const bridge_sessions = std.heap.page_allocator.create(serval_client.H2UpstreamSessionPool) catch {
+                return forwarder_mod.ForwardError.ConnectFailed;
+            };
+            bridge_sessions.* = serval_client.H2UpstreamSessionPool.init();
+            defer {
+                bridge_sessions.deinit();
+                std.heap.page_allocator.destroy(bridge_sessions);
+            }
 
             var bridge_handler = GrpcH2cBridgeHandler.init(
                 handler,
                 io,
                 &bridge_client,
-                &bridge_sessions,
+                bridge_sessions,
                 ctx,
             );
             defer bridge_handler.deinit();
@@ -1451,6 +1548,51 @@ pub fn Server(
             };
         }
 
+        fn tryHandleTerminatedH2TlsAlpn(
+            handler: *Handler,
+            metrics: *Metrics,
+            tracer: *Tracer,
+            ctx: *const Context,
+            maybe_tls: ?*TLSStream,
+            connection_id: u64,
+            frontend_mode: config.TlsH2FrontendMode,
+        ) bool {
+            assert(@intFromPtr(handler) != 0);
+            assert(@intFromPtr(metrics) != 0);
+            assert(@intFromPtr(tracer) != 0);
+            assert(@intFromPtr(ctx) != 0);
+
+            if (frontend_mode == .disabled) return false;
+
+            const tls_stream = maybe_tls orelse return false;
+            if (comptime !@hasDecl(Handler, "handleH2Headers")) return false;
+            if (comptime !@hasDecl(Handler, "handleH2Data")) return false;
+
+            const alpn = tls_stream.info.alpn() orelse return false;
+            if (!std.mem.eql(u8, alpn, "h2")) return false;
+
+            log.debug("server: conn={d} dispatching ALPN h2 to terminated h2 driver", .{connection_id});
+
+            var telemetry_handler = TerminatedH2TelemetryAdapter.init(
+                handler,
+                metrics,
+                tracer,
+                ctx,
+                null,
+                true,
+            );
+            h2_server.serveTlsConnection(
+                @TypeOf(telemetry_handler),
+                &telemetry_handler,
+                tls_stream,
+                connection_id,
+            ) catch |err| switch (err) {
+                error.ConnectionClosed => {},
+                else => log.warn("server: conn={d} terminated TLS h2 driver failed: {s}", .{ connection_id, @errorName(err) }),
+            };
+            return true;
+        }
+
         fn tryHandleTerminatedH2PriorKnowledge(
             handler: *Handler,
             metrics: *Metrics,
@@ -1472,7 +1614,11 @@ pub fn Server(
             if (buffer_len == 0) return false;
             if (comptime !@hasDecl(Handler, "handleH2Headers")) return false;
             if (comptime !@hasDecl(Handler, "handleH2Data")) return false;
-            if (!serval_h2.looksLikeClientConnectionPrefacePrefix(recv_buf[0..buffer_len])) return false;
+
+            const initial_bytes = recv_buf[0..buffer_len];
+            const looks_h2_prefix = serval_h2.looksLikeClientConnectionPrefacePrefix(initial_bytes);
+            const looks_h2_attempt = std.mem.startsWith(u8, initial_bytes, "PRI");
+            if (!looks_h2_prefix and !looks_h2_attempt) return false;
 
             log.debug("server: conn={d} dispatching prior-knowledge h2c to terminated h2 driver", .{connection_id});
 
@@ -1764,7 +1910,7 @@ pub fn Server(
             metrics: *Metrics,
             tracer: *Tracer,
             cfg: Config,
-            tls_ctx: ?*ssl.SSL_CTX,
+            tls_ctx_manager: ?*ReloadableServerCtx,
             io: Io,
             stream: Io.net.Stream,
         ) void {
@@ -1787,15 +1933,20 @@ pub fn Server(
             // TigerStyle: Blocking handshake - std.Io handles socket-level async
             // TLS span stays open for connection lifetime - request spans are children
             var tls_span: SpanHandle = .{};
-            var maybe_tls_stream: ?TLSStream = if (tls_ctx) |ctx| blk: {
-                // S1: precondition - ctx is non-null (enforced by if guard above)
+            var maybe_tls_stream: ?TLSStream = if (tls_ctx_manager) |manager| blk: {
                 const allocator = std.heap.c_allocator;
+                const tls_ctx_lease = manager.acquire() catch |err| {
+                    log.err("TLS context acquire failed: {s}", .{@errorName(err)});
+                    return;
+                };
+                defer manager.release(tls_ctx_lease);
 
                 // Start TLS handshake span (root for this connection's trace)
                 tls_span = tracer.startSpan("tls.handshake.server", null);
+                tracer.setIntAttribute(tls_span, "tls.ctx_generation", @intCast(tls_ctx_lease.generation));
 
                 const tls_stream = TLSStream.initServer(
-                    ctx,
+                    tls_ctx_lease.ctx,
                     @intCast(stream.socket.handle),
                     allocator,
                 ) catch |err| {
@@ -1858,6 +2009,41 @@ pub fn Server(
             // Get mutable pointer to TLS stream for I/O operations (if TLS is active)
             // TigerStyle: Mutable pointer needed for forwarder to write TLS responses.
             const maybe_tls_ptr: ?*TLSStream = if (maybe_tls_stream) |*tls| tls else null;
+
+            const has_terminated_h2_handler = comptime @hasDecl(Handler, "handleH2Headers") and @hasDecl(Handler, "handleH2Data");
+            switch (frontend.selectTlsAlpnDispatchAction(
+                maybe_tls_ptr,
+                cfg.tls_h2_frontend_mode,
+                has_terminated_h2_handler,
+            )) {
+                .generic_h2 => {
+                    if (frontend.tryServeTlsAlpnConnection(
+                        Handler,
+                        Pool,
+                        Tracer,
+                        GrpcH2cBridgeHandler,
+                        handler,
+                        forwarder,
+                        &ctx,
+                        maybe_tls_ptr,
+                        io,
+                        connection_id,
+                        cfg.tls_h2_frontend_mode,
+                    )) return;
+                },
+                .terminated_h2 => {
+                    if (tryHandleTerminatedH2TlsAlpn(
+                        handler,
+                        metrics,
+                        tracer,
+                        &ctx,
+                        maybe_tls_ptr,
+                        connection_id,
+                        cfg.tls_h2_frontend_mode,
+                    )) return;
+                },
+                .continue_h1 => {},
+            }
 
             // Request processing state
             var parser = Parser.init();
@@ -1924,6 +2110,11 @@ pub fn Server(
                     &buffer_len,
                     connection_id,
                 )) return;
+
+                const terminated_h2_handler = comptime @hasDecl(Handler, "handleH2Headers") and @hasDecl(Handler, "handleH2Data");
+                if (cfg.h2c_prior_knowledge_only and maybe_tls_ptr == null and terminated_h2_handler) {
+                    return;
+                }
 
                 // Accumulate reads until complete headers received
                 if (!accumulateHeaders(maybe_tls_ptr, &io_mut, stream, recv_buf[0..], buffer_offset, &buffer_len, connection_id)) return;
@@ -2785,6 +2976,51 @@ const TestHandler = struct {
         return .{ .host = "127.0.0.1", .port = 8001, .idx = 0 };
     }
 };
+
+fn createServerCtxForTest() !*ssl.SSL_CTX {
+    ssl.init();
+    return ssl.createServerCtx();
+}
+
+test "Server reload API returns unavailable when manager is not published" {
+    var handler = TestHandler{};
+    var pool = pool_mod.SimplePool.init();
+    var metrics = metrics_mod.NoopMetrics{};
+    var tracer = tracing_mod.NoopTracer{};
+
+    var server = Server(TestHandler, pool_mod.SimplePool, metrics_mod.NoopMetrics, tracing_mod.NoopTracer)
+        .init(&handler, &pool, &metrics, &tracer, .{}, null, DnsConfig{});
+
+    try std.testing.expectError(
+        error.TlsReloadUnavailable,
+        server.reloadServerTlsFromPemFiles("/tmp/non-empty-cert.pem", "/tmp/non-empty-key.pem"),
+    );
+    try std.testing.expectError(error.TlsReloadUnavailable, server.activeServerTlsGeneration());
+}
+
+test "Server reload API activates through published manager" {
+    var handler = TestHandler{};
+    var pool = pool_mod.SimplePool.init();
+    var metrics = metrics_mod.NoopMetrics{};
+    var tracer = tracing_mod.NoopTracer{};
+
+    var server = Server(TestHandler, pool_mod.SimplePool, metrics_mod.NoopMetrics, tracing_mod.NoopTracer)
+        .init(&handler, &pool, &metrics, &tracer, .{}, null, DnsConfig{});
+
+    const first_ctx = try createServerCtxForTest();
+    var manager = ReloadableServerCtx.init(first_ctx);
+    defer manager.deinit();
+
+    server.publishTlsCtxManager(&manager);
+    defer server.unpublishTlsCtxManager();
+
+    try std.testing.expectEqual(@as(u32, 1), try server.activeServerTlsGeneration());
+    try std.testing.expectError(
+        error.InvalidCertPath,
+        server.reloadServerTlsFromPemFiles("", "/tmp/non-empty-key.pem"),
+    );
+    try std.testing.expectEqual(@as(u32, 1), try server.activeServerTlsGeneration());
+}
 
 test "Server compiles with valid handler" {
     var handler = TestHandler{};

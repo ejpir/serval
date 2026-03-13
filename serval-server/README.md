@@ -2,7 +2,7 @@
 
 HTTP/1.1 server implementation for serval. Like Pingora's `server` + `apps` modules.
 
-Provides generic HTTP server infrastructure with protocol-specific implementations organized by version (h1/ today, initial h2c prior-knowledge + `Upgrade: h2c` gRPC proxy handoff, and an early `h2/` connection/runtime submodule for future stream-aware transport).
+Provides generic HTTP server infrastructure with protocol-specific implementations organized by version (h1/ today, gRPC-oriented HTTP/2 ingress/proxy handoff for prior-knowledge and `Upgrade: h2c`, and an early `h2/` connection/runtime submodule for future generic stream-aware transport).
 
 ## Module Structure
 
@@ -10,6 +10,10 @@ Provides generic HTTP server infrastructure with protocol-specific implementatio
 lib/serval-server/
 ├── mod.zig            # Main module exports (Server, MinimalServer)
 ├── README.md          # This file
+├── frontend/          # Protocol dispatch/adaptation helpers
+│   ├── mod.zig        # Frontend module exports
+│   ├── dispatch.zig   # TLS ALPN h2 dispatch policy selection
+│   └── generic_h2.zig # Generic TLS h2 frontend adapter (non-terminated handlers)
 ├── h1/                # HTTP/1.1 implementation
 │   ├── mod.zig        # H1 module exports
 │   ├── server.zig     # Generic Server struct with connection handling
@@ -20,7 +24,7 @@ lib/serval-server/
 │   ├── mod.zig        # H2 module exports
 │   ├── connection.zig # Bounded peer/local settings, stream table, flow windows
 │   ├── runtime.zig    # Per-frame inbound HTTP/2 runtime actions
-│   └── server.zig     # Plain-fd terminating HTTP/2 connection driver with streaming callbacks
+│   └── server.zig     # Plain-fd terminating HTTP/2 connection driver with streaming callbacks and bounded outbound HEADERS+CONTINUATION emission
 └── websocket/         # Native WebSocket endpoint support
     ├── mod.zig        # Public WebSocket server exports + hook verification
     ├── accept.zig     # `101 Switching Protocols` response builder
@@ -33,12 +37,15 @@ lib/serval-server/
 Generic HTTP server parameterized by Handler, Pool, Metrics, and Tracer types.
 Handles accept loop, connection lifecycle, request parsing, HTTP forwarding orchestration,
 WebSocket upgrade handoff to the proxy tunnel path, native WebSocket endpoint
-termination with a message-oriented session API, initial gRPC-over-h2c prior-knowledge
+termination with a message-oriented session API, gRPC-over-h2 prior-knowledge
 or `Upgrade: h2c` connection detection plus proxy handoff, and cleartext HTTP/2
 dispatch into the early terminated `h2/server.zig` driver for both prior-knowledge
 and upgrade paths when the handler implements explicit HTTP/2 callbacks.
 
-Protocol implementations are isolated in subdirectories (h1/, h2/) to prepare for multi-protocol support while maintaining backwards-compatible top-level exports.
+Native gRPC endpoint serving (service/method handlers owned by serval-server) is
+not implemented yet.
+
+Protocol implementations are isolated in subdirectories (h1/, h2/) with a neutral `frontend/` dispatch layer to keep ALPN/protocol routing decisions outside protocol-specific drivers.
 
 ## Handler Hooks
 
@@ -228,11 +235,13 @@ Message-oriented native session API:
 
 ## Current h2c Slice + Future HTTP/2 Structure
 
-Current support now has four cleartext HTTP/2 inbound behaviors:
+Current support now has five HTTP/2 inbound behaviors:
+- **TLS ALPN `h2` + terminated handler**: when ALPN negotiates `h2` and the handler implements `handleH2Headers` + `handleH2Data`, `Server` dispatches the TLS stream directly into `h2/server.zig` (terminated runtime over TLS)
+- **ALPN rollout policy knobs**: `Config.alpn_mixed_offer_policy` controls mixed-offer ALPN selection (`prefer_http11` vs `prefer_h2`) and `Config.tls_h2_frontend_mode` keeps frontend h2 dispatch explicit (`disabled`, `terminated_only`, `generic`)
 - **prior knowledge + terminated handler**: when the handler implements `handleH2Headers` + `handleH2Data`, `Server` detects the client preface on a plain connection and dispatches the accepted socket into `h2/server.zig`
-- **prior knowledge + proxy bridge/tunnel**: for cleartext h2c upstreams, Serval now routes through a bounded stream-aware bridge (downstream stream ↔ upstream stream mapping, response frame mapping, upstream reset fail-closed downstream reset, missing `grpc-status` fail-closed as downstream `RST_STREAM(PROTOCOL_ERROR)`, and `GOAWAY(NO_ERROR,last_stream_id>=active_stream)` no longer aborting that active stream); prior-knowledge detection now emits server SETTINGS as soon as the client preface is complete (before waiting for first HEADERS) to interoperate with grpc-go/grpcurl clients that wait for server SETTINGS before sending RPC headers; for non-h2c upstreams it still falls back to transparent byte tunneling
+- **prior knowledge + proxy bridge/tunnel**: for upstream protocol `.h2c` (cleartext) or `.h2` (TLS), Serval routes through a bounded stream-aware bridge (downstream stream ↔ upstream stream mapping, response frame mapping, upstream reset fail-closed downstream reset, missing `grpc-status` fail-closed as downstream `RST_STREAM(PROTOCOL_ERROR)`, and `GOAWAY(NO_ERROR,last_stream_id>=active_stream)` no longer aborting that active stream); prior-knowledge detection now emits server SETTINGS as soon as the client preface is complete (before waiting for first HEADERS) to interoperate with grpc-go/grpcurl clients that wait for server SETTINGS before sending RPC headers; for non-h2 upstreams it still falls back to transparent byte tunneling
 - **`Upgrade: h2c` + terminated handler**: on cleartext connections with explicit h2 handler callbacks, Serval sends `101 Switching Protocols`, replays the upgraded request into stream 1 in the terminated runtime, accepts an optional post-101 client preface, then continues in full HTTP/2 frame mode
-- **`Upgrade: h2c` + proxy bridge/tunnel**: Serval validates `HTTP2-Settings`, selects an upstream, and for cleartext h2c upstreams enters the bounded stream-aware bridge path (including stream-1 bootstrap from the HTTP/1.1 request) with the same fail-closed gRPC semantics (`grpc-status` required, else downstream `RST_STREAM(PROTOCOL_ERROR)`); non-h2c upstreams continue to use the translation+tunnel fallback
+- **`Upgrade: h2c` + proxy bridge/tunnel**: Serval validates `HTTP2-Settings`, selects an upstream, and for upstream protocol `.h2c` (cleartext) or `.h2` (TLS) enters the bounded stream-aware bridge path (including stream-1 bootstrap from the HTTP/1.1 request) with the same fail-closed gRPC semantics (`grpc-status` required, else downstream `RST_STREAM(PROTOCOL_ERROR)`); non-h2 upstreams continue to use the translation+tunnel fallback
 
 For terminated HTTP/2 handlers, `h2/server.zig` now also supports optional per-stream lifecycle callbacks:
 - `handleH2StreamOpen(stream_id, request)` when a new inbound request stream is first observed
@@ -244,7 +253,7 @@ In main `h1/server.zig` terminated-h2 dispatch paths (prior-knowledge and upgrad
 The repository now includes the first Phase-B `h2/` building blocks:
 - `connection.zig` for bounded peer/local settings, GOAWAY bookkeeping, stream tables, and flow windows
 - `runtime.zig` for per-frame inbound HTTP/2 actions (`send_settings_ack`, request HEADERS/DATA dispatch, bounded HEADERS+CONTINUATION request-header reassembly, bounded HPACK dynamic-table/Huffman decode, ping ack, RST_STREAM, GOAWAY) with `server.zig` now replenishing connection+stream flow-control windows via WINDOW_UPDATE on inbound DATA
-- `server.zig` for a terminating plain-fd HTTP/2 driver that wires those runtime actions into a real frame loop with streaming callbacks, supports upgraded stream-1 bootstrap + optional post-101 client preface, uses bounded nonblocking control-frame write retries for deterministic GOAWAY/RST emission under backpressure, and can now be reached from the main cleartext accept loop for both prior-knowledge and `Upgrade: h2c` cleartext paths
+- `server.zig` for a terminating HTTP/2 driver over plain fd and TLS streams that wires those runtime actions into a real frame loop with streaming callbacks, supports upgraded stream-1 bootstrap + optional post-101 client preface, uses bounded nonblocking control-frame write retries for deterministic GOAWAY/RST emission under backpressure, and can now be reached from the main accept loop for cleartext prior-knowledge/upgrade paths and TLS ALPN `h2` dispatch
 
 Full stream-aware HTTP/2 support will continue expanding that `h2/` subdirectory toward
 this target organization:
@@ -289,10 +298,20 @@ The mod.zig would dispatch based on negotiated protocol (via ALPN or h2c preface
 | TLS response forwarding | ✅ Complete |
 | WebSocket upgrade proxy handoff | ✅ Complete |
 | Native WebSocket endpoint serving | ✅ Complete |
-| gRPC over h2c proxy handoff (prior knowledge + inbound upgrade) | ✅ Stream-aware bridge active for cleartext h2c upstreams in both entry paths, including GOAWAY `last_stream_id`-aware active-stream handling and fail-closed `grpc-status` enforcement; legacy tunnel fallback remains for non-h2c targets |
-| HTTP/2 full stream-aware stack | ⏳ Planned (early Phase-B h2/server.zig driver now present) |
+| gRPC over h2 proxy handoff (prior knowledge + inbound upgrade) | ✅ Stream-aware bridge active for `.h2c` (cleartext) and `.h2` (TLS) upstreams in both entry paths, including GOAWAY `last_stream_id`-aware active-stream handling and fail-closed `grpc-status` enforcement; legacy tunnel fallback remains for non-h2 targets |
+| HTTP/2 full stream-aware stack | ⏳ In progress (current implementation is gRPC-focused; broader generic h2 stream-aware server/proxy behavior is still pending) |
+| Native gRPC endpoints | ❌ Not implemented (high priority) |
 | Daemon mode | ❌ Not implemented |
-| Hot reload | ❌ Not implemented |
+| Hot reload | ⏳ TLS context generation/refcount scaffolding integrated; PEM-driven activation API wired in TLS layer, external trigger/watch path pending |
+
+### TLS Hot-Activation API (scaffold)
+
+When server-side TLS is active and `run()` has published a reload manager:
+
+- `reloadServerTlsFromPemFiles(cert_path, key_path)` → activates a new TLS generation.
+- `activeServerTlsGeneration()` → reads the currently active generation.
+
+These methods are intended for control-plane/ACME integration; file-watcher triggering is still pending.
 
 ## TigerStyle Compliance
 

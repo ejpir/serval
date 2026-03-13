@@ -15,6 +15,7 @@ serval (this module)
 ├── serval-websocket # RFC 6455 handshake + frame helpers
 ├── serval-h2       # HTTP/2 / h2c frame, control, settings, flow-control, stream, and upgrade helpers
 ├── serval-grpc     # gRPC metadata + message envelope helpers
+├── serval-acme     # ACME certificate automation primitives (state/config/http-01 store)
 ├── serval-pool     # Connection pooling
 ├── serval-proxy    # Upstream forwarding
 ├── serval-metrics  # Request metrics
@@ -95,6 +96,58 @@ You can access types two ways:
 - `GrpcWireError`, `GrpcMetadataError`
 - `buildGrpcMessage`, `parseGrpcMessage`
 - `validateGrpcRequest`
+
+### From serval-acme
+- `AcmeCertState`
+- `AcmeRuntimeConfig`
+- `AcmeHttp01Store`
+- `AcmeChallengeView`
+- `AcmeUrl`
+- `AcmeReplayNonce`
+- `AcmeDirectory`
+- `AcmeAccountStatus`
+- `AcmeOrderStatus`
+- `AcmeAccountResponse`
+- `AcmeNewOrderRequest`
+- `AcmeOrderResponse`
+- `AcmeNewAccountPayload`
+- `AcmeClientError`
+- `AcmeJwkP256`
+- `AcmeProtectedHeaderJwkParams`
+- `AcmeProtectedHeaderKidParams`
+- `AcmeFlattenedJwsParams`
+- `AcmeJwsError`
+- `AcmeParsedUrl`
+- `AcmeWireRequest`
+- `AcmeWireError`
+- `AcmeComposeSignedRequestError`
+- `AcmeOperation`
+- `AcmeEndpoint`
+- `AcmeFlowContext`
+- `AcmeResponseView`
+- `AcmeParsedBody`
+- `AcmeHandledResponse`
+- `AcmeResponseOutcome`
+- `AcmeResponseReason`
+- `AcmeResponseAssessment`
+- `AcmeProtocolError`
+- `AcmeErrorClass`
+- `AcmeErrorReason`
+- `AcmeErrorAssessment`
+- `assessAcmeResponse`
+- `classifyAcmeProtocolError`
+- `AcmeTransportExecuteParams`
+- `AcmeTransportExecuteOperationParams`
+- `AcmeTransportExecuteResponse`
+- `AcmeTransportError`
+- `AcmeTransportExecuteOperationError`
+- `executeAcmeWireRequest`
+- `executeAcmeOperation`
+- `AcmeSignedBodies`
+- `AcmeTickResult`
+- `AcmeExecutor`
+- `AcmeManager`
+- `AcmeManagerError`
 
 ### From serval-pool
 - `Connection`, `SimplePool`, `NoPool`, `verifyPool`

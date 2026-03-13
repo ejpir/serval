@@ -156,6 +156,62 @@ pub const parseGrpcMessage = grpc.parseMessage;
 pub const validateGrpcRequest = grpc.validateRequest;
 
 // =============================================================================
+// ACME Helpers (from serval-acme)
+// =============================================================================
+
+pub const acme = @import("serval-acme");
+pub const AcmeCertState = acme.CertState;
+pub const AcmeRuntimeConfig = acme.RuntimeConfig;
+pub const AcmeHttp01Store = acme.Http01Store;
+pub const AcmeChallengeView = acme.ChallengeView;
+pub const AcmeUrl = acme.AcmeUrl;
+pub const AcmeReplayNonce = acme.AcmeReplayNonce;
+pub const AcmeDirectory = acme.AcmeDirectory;
+pub const AcmeAccountStatus = acme.AcmeAccountStatus;
+pub const AcmeOrderStatus = acme.AcmeOrderStatus;
+pub const AcmeAccountResponse = acme.AcmeAccountResponse;
+pub const AcmeNewOrderRequest = acme.AcmeNewOrderRequest;
+pub const AcmeOrderResponse = acme.AcmeOrderResponse;
+pub const AcmeNewAccountPayload = acme.AcmeNewAccountPayload;
+pub const AcmeClientError = acme.AcmeClientError;
+pub const AcmeJwkP256 = acme.AcmeJwkP256;
+pub const AcmeProtectedHeaderJwkParams = acme.AcmeProtectedHeaderJwkParams;
+pub const AcmeProtectedHeaderKidParams = acme.AcmeProtectedHeaderKidParams;
+pub const AcmeFlattenedJwsParams = acme.AcmeFlattenedJwsParams;
+pub const AcmeJwsError = acme.AcmeJwsError;
+pub const AcmeParsedUrl = acme.AcmeParsedUrl;
+pub const AcmeWireRequest = acme.AcmeWireRequest;
+pub const AcmeWireError = acme.AcmeWireError;
+pub const AcmeComposeSignedRequestError = acme.AcmeComposeSignedRequestError;
+pub const AcmeOperation = acme.AcmeOperation;
+pub const AcmeEndpoint = acme.AcmeEndpoint;
+pub const AcmeFlowContext = acme.AcmeFlowContext;
+pub const AcmeResponseView = acme.AcmeResponseView;
+pub const AcmeParsedBody = acme.AcmeParsedBody;
+pub const AcmeHandledResponse = acme.AcmeHandledResponse;
+pub const AcmeResponseOutcome = acme.AcmeResponseOutcome;
+pub const AcmeResponseReason = acme.AcmeResponseReason;
+pub const AcmeResponseAssessment = acme.AcmeResponseAssessment;
+pub const AcmeProtocolError = acme.AcmeProtocolError;
+pub const AcmeErrorClass = acme.AcmeErrorClass;
+pub const AcmeErrorReason = acme.AcmeErrorReason;
+pub const AcmeErrorAssessment = acme.AcmeErrorAssessment;
+pub const assessAcmeResponse = acme.assessAcmeResponse;
+pub const classifyAcmeProtocolError = acme.classifyAcmeProtocolError;
+pub const AcmeTransportExecuteParams = acme.AcmeTransportExecuteParams;
+pub const AcmeTransportExecuteOperationParams = acme.AcmeTransportExecuteOperationParams;
+pub const AcmeTransportExecuteResponse = acme.AcmeTransportExecuteResponse;
+pub const AcmeTransportError = acme.AcmeTransportError;
+pub const AcmeTransportExecuteOperationError = acme.AcmeTransportExecuteOperationError;
+pub const executeAcmeWireRequest = acme.executeAcmeWireRequest;
+pub const executeAcmeOperation = acme.executeAcmeOperation;
+pub const AcmeSignedBodies = acme.AcmeSignedBodies;
+pub const AcmeTickResult = acme.AcmeTickResult;
+pub const AcmeExecutor = acme.AcmeExecutor;
+pub const AcmeManager = acme.AcmeManager;
+pub const AcmeManagerError = acme.AcmeManagerError;
+
+// =============================================================================
 // Connection Pooling (from serval-pool)
 // =============================================================================
 
@@ -235,6 +291,7 @@ test {
     _ = @import("serval-websocket");
     _ = @import("serval-h2");
     _ = @import("serval-grpc");
+    _ = @import("serval-acme");
     _ = @import("serval-pool");
     _ = @import("serval-proxy");
     _ = @import("serval-metrics");

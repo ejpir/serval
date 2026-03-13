@@ -1,9 +1,10 @@
 // lib/serval-server/mod.zig
 //! Serval HTTP Server
 //!
-//! Provides HTTP/1.1 server (h1/) with future HTTP/2 support (h2/).
-//! TigerStyle: Modular protocol implementations.
+//! Provides frontend protocol dispatch plus HTTP/1.1 (h1/) and HTTP/2 (h2/) drivers.
+//! TigerStyle: Modular protocol implementations with explicit dispatch layer.
 
+pub const frontend = @import("frontend/mod.zig");
 pub const h1 = @import("h1/mod.zig");
 pub const h2 = @import("h2/mod.zig");
 pub const websocket = @import("websocket/mod.zig");
@@ -30,8 +31,10 @@ pub const H2StreamSummary = h2.StreamSummary;
 pub const H2ResponseWriter = h2.ResponseWriter;
 pub const H2ServerError = h2.ServerError;
 pub const servePlainH2Connection = h2.servePlainConnection;
+pub const serveTlsH2Connection = h2.serveTlsConnection;
 
 test {
+    _ = frontend;
     _ = h1;
     _ = h2;
     _ = websocket;
