@@ -7,6 +7,9 @@ selected an upstream. That includes upstream connect/reuse, HTTP/1 request and
 response forwarding, WebSocket upgrade/tunnel relay, and the current bounded
 HTTP/2 stream bridge used for gRPC proxying.
 
+Canonical bridge writeup:
+- [docs/architecture/h2-bridge.md](/home/nick/repos/serval/docs/architecture/h2-bridge.md)
+
 ## Layer
 
 - Layer 3: mechanics

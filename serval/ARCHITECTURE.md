@@ -401,6 +401,9 @@ upgrade path instead of the normal request/response forwarding path:
 
 ### gRPC over HTTP/2 Prior-Knowledge + Upgrade Flow
 
+Canonical bridge writeup:
+- [docs/architecture/h2-bridge.md](/home/nick/repos/serval/docs/architecture/h2-bridge.md)
+
 The current gRPC slice supports two **cleartext HTTP/2** inbound entry paths with an explicit,
 fail-closed handoff.
 

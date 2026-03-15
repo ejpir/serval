@@ -237,6 +237,9 @@ Message-oriented native session API:
 
 ## Current h2c Slice + Future HTTP/2 Structure
 
+Canonical bridge writeup:
+- [docs/architecture/h2-bridge.md](/home/nick/repos/serval/docs/architecture/h2-bridge.md)
+
 Current support now has five HTTP/2 inbound behaviors:
 - **TLS ALPN `h2` + terminated handler**: when ALPN negotiates `h2` and the handler implements `handleH2Headers` + `handleH2Data`, `Server` dispatches the TLS stream directly into `h2/server.zig` (terminated runtime over TLS)
 - **ALPN rollout policy knobs**: `Config.alpn_mixed_offer_policy` controls mixed-offer ALPN selection (`prefer_http11` vs `prefer_h2`) and `Config.tls_h2_frontend_mode` keeps frontend h2 dispatch explicit (`disabled`, `terminated_only`, `generic`); when ALPN has already negotiated `h2` and no terminated h2 hooks exist, server falls back to generic frontend h2 dispatch to avoid invalid h1 parsing on an h2 connection
