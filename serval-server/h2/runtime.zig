@@ -11,6 +11,10 @@ const assert = std.debug.assert;
 const config = @import("serval-core").config;
 const types = @import("serval-core").types;
 const h2 = @import("serval-h2");
+
+pub const initial_settings_count: usize = 5;
+pub const initial_settings_frame_buffer_size_bytes: usize =
+    h2.frame_header_size_bytes + (initial_settings_count * h2.setting_size_bytes);
 const connection = @import("connection.zig");
 
 pub const Error = error{
@@ -572,8 +576,20 @@ fn handleData(self: *Runtime, header: h2.FrameHeader, payload: []const u8) Error
         payload;
 
     const payload_len: u32 = @intCast(payload.len);
+
+    // RFC 9113 flow-control: classify stream-level exhaustion distinctly and
+    // avoid mutating connection window on stream-local underflow.
+    if (payload_len > self.state.flow.recv_window.available_bytes) return error.WindowUnderflow;
+    if (payload_len > stream.recv_window.available_bytes) return error.StreamFlowControlError;
+
     try self.state.consumeRecvWindow(payload_len);
-    try self.state.consumeStreamRecvWindow(header.stream_id, payload_len);
+    self.state.consumeStreamRecvWindow(header.stream_id, payload_len) catch |err| switch (err) {
+        error.WindowUnderflow,
+        error.WindowOverflow,
+        error.InvalidIncrement,
+        => return error.StreamFlowControlError,
+        else => return err,
+    };
 
     const end_stream = (header.flags & h2.flags_end_stream) != 0;
     try noteRequestData(self, header.stream_id, data_payload.len, end_stream);
@@ -667,6 +683,7 @@ fn buildLocalSettingsPayload(local_settings: h2.Settings, out: []u8) Error![]con
         .{ .id = @intFromEnum(h2.SettingId.max_concurrent_streams), .value = local_settings.max_concurrent_streams },
         .{ .id = @intFromEnum(h2.SettingId.initial_window_size), .value = local_settings.initial_window_size_bytes },
         .{ .id = @intFromEnum(h2.SettingId.max_frame_size), .value = local_settings.max_frame_size_bytes },
+        .{ .id = @intFromEnum(h2.SettingId.enable_connect_protocol), .value = if (local_settings.enable_connect_protocol) 1 else 0 },
     };
     return try h2.buildSettingsPayload(out, &settings);
 }
@@ -710,7 +727,7 @@ test "Runtime requires preface before frames" {
 
 test "Runtime writes initial settings and requires peer settings before headers" {
     var runtime = try Runtime.init();
-    var settings_buf: [h2.frame_header_size_bytes + (4 * h2.setting_size_bytes)]u8 = undefined;
+    var settings_buf: [initial_settings_frame_buffer_size_bytes]u8 = undefined;
     const encoded = try runtime.writeInitialSettingsFrame(&settings_buf);
     const header = try h2.parseFrameHeader(encoded);
 
@@ -733,7 +750,7 @@ test "Runtime writes initial settings and requires peer settings before headers"
 
 test "Runtime decodes request headers and data on one stream" {
     var runtime = try Runtime.init();
-    var settings_out: [h2.frame_header_size_bytes + (4 * h2.setting_size_bytes)]u8 = undefined;
+    var settings_out: [initial_settings_frame_buffer_size_bytes]u8 = undefined;
     _ = try runtime.writeInitialSettingsFrame(&settings_out);
     try runtime.receiveClientPreface();
 
@@ -785,7 +802,7 @@ test "Runtime decodes request headers and data on one stream" {
 
 test "Runtime ignores PRIORITY frame after initial settings" {
     var runtime = try Runtime.init();
-    var settings_out: [h2.frame_header_size_bytes + (4 * h2.setting_size_bytes)]u8 = undefined;
+    var settings_out: [initial_settings_frame_buffer_size_bytes]u8 = undefined;
     _ = try runtime.writeInitialSettingsFrame(&settings_out);
     try runtime.receiveClientPreface();
 
@@ -811,7 +828,7 @@ test "Runtime ignores PRIORITY frame after initial settings" {
 
 test "Runtime decodes HEADERS with PRIORITY flag" {
     var runtime = try Runtime.init();
-    var settings_out: [h2.frame_header_size_bytes + (4 * h2.setting_size_bytes)]u8 = undefined;
+    var settings_out: [initial_settings_frame_buffer_size_bytes]u8 = undefined;
     _ = try runtime.writeInitialSettingsFrame(&settings_out);
     try runtime.receiveClientPreface();
 
@@ -851,7 +868,7 @@ test "Runtime decodes HEADERS with PRIORITY flag" {
 
 test "Runtime decodes padded HEADERS" {
     var runtime = try Runtime.init();
-    var settings_out: [h2.frame_header_size_bytes + (4 * h2.setting_size_bytes)]u8 = undefined;
+    var settings_out: [initial_settings_frame_buffer_size_bytes]u8 = undefined;
     _ = try runtime.writeInitialSettingsFrame(&settings_out);
     try runtime.receiveClientPreface();
 
@@ -889,7 +906,7 @@ test "Runtime decodes padded HEADERS" {
 
 test "Runtime rejects self-dependent PRIORITY as stream protocol error" {
     var runtime = try Runtime.init();
-    var settings_out: [h2.frame_header_size_bytes + (4 * h2.setting_size_bytes)]u8 = undefined;
+    var settings_out: [initial_settings_frame_buffer_size_bytes]u8 = undefined;
     _ = try runtime.writeInitialSettingsFrame(&settings_out);
     try runtime.receiveClientPreface();
 
@@ -909,7 +926,7 @@ test "Runtime rejects self-dependent PRIORITY as stream protocol error" {
 
 test "Runtime rejects idle RST_STREAM as connection protocol error" {
     var runtime = try Runtime.init();
-    var settings_out: [h2.frame_header_size_bytes + (4 * h2.setting_size_bytes)]u8 = undefined;
+    var settings_out: [initial_settings_frame_buffer_size_bytes]u8 = undefined;
     _ = try runtime.writeInitialSettingsFrame(&settings_out);
     try runtime.receiveClientPreface();
 
@@ -928,7 +945,7 @@ test "Runtime rejects idle RST_STREAM as connection protocol error" {
 
 test "Runtime reassembles request HEADERS with CONTINUATION" {
     var runtime = try Runtime.init();
-    var settings_out: [h2.frame_header_size_bytes + (4 * h2.setting_size_bytes)]u8 = undefined;
+    var settings_out: [initial_settings_frame_buffer_size_bytes]u8 = undefined;
     _ = try runtime.writeInitialSettingsFrame(&settings_out);
     try runtime.receiveClientPreface();
 
@@ -984,7 +1001,7 @@ test "Runtime reassembles request HEADERS with CONTINUATION" {
 
 test "Runtime rejects interleaved frame while waiting for CONTINUATION" {
     var runtime = try Runtime.init();
-    var settings_out: [h2.frame_header_size_bytes + (4 * h2.setting_size_bytes)]u8 = undefined;
+    var settings_out: [initial_settings_frame_buffer_size_bytes]u8 = undefined;
     _ = try runtime.writeInitialSettingsFrame(&settings_out);
     try runtime.receiveClientPreface();
 
@@ -1006,7 +1023,7 @@ test "Runtime rejects interleaved frame while waiting for CONTINUATION" {
 
 test "Runtime rejects unexpected CONTINUATION without pending headers" {
     var runtime = try Runtime.init();
-    var settings_out: [h2.frame_header_size_bytes + (4 * h2.setting_size_bytes)]u8 = undefined;
+    var settings_out: [initial_settings_frame_buffer_size_bytes]u8 = undefined;
     _ = try runtime.writeInitialSettingsFrame(&settings_out);
     try runtime.receiveClientPreface();
 
@@ -1034,7 +1051,7 @@ test "Runtime rejects unexpected CONTINUATION without pending headers" {
 
 test "Runtime rejects CONTINUATION stream mismatch" {
     var runtime = try Runtime.init();
-    var settings_out: [h2.frame_header_size_bytes + (4 * h2.setting_size_bytes)]u8 = undefined;
+    var settings_out: [initial_settings_frame_buffer_size_bytes]u8 = undefined;
     _ = try runtime.writeInitialSettingsFrame(&settings_out);
     try runtime.receiveClientPreface();
 
@@ -1065,7 +1082,7 @@ test "Runtime rejects CONTINUATION stream mismatch" {
 
 test "Runtime rejects CONTINUATION with invalid flags" {
     var runtime = try Runtime.init();
-    var settings_out: [h2.frame_header_size_bytes + (4 * h2.setting_size_bytes)]u8 = undefined;
+    var settings_out: [initial_settings_frame_buffer_size_bytes]u8 = undefined;
     _ = try runtime.writeInitialSettingsFrame(&settings_out);
     try runtime.receiveClientPreface();
 
@@ -1101,7 +1118,7 @@ test "Runtime rejects CONTINUATION with invalid flags" {
 
 test "Runtime enforces continuation frame bound" {
     var runtime = try Runtime.init();
-    var settings_out: [h2.frame_header_size_bytes + (4 * h2.setting_size_bytes)]u8 = undefined;
+    var settings_out: [initial_settings_frame_buffer_size_bytes]u8 = undefined;
     _ = try runtime.writeInitialSettingsFrame(&settings_out);
     try runtime.receiveClientPreface();
 
@@ -1188,6 +1205,94 @@ test "Runtime applies WINDOW_UPDATE and RST_STREAM" {
         else => return error.InvalidFrame,
     }
     try std.testing.expect(runtime.state.getStream(1) == null);
+}
+
+test "Runtime classifies stream DATA window underflow as StreamFlowControlError" {
+    var runtime = try Runtime.init();
+    try runtime.receiveClientPreface();
+    const settings_header = h2.FrameHeader{ .length = 0, .frame_type = .settings, .flags = 0, .stream_id = 0 };
+    _ = try runtime.receiveFrame(settings_header, &[_]u8{});
+
+    var header_block_buf: [256]u8 = undefined;
+    const header_block = try buildHeaderBlock("/grpc.test.Echo/FlowUnderflow", &header_block_buf);
+    var headers_frame_buf: [h2.frame_header_size_bytes + 256]u8 = undefined;
+    const headers_frame = try appendFrame(&headers_frame_buf, .headers, h2.flags_end_headers, 1, header_block);
+    const headers_header = try h2.parseFrameHeader(headers_frame);
+    _ = try runtime.receiveFrame(headers_header, headers_frame[h2.frame_header_size_bytes .. h2.frame_header_size_bytes + headers_header.length]);
+
+    const conn_window_before = runtime.state.flow.recv_window.available_bytes;
+    const stream_window_before = runtime.state.getStream(1).?.recv_window.available_bytes;
+
+    try runtime.state.getStream(1).?.recv_window.set(1);
+
+    const data_header = h2.FrameHeader{
+        .length = 2,
+        .frame_type = .data,
+        .flags = 0,
+        .stream_id = 1,
+    };
+    try std.testing.expectError(error.StreamFlowControlError, runtime.receiveFrame(data_header, "ab"));
+
+    try std.testing.expectEqual(conn_window_before, runtime.state.flow.recv_window.available_bytes);
+    try std.testing.expectEqual(@as(u32, 1), runtime.state.getStream(1).?.recv_window.available_bytes);
+    try std.testing.expect(stream_window_before >= runtime.state.getStream(1).?.recv_window.available_bytes);
+}
+
+test "Runtime randomized frame sequence preserves bounded invariants" {
+    var runtime = try Runtime.init();
+    try runtime.receiveClientPreface();
+    const settings_header = h2.FrameHeader{ .length = 0, .frame_type = .settings, .flags = 0, .stream_id = 0 };
+    _ = try runtime.receiveFrame(settings_header, &[_]u8{});
+
+    var prng = std.Random.DefaultPrng.init(0x9c41_5be2_d3a7_f00d);
+    const random = prng.random();
+
+    var header_block_buf: [256]u8 = undefined;
+    const header_block = try buildHeaderBlock("/grpc.test.Echo/Fuzz", &header_block_buf);
+
+    var frame_buf: [h2.frame_header_size_bytes + 256]u8 = undefined;
+    var step: u32 = 0;
+    while (step < 512) : (step += 1) {
+        const opcode: u8 = random.uintLessThan(u8, 6);
+        const stream_id: u32 = (@as(u32, random.uintLessThan(u8, 8)) * 2) + 1;
+
+        const frame = switch (opcode) {
+            0 => appendFrame(
+                &frame_buf,
+                .headers,
+                if (random.boolean()) h2.flags_end_headers | h2.flags_end_stream else h2.flags_end_headers,
+                stream_id,
+                header_block,
+            ) catch continue,
+            1 => appendFrame(
+                &frame_buf,
+                .data,
+                if (random.boolean()) h2.flags_end_stream else 0,
+                stream_id,
+                "x",
+            ) catch continue,
+            2 => h2.buildWindowUpdateFrame(&frame_buf, 0, 1 + random.uintLessThan(u32, 1024)) catch continue,
+            3 => h2.buildWindowUpdateFrame(&frame_buf, stream_id, 1 + random.uintLessThan(u32, 1024)) catch continue,
+            4 => h2.buildRstStreamFrame(&frame_buf, stream_id, @intFromEnum(h2.ErrorCode.cancel)) catch continue,
+            5 => h2.buildPingFrame(
+                &frame_buf,
+                if (random.boolean()) 0 else h2.flags_ack,
+                [8]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
+            ) catch continue,
+            else => unreachable,
+        };
+
+        const header = h2.parseFrameHeader(frame) catch continue;
+        if (runtime.receiveFrame(header, frame[h2.frame_header_size_bytes .. h2.frame_header_size_bytes + header.length])) |action| {
+            _ = action;
+        } else |err| {
+            _ = err;
+        }
+
+        try std.testing.expect(runtime.state.streams.active_count <= config.H2_MAX_CONCURRENT_STREAMS);
+        try std.testing.expect(runtime.state.flow.recv_window.available_bytes <= config.H2_MAX_WINDOW_SIZE_BYTES);
+        try std.testing.expect(runtime.state.flow.send_window.available_bytes <= config.H2_MAX_WINDOW_SIZE_BYTES);
+    }
 }
 
 test "Runtime tracks peer GOAWAY and rejects higher streams" {

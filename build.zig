@@ -67,6 +67,7 @@ pub fn build(b: *std.Build) void {
     const serval_socket_module = b.addModule("serval-socket", .{
         .root_source_file = b.path("serval-socket/mod.zig"),
         .imports = &.{
+            .{ .name = "serval-core", .module = serval_core_module },
             .{ .name = "serval-tls", .module = serval_tls_module },
         },
     });
@@ -704,6 +705,21 @@ pub fn build(b: *std.Build) void {
     const integration_test_step = b.step("test-integration", "Run integration tests");
     integration_test_step.dependOn(&run_integration_tests.step);
 
+    const integration_test_64 = b.addTest(.{
+        .name = "integration_test_64",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: grpc h2c stream churn near concurrent-stream bound"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_64);
+    const run_integration_test_64 = b.addRunArtifact(integration_test_64);
+
+    const integration_test_64_step = b.step(
+        "test-integration-64",
+        "Run integration test 64 (grpc h2c stream churn near concurrent-stream bound)",
+    );
+    integration_test_64_step.dependOn(&run_integration_test_64.step);
+
     // =========================================================================
     // Examples
     // =========================================================================
@@ -877,6 +893,11 @@ pub fn build(b: *std.Build) void {
     force_llvm_lld(echo_backend);
     const build_echo_backend = b.addInstallArtifact(echo_backend, .{});
     const run_echo_backend = b.addRunArtifact(echo_backend);
+
+    // Ensure echo_backend is rebuilt before integration tests run.
+    // The test harness spawns ./zig-out/bin/echo_backend directly.
+    run_integration_tests.step.dependOn(&build_echo_backend.step);
+    run_integration_test_64.step.dependOn(&build_echo_backend.step);
 
     const build_echo_backend_step = b.step("build-echo-backend", "Build echo backend");
     build_echo_backend_step.dependOn(&build_echo_backend.step);

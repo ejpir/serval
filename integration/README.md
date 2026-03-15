@@ -12,6 +12,9 @@ zig build test-integration
 
 # Run with summary
 zig build test-integration --summary all
+
+# Run only test 64
+zig build test-integration-64
 ```
 
 Note: the integration suite uses a custom verbose test runner, so standard Zig

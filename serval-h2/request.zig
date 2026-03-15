@@ -213,6 +213,7 @@ pub fn decodeRequestHeaderBlockWithDecoder(
     var path_found = false;
     var scheme_found = false;
     var authority_found = false;
+    var protocol_found = false;
     var regular_headers_seen = false;
     var connect_method = false;
     var authority_value: []const u8 = "";
@@ -246,6 +247,12 @@ pub fn decodeRequestHeaderBlockWithDecoder(
                 try request.headers.put("host", field.value);
                 authority_found = true;
                 authority_value = field.value;
+            } else if (std.mem.eql(u8, field.name, ":protocol")) {
+                if (protocol_found) return error.DuplicatePseudoHeader;
+                if (!connect_method) return error.UnexpectedPseudoHeader;
+                if (field.value.len == 0) return error.UnexpectedPseudoHeader;
+                protocol_found = true;
+                try request.headers.put("x-http2-protocol", field.value);
             } else {
                 return error.UnexpectedPseudoHeader;
             }
@@ -275,9 +282,15 @@ pub fn decodeRequestHeaderBlockWithDecoder(
     if (!authority_found and request.headers.getHost() == null) return error.MissingAuthority;
 
     if (connect_method) {
-        if (path_found) return error.ConnectPathNotAllowed;
-        if (scheme_found) return error.ConnectSchemeNotAllowed;
+        if (protocol_found) {
+            if (!path_found or request.path.len == 0) return error.MissingPath;
+            if (!scheme_found) return error.MissingScheme;
+        } else {
+            if (path_found) return error.ConnectPathNotAllowed;
+            if (scheme_found) return error.ConnectSchemeNotAllowed;
+        }
     } else {
+        if (protocol_found) return error.UnexpectedPseudoHeader;
         if (!path_found or request.path.len == 0) return error.MissingPath;
         if (!scheme_found) return error.MissingScheme;
     }
@@ -873,4 +886,36 @@ test "decodeRequestHeaderBlock rejects CONNECT with :path" {
     }, &block_buf);
 
     try std.testing.expectError(error.ConnectPathNotAllowed, decodeRequestHeaderBlock(block, 1));
+}
+
+test "decodeRequestHeaderBlock accepts extended CONNECT websocket" {
+    var block_buf: [256]u8 = undefined;
+    const block = try encodeHeaderPairs(&.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":protocol", .value = "websocket" },
+        .{ .name = ":path", .value = "/ws-proxy/signal" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.com" },
+        .{ .name = "sec-websocket-key", .value = "dGhlIHNhbXBsZSBub25jZQ==" },
+        .{ .name = "sec-websocket-version", .value = "13" },
+    }, &block_buf);
+
+    const parsed = try decodeRequestHeaderBlock(block, 1);
+    try std.testing.expectEqual(Method.CONNECT, parsed.request.method);
+    try std.testing.expectEqualStrings("/ws-proxy/signal", parsed.request.path);
+    try std.testing.expectEqualStrings("https", parsed.request.headers.get("x-forwarded-proto").?);
+    try std.testing.expectEqualStrings("websocket", parsed.request.headers.get("x-http2-protocol").?);
+}
+
+test "decodeRequestHeaderBlock rejects :protocol on non-CONNECT" {
+    var block_buf: [256]u8 = undefined;
+    const block = try encodeHeaderPairs(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":protocol", .value = "websocket" },
+        .{ .name = ":path", .value = "/ws" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.com" },
+    }, &block_buf);
+
+    try std.testing.expectError(error.UnexpectedPseudoHeader, decodeRequestHeaderBlock(block, 1));
 }

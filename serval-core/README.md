@@ -47,7 +47,7 @@ const custom = headers.get("X-Custom");    // ?[]const u8
 **Why**: HTTP proxies check these headers on every request. Caching their indices avoids repeated O(n) scans at high throughput.
 
 ### Configuration
-- `Config` - Server configuration (port, timeouts, limits, h2 frontend + ALPN policies)
+- `Config` - Server configuration (listen_host, port, timeouts, limits, h2 frontend + ALPN policies)
 - `TlsConfig` - TLS configuration (cert paths, verification, timeouts)
 - `TlsH2FrontendMode` - TLS frontend h2 dispatch mode (`disabled`, `terminated_only`, `generic`)
 - `AlpnMixedOfferPolicy` - Mixed-offer ALPN selection policy (`prefer_http11`, `prefer_h2`)

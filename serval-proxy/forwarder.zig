@@ -536,6 +536,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
 
             const tunnel_span = self.tracer.startSpan("websocket_tunnel", forward_span);
             const tunnel_stats = tunnel_mod.relay(
+                io,
                 &client_socket,
                 &mutable_conn.socket,
                 initial_client_bytes,
@@ -620,6 +621,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
 
             const tunnel_span = self.tracer.startSpan("grpc_h2_tunnel", forward_span);
             const tunnel_stats = tunnel_mod.relayWithConfig(
+                io,
                 &client_socket,
                 &upstream_socket,
                 initial_client_bytes,
@@ -739,6 +741,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
 
             const tunnel_span = self.tracer.startSpan("grpc_h2c_upgrade_tunnel", forward_span);
             const tunnel_stats = relayGrpcH2cUpgradeSession(
+                io,
                 &client_socket,
                 &upstream_socket,
                 remaining_body_bytes,
@@ -771,6 +774,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
         }
 
         fn relayGrpcH2cUpgradeSession(
+            io: Io,
             client_socket: *Socket,
             upstream_socket: *Socket,
             remaining_body_bytes: u64,
@@ -788,6 +792,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             }
 
             const tunnel_stats = tunnel_mod.relayWithConfig(
+                io,
                 client_socket,
                 upstream_socket,
                 initial_client_bytes_after_body,
@@ -943,20 +948,60 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             else
                 Socket.Plain.init_client(client_stream.socket.handle);
 
-            // Stream request body if present
-            if (body_info.getContentLength()) |content_length| {
+            // Stream request body concurrently with reading the upstream response.
+            //
+            // Sequential body-then-response causes a TCP deadlock when the upstream
+            // echoes or streams back a response while receiving the request body:
+            //   - proxy blocks writing body (upstream TCP recv buffer full)
+            //   - upstream blocks sending response (proxy not reading)
+            // Running both directions concurrently breaks the deadlock.
+            //
+            // Context struct for the background body-streaming task.
+            // All fields are pointers into the current stack frame, so we must
+            // ensure the task completes before forwardWithConnection returns.
+            const BodyCtx = struct {
+                client: *Socket,
+                upstream: *Socket,
+                conn: *Connection,
+                io: Io,
+                body_info: BodyInfo,
+                result: ForwardError!u64 = 0,
+
+                fn run(bctx: *@This()) Io.Cancelable!void {
+                    bctx.result = streamRequestBody(
+                        bctx.client,
+                        bctx.upstream,
+                        bctx.conn,
+                        bctx.io,
+                        bctx.body_info,
+                    );
+                }
+            };
+
+            var body_ctx: BodyCtx = undefined;
+            var body_group: Io.Group = .init;
+            // LIFO errdefer: runs BEFORE the pool-release errdefer defined above,
+            // ensuring the background task releases its references to mutable_conn
+            // before the connection is returned to the pool on any error path.
+            errdefer body_group.cancel(io);
+
+            const has_body = if (body_info.getContentLength()) |content_length| blk: {
                 if (content_length > config.MAX_BODY_SIZE_BYTES) {
                     self.tracer.endSpan(send_span, "RequestBodyTooLarge");
                     return ForwardError.RequestBodyTooLarge;
                 }
-                debugLog("send: streaming body content_length={d}", .{content_length});
-                // Use Socket abstraction for unified TLS/plaintext handling.
-                // Connection.socket is already a Socket.
-                _ = streamRequestBody(&client_socket, &mutable_conn.socket, &mutable_conn, io, body_info) catch |err| {
-                    self.tracer.endSpan(send_span, @errorName(err));
-                    return err;
+                debugLog("send: streaming body concurrently content_length={d}", .{content_length});
+                body_ctx = .{
+                    .client = &client_socket,
+                    .upstream = &mutable_conn.socket,
+                    .conn = &mutable_conn,
+                    .io = io,
+                    .body_info = body_info,
+                    .result = 0,
                 };
-            }
+                body_group.async(io, BodyCtx.run, .{&body_ctx});
+                break :blk true;
+            } else false;
 
             const send_end_ns = time.monotonicNanos();
             const send_duration_ns = time.elapsedNanos(send_start_ns, send_end_ns);
@@ -964,11 +1009,10 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             self.tracer.endSpan(send_span, null);
             debugLog("send: complete duration_us={d}", .{send_duration_ns / 1000});
 
-            // Recv phase span (response headers + body)
+            // Recv phase span (response headers + body).
+            // Runs concurrently with body streaming when has_body is true.
             const recv_span = self.tracer.startSpan("recv_response", forward_span);
             debugLog("recv: awaiting response headers", .{});
-            // Use Socket abstraction for unified TLS/plaintext body forwarding.
-            // Connection.socket is already a Socket.
             var result = forwardResponse(io, &mutable_conn, client_stream, &mutable_conn.socket, &client_socket, is_pooled) catch |err| {
                 self.tracer.endSpan(recv_span, @errorName(err));
                 return err;
@@ -984,6 +1028,16 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             result.send_duration_ns = send_duration_ns;
             result.pool_wait_ns = pool_wait_ns;
             result.upstream_local_port = local_port;
+
+            // Wait for body streaming to finish before releasing the connection.
+            // Must happen before pool.release so the background task no longer
+            // holds references to mutable_conn.
+            body_group.await(io) catch {};
+            if (has_body) {
+                _ = body_ctx.result catch |err| {
+                    debugLog("send: body stream error={s}", .{@errorName(err)});
+                };
+            }
 
             // RFC 9112 recommends checking upstream's Connection: close header and not
             // pooling if present. Current implementation relies on StaleConnection retry

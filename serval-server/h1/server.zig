@@ -81,15 +81,9 @@ const CONNECTION_RECV_BUFFER_SIZE_BYTES = if (REQUEST_BUFFER_SIZE_BYTES > H2C_IN
     REQUEST_BUFFER_SIZE_BYTES
 else
     H2C_INITIAL_READ_BUFFER_SIZE_BYTES;
+const PLAIN_STREAM_READER_BUFFER_SIZE_BYTES: usize = 1;
 const DIRECT_RESPONSE_BUFFER_SIZE_BYTES = config.DIRECT_RESPONSE_BUFFER_SIZE_BYTES;
 const DIRECT_REQUEST_BODY_SIZE_BYTES = config.DIRECT_REQUEST_BODY_SIZE_BYTES;
-
-/// Retry sleep for non-blocking plain-socket reads.
-const CONNECTION_READ_RETRY_SLEEP_NS: u64 = time.ns_per_ms;
-/// Maximum plain-socket read stall before failing the connection read.
-const CONNECTION_READ_STALL_TIMEOUT_NS: u64 = 120 * time.ns_per_s;
-/// Explicit bound on WouldBlock retry attempts in plain-socket reads.
-const CONNECTION_READ_MAX_WOULDBLOCK_RETRIES: u32 = 240_000;
 
 /// Maximum attempts when taking TLS reload-control mutex.
 /// TigerStyle: Bounded spin loop for control-plane activation path.
@@ -257,8 +251,9 @@ pub fn Server(
             listener_fd_out: ?*std.atomic.Value(i32),
         ) !void {
             assert(self.config.port > 0);
+            assert(self.config.listen_host.len > 0);
 
-            const addr = Io.net.IpAddress.parse("0.0.0.0", self.config.port) catch
+            const addr = Io.net.IpAddress.parse(self.config.listen_host, self.config.port) catch
                 return error.InvalidAddress;
 
             var tcp_server = addr.listen(io, .{
@@ -318,7 +313,6 @@ pub fn Server(
             defer self.unpublishTlsCtxManager();
 
             var group: Io.Group = .init;
-            defer group.cancel(io);
 
             while (!shutdown.load(.acquire)) {
                 const accept_start_ns = realtimeNanos();
@@ -346,6 +340,10 @@ pub fn Server(
                     stream.close(io);
                 };
             }
+
+            group.await(io) catch |err| switch (err) {
+                error.Canceled => {},
+            };
         }
 
         // =========================================================================
@@ -358,7 +356,9 @@ pub fn Server(
         /// TigerStyle: Stack-allocated, no runtime allocation, no hidden buffering.
         const BodyReadContext = struct {
             maybe_tls: ?*TLSStream,
+            io: *Io,
             stream: Io.net.Stream,
+            plain_reader: ?*Io.net.Stream.Reader,
             conn_id: u64,
         };
 
@@ -370,19 +370,22 @@ pub fn Server(
             assert(@intFromPtr(ctx_ptr) != 0);
 
             const ctx: *BodyReadContext = @ptrCast(@alignCast(ctx_ptr));
-            return connectionRead(ctx.maybe_tls, ctx.stream, buf, ctx.conn_id);
+            return connectionRead(ctx.maybe_tls, ctx.io, ctx.stream, ctx.plain_reader, buf, ctx.conn_id);
         }
 
         /// Read from connection (TLS or plain socket).
-        /// Uses direct recv() for plain sockets - no buffering, no hidden state.
-        /// TigerStyle: Explicit reads, deterministic behavior, zero buffering overhead.
+        /// Plain sockets stay on std.Io so fibers, readiness, and cancellation remain intact.
+        /// TigerStyle: Explicit reads, deterministic behavior, no raw syscall bypass.
         fn connectionRead(
             maybe_tls: ?*const TLSStream,
+            io: *Io,
             stream: Io.net.Stream,
+            plain_reader: ?*Io.net.Stream.Reader,
             buf: []u8,
             conn_id: u64,
         ) ?usize {
             assert(buf.len > 0); // S1: precondition
+            assert(@intFromPtr(io) != 0); // S1: precondition
 
             if (maybe_tls) |tls| {
                 // TLS read (blocking - std.Io handles socket-level async)
@@ -394,35 +397,40 @@ pub fn Server(
                 };
                 return n;
             } else {
-                // Plain socket read on non-blocking fd.
-                // TigerStyle: bounded retry loop for WouldBlock to avoid flaky early aborts.
-                var retry_count: u32 = 0;
-                const start_wait_ns: u64 = time.monotonicNanos();
-
-                while (retry_count < CONNECTION_READ_MAX_WOULDBLOCK_RETRIES) : (retry_count += 1) {
-                    const n = std.posix.read(stream.socket.handle, buf) catch |err| switch (err) {
-                        error.WouldBlock => {
-                            const now_ns = time.monotonicNanos();
-                            if (now_ns -| start_wait_ns >= CONNECTION_READ_STALL_TIMEOUT_NS) {
-                                log.debug("server: conn={d} recv stall timeout", .{conn_id});
-                                return null;
-                            }
-                            time.sleep(CONNECTION_READ_RETRY_SLEEP_NS);
-                            continue;
-                        },
-                        else => {
-                            log.debug("server: conn={d} recv error: {s}", .{ conn_id, @errorName(err) });
-                            return null;
-                        },
-                    };
-
-                    if (n == 0) return null; // EOF
-                    return n;
-                }
-
-                log.debug("server: conn={d} recv retry limit reached", .{conn_id});
-                return null;
+                var fallback_reader_buf: [PLAIN_STREAM_READER_BUFFER_SIZE_BYTES]u8 = undefined;
+                var fallback_stream_reader = stream.reader(io.*, &fallback_reader_buf);
+                const stream_reader = plain_reader orelse &fallback_stream_reader;
+                var bufs: [1][]u8 = .{buf};
+                const n = stream_reader.interface.readVec(&bufs) catch |err| switch (err) {
+                    error.EndOfStream => return null,
+                    error.ReadFailed => {
+                        const read_err = stream_reader.err orelse unreachable;
+                        log.debug("server: conn={d} recv error: {s}", .{ conn_id, @errorName(read_err) });
+                        return null;
+                    },
+                };
+                if (n == 0) return null;
+                return n;
             }
+        }
+
+        fn buildH2HandoffBytes(
+            plain_reader: ?*Io.net.Stream.Reader,
+            visible_bytes: []const u8,
+            handoff_buf: []u8,
+        ) []const u8 {
+            assert(visible_bytes.len <= handoff_buf.len);
+
+            const plain_stream_reader = plain_reader orelse return visible_bytes;
+            if (plain_stream_reader.interface.seek >= plain_stream_reader.interface.end) return visible_bytes;
+
+            const pending = plain_stream_reader.interface.end - plain_stream_reader.interface.seek;
+            assert(visible_bytes.len + pending <= handoff_buf.len);
+            @memcpy(handoff_buf[0..visible_bytes.len], visible_bytes);
+            const buffered = plain_stream_reader.interface.buffer[plain_stream_reader.interface.seek..plain_stream_reader.interface.end];
+            @memcpy(handoff_buf[visible_bytes.len .. visible_bytes.len + pending], buffered);
+            plain_stream_reader.interface.seek = plain_stream_reader.interface.end;
+            return handoff_buf[0 .. visible_bytes.len + pending];
         }
 
         /// Write to connection (TLS or plain).
@@ -440,7 +448,7 @@ pub fn Server(
                 var mutable_tls = tls.*;
                 _ = try mutable_tls.write(data);
             } else {
-                // Plain socket write
+                // Plain socket write (blocking - fiber yields to scheduler until send buffer accepts data)
                 var write_buf: [config.SERVER_WRITE_BUFFER_SIZE_BYTES]u8 =
                     std.mem.zeroes([config.SERVER_WRITE_BUFFER_SIZE_BYTES]u8);
                 var writer = stream.writer(io.*, &write_buf);
@@ -498,7 +506,7 @@ pub fn Server(
                     sendErrorResponseTls(maybe_tls, io, stream, 431, "Request Header Fields Too Large");
                     return false;
                 }
-                const n = connectionRead(maybe_tls, stream, recv_buf[buffer_len.*..], conn_id) orelse return false;
+                const n = connectionRead(maybe_tls, io, stream, null, recv_buf[buffer_len.*..], conn_id) orelse return false;
                 if (n == 0) return false;
                 buffer_len.* += n;
             }
@@ -695,7 +703,7 @@ pub fn Server(
             assert(stream.socket.handle >= 0);
 
             var runtime = h2_runtime.Runtime.init() catch return false;
-            var settings_buf: [serval_h2.frame_header_size_bytes + (4 * serval_h2.setting_size_bytes)]u8 = undefined;
+            var settings_buf: [h2_runtime.initial_settings_frame_buffer_size_bytes]u8 = undefined;
             const settings_frame = runtime.writeInitialSettingsFrame(&settings_buf) catch return false;
             connectionWrite(maybe_tls, io, stream, settings_frame) catch return false;
             return true;
@@ -1026,7 +1034,8 @@ pub fn Server(
 
         const GrpcH2cBridgeHandler = struct {
             const pending_reset_capacity: usize = @intCast(config.H2_MAX_CONCURRENT_STREAMS);
-
+            const upstream_reader_idle_ms: i64 = 10;
+            const upstream_read_timeout_ms: i64 = 50;
             const PendingReset = struct {
                 used: bool = false,
                 downstream_stream_id: u32 = 0,
@@ -1043,6 +1052,13 @@ pub fn Server(
             dns_duration_ns: u64 = 0,
             tcp_connect_duration_ns: u64 = 0,
             upstream_local_port: u16 = 0,
+            bridge_mutex: Io.Mutex = .init,
+            connection_mutex: ?*Io.Mutex = null,
+            writer_template: ?*h2_server.ResponseWriter = null,
+            upstream_reader_group: Io.Group = .init,
+            upstream_reader_started: bool = false,
+            upstream_reader_stop: bool = false,
+            upstream_reader_scan_cursor: u16 = 0,
             pending_resets: [pending_reset_capacity]PendingReset = [_]PendingReset{.{}} ** pending_reset_capacity,
 
             pub const BridgeError = error{
@@ -1078,7 +1094,54 @@ pub fn Server(
 
             pub fn deinit(self: *@This()) void {
                 assert(@intFromPtr(self) != 0);
+                if (self.upstream_reader_started) {
+                    self.upstream_reader_stop = true;
+                    log.debug(
+                        "h2 bridge: conn={d} cancel upstream reader group reason=deinit",
+                        .{self.connection_ctx.connection_id},
+                    );
+                    self.upstream_reader_group.cancel(self.io);
+                    self.upstream_reader_started = false;
+                }
                 self.bridge.deinit();
+            }
+
+            pub fn startH2BackgroundTasks(
+                self: *@This(),
+                writer_template: *h2_server.ResponseWriter,
+                connection_mutex: *Io.Mutex,
+            ) void {
+                assert(@intFromPtr(self) != 0);
+                assert(@intFromPtr(writer_template) != 0);
+                assert(@intFromPtr(connection_mutex) != 0);
+
+                log.debug("h2 bridge: conn={d} start background tasks", .{self.connection_ctx.connection_id});
+                self.writer_template = writer_template;
+                self.connection_mutex = connection_mutex;
+                self.upstream_reader_stop = false;
+                if (self.upstream_reader_started) return;
+                self.upstream_reader_group.concurrent(self.io, upstreamReaderTask, .{self}) catch |err| {
+                    log.err(
+                        "h2 bridge: conn={d} failed to start upstream reader task: {s}",
+                        .{ self.connection_ctx.connection_id, @errorName(err) },
+                    );
+                    return;
+                };
+                self.upstream_reader_started = true;
+                log.debug("h2 bridge: conn={d} started upstream reader task", .{self.connection_ctx.connection_id});
+            }
+
+            pub fn stopH2BackgroundTasks(self: *@This()) void {
+                assert(@intFromPtr(self) != 0);
+
+                if (!self.upstream_reader_started) return;
+                self.upstream_reader_stop = true;
+                log.debug(
+                    "h2 bridge: conn={d} cancel upstream reader group reason=stop_background_tasks",
+                    .{self.connection_ctx.connection_id},
+                );
+                self.upstream_reader_group.cancel(self.io);
+                self.upstream_reader_started = false;
             }
 
             fn notePendingReset(self: *@This(), downstream_stream_id: u32, error_code_raw: u32) void {
@@ -1140,7 +1203,7 @@ pub fn Server(
                 stream_id: u32,
                 request: *const Request,
                 end_stream: bool,
-                writer: *h2_server.ResponseWriter,
+                _: *h2_server.ResponseWriter,
             ) BridgeError!void {
                 assert(@intFromPtr(self) != 0);
                 assert(stream_id > 0);
@@ -1156,6 +1219,22 @@ pub fn Server(
 
                 const upstream = try self.selectUpstream(request);
                 if (!supportsGrpcBridgeUpstream(upstream)) return error.UnsupportedProtocol;
+                log.debug(
+                    "h2 bridge: conn={d} open downstream_stream={d} path={s} upstream={s}:{d} tls={any} proto={s} end_stream={any}",
+                    .{
+                        self.connection_ctx.connection_id,
+                        stream_id,
+                        request.path,
+                        upstream.host,
+                        upstream.port,
+                        upstream.tls,
+                        @tagName(upstream.http_protocol),
+                        end_stream,
+                    },
+                );
+
+                self.bridge_mutex.lockUncancelable(self.io);
+                defer self.bridge_mutex.unlock(self.io);
 
                 const opened = try self.bridge.openDownstreamStream(
                     self.io,
@@ -1171,10 +1250,17 @@ pub fn Server(
                 if (self.upstream_local_port == 0 and opened.connect.local_port > 0) {
                     self.upstream_local_port = opened.connect.local_port;
                 }
-
-                if (end_stream) {
-                    try self.drainUntilTargetCompletes(stream_id, writer);
-                }
+                log.debug(
+                    "h2 bridge: conn={d} opened downstream_stream={d} reused={any} dns_ns={d} tcp_ns={d} local_port={d}",
+                    .{
+                        self.connection_ctx.connection_id,
+                        stream_id,
+                        opened.connect.reused,
+                        opened.connect.dns_duration_ns,
+                        opened.connect.tcp_connect_duration_ns,
+                        opened.connect.local_port,
+                    },
+                );
             }
 
             pub fn handleH2Data(
@@ -1186,18 +1272,21 @@ pub fn Server(
             ) BridgeError!void {
                 assert(@intFromPtr(self) != 0);
                 assert(stream_id > 0);
+                _ = writer;
 
                 if (self.takePendingReset(stream_id)) |error_code_raw| {
                     _ = error_code_raw;
                     return error.UpstreamConnectionClosing;
                 }
 
+                self.bridge_mutex.lockUncancelable(self.io);
+                defer self.bridge_mutex.unlock(self.io);
                 _ = self.bridge.bindingForDownstream(stream_id) orelse return error.MissingBinding;
+                log.debug(
+                    "h2 bridge: conn={d} downstream data stream={d} bytes={d} end_stream={any}",
+                    .{ self.connection_ctx.connection_id, stream_id, payload.len, end_stream },
+                );
                 try self.bridge.sendDownstreamData(stream_id, payload, end_stream);
-
-                if (end_stream) {
-                    try self.drainUntilTargetCompletes(stream_id, writer);
-                }
             }
 
             pub fn handleH2StreamReset(self: *@This(), stream_id: u32, error_code_raw: u32) void {
@@ -1205,6 +1294,8 @@ pub fn Server(
                 if (stream_id == 0) return;
 
                 _ = self.takePendingReset(stream_id);
+                self.bridge_mutex.lockUncancelable(self.io);
+                defer self.bridge_mutex.unlock(self.io);
                 self.bridge.cancelDownstreamStream(stream_id, error_code_raw) catch |err| switch (err) {
                     error.BindingNotFound,
                     error.StreamNotFound,
@@ -1236,58 +1327,6 @@ pub fn Server(
                 return action_result;
             }
 
-            fn drainUntilTargetCompletes(
-                self: *@This(),
-                target_downstream_stream_id: u32,
-                writer_template: *h2_server.ResponseWriter,
-            ) BridgeError!void {
-                assert(@intFromPtr(self) != 0);
-                assert(target_downstream_stream_id > 0);
-
-                var actions: u32 = 0;
-                while (actions < config.H2_CLIENT_MAX_FRAME_COUNT) : (actions += 1) {
-                    const action = self.bridge.receiveForDownstream(target_downstream_stream_id) catch |err| switch (err) {
-                        error.ConnectionClosed,
-                        error.ConnectionClosing,
-                        error.ReadFailed,
-                        error.WriteFailed,
-                        => return error.UpstreamConnectionClosing,
-                        else => return err,
-                    };
-                    switch (action) {
-                        .none => continue,
-                        .response_headers => |headers| {
-                            try self.emitResponseHeaders(headers, writer_template);
-                            if (headers.downstream_stream_id == target_downstream_stream_id and headers.end_stream) return;
-                        },
-                        .response_data => |data| {
-                            try self.emitResponseData(data, writer_template);
-                            if (data.downstream_stream_id == target_downstream_stream_id and data.end_stream) return;
-                        },
-                        .response_trailers => |trailers| {
-                            try self.emitResponseTrailers(trailers, writer_template);
-                            if (trailers.downstream_stream_id == target_downstream_stream_id) return;
-                        },
-                        .stream_reset => |reset| {
-                            if (reset.downstream_stream_id == target_downstream_stream_id) {
-                                return error.UpstreamConnectionClosing;
-                            }
-                            self.notePendingReset(reset.downstream_stream_id, reset.error_code_raw);
-                            continue;
-                        },
-                        .connection_close => |connection_close| {
-                            const binding = self.bridge.bindingForDownstream(target_downstream_stream_id) orelse return error.UpstreamConnectionClosing;
-                            if (goawayAffectsActiveTargetStream(binding.upstream_stream_id, connection_close.goaway)) {
-                                return error.UpstreamConnectionClosing;
-                            }
-                            continue;
-                        },
-                    }
-                }
-
-                return error.FrameLimitExceeded;
-            }
-
             fn emitResponseHeaders(
                 self: *@This(),
                 action: serval_proxy.h2.bridge.ResponseHeadersAction,
@@ -1299,6 +1338,15 @@ pub fn Server(
                 if (action.end_stream) {
                     try mapGrpcStatusValidationError(serval_grpc.requireGrpcStatus(&action.response.headers));
                 }
+                log.debug(
+                    "h2 bridge: conn={d} response headers stream={d} end_stream={any} status={d}",
+                    .{
+                        self.connection_ctx.connection_id,
+                        action.downstream_stream_id,
+                        action.end_stream,
+                        action.response.status,
+                    },
+                );
 
                 var writer = streamWriterFor(writer_template, action.downstream_stream_id);
                 var headers_buf: [config.MAX_HEADERS]h2_server.Header = undefined;
@@ -1316,6 +1364,15 @@ pub fn Server(
                 assert(@intFromPtr(self) != 0);
                 assert(action.downstream_stream_id > 0);
 
+                log.debug(
+                    "h2 bridge: conn={d} response data stream={d} end_stream={any} bytes={d}",
+                    .{
+                        self.connection_ctx.connection_id,
+                        action.downstream_stream_id,
+                        action.end_stream,
+                        action.payload.len,
+                    },
+                );
                 var writer = streamWriterFor(writer_template, action.downstream_stream_id);
                 try writer.sendData(action.payload, action.end_stream);
                 self.response_bytes +|= action.payload.len;
@@ -1329,6 +1386,16 @@ pub fn Server(
                 assert(@intFromPtr(self) != 0);
                 assert(action.downstream_stream_id > 0);
 
+                log.debug(
+                    "h2 bridge: conn={d} response trailers stream={d} trailer_count={d} grpc_status_present={any} grpc_status_value={s}",
+                    .{
+                        self.connection_ctx.connection_id,
+                        action.downstream_stream_id,
+                        action.trailers.count,
+                        action.trailers.get("grpc-status") != null,
+                        action.trailers.get("grpc-status") orelse "<missing>",
+                    },
+                );
                 try mapGrpcStatusValidationError(serval_grpc.requireGrpcStatus(&action.trailers));
 
                 var writer = streamWriterFor(writer_template, action.downstream_stream_id);
@@ -1336,6 +1403,23 @@ pub fn Server(
                 const source_trailers = action.trailers.headers[0..action.trailers.count];
                 const h2_trailers = copyHeaders(source_trailers, &trailers_buf);
                 try writer.sendTrailers(h2_trailers);
+            }
+
+            fn emitDownstreamReset(
+                self: *@This(),
+                downstream_stream_id: u32,
+                error_code_raw: u32,
+                writer_template: *h2_server.ResponseWriter,
+            ) BridgeError!void {
+                assert(@intFromPtr(self) != 0);
+                assert(downstream_stream_id > 0);
+
+                log.debug(
+                    "h2 bridge: conn={d} emit downstream reset stream={d} error_code=0x{x}",
+                    .{ self.connection_ctx.connection_id, downstream_stream_id, error_code_raw },
+                );
+                var writer = streamWriterFor(writer_template, downstream_stream_id);
+                try writer.sendReset(error_code_raw);
             }
 
             fn mapGrpcStatusValidationError(result: serval_grpc.MetadataError!void) BridgeError!void {
@@ -1385,6 +1469,294 @@ pub fn Server(
 
                 return out[0..source.len];
             }
+
+            fn upstreamReaderTask(self: *@This()) Io.Cancelable!void {
+                assert(@intFromPtr(self) != 0);
+                while (!self.upstream_reader_stop) {
+                    try std.Io.checkCancel(self.io);
+
+                    const action = self.receiveAnyUpstreamAction() catch |err| switch (err) {
+                        error.BindingNotFound,
+                        error.SessionNotFound,
+                        error.WouldBlock,
+                        => {
+                            try std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(upstream_reader_idle_ms), .awake);
+                            continue;
+                        },
+                        error.ConnectionClosed,
+                        error.ConnectionClosing,
+                        error.ReadFailed,
+                        error.WriteFailed,
+                        => {
+                            try std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(upstream_reader_idle_ms), .awake);
+                            continue;
+                        },
+                        else => {
+                            try std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(upstream_reader_idle_ms), .awake);
+                            continue;
+                        },
+                    };
+
+                    self.dispatchUpstreamAction(action);
+                }
+            }
+
+            fn receiveAnyUpstreamAction(self: *@This()) BridgeError!serval_proxy.h2.bridge.ReceiveAction {
+                assert(@intFromPtr(self) != 0);
+
+                self.bridge_mutex.lockUncancelable(self.io);
+                defer self.bridge_mutex.unlock(self.io);
+
+                if (self.bridge.activeBindingCount() == 0) return error.WouldBlock;
+
+                const timeout: Io.Timeout = .{ .duration = .{
+                    .raw = Io.Duration.fromMilliseconds(upstream_read_timeout_ms),
+                    .clock = .awake,
+                } };
+
+                const binding_table = &self.bridge.binding_table;
+                const slot_count: u16 = @intCast(binding_table.slots.len);
+                assert(slot_count > 0);
+
+                var scanned: u16 = 0;
+                while (scanned < slot_count) : (scanned += 1) {
+                    const cursor: u16 = @mod(self.upstream_reader_scan_cursor + scanned, slot_count);
+                    const index: usize = @intCast(cursor);
+                    if (!binding_table.slots[index].used) continue;
+                    const binding = binding_table.slots[index].binding;
+                    self.upstream_reader_scan_cursor = @mod(cursor + 1, slot_count);
+                    log.debug(
+                        "h2 bridge: conn={d} waiting upstream action downstream_stream={d} upstream_stream={d} idx={d} gen={d}",
+                        .{
+                            self.connection_ctx.connection_id,
+                            binding.downstream_stream_id,
+                            binding.upstream_stream_id,
+                            binding.upstream_index,
+                            binding.upstream_session_generation,
+                        },
+                    );
+                    return self.bridge.receiveForDownstream(self.io, timeout, binding.downstream_stream_id) catch |err| switch (err) {
+                        error.BindingNotFound => continue,
+                        error.SessionNotFound => {
+                            _ = self.bridge.binding_table.removeByDownstream(binding.downstream_stream_id) catch |remove_err| switch (remove_err) {
+                                error.BindingNotFound => {},
+                                else => return remove_err,
+                            };
+                            continue;
+                        },
+                        error.WouldBlock,
+                        error.ReadFailed,
+                        => continue,
+                        else => return err,
+                    };
+                }
+
+                return error.WouldBlock;
+            }
+
+            fn dispatchUpstreamAction(self: *@This(), action: serval_proxy.h2.bridge.ReceiveAction) void {
+                assert(@intFromPtr(self) != 0);
+
+                const connection_mutex = self.connection_mutex orelse return;
+                const writer_template = self.writer_template orelse return;
+
+                connection_mutex.lockUncancelable(self.io);
+                defer connection_mutex.unlock(self.io);
+                log.debug(
+                    "h2 bridge: conn={d} dispatch upstream action={s}",
+                    .{ self.connection_ctx.connection_id, @tagName(action) },
+                );
+
+                switch (action) {
+                    .none => {},
+                    .response_headers => |headers| {
+                        self.emitResponseHeaders(headers, writer_template) catch |err| switch (err) {
+                            error.UpstreamConnectionClosing,
+                            error.ConnectionClosing,
+                            error.ConnectionClosed,
+                            error.ReadFailed,
+                            error.WriteFailed,
+                            error.FrameLimitExceeded,
+                            error.MissingGrpcStatus,
+                            error.InvalidGrpcStatus,
+                            => {
+                                log.debug(
+                                    "h2 bridge: conn={d} response headers failed stream={d} err={s}",
+                                    .{
+                                        self.connection_ctx.connection_id,
+                                        headers.downstream_stream_id,
+                                        @errorName(err),
+                                    },
+                                );
+                                switch (err) {
+                                    error.UpstreamConnectionClosing,
+                                    error.ConnectionClosing,
+                                    error.ConnectionClosed,
+                                    error.ReadFailed,
+                                    error.WriteFailed,
+                                    error.FrameLimitExceeded,
+                                    => self.emitOrNotePendingReset(headers.downstream_stream_id, @intFromEnum(serval_h2.ErrorCode.cancel), writer_template),
+                                    error.MissingGrpcStatus,
+                                    error.InvalidGrpcStatus,
+                                    => self.emitOrNotePendingReset(headers.downstream_stream_id, @intFromEnum(serval_h2.ErrorCode.protocol_error), writer_template),
+                                    else => unreachable,
+                                }
+                            },
+                            else => {
+                                log.debug(
+                                    "h2 bridge: conn={d} response headers failed stream={d} err={s}",
+                                    .{
+                                        self.connection_ctx.connection_id,
+                                        headers.downstream_stream_id,
+                                        @errorName(err),
+                                    },
+                                );
+                                self.emitOrNotePendingReset(headers.downstream_stream_id, @intFromEnum(serval_h2.ErrorCode.internal_error), writer_template);
+                            },
+                        };
+                    },
+                    .response_data => |data| {
+                        self.emitResponseData(data, writer_template) catch |err| switch (err) {
+                            error.UpstreamConnectionClosing,
+                            error.ConnectionClosing,
+                            error.ConnectionClosed,
+                            error.ReadFailed,
+                            error.WriteFailed,
+                            error.FrameLimitExceeded,
+                            => {
+                                log.debug(
+                                    "h2 bridge: conn={d} response data failed stream={d} err={s}",
+                                    .{
+                                        self.connection_ctx.connection_id,
+                                        data.downstream_stream_id,
+                                        @errorName(err),
+                                    },
+                                );
+                                self.emitOrNotePendingReset(data.downstream_stream_id, @intFromEnum(serval_h2.ErrorCode.cancel), writer_template);
+                            },
+                            else => {
+                                log.debug(
+                                    "h2 bridge: conn={d} response data failed stream={d} err={s}",
+                                    .{
+                                        self.connection_ctx.connection_id,
+                                        data.downstream_stream_id,
+                                        @errorName(err),
+                                    },
+                                );
+                                self.emitOrNotePendingReset(data.downstream_stream_id, @intFromEnum(serval_h2.ErrorCode.internal_error), writer_template);
+                            },
+                        };
+                    },
+                    .response_trailers => |trailers| {
+                        self.emitResponseTrailers(trailers, writer_template) catch |err| switch (err) {
+                            error.MissingGrpcStatus,
+                            error.InvalidGrpcStatus,
+                            => {
+                                log.debug(
+                                    "h2 bridge: conn={d} response trailers failed stream={d} err={s}",
+                                    .{
+                                        self.connection_ctx.connection_id,
+                                        trailers.downstream_stream_id,
+                                        @errorName(err),
+                                    },
+                                );
+                                self.emitOrNotePendingReset(trailers.downstream_stream_id, @intFromEnum(serval_h2.ErrorCode.protocol_error), writer_template);
+                            },
+                            else => {
+                                log.debug(
+                                    "h2 bridge: conn={d} response trailers failed stream={d} err={s}",
+                                    .{
+                                        self.connection_ctx.connection_id,
+                                        trailers.downstream_stream_id,
+                                        @errorName(err),
+                                    },
+                                );
+                                self.emitOrNotePendingReset(trailers.downstream_stream_id, @intFromEnum(serval_h2.ErrorCode.internal_error), writer_template);
+                            },
+                        };
+                    },
+                    .stream_reset => |reset| {
+                        self.emitOrNotePendingReset(reset.downstream_stream_id, reset.error_code_raw, writer_template);
+                    },
+                    .connection_close => |close| {
+                        self.handleUpstreamConnectionClose(close, writer_template);
+                    },
+                }
+            }
+
+            fn emitOrNotePendingReset(
+                self: *@This(),
+                downstream_stream_id: u32,
+                error_code_raw: u32,
+                writer_template: *h2_server.ResponseWriter,
+            ) void {
+                assert(@intFromPtr(self) != 0);
+                assert(downstream_stream_id > 0);
+                assert(@intFromPtr(writer_template) != 0);
+
+                self.emitDownstreamReset(downstream_stream_id, error_code_raw, writer_template) catch {
+                    log.debug(
+                        "h2 bridge: conn={d} defer downstream reset stream={d} error_code=0x{x}",
+                        .{ self.connection_ctx.connection_id, downstream_stream_id, error_code_raw },
+                    );
+                    self.notePendingReset(downstream_stream_id, error_code_raw);
+                };
+            }
+
+            fn handleUpstreamConnectionClose(
+                self: *@This(),
+                close: serval_proxy.h2.bridge.ConnectionCloseAction,
+                writer_template: *h2_server.ResponseWriter,
+            ) void {
+                assert(@intFromPtr(self) != 0);
+
+                var downstream_ids: [config.H2_MAX_CONCURRENT_STREAMS]u32 = [_]u32{0} ** config.H2_MAX_CONCURRENT_STREAMS;
+                var downstream_count: u16 = 0;
+
+                {
+                    self.bridge_mutex.lockUncancelable(self.io);
+                    defer self.bridge_mutex.unlock(self.io);
+
+                    var index: usize = 0;
+                    while (index < self.bridge.binding_table.slots.len) : (index += 1) {
+                        const slot = self.bridge.binding_table.slots[index];
+                        if (!slot.used) continue;
+
+                        const binding = slot.binding;
+                        if (binding.upstream_index != close.upstream_index) continue;
+                        if (binding.upstream_session_generation != close.upstream_session_generation) continue;
+                        if (!goawayAffectsActiveTargetStream(binding.upstream_stream_id, close.goaway)) continue;
+                        if (downstream_count >= downstream_ids.len) break;
+
+                        downstream_ids[downstream_count] = binding.downstream_stream_id;
+                        downstream_count += 1;
+                        _ = self.bridge.binding_table.removeByDownstream(binding.downstream_stream_id) catch continue;
+                    }
+                }
+
+                const reset_error_code_raw: u32 = if (close.goaway.error_code_raw == @intFromEnum(serval_h2.ErrorCode.no_error))
+                    @intFromEnum(serval_h2.ErrorCode.cancel)
+                else
+                    close.goaway.error_code_raw;
+
+                log.debug(
+                    "h2 bridge: conn={d} upstream close last_stream_id={d} error_code=0x{x} affected_streams={d}",
+                    .{
+                        self.connection_ctx.connection_id,
+                        close.goaway.last_stream_id,
+                        close.goaway.error_code_raw,
+                        downstream_count,
+                    },
+                );
+
+                var emit_index: u16 = 0;
+                while (emit_index < downstream_count) : (emit_index += 1) {
+                    const downstream_stream_id = downstream_ids[emit_index];
+                    self.emitDownstreamReset(downstream_stream_id, reset_error_code_raw, writer_template) catch {
+                        self.notePendingReset(downstream_stream_id, reset_error_code_raw);
+                    };
+                }
+            }
         };
 
         fn forwardGrpcH2cWithBridge(
@@ -1431,14 +1803,21 @@ pub fn Server(
                 GrpcH2cBridgeHandler,
                 &bridge_handler,
                 @intCast(stream.socket.handle),
+                io,
                 connection_id,
                 initial_client_bytes,
                 .{ .local_settings_already_sent = local_settings_already_sent },
-            ) catch |err| switch (err) {
-                error.ConnectionClosed => {},
-                error.ReadFailed => return forwarder_mod.ForwardError.RecvFailed,
-                error.WriteFailed => return forwarder_mod.ForwardError.SendFailed,
-                else => return forwarder_mod.ForwardError.InvalidResponse,
+            ) catch |err| {
+                log.warn("server: conn={d} grpc h2 bridge driver failed: {s}", .{
+                    connection_id,
+                    @errorName(err),
+                });
+                switch (err) {
+                    error.ConnectionClosed => {},
+                    error.ReadFailed => return forwarder_mod.ForwardError.RecvFailed,
+                    error.WriteFailed => return forwarder_mod.ForwardError.SendFailed,
+                    else => return forwarder_mod.ForwardError.InvalidResponse,
+                }
             };
             const end_ns = time.monotonicNanos();
 
@@ -1521,6 +1900,7 @@ pub fn Server(
                 GrpcH2cBridgeHandler,
                 &bridge_handler,
                 @intCast(stream.socket.handle),
+                io,
                 connection_id,
                 &parser.request,
                 settings_payload,
@@ -1554,6 +1934,7 @@ pub fn Server(
             tracer: *Tracer,
             ctx: *const Context,
             maybe_tls: ?*TLSStream,
+            io: Io,
             connection_id: u64,
             frontend_mode: config.TlsH2FrontendMode,
         ) bool {
@@ -1585,6 +1966,7 @@ pub fn Server(
                 @TypeOf(telemetry_handler),
                 &telemetry_handler,
                 tls_stream,
+                io,
                 connection_id,
             ) catch |err| switch (err) {
                 error.ConnectionClosed => {},
@@ -1599,9 +1981,11 @@ pub fn Server(
             tracer: *Tracer,
             ctx: *const Context,
             maybe_tls: ?*const TLSStream,
+            io: Io,
             stream: Io.net.Stream,
-            recv_buf: []const u8,
-            buffer_len: usize,
+            plain_reader: ?*Io.net.Stream.Reader,
+            recv_buf: []u8,
+            buffer_len: *usize,
             connection_id: u64,
         ) bool {
             assert(@intFromPtr(handler) != 0);
@@ -1611,14 +1995,16 @@ pub fn Server(
             assert(recv_buf.len >= H2C_INITIAL_READ_BUFFER_SIZE_BYTES);
 
             if (maybe_tls != null) return false;
-            if (buffer_len == 0) return false;
+            if (buffer_len.* == 0) return false;
             if (comptime !@hasDecl(Handler, "handleH2Headers")) return false;
             if (comptime !@hasDecl(Handler, "handleH2Data")) return false;
 
-            const initial_bytes = recv_buf[0..buffer_len];
+            const initial_bytes = recv_buf[0..buffer_len.*];
             const looks_h2_prefix = serval_h2.looksLikeClientConnectionPrefacePrefix(initial_bytes);
             const looks_h2_attempt = std.mem.startsWith(u8, initial_bytes, "PRI");
             if (!looks_h2_prefix and !looks_h2_attempt) return false;
+            var handoff_buf: [CONNECTION_RECV_BUFFER_SIZE_BYTES + PLAIN_STREAM_READER_BUFFER_SIZE_BYTES]u8 = undefined;
+            const handoff_bytes = buildH2HandoffBytes(plain_reader, recv_buf[0..buffer_len.*], &handoff_buf);
 
             log.debug("server: conn={d} dispatching prior-knowledge h2c to terminated h2 driver", .{connection_id});
 
@@ -1634,8 +2020,9 @@ pub fn Server(
                 @TypeOf(telemetry_handler),
                 &telemetry_handler,
                 @intCast(stream.socket.handle),
+                io,
                 connection_id,
-                recv_buf[0..buffer_len],
+                handoff_bytes,
             ) catch |err| switch (err) {
                 error.ConnectionClosed => {},
                 else => log.warn("server: conn={d} terminated h2 driver failed: {s}", .{ connection_id, @errorName(err) }),
@@ -1713,6 +2100,7 @@ pub fn Server(
                 @TypeOf(telemetry_handler),
                 &telemetry_handler,
                 @intCast(stream.socket.handle),
+                io.*,
                 connection_id,
                 &parser.request,
                 settings_payload,
@@ -1752,6 +2140,7 @@ pub fn Server(
             maybe_tls: ?*TLSStream,
             io: *Io,
             stream: Io.net.Stream,
+            plain_reader: ?*Io.net.Stream.Reader,
             ctx: *Context,
             recv_buf: []u8,
             buffer_len: *usize,
@@ -1761,7 +2150,6 @@ pub fn Server(
 
             if (buffer_len.* == 0) return false;
             if (!serval_h2.looksLikeClientConnectionPrefacePrefix(recv_buf[0..buffer_len.*])) return false;
-
             log.debug(
                 "server: conn={d} detected grpc prior-knowledge preface bytes={d} tls_frontend={}",
                 .{ connection_id, buffer_len.*, maybe_tls != null },
@@ -1788,7 +2176,7 @@ pub fn Server(
                             sendH2GoAway(maybe_tls, io, stream, 0, H2_ERROR_PROTOCOL);
                             return true;
                         }
-                        const n = connectionRead(maybe_tls, stream, recv_buf[buffer_len.*..], connection_id) orelse return true;
+                        const n = connectionRead(maybe_tls, io, stream, plain_reader, recv_buf[buffer_len.*..], connection_id) orelse return true;
                         buffer_len.* += n;
                         continue;
                     },
@@ -1860,7 +2248,10 @@ pub fn Server(
                     io.*,
                     stream,
                     ctx,
-                    recv_buf[0..buffer_len.*],
+                    blk: {
+                        var handoff_buf: [CONNECTION_RECV_BUFFER_SIZE_BYTES + PLAIN_STREAM_READER_BUFFER_SIZE_BYTES]u8 = undefined;
+                        break :blk buildH2HandoffBytes(plain_reader, recv_buf[0..buffer_len.*], &handoff_buf);
+                    },
                     connection_id,
                     local_settings_already_sent,
                 )
@@ -2009,6 +2400,9 @@ pub fn Server(
             // Get mutable pointer to TLS stream for I/O operations (if TLS is active)
             // TigerStyle: Mutable pointer needed for forwarder to write TLS responses.
             const maybe_tls_ptr: ?*TLSStream = if (maybe_tls_stream) |*tls| tls else null;
+            var plain_reader_buf: [1]u8 = undefined;
+            var plain_stream_reader = stream.reader(io_mut, &plain_reader_buf);
+            const maybe_plain_reader: ?*Io.net.Stream.Reader = if (maybe_tls_ptr == null) &plain_stream_reader else null;
 
             const has_terminated_h2_handler = comptime @hasDecl(Handler, "handleH2Headers") and @hasDecl(Handler, "handleH2Data");
             switch (frontend.selectTlsAlpnDispatchAction(
@@ -2017,6 +2411,13 @@ pub fn Server(
                 has_terminated_h2_handler,
             )) {
                 .generic_h2 => {
+                    if (cfg.tls_h2_frontend_mode != .generic) {
+                        log.warn(
+                            "server: conn={d} ALPN h2 generic frontend fallback active mode={s} has_terminated_h2_handler={} (protocol-safety override)",
+                            .{ connection_id, @tagName(cfg.tls_h2_frontend_mode), has_terminated_h2_handler },
+                        );
+                    }
+
                     if (frontend.tryServeTlsAlpnConnection(
                         Handler,
                         Pool,
@@ -2038,6 +2439,7 @@ pub fn Server(
                         tracer,
                         &ctx,
                         maybe_tls_ptr,
+                        io_mut,
                         connection_id,
                         cfg.tls_h2_frontend_mode,
                     )) return;
@@ -2080,7 +2482,7 @@ pub fn Server(
                 log.debug("server: conn={d} waiting for request handler_start={d}", .{ connection_id, @as(u64, @intCast(handler_start_ns)) });
                 const read_start_ns = realtimeNanos();
                 if (buffer_offset >= buffer_len) {
-                    const n = connectionRead(maybe_tls_ptr, stream, &recv_buf, connection_id) orelse return;
+                    const n = connectionRead(maybe_tls_ptr, &io_mut, stream, maybe_plain_reader, &recv_buf, connection_id) orelse return;
                     buffer_len = n;
                     buffer_offset = 0;
                 }
@@ -2091,9 +2493,11 @@ pub fn Server(
                     tracer,
                     &ctx,
                     maybe_tls_ptr,
+                    io_mut,
                     stream,
+                    maybe_plain_reader,
                     recv_buf[0..],
-                    buffer_len,
+                    &buffer_len,
                     connection_id,
                 )) return;
 
@@ -2105,6 +2509,7 @@ pub fn Server(
                     maybe_tls_ptr,
                     &io_mut,
                     stream,
+                    maybe_plain_reader,
                     &ctx,
                     recv_buf[0..],
                     &buffer_len,
@@ -2185,7 +2590,9 @@ pub fn Server(
                     // Set up BodyReadContext for the read function
                     var body_read_ctx = BodyReadContext{
                         .maybe_tls = maybe_tls_ptr,
+                        .io = &io_mut,
                         .stream = stream,
+                        .plain_reader = maybe_plain_reader,
                         .conn_id = connection_id,
                     };
 

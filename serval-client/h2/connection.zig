@@ -6,9 +6,11 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const Io = std.Io;
 const posix = std.posix;
 
 const config = @import("serval-core").config;
+const log = @import("serval-core").log.scoped(.client_h2_conn);
 const types = @import("serval-core").types;
 const h2 = @import("serval-h2");
 const serval_socket = @import("serval-socket");
@@ -31,6 +33,7 @@ pub const Error = error{
     ReadFailed,
     WriteFailed,
     ConnectionClosed,
+    WouldBlock,
     FrameLimitExceeded,
     SendWindowExhausted,
     UnexpectedHandshakeFrame,
@@ -147,7 +150,23 @@ pub const ClientConnection = struct {
         var frames: u32 = 0;
 
         while (sent < payload_len and frames < config.H2_CLIENT_MAX_FRAME_COUNT) : (frames += 1) {
-            const stream = self.runtime.state.getStream(stream_id) orelse return error.StreamNotFound;
+            const stream = self.runtime.state.getStream(stream_id) orelse {
+                log.warn(
+                    "client h2 connection: missing stream in sendRequestData stream={d} sent={d}/{d} frames={d} active={d} last_local={d} last_remote={d} goaway={any} last_stream_id={d}",
+                    .{
+                        stream_id,
+                        sent,
+                        payload_len,
+                        frames,
+                        self.runtime.state.streams.active_count,
+                        self.runtime.state.streams.last_local_stream_id,
+                        self.runtime.state.streams.last_remote_stream_id,
+                        self.runtime.state.goaway_received,
+                        self.runtime.state.peer_goaway_last_stream_id,
+                    },
+                );
+                return error.StreamNotFound;
+            };
             if (self.runtime.state.goaway_received and stream_id > self.runtime.state.peer_goaway_last_stream_id) {
                 return error.ConnectionClosing;
             }
@@ -194,11 +213,19 @@ pub const ClientConnection = struct {
     }
 
     pub fn receiveAction(self: *ClientConnection) Error!runtime_mod.ReceiveAction {
+        return self.receiveActionTimeout(null, .none);
+    }
+
+    pub fn receiveActionIo(self: *ClientConnection, io: Io) Error!runtime_mod.ReceiveAction {
+        return self.receiveActionTimeout(io, .none);
+    }
+
+    pub fn receiveActionTimeout(self: *ClientConnection, maybe_io: ?Io, timeout: Io.Timeout) Error!runtime_mod.ReceiveAction {
         assert(@intFromPtr(self) != 0);
 
         self.finalizePendingFrame();
         if (self.frame_count >= config.H2_CLIENT_MAX_FRAME_COUNT) return error.FrameLimitExceeded;
-        if (!try self.ensureFrame()) return error.ConnectionClosed;
+        if (!try self.ensureFrame(maybe_io, timeout)) return error.ConnectionClosed;
 
         const header = try h2.parseFrameHeader(self.recv_buf[0..h2.frame_header_size_bytes]);
         const frame_len: usize = @as(usize, h2.frame_header_size_bytes) + @as(usize, header.length);
@@ -212,11 +239,23 @@ pub const ClientConnection = struct {
     }
 
     pub fn receiveActionHandlingControl(self: *ClientConnection) Error!runtime_mod.ReceiveAction {
+        return self.receiveActionHandlingControlTimeout(null, .none);
+    }
+
+    pub fn receiveActionHandlingControlIo(self: *ClientConnection, io: Io) Error!runtime_mod.ReceiveAction {
+        return self.receiveActionHandlingControlTimeout(io, .none);
+    }
+
+    pub fn receiveActionHandlingControlTimeout(
+        self: *ClientConnection,
+        maybe_io: ?Io,
+        timeout: Io.Timeout,
+    ) Error!runtime_mod.ReceiveAction {
         assert(@intFromPtr(self) != 0);
 
         var frames: u32 = 0;
         while (frames < config.H2_CLIENT_MAX_FRAME_COUNT) : (frames += 1) {
-            const action = try self.receiveAction();
+            const action = try self.receiveActionTimeout(maybe_io, timeout);
             if (try self.handleControlAction(action)) continue;
             return action;
         }
@@ -246,41 +285,39 @@ pub const ClientConnection = struct {
         return true;
     }
 
-    fn ensureFrame(self: *ClientConnection) Error!bool {
+    fn ensureFrame(self: *ClientConnection, maybe_io: ?Io, timeout: Io.Timeout) Error!bool {
         assert(@intFromPtr(self) != 0);
 
         if (self.recv_len == 0) {
-            const n = try self.readIntoBuffer();
+            const n = try self.readIntoBuffer(maybe_io, timeout);
             if (n == 0) return false;
         }
 
-        try self.fillBuffer(h2.frame_header_size_bytes);
+        try self.fillBuffer(maybe_io, timeout, h2.frame_header_size_bytes);
         const header = try h2.parseFrameHeader(self.recv_buf[0..h2.frame_header_size_bytes]);
         const frame_len: usize = @as(usize, h2.frame_header_size_bytes) + @as(usize, header.length);
-        try self.fillBuffer(frame_len);
+        try self.fillBuffer(maybe_io, timeout, frame_len);
         return true;
     }
 
-    fn fillBuffer(self: *ClientConnection, needed_len: usize) Error!void {
+    fn fillBuffer(self: *ClientConnection, maybe_io: ?Io, timeout: Io.Timeout, needed_len: usize) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(needed_len <= self.recv_buf.len);
 
         var reads: u32 = 0;
         while (self.recv_len < needed_len and reads < self.recv_buf.len) : (reads += 1) {
-            const n = try self.readIntoBuffer();
+            const n = try self.readIntoBuffer(maybe_io, timeout);
             if (n == 0) return error.ConnectionClosed;
         }
 
         if (self.recv_len < needed_len) return error.ReadFailed;
     }
 
-    fn readIntoBuffer(self: *ClientConnection) Error!usize {
+    fn readIntoBuffer(self: *ClientConnection, maybe_io: ?Io, timeout: Io.Timeout) Error!usize {
         assert(@intFromPtr(self) != 0);
         assert(self.recv_len <= self.recv_buf.len);
 
-        const n = self.socket.read(self.recv_buf[self.recv_len..]) catch |err| {
-            return mapReadError(err);
-        };
+        const n = try readSome(self.socket, maybe_io, timeout, self.recv_buf[self.recv_len..]);
         if (n == 0) return 0;
 
         self.recv_len += n;
@@ -317,6 +354,69 @@ pub const ClientConnection = struct {
         };
     }
 };
+
+fn readSome(socket: *Socket, maybe_io: ?Io, timeout: Io.Timeout, out: []u8) Error!u32 {
+    assert(@intFromPtr(socket) != 0);
+    assert(out.len > 0);
+
+    return switch (socket.*) {
+        .plain => |*plain| blk: {
+            if (maybe_io) |io| {
+                try waitUntilReadable(plain.fd, io, timeout);
+            }
+            const n = plain.read(out) catch |err| return mapReadError(err);
+            break :blk n;
+        },
+        .tls => |*tls_socket| blk: {
+            if (tls_socket.has_pending_read()) {
+                const n = tls_socket.stream.read(out) catch |err| switch (err) {
+                    error.WouldBlock => return error.WouldBlock,
+                    else => return error.ReadFailed,
+                };
+                break :blk n;
+            }
+
+            if (maybe_io) |io| {
+                try waitUntilReadable(tls_socket.fd, io, timeout);
+            }
+            const n = tls_socket.stream.read(out) catch |err| switch (err) {
+                error.WouldBlock => return error.WouldBlock,
+                error.ConnectionReset => return error.ConnectionClosed,
+                else => return error.ReadFailed,
+            };
+            break :blk n;
+        },
+    };
+}
+
+fn waitUntilReadable(fd: i32, io: Io, timeout: Io.Timeout) Error!void {
+    assert(fd >= 0);
+
+    var messages: [1]Io.net.IncomingMessage = .{Io.net.IncomingMessage.init};
+    var peek_buf: [1]u8 = undefined;
+    const maybe_err, _ = rawStreamForFd(fd).socket.receiveManyTimeout(
+        io,
+        &messages,
+        &peek_buf,
+        .{ .peek = true },
+        timeout,
+    );
+    if (maybe_err) |err| switch (err) {
+        error.Timeout => return error.WouldBlock,
+        error.ConnectionResetByPeer => return error.ConnectionClosed,
+        else => return error.ReadFailed,
+    };
+}
+
+fn rawStreamForFd(fd: i32) Io.net.Stream {
+    assert(fd >= 0);
+    return .{
+        .socket = .{
+            .handle = fd,
+            .address = .{ .ip4 = .unspecified(0) },
+        },
+    };
+}
 
 fn mapReadError(err: SocketError) Error {
     return switch (err) {

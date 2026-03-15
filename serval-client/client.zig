@@ -13,6 +13,7 @@ const assert = std.debug.assert;
 const posix = std.posix;
 
 const serval_core = @import("serval-core");
+const closeFd = serval_core.closeFd;
 const types = serval_core.types;
 const config = serval_core.config;
 const time = serval_core.time;
@@ -226,7 +227,7 @@ pub const Client = struct {
             // TLS required - client_ctx must be set
             const ctx = self.client_ctx orelse {
                 // No TLS context - cannot connect to TLS upstream
-                posix.close(fd);
+                closeFd(fd);
                 return ClientError.TlsHandshakeFailed;
             };
 
@@ -250,7 +251,7 @@ pub const Client = struct {
                 self.enable_ktls,
                 desired_alpn,
             ) catch {
-                posix.close(fd);
+                closeFd(fd);
                 return ClientError.TlsHandshakeFailed;
             };
 

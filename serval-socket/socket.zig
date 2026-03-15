@@ -7,6 +7,8 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const posix = std.posix;
+const serval_core = @import("serval-core");
+const closeFd = serval_core.closeFd;
 
 pub const tls_socket = @import("tls_socket.zig");
 
@@ -80,7 +82,7 @@ pub const PlainSocket = struct {
     /// TigerStyle: Explicit close, caller owns fd.
     pub fn close(self: *PlainSocket) void {
         assert(self.fd >= 0); // S1: precondition
-        posix.close(self.fd);
+        closeFd(self.fd);
         self.fd = -1; // Mark as closed
     }
 };

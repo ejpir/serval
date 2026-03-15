@@ -10,6 +10,7 @@ const assert = std.debug.assert;
 const serval_core = @import("serval-core");
 const log = serval_core.log.scoped(.tls);
 const config = serval_core.config;
+const posix = std.posix;
 
 // Opaque types
 pub const SSL_CTX = opaque {};
@@ -82,6 +83,7 @@ pub extern fn SSL_is_init_finished(ssl: *const SSL) c_int;
 pub extern fn SSL_read(ssl: *SSL, buf: [*]u8, num: c_int) c_int;
 pub extern fn SSL_write(ssl: *SSL, buf: [*]const u8, num: c_int) c_int;
 pub extern fn SSL_shutdown(ssl: *SSL) c_int;
+pub extern fn SSL_set_quiet_shutdown(ssl: *SSL, mode: c_int) void;
 pub extern fn SSL_get_error(ssl: *const SSL, ret: c_int) c_int;
 pub extern fn SSL_pending(ssl: *const SSL) c_int;
 pub extern fn SSL_get_version(ssl: *const SSL) ?[*:0]const u8;
@@ -218,7 +220,18 @@ pub extern fn ERR_clear_error() void;
 
 // High-level wrappers
 pub fn init() void {
+    installSigpipeIgnore();
     _ = OPENSSL_init_ssl(0, null);
+}
+
+fn installSigpipeIgnore() void {
+    const sig_ign: ?posix.Sigaction.handler_fn = @ptrFromInt(1);
+    const action = posix.Sigaction{
+        .handler = .{ .handler = sig_ign },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.PIPE, &action, null);
 }
 
 pub fn createClientCtx() !*SSL_CTX {
@@ -288,6 +301,7 @@ pub fn createServerCtxFromPemFiles(
 }
 
 pub const SSL_TLSEXT_ERR_OK: c_int = 0;
+pub const SSL_TLSEXT_ERR_ALERT_FATAL: c_int = 2;
 pub const SSL_TLSEXT_ERR_NOACK: c_int = 3;
 
 const alpn_protocol_h2: []const u8 = "h2";
@@ -372,6 +386,18 @@ fn serverAlpnSelectCb(
                 outlen.* = @intCast(alpn_protocol_http11.len);
                 return SSL_TLSEXT_ERR_OK;
             }
+        },
+        .http11_only => {
+            if (supports_http11) {
+                out.* = @ptrCast(alpn_protocol_http11.ptr);
+                outlen.* = @intCast(alpn_protocol_http11.len);
+                return SSL_TLSEXT_ERR_OK;
+            }
+            // Reject h2-only clients with TLS no_application_protocol alert.
+            // This causes the TLS handshake to fail immediately, so clients
+            // fall back to alternative transports (e.g., WebSocket) quickly
+            // rather than holding idle connections.
+            return SSL_TLSEXT_ERR_ALERT_FATAL;
         },
     }
 
@@ -529,4 +555,46 @@ test "setServerAlpnMixedOfferPolicy updates global ALPN policy" {
 
     setServerAlpnMixedOfferPolicy(.prefer_http11);
     try std.testing.expectEqual(AlpnMixedOfferPolicy.prefer_http11, getServerAlpnMixedOfferPolicy());
+}
+
+test "ALPN http11_only selects http/1.1 when client offers both" {
+    var policy: AlpnMixedOfferPolicy = .http11_only;
+    var selected_ptr: ?[*]const u8 = null;
+    var selected_len: u8 = 0;
+
+    // Wire format: [len][proto][len][proto]
+    const wire = [_]u8{2} ++ "h2" ++ [_]u8{8} ++ "http/1.1";
+
+    const rc = serverAlpnSelectCb(
+        @ptrFromInt(1),
+        &selected_ptr,
+        &selected_len,
+        wire[0..].ptr,
+        @intCast(wire.len),
+        @ptrCast(&policy),
+    );
+
+    try std.testing.expectEqual(SSL_TLSEXT_ERR_OK, rc);
+    try std.testing.expect(selected_ptr != null);
+    try std.testing.expectEqualStrings(alpn_protocol_http11, selected_ptr.?[0..selected_len]);
+}
+
+test "ALPN http11_only rejects h2-only client with fatal alert" {
+    var policy: AlpnMixedOfferPolicy = .http11_only;
+    var selected_ptr: ?[*]const u8 = null;
+    var selected_len: u8 = 0;
+
+    // Wire format: h2 only
+    const wire = [_]u8{2} ++ "h2";
+
+    const rc = serverAlpnSelectCb(
+        @ptrFromInt(1),
+        &selected_ptr,
+        &selected_len,
+        wire[0..].ptr,
+        @intCast(wire.len),
+        @ptrCast(&policy),
+    );
+
+    try std.testing.expectEqual(SSL_TLSEXT_ERR_ALERT_FATAL, rc);
 }

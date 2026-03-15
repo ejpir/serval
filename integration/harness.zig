@@ -111,10 +111,6 @@ const POST_LARGE_MAX_SEND_WOULDBLOCK: u32 = 120_000;
 /// Sleep interval after WouldBlock in large POST loops.
 const POST_LARGE_RETRY_SLEEP_NS: u64 = 1_000_000;
 
-/// Maximum chunks for chunked transfer encoding decoding (bounded loop).
-/// TigerStyle C1: Named constant for loop bound.
-const MAX_CHUNKS: u32 = 100;
-
 /// Maximum decoded body size for chunked encoding.
 /// TigerStyle C1: Named constant with unit suffix.
 const MAX_DECODED_BODY_SIZE_BYTES: u32 = 4096;
@@ -125,6 +121,113 @@ const CRLF_LEN_BYTES: u32 = 2;
 
 /// IPv4 loopback address in network byte order.
 const LOOPBACK_IPV4_BE: u32 = 0x7F000001;
+
+const LargeSendError = error{
+    SendTimeout,
+    ConnectionReset,
+    SendFailed,
+};
+
+const LargeBodySendState = struct {
+    sock: posix.socket_t,
+    body: []const u8,
+    err: ?LargeSendError = null,
+};
+
+const GeneratedBodySendState = struct {
+    sock: posix.socket_t,
+    body_size_bytes: u64,
+    fill_byte: u8,
+    err: ?LargeSendError = null,
+};
+
+fn sendLargeBodyThread(state: *LargeBodySendState) void {
+    assert(@intFromPtr(state) != 0);
+
+    var sent: usize = 0;
+    var send_wouldblock_count: u32 = 0;
+    var last_send_progress_ns: u64 = monotonic_now_ns();
+
+    while (sent < state.body.len) {
+        const chunk_len = @min(state.body.len - sent, POST_LARGE_SEND_CHUNK_SIZE_BYTES);
+        const n = posix.send(state.sock, state.body[sent .. sent + chunk_len], 0) catch |err| {
+            switch (err) {
+                error.Interrupted => continue,
+                error.WouldBlock => {
+                    send_wouldblock_count += 1;
+                    const now_ns = monotonic_now_ns();
+                    if (send_wouldblock_count >= POST_LARGE_MAX_SEND_WOULDBLOCK or
+                        now_ns -| last_send_progress_ns >= POST_LARGE_SEND_STALL_TIMEOUT_NS)
+                    {
+                        state.err = error.SendTimeout;
+                        return;
+                    }
+                    posix.nanosleep(0, POST_LARGE_RETRY_SLEEP_NS);
+                    continue;
+                },
+                else => {
+                    state.err = error.SendFailed;
+                    return;
+                },
+            }
+        };
+        if (n == 0) {
+            state.err = error.ConnectionReset;
+            return;
+        }
+
+        send_wouldblock_count = 0;
+        sent += n;
+        last_send_progress_ns = monotonic_now_ns();
+    }
+}
+
+fn sendGeneratedBodyThread(state: *GeneratedBodySendState) void {
+    assert(@intFromPtr(state) != 0);
+
+    var chunk_buf: [POST_LARGE_SEND_CHUNK_SIZE_BYTES]u8 = undefined;
+    @memset(&chunk_buf, state.fill_byte);
+
+    var sent_bytes: u64 = 0;
+    var send_wouldblock_count: u32 = 0;
+    var last_send_progress_ns: u64 = monotonic_now_ns();
+
+    while (sent_bytes < state.body_size_bytes) {
+        const remaining_bytes: u64 = state.body_size_bytes - sent_bytes;
+        const chunk_len_u64: u64 = @min(remaining_bytes, @as(u64, POST_LARGE_SEND_CHUNK_SIZE_BYTES));
+        const chunk_len: usize = @intCast(chunk_len_u64);
+
+        const n = posix.send(state.sock, chunk_buf[0..chunk_len], 0) catch |err| {
+            switch (err) {
+                error.Interrupted => continue,
+                error.WouldBlock => {
+                    send_wouldblock_count += 1;
+                    const now_ns = monotonic_now_ns();
+                    if (send_wouldblock_count >= POST_LARGE_MAX_SEND_WOULDBLOCK or
+                        now_ns -| last_send_progress_ns >= POST_LARGE_SEND_STALL_TIMEOUT_NS)
+                    {
+                        state.err = error.SendTimeout;
+                        return;
+                    }
+                    posix.nanosleep(0, POST_LARGE_RETRY_SLEEP_NS);
+                    continue;
+                },
+                else => {
+                    state.err = error.SendFailed;
+                    return;
+                },
+            }
+        };
+        if (n == 0) {
+            state.err = error.ConnectionReset;
+            return;
+        }
+
+        send_wouldblock_count = 0;
+        sent_bytes += @intCast(n);
+        last_send_progress_ns = monotonic_now_ns();
+    }
+}
 
 // =============================================================================
 // kTLS Detection
@@ -606,19 +709,14 @@ fn spawnProcess(allocator: std.mem.Allocator, argv: []const []const u8) SpawnErr
     const pid = posix.fork() catch return error.ForkFailed;
     if (pid == 0) {
         // Child process
-        // Redirect stdin/stdout/stderr to /dev/null
+        // Redirect stdin to /dev/null so child doesn't read from terminal.
+        // Leave stdout/stderr inherited so server logs appear in test output.
         // TigerStyle: Exit with distinct codes on failure (not catch {})
         const devnull = posix.open("/dev/null", .{ .ACCMODE = .RDWR }, 0) catch {
             std.process.exit(126); // Cannot open /dev/null
         };
         posix.dup2(devnull, posix.STDIN_FILENO) catch {
             std.process.exit(125); // dup2 failed
-        };
-        posix.dup2(devnull, posix.STDOUT_FILENO) catch {
-            std.process.exit(125);
-        };
-        posix.dup2(devnull, posix.STDERR_FILENO) catch {
-            std.process.exit(125);
         };
         if (devnull > 2) posix.close(devnull);
 
@@ -1008,42 +1106,21 @@ pub const TestClient = struct {
         }
         std.debug.print("[DEBUG postLarge] headers sent\n", .{});
 
-        // Send body in bounded chunks (handle WouldBlock for large transfers)
-        sent = 0;
-        var last_progress: usize = 0;
-        var send_wouldblock_count: u32 = 0;
-        var last_send_progress_ns: u64 = monotonic_now_ns();
-        while (sent < body.len) {
-            const chunk_len = @min(body.len - sent, POST_LARGE_SEND_CHUNK_SIZE_BYTES);
-            const n = posix.send(sock, body[sent .. sent + chunk_len], 0) catch |err| {
-                if (err == error.Interrupted) continue;
-                if (err == error.WouldBlock) {
-                    send_wouldblock_count += 1;
-                    const now_ns = monotonic_now_ns();
-                    if (send_wouldblock_count >= POST_LARGE_MAX_SEND_WOULDBLOCK or
-                        now_ns -| last_send_progress_ns >= POST_LARGE_SEND_STALL_TIMEOUT_NS)
-                    {
-                        return error.SendTimeout;
-                    }
-                    // Socket buffer full - wait briefly and retry.
-                    posix.nanosleep(0, POST_LARGE_RETRY_SLEEP_NS);
-                    continue;
-                }
-                return err;
-            };
-            if (n == 0) return error.ConnectionReset;
-            send_wouldblock_count = 0;
-            sent += n;
-            last_send_progress_ns = monotonic_now_ns();
-            // Progress every 100MB
-            if (sent - last_progress >= 100 * 1024 * 1024) {
-                std.debug.print("[DEBUG postLarge] sent {d} MB / {d} MB\n", .{ sent / (1024 * 1024), body.len / (1024 * 1024) });
-                last_progress = sent;
-            }
-        }
-        std.debug.print("[DEBUG postLarge] body fully sent ({d} bytes)\n", .{sent});
+        var send_state = LargeBodySendState{
+            .sock = sock,
+            .body = body,
+        };
+        const send_thread = try std.Thread.spawn(.{}, sendLargeBodyThread, .{&send_state});
+        defer send_thread.join();
 
-        return self.readPostLargeResponse(sock, "postLarge");
+        const response = try self.readPostLargeResponse(sock, "postLarge");
+        if (send_state.err) |err| {
+            response.deinit();
+            return err;
+        }
+
+        std.debug.print("[DEBUG postLarge] body fully sent ({d} bytes)\n", .{body.len});
+        return response;
     }
 
     /// Make HTTP POST request with generated body bytes (no full payload allocation).
@@ -1094,51 +1171,22 @@ pub const TestClient = struct {
         }
         std.debug.print("[DEBUG postLargeGenerated] headers sent\n", .{});
 
-        var chunk_buf: [POST_LARGE_SEND_CHUNK_SIZE_BYTES]u8 = undefined;
-        @memset(&chunk_buf, fill_byte);
+        var send_state = GeneratedBodySendState{
+            .sock = sock,
+            .body_size_bytes = body_size_bytes,
+            .fill_byte = fill_byte,
+        };
+        const send_thread = try std.Thread.spawn(.{}, sendGeneratedBodyThread, .{&send_state});
+        defer send_thread.join();
 
-        var sent_bytes: u64 = 0;
-        var last_progress_bytes: u64 = 0;
-        var send_wouldblock_count: u32 = 0;
-        var last_send_progress_ns: u64 = monotonic_now_ns();
-
-        while (sent_bytes < body_size_bytes) {
-            const remaining_bytes: u64 = body_size_bytes - sent_bytes;
-            const chunk_len_u64: u64 = @min(remaining_bytes, @as(u64, POST_LARGE_SEND_CHUNK_SIZE_BYTES));
-            const chunk_len: usize = @intCast(chunk_len_u64);
-
-            const n = posix.send(sock, chunk_buf[0..chunk_len], 0) catch |err| {
-                if (err == error.Interrupted) continue;
-                if (err == error.WouldBlock) {
-                    send_wouldblock_count += 1;
-                    const now_ns = monotonic_now_ns();
-                    if (send_wouldblock_count >= POST_LARGE_MAX_SEND_WOULDBLOCK or
-                        now_ns -| last_send_progress_ns >= POST_LARGE_SEND_STALL_TIMEOUT_NS)
-                    {
-                        return error.SendTimeout;
-                    }
-                    posix.nanosleep(0, POST_LARGE_RETRY_SLEEP_NS);
-                    continue;
-                }
-                return err;
-            };
-            if (n == 0) return error.ConnectionReset;
-
-            send_wouldblock_count = 0;
-            sent_bytes += @intCast(n);
-            last_send_progress_ns = monotonic_now_ns();
-
-            if (sent_bytes - last_progress_bytes >= 100 * 1024 * 1024) {
-                std.debug.print(
-                    "[DEBUG postLargeGenerated] sent {d} MB / {d} MB\n",
-                    .{ sent_bytes / (1024 * 1024), body_size_bytes / (1024 * 1024) },
-                );
-                last_progress_bytes = sent_bytes;
-            }
+        const response = try self.readPostLargeResponse(sock, "postLargeGenerated");
+        if (send_state.err) |err| {
+            response.deinit();
+            return err;
         }
 
-        std.debug.print("[DEBUG postLargeGenerated] body fully sent ({d} bytes)\n", .{sent_bytes});
-        return self.readPostLargeResponse(sock, "postLargeGenerated");
+        std.debug.print("[DEBUG postLargeGenerated] body fully sent ({d} bytes)\n", .{body_size_bytes});
+        return response;
     }
 
     fn readPostLargeResponse(self: *TestClient, sock: posix.socket_t, comptime debug_label: []const u8) !Response {
@@ -1205,7 +1253,18 @@ pub const TestClient = struct {
         const data = resp_data.items;
         const status = parseStatusCode(data) orelse return error.InvalidResponse;
 
-        const body_slice = findBody(data) orelse "";
+        var body_slice = findBody(data) orelse "";
+        var decoded_body_buf: []u8 = &[_]u8{};
+        defer if (decoded_body_buf.len > 0) self.allocator.free(decoded_body_buf);
+
+        if (findHeader(data, "Transfer-Encoding")) |te| {
+            if (std.mem.indexOf(u8, te, "chunked") != null) {
+                decoded_body_buf = try self.allocator.alloc(u8, body_slice.len);
+                body_slice = decodeChunkedBody(body_slice, decoded_body_buf) orelse
+                    return error.InvalidChunkedEncoding;
+            }
+        }
+
         const resp_body = if (body_slice.len > 0)
             try self.allocator.dupe(u8, body_slice)
         else
@@ -1243,9 +1302,10 @@ pub const TestClient = struct {
         var pos: usize = 0;
         var out_pos: usize = 0;
         var chunk_count: u32 = 0;
+        const max_chunks: u32 = @intCast((data.len / 5) + 1);
 
         // S3: Bounded loop - max chunks prevents infinite loop on malformed data
-        while (pos < data.len and chunk_count < MAX_CHUNKS) : (chunk_count += 1) {
+        while (pos < data.len and chunk_count < max_chunks) : (chunk_count += 1) {
             // Find end of chunk size line (CRLF)
             const crlf_pos = std.mem.indexOfPos(u8, data, pos, "\r\n") orelse return null;
             const size_line = data[pos..crlf_pos];

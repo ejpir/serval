@@ -14,7 +14,11 @@ const types = serval_core.types;
 const context = serval_core.context;
 
 const serval_client = @import("serval-client");
+const Connection = serval_client.Connection;
 const serval_grpc = @import("serval-grpc");
+const serval_proxy = @import("serval-proxy");
+const serval_proxy_h1 = serval_proxy.h1;
+const Socket = @import("serval-socket").Socket;
 const serval_tls = @import("serval-tls");
 const TLSStream = serval_tls.TLSStream;
 const forwarder_mod = @import("serval-proxy").forwarder;
@@ -34,9 +38,19 @@ pub fn GenericTlsH2FrontendHandler(
 
     return struct {
         const Self = @This();
+        const websocket_stream_capacity: usize = config.H2_MAX_CONCURRENT_STREAMS;
+        const websocket_read_timeout_ms: i64 = 1000;
+
+        const WebSocketStreamState = struct {
+            used: bool = false,
+            closing: bool = false,
+            stream_id: u32 = 0,
+            upstream_conn: Connection = undefined,
+        };
 
         pub const Error = error{
             TooManyTrackedGrpcStreams,
+            TooManyTrackedWebSocketStreams,
             HeaderForwardingFailed,
             UnsupportedChunkedWithPreRead,
             UpstreamResponseBodyReadFailed,
@@ -45,6 +59,8 @@ pub fn GenericTlsH2FrontendHandler(
             UpstreamResponseHeadersFailed,
             UnsupportedProtocol,
             ResponseFrameLimitExceeded,
+            MissingWebSocketKey,
+            InvalidWebSocketRequest,
         } || BridgeHandler.BridgeError || h2_server.Error;
 
         inner: *Handler,
@@ -54,6 +70,13 @@ pub fn GenericTlsH2FrontendHandler(
         grpc_handler: BridgeHandler,
         tracked_grpc_streams: [config.H2_MAX_CONCURRENT_STREAMS]u32 = [_]u32{0} ** config.H2_MAX_CONCURRENT_STREAMS,
         tracked_grpc_stream_count: u16 = 0,
+        websocket_mutex: Io.Mutex = .init,
+        websocket_reader_group: Io.Group = .init,
+        websocket_reader_started: bool = false,
+        writer_template: ?*h2_server.ResponseWriter = null,
+        connection_mutex: ?*Io.Mutex = null,
+        websocket_streams: [websocket_stream_capacity]WebSocketStreamState = [_]WebSocketStreamState{.{}} ** websocket_stream_capacity,
+        tracked_websocket_stream_count: u16 = 0,
 
         pub fn init(
             inner: *Handler,
@@ -77,7 +100,49 @@ pub fn GenericTlsH2FrontendHandler(
 
         pub fn deinit(self: *Self) void {
             assert(@intFromPtr(self) != 0);
+            self.stopH2BackgroundTasks();
             self.grpc_handler.deinit();
+        }
+
+        pub fn startH2BackgroundTasks(
+            self: *Self,
+            writer_template: *h2_server.ResponseWriter,
+            connection_mutex: *Io.Mutex,
+        ) void {
+            assert(@intFromPtr(self) != 0);
+            assert(@intFromPtr(writer_template) != 0);
+            assert(@intFromPtr(connection_mutex) != 0);
+
+            log.debug("generic h2: start background tasks", .{});
+            self.writer_template = writer_template;
+            self.connection_mutex = connection_mutex;
+            self.grpc_handler.startH2BackgroundTasks(writer_template, connection_mutex);
+            log.debug("generic h2: started grpc bridge background tasks", .{});
+        }
+
+        pub fn stopH2BackgroundTasks(self: *Self) void {
+            assert(@intFromPtr(self) != 0);
+
+            if (self.websocket_reader_started) {
+                log.debug("generic h2: cancel websocket reader group reason=stop_background_tasks", .{});
+                self.websocket_reader_group.cancel(self.io);
+                self.websocket_reader_started = false;
+            }
+            log.debug("generic h2: stop grpc bridge background tasks", .{});
+            self.grpc_handler.stopH2BackgroundTasks();
+            self.writer_template = null;
+            self.connection_mutex = null;
+
+            self.websocket_mutex.lockUncancelable(self.io);
+            defer self.websocket_mutex.unlock(self.io);
+
+            var index: usize = 0;
+            while (index < self.websocket_streams.len) : (index += 1) {
+                if (!self.websocket_streams[index].used) continue;
+                self.websocket_streams[index].upstream_conn.close();
+                self.websocket_streams[index] = .{};
+            }
+            self.tracked_websocket_stream_count = 0;
         }
 
         pub fn handleH2Headers(
@@ -97,6 +162,11 @@ pub fn GenericTlsH2FrontendHandler(
                     return err;
                 };
                 if (end_stream) self.untrackGrpcStream(stream_id);
+                return;
+            }
+
+            if (isExtendedConnectWebSocketRequest(request)) {
+                try self.handleWebSocketConnect(stream_id, request, writer);
                 return;
             }
 
@@ -150,6 +220,12 @@ pub fn GenericTlsH2FrontendHandler(
                 return;
             }
 
+            if (self.isTrackedWebSocketStream(stream_id)) {
+                try self.forwardWebSocketData(stream_id, payload);
+                if (end_stream) self.markWebSocketStreamClosing(stream_id);
+                return;
+            }
+
             try sendSimpleTextResponse(writer, 413, "request body over generic h2 frontend not supported");
         }
 
@@ -160,6 +236,7 @@ pub fn GenericTlsH2FrontendHandler(
                 self.untrackGrpcStream(stream_id);
                 self.grpc_handler.handleH2StreamReset(stream_id, error_code_raw);
             }
+            self.markWebSocketStreamClosing(stream_id);
         }
 
         pub fn handleH2ConnectionClose(self: *Self, goaway: @import("serval-h2").GoAway) void {
@@ -170,6 +247,7 @@ pub fn GenericTlsH2FrontendHandler(
         pub fn handleH2StreamClose(self: *Self, summary: h2_server.StreamSummary) void {
             assert(@intFromPtr(self) != 0);
             self.untrackGrpcStream(summary.stream_id);
+            self.markWebSocketStreamClosing(summary.stream_id);
         }
 
         fn makeStreamContext(self: *Self) Context {
@@ -296,6 +374,207 @@ pub fn GenericTlsH2FrontendHandler(
             }
         }
 
+        fn handleWebSocketConnect(self: *Self, stream_id: u32, request: *const Request, writer: *h2_server.ResponseWriter) Error!void {
+            assert(@intFromPtr(self) != 0);
+            assert(stream_id > 0);
+
+            const request_key = request.headers.get("sec-websocket-key") orelse
+                request.headers.get("Sec-WebSocket-Key") orelse
+                return error.MissingWebSocketKey;
+
+            var accept_key_buf: [@import("serval-websocket").websocket_accept_key_size_bytes]u8 = undefined;
+            const expected_accept = @import("serval-websocket").computeAcceptKey(request_key, &accept_key_buf) catch {
+                return error.InvalidWebSocketRequest;
+            };
+
+            const upstream = try self.selectUpstream(request, writer);
+            if (upstream == null) return;
+            if (upstream.?.http_protocol != .h1) return error.UnsupportedProtocol;
+
+            var upgrade_request = request.*;
+            upgrade_request.method = .GET;
+
+            var client = serval_client.Client.init(
+                std.heap.page_allocator,
+                &self.forwarder.dns_resolver,
+                self.forwarder.client_ctx,
+                self.forwarder.verify_upstream_tls,
+            );
+            var connect_result = client.connect(upstream.?, self.io) catch return error.UpstreamConnectFailed;
+
+            serval_proxy_h1.sendUpgradeRequest(&connect_result.conn, self.io, &upgrade_request, null) catch {
+                connect_result.conn.close();
+                return error.UpstreamSendFailed;
+            };
+
+            const upgrade_result = serval_proxy_h1.websocket.receiveUpgradeResponse(
+                self.io,
+                &connect_result.conn,
+                false,
+                expected_accept,
+            ) catch {
+                connect_result.conn.close();
+                return error.UpstreamResponseHeadersFailed;
+            };
+            if (!upgrade_result.upgraded) {
+                connect_result.conn.close();
+                try sendSimpleStatusResponse(writer, 502);
+                return;
+            }
+
+            try self.trackWebSocketStream(stream_id, connect_result.conn);
+            writer.sendHeaders(200, &.{}, false) catch |err| {
+                self.markWebSocketStreamClosing(stream_id);
+                return err;
+            };
+
+            self.websocket_reader_group.concurrent(self.io, websocketReaderTask, .{ self, stream_id }) catch |err| {
+                self.markWebSocketStreamClosing(stream_id);
+                log.err("generic h2: failed to start websocket reader task stream={d}: {s}", .{
+                    stream_id,
+                    @errorName(err),
+                });
+                return error.UpstreamResponseBodyReadFailed;
+            };
+            self.websocket_reader_started = true;
+        }
+
+        fn forwardWebSocketData(self: *Self, stream_id: u32, payload: []const u8) Error!void {
+            assert(@intFromPtr(self) != 0);
+            assert(stream_id > 0);
+
+            if (payload.len == 0) return;
+
+            const state = self.getWebSocketStreamState(stream_id) orelse return error.UnsupportedProtocol;
+            if (state.closing) return error.UnsupportedProtocol;
+
+            writeAllConnection(&state.upstream_conn, self.io, payload) catch return error.UpstreamSendFailed;
+        }
+
+        fn websocketReaderTask(self: *Self, stream_id: u32) Io.Cancelable!void {
+            assert(@intFromPtr(self) != 0);
+            assert(stream_id > 0);
+
+            var read_buf: [config.H2_MAX_FRAME_SIZE_BYTES]u8 = undefined;
+            const timeout = timeoutForMilliseconds(websocket_read_timeout_ms);
+
+            while (true) {
+                try std.Io.checkCancel(self.io);
+
+                const state = self.getWebSocketStreamState(stream_id) orelse return;
+                if (state.closing) break;
+
+                const bytes_read = readSomeConnection(&state.upstream_conn, self.io, timeout, &read_buf) catch |err| switch (err) {
+                    error.Timeout => continue,
+                    error.ConnectionClosed => break,
+                    else => {
+                        self.markWebSocketStreamClosing(stream_id);
+                        break;
+                    },
+                };
+                if (bytes_read == 0) break;
+
+                const writer_template = self.writer_template orelse break;
+                const connection_mutex = self.connection_mutex orelse break;
+                connection_mutex.lockUncancelable(self.io);
+                defer connection_mutex.unlock(self.io);
+
+                var stream_writer = streamWriterFor(writer_template, stream_id);
+                stream_writer.sendData(read_buf[0..bytes_read], false) catch {
+                    self.markWebSocketStreamClosing(stream_id);
+                    break;
+                };
+            }
+
+            const writer_template = self.writer_template;
+            const connection_mutex = self.connection_mutex;
+            self.removeWebSocketStream(stream_id);
+
+            if (writer_template == null or connection_mutex == null) return;
+            connection_mutex.?.lockUncancelable(self.io);
+            defer connection_mutex.?.unlock(self.io);
+
+            var stream_writer = streamWriterFor(writer_template.?, stream_id);
+            _ = stream_writer.sendData(&[_]u8{}, true) catch {};
+        }
+
+        fn trackWebSocketStream(self: *Self, stream_id: u32, conn: Connection) Error!void {
+            assert(@intFromPtr(self) != 0);
+            assert(stream_id > 0);
+
+            self.websocket_mutex.lockUncancelable(self.io);
+            defer self.websocket_mutex.unlock(self.io);
+
+            if (self.tracked_websocket_stream_count >= config.H2_MAX_CONCURRENT_STREAMS) return error.TooManyTrackedWebSocketStreams;
+
+            var index: usize = 0;
+            while (index < self.websocket_streams.len) : (index += 1) {
+                if (self.websocket_streams[index].used) continue;
+                self.websocket_streams[index] = .{
+                    .used = true,
+                    .stream_id = stream_id,
+                    .upstream_conn = conn,
+                };
+                self.tracked_websocket_stream_count += 1;
+                return;
+            }
+
+            return error.TooManyTrackedWebSocketStreams;
+        }
+
+        fn markWebSocketStreamClosing(self: *Self, stream_id: u32) void {
+            assert(@intFromPtr(self) != 0);
+            if (stream_id == 0) return;
+
+            self.websocket_mutex.lockUncancelable(self.io);
+            defer self.websocket_mutex.unlock(self.io);
+
+            var index: usize = 0;
+            while (index < self.websocket_streams.len) : (index += 1) {
+                if (!self.websocket_streams[index].used) continue;
+                if (self.websocket_streams[index].stream_id != stream_id) continue;
+                self.websocket_streams[index].closing = true;
+                return;
+            }
+        }
+
+        fn removeWebSocketStream(self: *Self, stream_id: u32) void {
+            assert(@intFromPtr(self) != 0);
+            if (stream_id == 0) return;
+
+            self.websocket_mutex.lockUncancelable(self.io);
+            defer self.websocket_mutex.unlock(self.io);
+
+            var index: usize = 0;
+            while (index < self.websocket_streams.len) : (index += 1) {
+                if (!self.websocket_streams[index].used) continue;
+                if (self.websocket_streams[index].stream_id != stream_id) continue;
+                self.websocket_streams[index].upstream_conn.close();
+                self.websocket_streams[index] = .{};
+                if (self.tracked_websocket_stream_count > 0) self.tracked_websocket_stream_count -= 1;
+                return;
+            }
+        }
+
+        fn getWebSocketStreamState(self: *Self, stream_id: u32) ?*WebSocketStreamState {
+            assert(@intFromPtr(self) != 0);
+            if (stream_id == 0) return null;
+
+            self.websocket_mutex.lockUncancelable(self.io);
+            defer self.websocket_mutex.unlock(self.io);
+
+            var index: usize = 0;
+            while (index < self.websocket_streams.len) : (index += 1) {
+                if (!self.websocket_streams[index].used) continue;
+                if (self.websocket_streams[index].stream_id == stream_id) return &self.websocket_streams[index];
+            }
+            return null;
+        }
+
+        fn isTrackedWebSocketStream(self: *Self, stream_id: u32) bool {
+            return self.getWebSocketStreamState(stream_id) != null;
+        }
+
         fn filterResponseHeaders(source_headers: *const types.HeaderMap, out: *[config.MAX_HEADERS]h2_server.Header) Error![]const h2_server.Header {
             assert(@intFromPtr(source_headers) != 0);
 
@@ -336,6 +615,20 @@ pub fn GenericTlsH2FrontendHandler(
         fn isGrpcRequest(request: *const Request) bool {
             serval_grpc.validateRequest(request) catch return false;
             return true;
+        }
+
+        fn isExtendedConnectWebSocketRequest(request: *const Request) bool {
+            assert(@intFromPtr(request) != 0);
+
+            if (request.method != .CONNECT) return false;
+            if (request.path.len == 0) return false;
+            if (request.headers.get("x-forwarded-proto") == null) return false;
+
+            const protocol = request.headers.get("x-http2-protocol") orelse return false;
+            if (!std.ascii.eqlIgnoreCase(protocol, "websocket")) return false;
+
+            return request.headers.get("sec-websocket-key") != null or
+                request.headers.get("Sec-WebSocket-Key") != null;
         }
 
         fn trackGrpcStream(self: *Self, stream_id: u32) Error!void {
@@ -396,7 +689,10 @@ pub fn tryServeTlsAlpnConnection(
     assert(@intFromPtr(forwarder) != 0);
     assert(@intFromPtr(connection_ctx) != 0);
 
-    if (frontend_mode != .generic) return false;
+    if (frontend_mode == .disabled) {
+        // Dispatcher may still route ALPN h2 here as protocol-safety fallback.
+        // Keep serving generic h2 rather than attempting h1 on a negotiated h2 conn.
+    }
 
     const tls_stream = maybe_tls orelse return false;
     if (comptime @hasDecl(Handler, "handleH2Headers") and @hasDecl(Handler, "handleH2Data")) {
@@ -447,10 +743,117 @@ pub fn tryServeTlsAlpnConnection(
         @TypeOf(generic_handler),
         &generic_handler,
         tls_stream,
+        io,
         connection_id,
     ) catch |err| switch (err) {
         error.ConnectionClosed => {},
         else => log.warn("server: conn={d} generic frontend TLS h2 driver failed: {s}", .{ connection_id, @errorName(err) }),
     };
     return true;
+}
+
+const WebSocketIoError = error{
+    Timeout,
+    ConnectionClosed,
+    ReadFailed,
+    WriteFailed,
+};
+
+fn streamWriterFor(template: *h2_server.ResponseWriter, stream_id: u32) h2_server.ResponseWriter {
+    assert(@intFromPtr(template) != 0);
+    assert(stream_id > 0);
+
+    var writer = template.*;
+    writer.stream_id = stream_id;
+    return writer;
+}
+
+fn timeoutForMilliseconds(timeout_ms: i64) Io.Timeout {
+    assert(timeout_ms > 0);
+    return .{ .duration = .{
+        .raw = Io.Duration.fromMilliseconds(timeout_ms),
+        .clock = .awake,
+    } };
+}
+
+fn readSomeConnection(conn: *Connection, io: Io, timeout: Io.Timeout, out: []u8) WebSocketIoError!u32 {
+    assert(@intFromPtr(conn) != 0);
+    assert(out.len > 0);
+
+    return switch (conn.socket) {
+        .plain => |*plain| blk: {
+            try waitUntilReadable(plain.fd, io, timeout);
+            const n = plain.read(out) catch return error.ReadFailed;
+            break :blk n;
+        },
+        .tls => |*tls_socket| blk: {
+            if (!tls_socket.has_pending_read()) try waitUntilReadable(tls_socket.fd, io, timeout);
+            const n = tls_socket.stream.read(out) catch |err| switch (err) {
+                error.WouldBlock => return error.Timeout,
+                error.ConnectionReset => return error.ConnectionClosed,
+                else => return error.ReadFailed,
+            };
+            break :blk n;
+        },
+    };
+}
+
+fn writeAllConnection(conn: *Connection, io: Io, data: []const u8) WebSocketIoError!void {
+    assert(@intFromPtr(conn) != 0);
+    if (data.len == 0) return;
+
+    return switch (conn.socket) {
+        .plain => |plain| {
+            var writer_buf: [config.SERVER_WRITE_BUFFER_SIZE_BYTES]u8 = undefined;
+            var writer = rawStreamForFd(plain.fd).writer(io, &writer_buf);
+            writer.interface.writeAll(data) catch return error.WriteFailed;
+            writer.interface.flush() catch return error.WriteFailed;
+        },
+        .tls => |*tls_socket| {
+            var sent: usize = 0;
+            var iterations: u32 = 0;
+            while (sent < data.len and iterations < Socket.max_write_iterations_count) : (iterations += 1) {
+                const n = tls_socket.stream.write(data[sent..]) catch |err| switch (err) {
+                    error.WouldBlock => {
+                        std.Io.sleep(io, Io.Duration.fromMilliseconds(1), .awake) catch return error.WriteFailed;
+                        continue;
+                    },
+                    error.ConnectionReset => return error.ConnectionClosed,
+                    else => return error.WriteFailed,
+                };
+                if (n == 0) return error.ConnectionClosed;
+                sent += n;
+            }
+            if (sent < data.len) return error.WriteFailed;
+        },
+    };
+}
+
+fn waitUntilReadable(fd: i32, io: Io, timeout: Io.Timeout) WebSocketIoError!void {
+    assert(fd >= 0);
+
+    var messages: [1]Io.net.IncomingMessage = .{Io.net.IncomingMessage.init};
+    var peek_buf: [1]u8 = undefined;
+    const maybe_err, _ = rawStreamForFd(fd).socket.receiveManyTimeout(
+        io,
+        &messages,
+        &peek_buf,
+        .{ .peek = true },
+        timeout,
+    );
+    if (maybe_err) |err| switch (err) {
+        error.Timeout => return error.Timeout,
+        error.ConnectionResetByPeer => return error.ConnectionClosed,
+        else => return error.ReadFailed,
+    };
+}
+
+fn rawStreamForFd(fd: i32) Io.net.Stream {
+    assert(fd >= 0);
+    return .{
+        .socket = .{
+            .handle = fd,
+            .address = .{ .ip4 = .unspecified(0) },
+        },
+    };
 }

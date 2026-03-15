@@ -73,6 +73,20 @@ pub const TLSStream = struct {
         };
     }
 
+    /// Returns true if the TLS library has decrypted plaintext buffered.
+    /// When true, a subsequent `read()` will return data immediately even if
+    /// the underlying fd would not be poll-readable.
+    /// TigerStyle: Required for correct poll-based multiplexing on TLS sockets.
+    pub fn hasPendingRead(self: *const TLSStream) bool {
+        return switch (self.mode) {
+            .ktls => false,
+            .userspace => |ssl_conn| blk: {
+                const pending = ssl.SSL_pending(ssl_conn);
+                break :blk pending > 0;
+            },
+        };
+    }
+
     /// Get underlying SSL object for userspace mode, null for kTLS.
     /// Useful for advanced operations (session tickets, renegotiation).
     pub fn getSSL(self: *TLSStream) ?*ssl.SSL {
@@ -262,8 +276,11 @@ pub const TLSStream = struct {
                 const n = ssl.SSL_read(ssl_conn, buf.ptr, @intCast(buf.len));
                 if (n <= 0) {
                     const err = ssl.SSL_get_error(ssl_conn, n);
-                    if (err == ssl.SSL_ERROR_ZERO_RETURN) return 0; // Clean shutdown
-                    return error.SslRead;
+                    switch (err) {
+                        ssl.SSL_ERROR_ZERO_RETURN => return 0,
+                        ssl.SSL_ERROR_WANT_READ, ssl.SSL_ERROR_WANT_WRITE => return error.WouldBlock,
+                        else => return error.SslRead,
+                    }
                 }
                 const bytes_read: u32 = @intCast(n);
                 assert(bytes_read <= buf.len); // S1: postcondition
@@ -272,7 +289,7 @@ pub const TLSStream = struct {
         }
     }
 
-    /// Blocking TLS write.
+    /// TLS write with nonblocking-aware error mapping.
     /// Returns number of bytes written.
     /// TigerStyle: Explicit switch on mode (no default case).
     pub fn write(self: *TLSStream, data: []const u8) !u32 {
@@ -287,9 +304,11 @@ pub const TLSStream = struct {
                     .flags = .{ .nonblocking = true },
                 };
                 const n = file.writeStreaming(std.Options.debug_io, &.{}, &.{data}, 1) catch |err| {
-                    // Map write errors to TLS errors for consistent API
+                    // Map write errors to TLS errors for consistent API.
+                    // Nonblocking write can legitimately stall; caller retries with bounds.
                     return switch (err) {
                         error.BrokenPipe => error.ConnectionReset,
+                        error.WouldBlock => error.WouldBlock,
                         else => error.KtlsWrite,
                     };
                 };
@@ -298,9 +317,18 @@ pub const TLSStream = struct {
                 return bytes_written;
             },
             .userspace => |ssl_conn| {
-                // Userspace: write through BoringSSL
+                // Userspace: write through OpenSSL/BoringSSL.
+                // On nonblocking fds, WANT_READ/WANT_WRITE are retryable, not fatal.
                 const n = ssl.SSL_write(ssl_conn, data.ptr, @intCast(data.len));
-                if (n <= 0) return error.SslWrite;
+                if (n <= 0) {
+                    const ssl_err = ssl.SSL_get_error(ssl_conn, n);
+                    switch (ssl_err) {
+                        ssl.SSL_ERROR_WANT_READ, ssl.SSL_ERROR_WANT_WRITE => return error.WouldBlock,
+                        ssl.SSL_ERROR_ZERO_RETURN => return error.ConnectionReset,
+                        ssl.SSL_ERROR_SYSCALL => return error.ConnectionReset,
+                        else => return error.SslWrite,
+                    }
+                }
 
                 const bytes_written: u32 = @intCast(n);
                 assert(bytes_written <= data.len); // S1: postcondition
@@ -319,7 +347,10 @@ pub const TLSStream = struct {
                 // No SSL resources to free, caller closes fd
             },
             .userspace => |ssl_conn| {
-                // Userspace: graceful SSL shutdown and free resources
+                // Userspace: quiet shutdown avoids writing close_notify into a
+                // peer that already closed, which can otherwise raise SIGPIPE
+                // during tunnel cleanup on OpenSSL's socket BIO path.
+                ssl.SSL_set_quiet_shutdown(ssl_conn, 1);
                 _ = ssl.SSL_shutdown(ssl_conn);
                 ssl.SSL_free(ssl_conn);
             },

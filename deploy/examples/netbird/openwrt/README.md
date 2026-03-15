@@ -68,9 +68,13 @@ ssh root@192.168.1.1 'chmod 0755 /usr/sbin/netbird_proxy /etc/init.d/serval-netb
 
 Edit `/etc/serval/netbird.conf` and set real backend endpoints.
 
+For IPv6 listener support, set:
+- `listen_host=::` (dual-stack behavior depends on kernel `net.ipv6.bindv6only`)
+
 Policy enforced by the binary:
-- gRPC service paths (`/signalexchange.SignalExchange/*`, `/management.ManagementService/*`, `/management.ProxyService/*`) must use `.h2c` or `.h2` upstreams.
-- WebSocket/API/OIDC/UI/dashboard paths must use `.h1` upstreams.
+- gRPC service paths (`/signalexchange.SignalExchange/*`, `/management.ManagementService/*`) must use `.h2c` or `.h2` upstreams.
+- Zitadel paths (`/admin/v1/*`, `/auth/v1/*`, `/management/v1/*`, `/system/v1/*`, `/assets/v1/*`, `/ui/*`, `/oidc/v1/*`, `/saml/v2/*`, `/oauth/v2/*`, `/openapi/*`, `/debug/*`, `/device*`, `/.well-known/openid-configuration`, `/zitadel.*`) must use `.h2c` or `.h2` upstreams.
+- WebSocket/API/relay/dashboard paths must use `.h1` upstreams.
 - Mixed protocol on same host:port is supported only via explicit split entries (`management_grpc` + `management_http`).
 - Frontend ALPN behavior is configurable via `alpn_mixed_offer_policy` and `tls_h2_frontend_mode` in `/etc/serval/netbird.conf`.
 

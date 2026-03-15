@@ -107,9 +107,12 @@ fn writeAllTls(tls: *TLSStream, data: []const u8, connection_id: u64) TransportE
 
     while (sent < total_len and iterations < max_write_iterations_count) : (iterations += 1) {
         const offset: usize = @intCast(sent);
-        const n = tls.write(data[offset..]) catch |err| {
-            log.debug("websocket TLS write error conn={d}: {s}", .{ connection_id, @errorName(err) });
-            return mapTlsWriteError(err);
+        const n = tls.write(data[offset..]) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => {
+                log.debug("websocket TLS write error conn={d}: {s}", .{ connection_id, @errorName(err) });
+                return mapTlsWriteError(err);
+            },
         };
         if (n == 0) return error.ConnectionClosed;
         sent += n;

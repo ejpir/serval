@@ -301,8 +301,9 @@ zig build run-netbird-proxy -- --config /etc/serval/netbird.conf
 OpenWrt deployment guide (ARM/procd/fw4): `deploy/examples/netbird/openwrt/README.md`.
 
 Route contract enforced by the binary:
-- gRPC service paths (`/signalexchange.SignalExchange/*`, `/management.ManagementService/*`, `/management.ProxyService/*`) route to gRPC upstreams (`h2c://` or `h2://`).
-- WebSocket/API/OIDC/UI/dashboard paths route to HTTP/1.1 upstreams (`http://` or `https://`).
+- gRPC service paths (`/signalexchange.SignalExchange/*`, `/management.ManagementService/*`) route to h2 upstreams (`h2c://` or `h2://`).
+- Zitadel paths (`/admin/v1/*`, `/auth/v1/*`, `/management/v1/*`, `/system/v1/*`, `/assets/v1/*`, `/ui/*`, `/oidc/v1/*`, `/saml/v2/*`, `/oauth/v2/*`, `/openapi/*`, `/debug/*`, `/device*`, `/.well-known/openid-configuration`, `/zitadel.*`) route to h2 upstreams (`h2c://` or `h2://`).
+- WebSocket/API/relay/dashboard paths route to HTTP/1.1 upstreams (`http://` or `https://`).
 - Mixed protocol backends on the same host:port must be configured as explicit separate entries (example: `management_grpc` + `management_http`).
 - Frontend ALPN policy is configurable in the NetBird config template via `alpn_mixed_offer_policy` and `tls_h2_frontend_mode`.
 

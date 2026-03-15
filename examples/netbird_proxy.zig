@@ -2,8 +2,9 @@
 //! NetBird Reverse Proxy Example (Production-oriented)
 //!
 //! Serves NetBird path matrix with explicit per-route protocol policy:
-//! - gRPC service paths -> h2c/h2 upstreams
-//! - WebSocket/API/OIDC/UI/catch-all paths -> HTTP/1.1 upstreams
+//! - NetBird gRPC service paths -> h2c/h2 upstreams
+//! - Zitadel paths (Caddy parity) -> h2c/h2 upstreams
+//! - WebSocket/API/relay/dashboard paths -> HTTP/1.1 upstreams
 //!
 //! This binary is intended as a deployable starting point for self-hosted NetBird
 //! fronting with Serval. TLS frontend is required (self-signed certs supported).
@@ -27,7 +28,7 @@ const DEFAULT_SIGNAL_HTTP_SPEC: []const u8 = "http://signal:80";
 const DEFAULT_MANAGEMENT_HTTP_SPEC: []const u8 = "http://management:80";
 const DEFAULT_RELAY_HTTP_SPEC: []const u8 = "http://relay:80";
 const DEFAULT_DASHBOARD_HTTP_SPEC: []const u8 = "http://dashboard:80";
-const DEFAULT_ZITADEL_HTTP_SPEC: []const u8 = "http://zitadel:8080";
+const DEFAULT_ZITADEL_HTTP_SPEC: []const u8 = "h2c://zitadel:8080";
 
 const NETBIRD_HEALTH_BODY: []const u8 = "ok\n";
 
@@ -45,6 +46,7 @@ const NetbirdExtra = struct {
 };
 
 const NetbirdProxyConfig = struct {
+    listen_host: []const u8 = "0.0.0.0",
     listen_port: u16 = 8080,
     cert_path: ?[]const u8 = null,
     key_path: ?[]const u8 = null,
@@ -86,16 +88,32 @@ const NetbirdRouteSpec = struct {
 const netbird_route_specs = [_]NetbirdRouteSpec{
     .{ .matcher = .{ .prefix = "/signalexchange.SignalExchange/" }, .role = .signal_grpc },
     .{ .matcher = .{ .prefix = "/management.ManagementService/" }, .role = .management_grpc },
-    .{ .matcher = .{ .prefix = "/management.ProxyService/" }, .role = .management_grpc },
     .{ .matcher = .{ .prefix = "/ws-proxy/signal" }, .role = .signal_http },
     .{ .matcher = .{ .prefix = "/ws-proxy/management" }, .role = .management_http },
     .{ .matcher = .{ .prefix = "/relay" }, .role = .relay_http },
     .{ .matcher = .{ .prefix = "/api/" }, .role = .management_http },
-    .{ .matcher = .{ .prefix = "/oauth2/" }, .role = .management_http },
-    .{ .matcher = .{ .prefix = "/.well-known/" }, .role = .zitadel_http },
+
+    // Caddy-compat Zitadel route matrix (legacy deployment parity)
+    .{ .matcher = .{ .prefix = "/zitadel.admin.v1.AdminService/" }, .role = .zitadel_http },
+    .{ .matcher = .{ .prefix = "/admin/v1/" }, .role = .zitadel_http },
+    .{ .matcher = .{ .prefix = "/zitadel.auth.v1.AuthService/" }, .role = .zitadel_http },
+    .{ .matcher = .{ .prefix = "/auth/v1/" }, .role = .zitadel_http },
+    .{ .matcher = .{ .prefix = "/zitadel.management.v1.ManagementService/" }, .role = .zitadel_http },
+    .{ .matcher = .{ .prefix = "/management/v1/" }, .role = .zitadel_http },
+    .{ .matcher = .{ .prefix = "/zitadel.system.v1.SystemService/" }, .role = .zitadel_http },
+    .{ .matcher = .{ .prefix = "/system/v1/" }, .role = .zitadel_http },
+    .{ .matcher = .{ .prefix = "/assets/v1/" }, .role = .zitadel_http },
+    .{ .matcher = .{ .prefix = "/saml/v2/" }, .role = .zitadel_http },
+    .{ .matcher = .{ .prefix = "/openapi/" }, .role = .zitadel_http },
+    .{ .matcher = .{ .prefix = "/debug/" }, .role = .zitadel_http },
+    .{ .matcher = .{ .exact = "/device" }, .role = .zitadel_http },
+    .{ .matcher = .{ .prefix = "/device/" }, .role = .zitadel_http },
+    .{ .matcher = .{ .prefix = "/zitadel.user.v2.UserService/" }, .role = .zitadel_http },
+
+    .{ .matcher = .{ .exact = "/.well-known/openid-configuration" }, .role = .zitadel_http },
     .{ .matcher = .{ .prefix = "/ui/" }, .role = .zitadel_http },
-    .{ .matcher = .{ .prefix = "/oidc/" }, .role = .zitadel_http },
-    .{ .matcher = .{ .prefix = "/oauth/" }, .role = .zitadel_http },
+    .{ .matcher = .{ .prefix = "/oidc/v1/" }, .role = .zitadel_http },
+    .{ .matcher = .{ .prefix = "/oauth/v2/" }, .role = .zitadel_http },
     .{ .matcher = .{ .prefix = "/" }, .role = .dashboard_http },
 };
 
@@ -144,7 +162,10 @@ const NetbirdProxyHandler = struct {
         _ = ctx;
         assert(response_buf.len >= NETBIRD_HEALTH_BODY.len);
 
+        std.debug.print("[DEBUG] onRequest: method={s} path={s}\n", .{ @tagName(request.method), request.path });
+
         if (std.mem.eql(u8, request.path, "/healthz") or std.mem.eql(u8, request.path, "/readyz")) {
+            std.debug.print("[DEBUG] -> health check, returning 200\n", .{});
             const body = netbirdWriteStaticBody(response_buf, NETBIRD_HEALTH_BODY);
             return .{ .send_response = .{
                 .status = 200,
@@ -153,6 +174,7 @@ const NetbirdProxyHandler = struct {
             } };
         }
 
+        std.debug.print("[DEBUG] -> continue to upstream\n", .{});
         return .continue_request;
     }
 
@@ -164,7 +186,23 @@ const NetbirdProxyHandler = struct {
         _ = ctx;
 
         const role = resolveRouteRole(request.path);
-        return self.upstreams.get(role);
+        const upstream = self.upstreams.get(role);
+        
+        const protocol = switch (upstream.http_protocol) {
+            .h1 => if (upstream.tls) "https" else "http",
+            .h2c => "h2c",
+            .h2 => "h2",
+        };
+
+        std.debug.print("[DEBUG] selectUpstream: path={s} -> role={s} upstream={s}://{s}:{d}\n", .{
+            request.path,
+            @tagName(role),
+            protocol,
+            upstream.host,
+            upstream.port,
+        });
+
+        return upstream;
     }
 };
 
@@ -207,6 +245,7 @@ fn parseAlpnMixedOfferPolicy(value: []const u8) !serval.config.AlpnMixedOfferPol
     const trimmed = std.mem.trim(u8, value, " \t\r");
     if (std.ascii.eqlIgnoreCase(trimmed, "prefer_http11")) return .prefer_http11;
     if (std.ascii.eqlIgnoreCase(trimmed, "prefer_h2")) return .prefer_h2;
+    if (std.ascii.eqlIgnoreCase(trimmed, "http11_only")) return .http11_only;
     return error.InvalidAlpnMixedOfferPolicy;
 }
 
@@ -215,6 +254,12 @@ fn parsePort(value: []const u8) !u16 {
     const parsed = try std.fmt.parseInt(u16, trimmed, 10);
     if (parsed == 0) return error.InvalidPort;
     return parsed;
+}
+
+fn parseListenHost(value: []const u8) ![]const u8 {
+    const trimmed = std.mem.trim(u8, value, " \t\r");
+    if (trimmed.len == 0) return error.InvalidListenHost;
+    return trimmed;
 }
 
 fn splitHostPort(endpoint: []const u8) !struct { host: []const u8, port: u16 } {
@@ -337,6 +382,10 @@ fn parseConfigLine(
     const value = std.mem.trim(u8, trimmed[eq_idx + 1 ..], " \t");
     if (value.len == 0) return error.InvalidConfigLine;
 
+    if (std.mem.eql(u8, key, "listen_host")) {
+        cfg.listen_host = try parseListenHost(value);
+        return;
+    }
     if (std.mem.eql(u8, key, "listen_port")) {
         cfg.listen_port = try parsePort(value);
         saw_listen_port.* = true;
@@ -432,15 +481,14 @@ fn printUpstream(name: []const u8, upstream: serval.Upstream) void {
 }
 
 fn printRouteMatrix() void {
-    std.debug.print("Route matrix:\n", .{});
+    std.debug.print("Route matrix (Caddy parity):\n", .{});
     std.debug.print("  /signalexchange.SignalExchange/*  -> signal_grpc (h2c/h2)\n", .{});
     std.debug.print("  /management.ManagementService/*   -> management_grpc (h2c/h2)\n", .{});
-    std.debug.print("  /management.ProxyService/*        -> management_grpc (h2c/h2)\n", .{});
     std.debug.print("  /ws-proxy/signal*                 -> signal_http (websocket/http1)\n", .{});
     std.debug.print("  /ws-proxy/management*             -> management_http (websocket/http1)\n", .{});
     std.debug.print("  /relay*                           -> relay_http (websocket/http1)\n", .{});
-    std.debug.print("  /api/*, /oauth2/*                 -> management_http\n", .{});
-    std.debug.print("  /.well-known/*,/ui/*,/oidc/*,/oauth/* -> zitadel_http\n", .{});
+    std.debug.print("  /api/*                            -> management_http\n", .{});
+    std.debug.print("  Zitadel paths (/admin/v1,/auth/v1,/management/v1,/system/v1,/assets/v1,/ui,/oidc/v1,/saml/v2,/oauth/v2,/openapi,/debug,/device,/.well-known/openid-configuration,...) -> zitadel_http (h2c/h2)\n", .{});
     std.debug.print("  /*                                -> dashboard_http\n", .{});
 }
 
@@ -513,7 +561,7 @@ pub fn main(process_init: std.process.Init) !void {
         .signal_http = try buildUpstream(cfg.signal_http_spec, signal_http_idx, .h1, false),
         .management_http = try buildUpstream(cfg.management_http_spec, management_http_idx, .h1, false),
         .relay_http = try buildUpstream(cfg.relay_http_spec, relay_http_idx, .h1, false),
-        .zitadel_http = try buildUpstream(cfg.zitadel_http_spec, zitadel_http_idx, .h1, false),
+        .zitadel_http = try buildUpstream(cfg.zitadel_http_spec, zitadel_http_idx, .h2c, false),
         .dashboard_http = try buildUpstream(cfg.dashboard_http_spec, dashboard_http_idx, .h1, false),
     };
 
@@ -522,7 +570,7 @@ pub fn main(process_init: std.process.Init) !void {
     try validateHttpUpstream("signal_http", upstreams.signal_http);
     try validateHttpUpstream("management_http", upstreams.management_http);
     try validateHttpUpstream("relay_http", upstreams.relay_http);
-    try validateHttpUpstream("zitadel_http", upstreams.zitadel_http);
+    try validateGrpcUpstream("zitadel_http", upstreams.zitadel_http);
     try validateHttpUpstream("dashboard_http", upstreams.dashboard_http);
 
     var upstream_client_ctx: ?*ssl.SSL_CTX = null;
@@ -554,7 +602,7 @@ pub fn main(process_init: std.process.Init) !void {
         .verify_upstream = cfg.verify_upstream,
     };
 
-    std.debug.print("NetBird proxy listening on :{d} (HTTPS)\n", .{cfg.listen_port});
+    std.debug.print("NetBird proxy listening on {s}:{d} (HTTPS)\n", .{ cfg.listen_host, cfg.listen_port });
     std.debug.print("TLS cert: {s}\n", .{cfg.cert_path.?});
     std.debug.print("TLS key:  {s}\n", .{cfg.key_path.?});
     std.debug.print("Upstream verify: {}\n", .{cfg.verify_upstream});
@@ -582,6 +630,7 @@ pub fn main(process_init: std.process.Init) !void {
         &metrics,
         &tracer,
         .{
+            .listen_host = cfg.listen_host,
             .port = cfg.listen_port,
             .tls = tls_config,
             .tls_h2_frontend_mode = cfg.tls_h2_frontend_mode,
@@ -604,6 +653,7 @@ test "parseTlsH2FrontendMode supports all valid values" {
 test "parseAlpnMixedOfferPolicy supports all valid values" {
     try std.testing.expectEqual(serval.config.AlpnMixedOfferPolicy.prefer_http11, try parseAlpnMixedOfferPolicy("prefer_http11"));
     try std.testing.expectEqual(serval.config.AlpnMixedOfferPolicy.prefer_h2, try parseAlpnMixedOfferPolicy("prefer_h2"));
+    try std.testing.expectEqual(serval.config.AlpnMixedOfferPolicy.http11_only, try parseAlpnMixedOfferPolicy("http11_only"));
     try std.testing.expectError(error.InvalidAlpnMixedOfferPolicy, parseAlpnMixedOfferPolicy("invalid"));
 }
 
@@ -616,4 +666,47 @@ test "parseConfigLine parses ALPN and frontend h2 policy keys" {
 
     try parseConfigLine(&cfg, "alpn_mixed_offer_policy=prefer_h2", &saw_listen_port);
     try std.testing.expectEqual(serval.config.AlpnMixedOfferPolicy.prefer_h2, cfg.alpn_mixed_offer_policy);
+}
+
+test "parseListenHost validates non-empty value" {
+    try std.testing.expectEqualStrings("::", try parseListenHost("::"));
+    try std.testing.expectEqualStrings("0.0.0.0", try parseListenHost(" 0.0.0.0 "));
+    try std.testing.expectError(error.InvalidListenHost, parseListenHost("   "));
+}
+
+test "parseConfigLine parses listen_host" {
+    var cfg = NetbirdProxyConfig{};
+    var saw_listen_port = false;
+
+    try parseConfigLine(&cfg, "listen_host=::", &saw_listen_port);
+    try std.testing.expectEqualStrings("::", cfg.listen_host);
+    try std.testing.expect(!saw_listen_port);
+}
+
+test "resolveRouteRole keeps caddy-compatible zitadel paths on zitadel_http" {
+    const cases = [_]struct {
+        path: []const u8,
+        expected: UpstreamRole,
+    }{
+        .{ .path = "/admin/v1/projects", .expected = .zitadel_http },
+        .{ .path = "/auth/v1/login", .expected = .zitadel_http },
+        .{ .path = "/management/v1/users", .expected = .zitadel_http },
+        .{ .path = "/system/v1/healthz", .expected = .zitadel_http },
+        .{ .path = "/assets/v1/static/logo.svg", .expected = .zitadel_http },
+        .{ .path = "/saml/v2/metadata", .expected = .zitadel_http },
+        .{ .path = "/oidc/v1/authorize", .expected = .zitadel_http },
+        .{ .path = "/oauth/v2/token", .expected = .zitadel_http },
+        .{ .path = "/.well-known/openid-configuration", .expected = .zitadel_http },
+        .{ .path = "/openapi/spec", .expected = .zitadel_http },
+        .{ .path = "/debug/events", .expected = .zitadel_http },
+        .{ .path = "/device", .expected = .zitadel_http },
+        .{ .path = "/device/authorize", .expected = .zitadel_http },
+        .{ .path = "/zitadel.user.v2.UserService/GetUserByID", .expected = .zitadel_http },
+        .{ .path = "/.well-known/other", .expected = .dashboard_http },
+        .{ .path = "/oauth2/token", .expected = .dashboard_http },
+    };
+
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, resolveRouteRole(case.path));
+    }
 }

@@ -33,13 +33,14 @@ No business logic, only protocol implementation. Sits alongside serval-http and 
   - Low-level SSL function bindings
   - Error handling utilities
   - `SSL_pending()` binding for userspace TLS buffered-read inspection
+  - Installs process-wide `SIGPIPE` ignore before OpenSSL socket-BIO use on Linux
 
 - `TLSStream` - Unified TLS stream interface
   - `initServer()` - Server-side TLS termination (accepts client connections)
   - `initClient()` - Client-side TLS origination (connects to HTTPS backends)
-  - `read()` - TLS read (decrypts incoming data)
+  - `read()` - TLS read (decrypts incoming data, returns `error.WouldBlock` on nonblocking WANT_READ/WANT_WRITE)
   - `write()` - TLS write (encrypts outgoing data)
-  - `close()` - Graceful TLS shutdown (sends close_notify)
+  - `close()` - Quiet TLS shutdown for deterministic teardown without peer-close `SIGPIPE`
   - `isKtls()` - Check if kTLS kernel offload is active (zero overhead)
   - `queryKtlsStatus()` - Get detailed kTLS TX/RX status (for diagnostics)
 
@@ -73,7 +74,7 @@ No business logic, only protocol implementation. Sits alongside serval-http and 
 - [x] Server certificate loading
 - [x] Client SNI support
 - [x] Upstream certificate verification (optional via `verify_upstream`)
-- [x] Non-blocking read/write
+- [x] Non-blocking read/write (SSL WANT_READ/WANT_WRITE mapped to retryable backpressure)
 - [x] Graceful shutdown (close_notify)
 
 ### Phase 2 (Complete)
@@ -195,6 +196,7 @@ pub const TlsError = error{
     SslSetSni,
     SslRead,
     SslWrite,
+    WouldBlock,
 };
 ```
 

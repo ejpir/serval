@@ -17,8 +17,10 @@ This first slice provides bounded helpers for:
 - `Upgrade: h2c` request detection, validation, and `HTTP2-Settings` decoding
 - bounded HPACK decoding/encoding including static-table and dynamic-table indexed fields, indexed names, literal header blocks, dynamic-table size updates, and Huffman string decoding
 - request-header decoding for stream-aware server/client runtimes with strict pseudo-header ordering, duplicate detection, CONNECT constraints, connection-specific header rejection, and `te=trailers` enforcement
+- request-header decoding now also accepts RFC 8441 Extended CONNECT (`:protocol`) for WebSocket-over-h2 while keeping classic CONNECT constraints for non-extended requests
 - initial request parsing for h2c prior-knowledge connection routing, including bounded HEADERS+CONTINUATION reassembly
 - HTTP/1.1 upgrade-request translation into an upstream prior-knowledge h2c preamble
+- SETTINGS helpers now encode/decode `SETTINGS_ENABLE_CONNECT_PROTOCOL` (0x8) so frontends can explicitly advertise Extended CONNECT support
 
 ## Not in this module
 

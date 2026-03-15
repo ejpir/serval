@@ -18,7 +18,9 @@
 //! - RFC 5246 (TLS 1.2 key derivation)
 
 const std = @import("std");
-const log = @import("serval-core").log.scoped(.tls);
+const serval_core = @import("serval-core");
+const log = serval_core.log.scoped(.tls);
+const closeFd = serval_core.closeFd;
 const builtin = @import("builtin");
 const posix = std.posix;
 const assert = std.debug.assert;
@@ -218,7 +220,7 @@ pub fn isKtlsRuntimeAvailable() bool {
     const ulp_fd = posix.openat(posix.AT.FDCWD, KTLS_ULP_PROC_PATH, .{ .ACCMODE = .RDONLY }, 0) catch {
         return false;
     };
-    defer posix.close(ulp_fd);
+    defer closeFd(ulp_fd);
 
     var buf: [256]u8 = undefined;
     const n = posix.read(ulp_fd, &buf) catch {

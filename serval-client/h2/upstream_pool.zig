@@ -100,10 +100,26 @@ pub const UpstreamSession = struct {
         return action;
     }
 
+    pub fn receiveActionTimeout(self: *UpstreamSession, io: Io, timeout: Io.Timeout) Error!runtime_mod.ReceiveAction {
+        assert(@intFromPtr(self) != 0);
+
+        const action = try self.h2.receiveActionTimeout(io, timeout);
+        self.last_used_ns = time.monotonicNanos();
+        return action;
+    }
+
     pub fn receiveActionHandlingControl(self: *UpstreamSession) Error!runtime_mod.ReceiveAction {
         assert(@intFromPtr(self) != 0);
 
         const action = try self.h2.receiveActionHandlingControl();
+        self.last_used_ns = time.monotonicNanos();
+        return action;
+    }
+
+    pub fn receiveActionHandlingControlTimeout(self: *UpstreamSession, io: Io, timeout: Io.Timeout) Error!runtime_mod.ReceiveAction {
+        assert(@intFromPtr(self) != 0);
+
+        const action = try self.h2.receiveActionHandlingControlTimeout(io, timeout);
         self.last_used_ns = time.monotonicNanos();
         return action;
     }
@@ -529,8 +545,9 @@ test "UpstreamSessionPool reuses healthy cached session" {
     net.DnsResolver.init(&dns_resolver, .{});
     var client = Client.init(std.testing.allocator, &dns_resolver, null, false);
 
-    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
-    defer threaded.deinit();
+    var evented: std.Io.Evented = undefined;
+    try evented.init(std.testing.allocator, .{ .thread_limit = 0 });
+    defer evented.deinit();
 
     const upstream = Upstream{
         .host = "127.0.0.1",
@@ -540,7 +557,7 @@ test "UpstreamSessionPool reuses healthy cached session" {
         .http_protocol = .h2c,
     };
 
-    const acquired = try pool.acquireOrConnect(&client, upstream, threaded.io());
+    const acquired = try pool.acquireOrConnect(&client, upstream, evented.io());
     try std.testing.expect(acquired.connect.reused);
     try std.testing.expectEqual(@as(u64, 0), acquired.connect.dns_duration_ns);
     try std.testing.expectEqual(@as(u64, 0), acquired.connect.tcp_connect_duration_ns);

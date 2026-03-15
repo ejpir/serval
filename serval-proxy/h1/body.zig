@@ -22,6 +22,7 @@ const chunked_transfer = @import("chunked.zig");
 const forwardChunkedBody = chunked_transfer.forwardChunkedBody;
 
 const core = @import("serval-core");
+const closeFd = core.closeFd;
 const serval_time = core.time;
 const SPLICE_CHUNK_SIZE_BYTES = core.config.SPLICE_CHUNK_SIZE_BYTES;
 const COPY_CHUNK_SIZE_BYTES = core.config.COPY_CHUNK_SIZE_BYTES;
@@ -126,8 +127,8 @@ fn forwardBodySplice(upstream_fd: i32, client_fd: i32, length_bytes: u64) Forwar
         return ForwardError.SpliceFailed;
     }
     defer {
-        posix.close(pipe_fds[0]);
-        posix.close(pipe_fds[1]);
+        closeFd(pipe_fds[0]);
+        closeFd(pipe_fds[1]);
     }
 
     var forwarded_bytes: u64 = 0;

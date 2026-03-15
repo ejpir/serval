@@ -82,6 +82,10 @@ const BIG_PAYLOAD_SIZE_5GB: usize = 5 * 1024 * 1024 * 1024;
 /// Prevents indefinite hangs on blocking recv() when a frame never arrives.
 const TCP_RECV_TIMEOUT_SEC: isize = 20;
 
+fn init_test_io_runtime(runtime: *std.Io.Evented, allocator: std.mem.Allocator) !void {
+    try runtime.init(allocator, .{ .thread_limit = 0 });
+}
+
 // =============================================================================
 // HTTP Integration Tests
 // =============================================================================
@@ -979,8 +983,12 @@ fn nativeWebSocketServerMain(
     var pool = serval.SimplePool.init();
     var metrics = serval.NoopMetrics{};
     var tracer = serval.NoopTracer{};
-    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
-    defer threaded.deinit();
+    var evented: std.Io.Evented = undefined;
+    init_test_io_runtime(&evented, std.heap.page_allocator) catch |err| {
+        std.log.err("native websocket test io init failed: {s}", .{@errorName(err)});
+        return;
+    };
+    defer evented.deinit();
 
     const ServerType = serval.Server(
         NativeWebSocketHandler,
@@ -998,7 +1006,7 @@ fn nativeWebSocketServerMain(
         serval_net.DnsConfig{},
     );
 
-    server.run(threaded.io(), &shared.shutdown, &shared.listener_fd) catch |err| {
+    server.run(evented.io(), &shared.shutdown, &shared.listener_fd) catch |err| {
         std.log.err("native websocket test server failed: {s}", .{@errorName(err)});
     };
 }
@@ -1856,6 +1864,39 @@ fn buildGrpcH2Request(path: []const u8, authority: []const u8, payload: []const 
     return out[0..pos];
 }
 
+fn buildSimpleH2GetRequest(path: []const u8, authority: []const u8, scheme: []const u8, out: []u8) ![]const u8 {
+    assert(path.len > 0);
+    assert(authority.len > 0);
+    assert(scheme.len > 0);
+
+    var header_block_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const header_block = try buildH2HeaderBlock(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = path },
+        .{ .name = ":scheme", .value = scheme },
+        .{ .name = ":authority", .value = authority },
+    }, &header_block_buf);
+
+    var pos: usize = 0;
+    if (out.len < serval_h2.client_connection_preface.len) return error.BufferTooSmall;
+    @memcpy(out[0..serval_h2.client_connection_preface.len], serval_h2.client_connection_preface);
+    pos += serval_h2.client_connection_preface.len;
+
+    const settings_frame = try appendH2Frame(out[pos..], .settings, 0, 0, &[_]u8{});
+    pos += settings_frame.len;
+
+    const headers_frame = try appendH2Frame(
+        out[pos..],
+        .headers,
+        serval_h2.flags_end_headers | serval_h2.flags_end_stream,
+        1,
+        header_block,
+    );
+    pos += headers_frame.len;
+
+    return out[0..pos];
+}
+
 fn buildGrpcH2RequestWithExtraHeaders(
     path: []const u8,
     authority: []const u8,
@@ -2198,6 +2239,37 @@ fn readH2Frame(sock: posix.socket_t, initial: []const u8, out: []u8) !H2FrameVie
     };
 }
 
+fn readH2FrameSocket(socket: *serval.Socket, initial: []const u8, out: []u8) !H2FrameView {
+    var total: usize = 0;
+    if (initial.len > 0) {
+        if (initial.len > out.len) return error.BufferTooSmall;
+        std.mem.copyForwards(u8, out[0..initial.len], initial);
+        total = initial.len;
+    }
+
+    while (total < serval_h2.frame_header_size_bytes) {
+        const n_u32 = try socket.read(out[total..]);
+        if (n_u32 == 0) return error.ConnectionClosed;
+        const n: usize = @intCast(n_u32);
+        total += n;
+    }
+
+    const header = try serval_h2.parseFrameHeader(out[0..serval_h2.frame_header_size_bytes]);
+    const frame_len: usize = serval_h2.frame_header_size_bytes + header.length;
+    while (total < frame_len) {
+        const n_u32 = try socket.read(out[total..]);
+        if (n_u32 == 0) return error.ConnectionClosed;
+        const n: usize = @intCast(n_u32);
+        total += n;
+    }
+
+    return .{
+        .header = header,
+        .payload = out[serval_h2.frame_header_size_bytes..frame_len],
+        .remaining = out[frame_len..total],
+    };
+}
+
 fn decodeH2Fields(payload: []const u8, out: []serval_h2.HeaderField) ![]const serval_h2.HeaderField {
     return serval_h2.decodeHeaderBlock(payload, out);
 }
@@ -2206,6 +2278,12 @@ fn sendH2SettingsAck(sock: posix.socket_t) !void {
     var buf: [serval_h2.frame_header_size_bytes]u8 = undefined;
     const frame = try appendH2Frame(&buf, .settings, serval_h2.flags_ack, 0, &[_]u8{});
     try sendAllTcp(sock, frame);
+}
+
+fn sendH2SettingsAckSocket(socket: *serval.Socket) !void {
+    var buf: [serval_h2.frame_header_size_bytes]u8 = undefined;
+    const frame = try appendH2Frame(&buf, .settings, serval_h2.flags_ack, 0, &[_]u8{});
+    try sendAllSocket(socket, frame);
 }
 
 fn sendH2ClientPrefaceAndSettings(sock: posix.socket_t) !void {
@@ -2786,6 +2864,10 @@ fn terminatedH2ServerMain(config: TerminatedH2ServerConfig) void {
 }
 
 fn terminatedH2ServerMainImpl(config: TerminatedH2ServerConfig) !void {
+    var evented: std.Io.Evented = undefined;
+    try init_test_io_runtime(&evented, testing.allocator);
+    defer evented.deinit();
+
     const listener = try createTcpListener(config.port);
     defer posix.close(listener);
 
@@ -2797,7 +2879,7 @@ fn terminatedH2ServerMainImpl(config: TerminatedH2ServerConfig) !void {
         .expected_request_payload = config.expected_request_payload,
         .response_payload = config.response_payload,
     };
-    serval.server.servePlainH2Connection(TerminatedH2UnaryHandler, &handler, conn, 1) catch |err| {
+    serval.server.servePlainH2Connection(TerminatedH2UnaryHandler, &handler, conn, evented.io(), 1) catch |err| {
         // Allow the peer to drain fail-closed control frames (GOAWAY) before close.
         posix.nanosleep(0, 10 * std.time.ns_per_ms);
         return err;
@@ -2910,8 +2992,12 @@ fn terminatedH2AcceptLoopServerMain(shared: *TerminatedH2AcceptLoopServerShared,
     var pool = serval.SimplePool.init();
     var metrics = serval.NoopMetrics{};
     var tracer = serval.NoopTracer{};
-    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
-    defer threaded.deinit();
+    var evented: std.Io.Evented = undefined;
+    init_test_io_runtime(&evented, std.heap.page_allocator) catch |err| {
+        std.log.err("terminated h2 accept loop io init failed: {s}", .{@errorName(err)});
+        return;
+    };
+    defer evented.deinit();
 
     const ServerType = serval.Server(
         TerminatedH2UnaryHandler,
@@ -2929,7 +3015,7 @@ fn terminatedH2AcceptLoopServerMain(shared: *TerminatedH2AcceptLoopServerShared,
         serval_net.DnsConfig{},
     );
 
-    server.run(threaded.io(), &shared.shutdown, &shared.listener_fd) catch |err| {
+    server.run(evented.io(), &shared.shutdown, &shared.listener_fd) catch |err| {
         std.log.err("terminated h2 accept-loop server failed: {s}", .{@errorName(err)});
     };
 }
@@ -2944,8 +3030,12 @@ fn terminatedH2TelemetryServerMain(shared: *TerminatedH2AcceptLoopServerShared, 
     var pool = serval.SimplePool.init();
     var metrics = H2MainServerTelemetryMetrics{ .shared = config.telemetry_shared };
     var tracer = H2MainServerTelemetryTracer{ .shared = config.telemetry_shared };
-    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
-    defer threaded.deinit();
+    var evented: std.Io.Evented = undefined;
+    init_test_io_runtime(&evented, std.heap.page_allocator) catch |err| {
+        std.log.err("terminated h2 telemetry io init failed: {s}", .{@errorName(err)});
+        return;
+    };
+    defer evented.deinit();
 
     const ServerType = serval.Server(
         TerminatedH2UnaryHandler,
@@ -2963,7 +3053,7 @@ fn terminatedH2TelemetryServerMain(shared: *TerminatedH2AcceptLoopServerShared, 
         serval_net.DnsConfig{},
     );
 
-    server.run(threaded.io(), &shared.shutdown, &shared.listener_fd) catch |err| {
+    server.run(evented.io(), &shared.shutdown, &shared.listener_fd) catch |err| {
         std.log.err("terminated h2 telemetry server failed: {s}", .{@errorName(err)});
     };
 }
@@ -2975,6 +3065,10 @@ fn terminatedH2ResetServerMain(config: TerminatedH2ResetServerConfig) void {
 }
 
 fn terminatedH2ResetServerMainImpl(config: TerminatedH2ResetServerConfig) !void {
+    var evented: std.Io.Evented = undefined;
+    try init_test_io_runtime(&evented, testing.allocator);
+    defer evented.deinit();
+
     const listener = try createTcpListener(config.port);
     defer posix.close(listener);
 
@@ -2987,7 +3081,7 @@ fn terminatedH2ResetServerMainImpl(config: TerminatedH2ResetServerConfig) !void 
         .expected_request_payload = config.expected_request_payload,
         .response_payload = config.response_payload,
     };
-    try serval.server.servePlainH2Connection(TerminatedH2ResetHandler, &handler, conn, 2);
+    try serval.server.servePlainH2Connection(TerminatedH2ResetHandler, &handler, conn, evented.io(), 2);
 
     var request_msg_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
     const request_message = try serval_grpc.buildMessage(&request_msg_buf, false, config.expected_request_payload);
@@ -3032,6 +3126,10 @@ fn terminatedH2MultiServerMain(config: TerminatedH2MultiServerConfig) void {
 }
 
 fn terminatedH2MultiServerMainImpl(config: TerminatedH2MultiServerConfig) !void {
+    var evented: std.Io.Evented = undefined;
+    try init_test_io_runtime(&evented, testing.allocator);
+    defer evented.deinit();
+
     const listener = try createTcpListener(config.port);
     defer posix.close(listener);
 
@@ -3046,7 +3144,7 @@ fn terminatedH2MultiServerMainImpl(config: TerminatedH2MultiServerConfig) !void 
         .first_response_payload = config.first_response_payload,
         .second_response_payload = config.second_response_payload,
     };
-    try serval.server.servePlainH2Connection(TerminatedH2MultiHandler, &handler, conn, 3);
+    try serval.server.servePlainH2Connection(TerminatedH2MultiHandler, &handler, conn, evented.io(), 3);
 }
 
 fn startTerminatedH2MultiServer(config: TerminatedH2MultiServerConfig) !std.Thread {
@@ -3062,6 +3160,10 @@ fn terminatedH2ChurnServerMain(config: TerminatedH2ChurnServerConfig) void {
 }
 
 fn terminatedH2ChurnServerMainImpl(config: TerminatedH2ChurnServerConfig) !void {
+    var evented: std.Io.Evented = undefined;
+    try init_test_io_runtime(&evented, testing.allocator);
+    defer evented.deinit();
+
     const listener = try createTcpListener(config.port);
     defer posix.close(listener);
 
@@ -3074,7 +3176,7 @@ fn terminatedH2ChurnServerMainImpl(config: TerminatedH2ChurnServerConfig) !void 
         .response_payload = config.response_payload,
         .expected_stream_count = config.expected_stream_count,
     };
-    try serval.server.servePlainH2Connection(TerminatedH2ChurnHandler, &handler, conn, 5);
+    try serval.server.servePlainH2Connection(TerminatedH2ChurnHandler, &handler, conn, evented.io(), 5);
 
     try testing.expectEqual(config.expected_stream_count, handler.completed_stream_count);
 }
@@ -3092,6 +3194,10 @@ fn terminatedH2FlowControlServerMain(config: TerminatedH2FlowControlServerConfig
 }
 
 fn terminatedH2FlowControlServerMainImpl(config: TerminatedH2FlowControlServerConfig) !void {
+    var evented: std.Io.Evented = undefined;
+    try init_test_io_runtime(&evented, testing.allocator);
+    defer evented.deinit();
+
     const listener = try createTcpListener(config.port);
     defer posix.close(listener);
 
@@ -3102,7 +3208,7 @@ fn terminatedH2FlowControlServerMainImpl(config: TerminatedH2FlowControlServerCo
         .path = config.path,
         .expected_total_bytes = config.expected_total_bytes,
     };
-    try serval.server.servePlainH2Connection(TerminatedH2FlowControlHandler, &handler, conn, 4);
+    try serval.server.servePlainH2Connection(TerminatedH2FlowControlHandler, &handler, conn, evented.io(), 4);
 }
 
 fn startTerminatedH2FlowControlServer(config: TerminatedH2FlowControlServerConfig) !std.Thread {
@@ -3711,6 +3817,8 @@ const GrpcH2ProxyServerShared = struct {
     listener_fd: std.atomic.Value(i32),
     insecure_skip_verify: bool,
     frontend_tls: bool,
+    tls_h2_frontend_mode: @TypeOf((serval.Config{}).tls_h2_frontend_mode),
+    alpn_mixed_offer_policy: @TypeOf((serval.Config{}).alpn_mixed_offer_policy),
 };
 
 const GrpcH2ProxyServer = struct {
@@ -3719,7 +3827,10 @@ const GrpcH2ProxyServer = struct {
 
     fn wakeListener(port: u16, frontend_tls: bool) void {
         if (frontend_tls) {
-            const wake_socket = connectTcpTls(port, "h2") catch null;
+            // Shutdown wakeups only need to unblock accept(); forcing ALPN h2
+            // drives the generic h2 frontend during teardown and trips an
+            // unrelated std.Io.Uring group-cancel race.
+            const wake_socket = connectTcpTls(port, "http/1.1") catch null;
             if (wake_socket) |socket| {
                 var close_socket = socket;
                 close_socket.close();
@@ -3749,6 +3860,24 @@ const GrpcH2ProxyServer = struct {
         insecure_skip_verify: bool,
         frontend_tls: bool,
     ) !GrpcH2ProxyServer {
+        return startWithFrontendOptions(
+            port,
+            upstream,
+            insecure_skip_verify,
+            frontend_tls,
+            .terminated_only,
+            .prefer_http11,
+        );
+    }
+
+    fn startWithFrontendOptions(
+        port: u16,
+        upstream: serval.Upstream,
+        insecure_skip_verify: bool,
+        frontend_tls: bool,
+        tls_h2_frontend_mode: @TypeOf((serval.Config{}).tls_h2_frontend_mode),
+        alpn_mixed_offer_policy: @TypeOf((serval.Config{}).alpn_mixed_offer_policy),
+    ) !GrpcH2ProxyServer {
         const shared = try std.heap.page_allocator.create(GrpcH2ProxyServerShared);
         errdefer std.heap.page_allocator.destroy(shared);
 
@@ -3758,6 +3887,8 @@ const GrpcH2ProxyServer = struct {
             .listener_fd = std.atomic.Value(i32).init(-1),
             .insecure_skip_verify = insecure_skip_verify,
             .frontend_tls = frontend_tls,
+            .tls_h2_frontend_mode = tls_h2_frontend_mode,
+            .alpn_mixed_offer_policy = alpn_mixed_offer_policy,
         };
 
         var server = GrpcH2ProxyServer{ .shared = shared, .thread = null };
@@ -3806,8 +3937,12 @@ fn grpcH2ProxyServerMain(shared: *GrpcH2ProxyServerShared, upstream: serval.Upst
     var pool = serval.SimplePool.init();
     var metrics = serval.NoopMetrics{};
     var tracer = serval.NoopTracer{};
-    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
-    defer threaded.deinit();
+    var evented: std.Io.Evented = undefined;
+    init_test_io_runtime(&evented, std.heap.page_allocator) catch |err| {
+        std.log.err("grpc h2 proxy io init failed: {s}", .{@errorName(err)});
+        return;
+    };
+    defer evented.deinit();
 
     var client_ctx: ?*ssl.SSL_CTX = null;
     if (upstream.tls) {
@@ -3826,6 +3961,8 @@ fn grpcH2ProxyServerMain(shared: *GrpcH2ProxyServerShared, upstream: serval.Upst
     defer if (client_ctx) |ctx| ssl.SSL_CTX_free(ctx);
 
     var server_cfg = serval.Config{ .port = shared.port };
+    server_cfg.tls_h2_frontend_mode = shared.tls_h2_frontend_mode;
+    server_cfg.alpn_mixed_offer_policy = shared.alpn_mixed_offer_policy;
     if (shared.frontend_tls or upstream.tls) {
         server_cfg.tls = .{
             .cert_path = if (shared.frontend_tls) harness.TEST_CERT_PATH else null,
@@ -3850,7 +3987,7 @@ fn grpcH2ProxyServerMain(shared: *GrpcH2ProxyServerShared, upstream: serval.Upst
         serval_net.DnsConfig{},
     );
 
-    server.run(threaded.io(), &shared.shutdown, &shared.listener_fd) catch |err| {
+    server.run(evented.io(), &shared.shutdown, &shared.listener_fd) catch |err| {
         std.log.err("grpc h2 proxy test server failed: {s}", .{@errorName(err)});
     };
 }
@@ -4157,8 +4294,12 @@ fn netbirdDualBackendServerMain(shared: *NetbirdServerShared) void {
     var pool = serval.SimplePool.init();
     var metrics = serval.NoopMetrics{};
     var tracer = serval.NoopTracer{};
-    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
-    defer threaded.deinit();
+    var evented: std.Io.Evented = undefined;
+    init_test_io_runtime(&evented, std.heap.page_allocator) catch |err| {
+        std.log.err("netbird dual backend io init failed: {s}", .{@errorName(err)});
+        return;
+    };
+    defer evented.deinit();
 
     const ServerType = serval.Server(
         NetbirdDualBackendHandler,
@@ -4176,7 +4317,7 @@ fn netbirdDualBackendServerMain(shared: *NetbirdServerShared) void {
         serval_net.DnsConfig{},
     );
 
-    server.run(threaded.io(), &shared.shutdown, &shared.listener_fd) catch |err| {
+    server.run(evented.io(), &shared.shutdown, &shared.listener_fd) catch |err| {
         std.log.err("netbird backend test server failed: {s}", .{@errorName(err)});
     };
 }
@@ -4274,8 +4415,12 @@ fn netbirdRouteProxyServerMain(shared: *NetbirdServerShared, config: NetbirdRout
     var pool = serval.SimplePool.init();
     var metrics = serval.NoopMetrics{};
     var tracer = serval.NoopTracer{};
-    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
-    defer threaded.deinit();
+    var evented: std.Io.Evented = undefined;
+    init_test_io_runtime(&evented, std.heap.page_allocator) catch |err| {
+        std.log.err("netbird route proxy io init failed: {s}", .{@errorName(err)});
+        return;
+    };
+    defer evented.deinit();
 
     const ServerType = serval.Server(
         NetbirdRouteProxyHandler,
@@ -4293,7 +4438,7 @@ fn netbirdRouteProxyServerMain(shared: *NetbirdServerShared, config: NetbirdRout
         serval_net.DnsConfig{},
     );
 
-    server.run(threaded.io(), &shared.shutdown, &shared.listener_fd) catch |err| {
+    server.run(evented.io(), &shared.shutdown, &shared.listener_fd) catch |err| {
         std.log.err("netbird proxy test server failed: {s}", .{@errorName(err)});
     };
 }
@@ -4644,8 +4789,9 @@ test "integration: serval-client h2 upstream session pool reuses connected sessi
     var session_pool = serval_client.H2UpstreamSessionPool.init();
     defer session_pool.deinit();
 
-    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
-    defer threaded.deinit();
+    var evented: std.Io.Evented = undefined;
+    try init_test_io_runtime(&evented, testing.allocator);
+    defer evented.deinit();
 
     const upstream = serval.Upstream{
         .host = "127.0.0.1",
@@ -4655,7 +4801,7 @@ test "integration: serval-client h2 upstream session pool reuses connected sessi
         .http_protocol = .h2c,
     };
 
-    const acquired_first = try session_pool.acquireOrConnect(&http_client, upstream, threaded.io());
+    const acquired_first = try session_pool.acquireOrConnect(&http_client, upstream, evented.io());
     try testing.expect(!acquired_first.connect.reused);
     try testing.expect(acquired_first.connect.tcp_connect_duration_ns > 0);
 
@@ -4671,7 +4817,7 @@ test "integration: serval-client h2 upstream session pool reuses connected sessi
     );
 
     const first_fd = acquired_first.session.connection.socket.get_fd();
-    const acquired_second = try session_pool.acquireOrConnect(&http_client, upstream, threaded.io());
+    const acquired_second = try session_pool.acquireOrConnect(&http_client, upstream, evented.io());
     try testing.expect(acquired_second.connect.reused);
     try testing.expectEqual(first_fd, acquired_second.session.connection.socket.get_fd());
 
@@ -4707,8 +4853,9 @@ test "integration: serval-proxy h2 stream bridge binds downstream to upstream st
     var bridge = serval.proxy.H2StreamBridge.init(&http_client, &session_pool);
     defer bridge.deinit();
 
-    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
-    defer threaded.deinit();
+    var evented: std.Io.Evented = undefined;
+    try init_test_io_runtime(&evented, testing.allocator);
+    defer evented.deinit();
 
     const upstream = serval.Upstream{
         .host = "127.0.0.1",
@@ -4723,7 +4870,7 @@ test "integration: serval-proxy h2 stream bridge binds downstream to upstream st
 
     try sendGrpcUnaryViaStreamBridge(
         &bridge,
-        threaded.io(),
+        evented.io(),
         upstream,
         11,
         authority,
@@ -4736,7 +4883,7 @@ test "integration: serval-proxy h2 stream bridge binds downstream to upstream st
 
     try sendGrpcUnaryViaStreamBridge(
         &bridge,
-        threaded.io(),
+        evented.io(),
         upstream,
         13,
         authority,
@@ -5556,6 +5703,105 @@ test "integration: terminated h2 server replenishes flow-control windows for mul
     try testing.expect(saw_response_data);
 }
 
+test "integration: TLS ALPN h2 generic frontend sends SETTINGS first and forwards non-gRPC route" {
+    const allocator = testing.allocator;
+    const backend_port = harness.getPort();
+    const proxy_port = harness.getPort();
+
+    var pm = harness.ProcessManager.init(allocator);
+    defer pm.deinit();
+
+    try pm.startEchoBackend(backend_port, "h2-generic-backend", .{});
+
+    var proxy = try GrpcH2ProxyServer.startWithFrontendOptions(
+        proxy_port,
+        .{
+            .host = "127.0.0.1",
+            .port = backend_port,
+            .idx = 0,
+            .http_protocol = .h1,
+        },
+        false,
+        true,
+        .generic,
+        .prefer_h2,
+    );
+    defer proxy.stop();
+
+    var socket = try connectTcpTls(proxy_port, "h2");
+    defer socket.close();
+
+    var authority_buf: [32]u8 = undefined;
+    const authority = try std.fmt.bufPrint(&authority_buf, "127.0.0.1:{d}", .{proxy_port});
+
+    var request_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const request = try buildSimpleH2GetRequest("/h2-generic", authority, "https", &request_buf);
+    try sendAllSocket(&socket, request);
+
+    var frame_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var initial: []const u8 = &[_]u8{};
+    var body_buf: [2048]u8 = undefined;
+    var body_len: usize = 0;
+
+    var first_frame_checked = false;
+    var saw_server_settings = false;
+    var saw_response_headers = false;
+    var saw_response_data = false;
+
+    var iterations: u32 = 0;
+    while (iterations < H2_MAX_FRAME_READS) : (iterations += 1) {
+        const frame_view = try readH2FrameSocket(&socket, initial, &frame_buf);
+        initial = frame_view.remaining;
+
+        if (!first_frame_checked) {
+            first_frame_checked = true;
+            try testing.expectEqual(serval_h2.FrameType.settings, frame_view.header.frame_type);
+            try testing.expect((frame_view.header.flags & serval_h2.flags_ack) == 0);
+            saw_server_settings = true;
+            try sendH2SettingsAckSocket(&socket);
+            continue;
+        }
+
+        switch (frame_view.header.frame_type) {
+            .settings => {
+                if ((frame_view.header.flags & serval_h2.flags_ack) == 0) {
+                    saw_server_settings = true;
+                    try sendH2SettingsAckSocket(&socket);
+                }
+            },
+            .headers => {
+                var fields_buf: [H2_MAX_HEADER_FIELDS]serval_h2.HeaderField = undefined;
+                const fields = try decodeH2Fields(frame_view.payload, &fields_buf);
+                if (fields.len == 0) return error.InvalidFrame;
+                try testing.expectEqualStrings(":status", fields[0].name);
+                try testing.expectEqualStrings("200", fields[0].value);
+                saw_response_headers = true;
+
+                if ((frame_view.header.flags & serval_h2.flags_end_stream) != 0) break;
+            },
+            .data => {
+                saw_response_data = true;
+                if (body_len + frame_view.payload.len > body_buf.len) return error.BufferTooSmall;
+                @memcpy(body_buf[body_len..][0..frame_view.payload.len], frame_view.payload);
+                body_len += frame_view.payload.len;
+
+                if ((frame_view.header.flags & serval_h2.flags_end_stream) != 0) break;
+            },
+            else => {},
+        }
+
+        if (saw_response_headers and saw_response_data) {
+            const body = body_buf[0..body_len];
+            if (std.mem.indexOf(u8, body, "/h2-generic") != null) break;
+        }
+    }
+
+    try testing.expect(saw_server_settings);
+    try testing.expect(saw_response_headers);
+    try testing.expect(saw_response_data);
+    try testing.expect(std.mem.indexOf(u8, body_buf[0..body_len], "/h2-generic") != null);
+}
+
 test "integration: grpc h2 prior-knowledge unary request is proxied to tls h2 upstream" {
     const backend_port = harness.getPort();
     const proxy_port = harness.getPort();
@@ -5825,7 +6071,8 @@ test "integration: grpcurl plaintext unary interop against grpc h2c proxy" {
     const proto_path = try std.fmt.allocPrint(allocator, "/tmp/{s}", .{proto_name});
     defer allocator.free(proto_path);
 
-    var file_io: std.Io.Threaded = .init(allocator, .{});
+    var file_io: std.Io.Evented = undefined;
+    try init_test_io_runtime(&file_io, allocator);
     defer file_io.deinit();
     const io = file_io.io();
 
@@ -5907,7 +6154,8 @@ test "integration: grpcurl tls unary interop against grpc h2 proxy" {
     const proto_path = try std.fmt.allocPrint(allocator, "/tmp/{s}", .{proto_name});
     defer allocator.free(proto_path);
 
-    var file_io: std.Io.Threaded = .init(allocator, .{});
+    var file_io: std.Io.Evented = undefined;
+    try init_test_io_runtime(&file_io, allocator);
     defer file_io.deinit();
     const io = file_io.io();
 
@@ -5995,7 +6243,8 @@ test "integration: grpcurl plaintext unary interop asserts metadata and trailers
     const proto_path = try std.fmt.allocPrint(allocator, "/tmp/{s}", .{proto_name});
     defer allocator.free(proto_path);
 
-    var file_io: std.Io.Threaded = .init(allocator, .{});
+    var file_io: std.Io.Evented = undefined;
+    try init_test_io_runtime(&file_io, allocator);
     defer file_io.deinit();
     const io = file_io.io();
 
@@ -6071,7 +6320,8 @@ test "integration: grpcurl plaintext unary metadata/trailer churn loop against g
     const proto_path = try std.fmt.allocPrint(allocator, "/tmp/{s}", .{proto_name});
     defer allocator.free(proto_path);
 
-    var file_io: std.Io.Threaded = .init(allocator, .{});
+    var file_io: std.Io.Evented = undefined;
+    try init_test_io_runtime(&file_io, allocator);
     defer file_io.deinit();
     const io = file_io.io();
 
@@ -6203,7 +6453,8 @@ test "integration: grpc-go plaintext unary interop against grpc h2c proxy" {
     const grpc_go_dir = try std.fmt.allocPrint(allocator, "/tmp/serval_grpcgo_{d}_{d}", .{ proxy_port, backend_port });
     defer allocator.free(grpc_go_dir);
 
-    var file_io: std.Io.Threaded = .init(allocator, .{});
+    var file_io: std.Io.Evented = undefined;
+    try init_test_io_runtime(&file_io, allocator);
     defer file_io.deinit();
     const io = file_io.io();
 
@@ -6331,7 +6582,8 @@ test "integration: grpc-go tls unary interop against grpc h2 proxy" {
     const grpc_go_dir = try std.fmt.allocPrint(allocator, "/tmp/serval_grpcgo_tls_{d}_{d}", .{ proxy_port, backend_port });
     defer allocator.free(grpc_go_dir);
 
-    var file_io: std.Io.Threaded = .init(allocator, .{});
+    var file_io: std.Io.Evented = undefined;
+    try init_test_io_runtime(&file_io, allocator);
     defer file_io.deinit();
     const io = file_io.io();
 
@@ -6462,7 +6714,8 @@ test "integration: grpc-go plaintext server streaming interop against grpc h2c p
     const grpc_go_dir = try std.fmt.allocPrint(allocator, "/tmp/serval_grpcgo_stream_{d}_{d}", .{ proxy_port, backend_port });
     defer allocator.free(grpc_go_dir);
 
-    var file_io: std.Io.Threaded = .init(allocator, .{});
+    var file_io: std.Io.Evented = undefined;
+    try init_test_io_runtime(&file_io, allocator);
     defer file_io.deinit();
     const io = file_io.io();
 
@@ -6627,7 +6880,8 @@ test "integration: grpc-go plaintext unary interop asserts metadata and trailers
     const grpc_go_dir = try std.fmt.allocPrint(allocator, "/tmp/serval_grpcgo_meta_{d}_{d}", .{ proxy_port, backend_port });
     defer allocator.free(grpc_go_dir);
 
-    var file_io: std.Io.Threaded = .init(allocator, .{});
+    var file_io: std.Io.Evented = undefined;
+    try init_test_io_runtime(&file_io, allocator);
     defer file_io.deinit();
     const io = file_io.io();
 
@@ -6778,7 +7032,8 @@ test "integration: grpc-go plaintext server streaming interop asserts metadata a
     const grpc_go_dir = try std.fmt.allocPrint(allocator, "/tmp/serval_grpcgo_stream_meta_{d}_{d}", .{ proxy_port, backend_port });
     defer allocator.free(grpc_go_dir);
 
-    var file_io: std.Io.Threaded = .init(allocator, .{});
+    var file_io: std.Io.Evented = undefined;
+    try init_test_io_runtime(&file_io, allocator);
     defer file_io.deinit();
     const io = file_io.io();
 
@@ -6942,7 +7197,8 @@ test "integration: grpc-go plaintext unary metadata/trailer churn loop against g
     const grpc_go_dir = try std.fmt.allocPrint(allocator, "/tmp/serval_grpcgo_meta_loop_{d}_{d}", .{ proxy_port, backend_port });
     defer allocator.free(grpc_go_dir);
 
-    var file_io: std.Io.Threaded = .init(allocator, .{});
+    var file_io: std.Io.Evented = undefined;
+    try init_test_io_runtime(&file_io, allocator);
     defer file_io.deinit();
     const io = file_io.io();
 
@@ -7114,7 +7370,8 @@ test "integration: grpc-go plaintext server streaming metadata/trailer churn loo
     const grpc_go_dir = try std.fmt.allocPrint(allocator, "/tmp/serval_grpcgo_stream_meta_loop_{d}_{d}", .{ proxy_port, backend_port });
     defer allocator.free(grpc_go_dir);
 
-    var file_io: std.Io.Threaded = .init(allocator, .{});
+    var file_io: std.Io.Evented = undefined;
+    try init_test_io_runtime(&file_io, allocator);
     defer file_io.deinit();
     const io = file_io.io();
 
@@ -9874,7 +10131,10 @@ test "integration: lb forwards 100MB payload correctly" {
     defer pm.deinit();
 
     // Start echo backend with --echo-body mode
-    try pm.startEchoBackend(backend_port, "100mb-backend", .{ .echo_body = true });
+    try pm.startEchoBackend(backend_port, "100mb-backend", .{
+        .echo_body = true,
+        .debug = true,
+    });
 
     var backend_addr_buf: [ADDR_BUF_LEN]u8 = undefined;
     const backend_addr = std.fmt.bufPrint(&backend_addr_buf, "127.0.0.1:{d}", .{backend_port}) catch unreachable;
@@ -9909,7 +10169,10 @@ test "integration: lb forwards generated payload stream correctly" {
     defer pm.deinit();
 
     // Echo body mode verifies byte-for-byte forwarding with generated payload stream.
-    try pm.startEchoBackend(backend_port, "generated-stream-backend", .{ .echo_body = true });
+    try pm.startEchoBackend(backend_port, "generated-stream-backend", .{
+        .echo_body = true,
+        .debug = true,
+    });
 
     var backend_addr_buf: [ADDR_BUF_LEN]u8 = undefined;
     const backend_addr = std.fmt.bufPrint(&backend_addr_buf, "127.0.0.1:{d}", .{backend_port}) catch unreachable;

@@ -64,6 +64,10 @@ pub const monotonicNanos = time.monotonicNanos;
 pub const elapsedNanos = time.elapsedNanos;
 pub const elapsedSince = time.elapsedSince;
 
+// POSIX compatibility
+pub const posix_compat = @import("posix_compat.zig");
+pub const closeFd = posix_compat.closeFd;
+
 // String utilities
 pub const strings = @import("strings.zig");
 pub const eqlIgnoreCase = strings.eqlIgnoreCase;
@@ -80,4 +84,5 @@ test {
     _ = @import("time.zig");
     _ = @import("span_handle.zig");
     _ = @import("strings.zig");
+    _ = @import("posix_compat.zig");
 }

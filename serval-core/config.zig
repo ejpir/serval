@@ -70,8 +70,9 @@ pub const MAX_CHUNK_ITERATIONS: u32 = 1024 * 1024;
 
 /// Maximum chunks for streaming response callbacks.
 /// TigerStyle S3: Bounded loop limit for handler-generated streams.
-/// 64K chunks * 8KB buffer = 512MB max streamed response.
-pub const MAX_STREAM_CHUNK_COUNT: u32 = 65536;
+/// With the current 1KB streaming scratch buffer, 256K chunks covers 256MB.
+/// This keeps large echo/integration streaming bounded while allowing 100MB tests.
+pub const MAX_STREAM_CHUNK_COUNT: u32 = 262_144;
 
 /// Buffer size for direct response handlers (echo backends, health checks, etc.)
 /// Only allocated when handler implements onRequest hook.
@@ -553,23 +554,38 @@ comptime {
 // =============================================================================
 
 /// TLS frontend HTTP/2 dispatch mode.
-/// - disabled: ignore ALPN h2 and stay on HTTP/1.1 request loop
-/// - terminated_only: dispatch ALPN h2 only when handler implements terminated h2 hooks
-/// - generic: reserved for full generic h2 frontend orchestration
+/// - disabled: disable explicit frontend-h2 policy routing (ALPN h2 safety fallback may still use generic h2 to avoid h1 parsing on a negotiated h2 connection)
+/// - terminated_only: prefer terminated h2 when handler implements explicit h2 hooks; otherwise ALPN h2 falls back to generic frontend h2
+/// - generic: always use generic frontend h2 for ALPN h2 when terminated hooks are absent
 pub const TlsH2FrontendMode = enum {
     disabled,
     terminated_only,
     generic,
 };
 
-/// ALPN policy when client offers both `h2` and `http/1.1`.
+/// ALPN negotiation policy for TLS frontend connections.
 /// TigerStyle: explicit deployment policy, no hidden defaults.
 pub const AlpnMixedOfferPolicy = enum {
+    /// When client offers both h2 and http/1.1, select http/1.1.
+    /// If client offers only h2, accept h2.
     prefer_http11,
+    /// When client offers both h2 and http/1.1, select h2.
+    /// If client offers only http/1.1, accept http/1.1.
     prefer_h2,
+    /// Only accept http/1.1. Reject h2 even if client offers only h2.
+    /// Use this when h2 proxy support is incomplete (e.g., streaming gRPC).
+    /// Clients that only speak h2 will fail ALPN and must fall back to
+    /// alternative transports (e.g., WebSocket).
+    http11_only,
 };
 
 pub const Config = struct {
+    /// Host/address to bind the frontend listener to.
+    /// Examples:
+    /// - "0.0.0.0" (IPv4 any)
+    /// - "::" (IPv6 any; typically dual-stack when kernel allows)
+    listen_host: []const u8 = "0.0.0.0",
+
     /// Port to listen on
     port: u16 = 8080,
 
@@ -669,6 +685,7 @@ pub const TlsConfig = struct {
 
 test "Config has sensible defaults" {
     const cfg = Config{};
+    try std.testing.expectEqualStrings("0.0.0.0", cfg.listen_host);
     try std.testing.expectEqual(@as(u16, 8080), cfg.port);
     try std.testing.expectEqual(@as(u32, 15_000), cfg.keepalive_timeout_ms);
     try std.testing.expect(cfg.tls == null);

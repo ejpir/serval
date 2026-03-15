@@ -135,7 +135,9 @@ bounded `h2/` primitives for that migration:
 - Response streaming to client
 - WebSocket upgrade forwarding with RFC 6455 handshake validation
 - Bidirectional tunnel relay after `101 Switching Protocols`
-- gRPC over h2 stream-aware bridging for prior-knowledge and `Upgrade: h2c` entry when upstream protocol is `.h2c` (cleartext) or `.h2` (TLS), including fail-closed invalid responses (`grpc-status` required), GOAWAY `last_stream_id`-aware active-stream handling, and session-generation-aware binding across upstream rollover
+- Tunnel relay now runs as two cooperative `std.Io` fibers instead of a raw `poll(2)` loop; the same nonblocking relay path is reused by upgraded h2 WebSocket proxying
+- Tunnel relay now treats downstream/upstream write-side connection resets as closed-peer termination instead of an internal proxy error, avoiding assertion failures during TLS tunnel cleanup
+- gRPC over h2 stream-aware bridging for prior-knowledge and `Upgrade: h2c` entry when upstream protocol is `.h2c` (cleartext) or `.h2` (TLS), including fail-closed invalid responses (`grpc-status` required), GOAWAY `last_stream_id`-aware active-stream handling, session-generation-aware binding across upstream rollover, and fail-closed downstream DATA forwarding when upstream transitions to `ConnectionClosing` (no retry masking)
 - Legacy translation+tunnel fallback for non-h2 upstream targets where full stream-aware proxying does not apply
 - Upgraded/tunneled connections are closed instead of being returned to the HTTP pool
 

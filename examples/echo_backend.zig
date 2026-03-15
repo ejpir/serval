@@ -182,40 +182,18 @@ const EchoHandler = struct {
 
         // In echo-body mode, read request body and return it exactly
         if (self.echo_body) {
-            // Read body lazily using context's body reader
-            const body = ctx.readBody(response_buf) catch |err| {
-                if (self.debug) {
-                    std.debug.print("[{s}] {s} {s} -> 500 (body read error: {s})\n", .{
-                        self.id,
-                        @tagName(request.method),
-                        request.path,
-                        @errorName(err),
-                    });
-                }
-                return .{ .send_response = .{
-                    .status = 500,
-                    .body = "Failed to read request body",
-                    .content_type = "text/plain",
-                    .extra_headers = "",
-                    .response_mode = .content_length,
-                } };
-            };
-
             if (self.debug) {
-                std.debug.print("[{s}] {s} {s} -> 200 (echo-body: {d} bytes)\n", .{
+                std.debug.print("[{s}] {s} {s} -> 200 (echo-body stream)\n", .{
                     self.id,
                     @tagName(request.method),
                     request.path,
-                    body.len,
                 });
             }
 
-            return .{ .send_response = .{
+            return .{ .stream = .{
                 .status = 200,
-                .body = body,
                 .content_type = "application/octet-stream",
                 .extra_headers = self.extra_headers_buf[0..self.extra_headers_len],
-                .response_mode = if (self.chunked) .chunked else .content_length,
             } };
         }
 
@@ -239,6 +217,34 @@ const EchoHandler = struct {
             .extra_headers = self.extra_headers_buf[0..self.extra_headers_len],
             .response_mode = if (self.chunked) .chunked else .content_length,
         } };
+    }
+
+    pub fn nextChunk(self: *@This(), ctx: *serval.Context, response_buf: []u8) !?usize {
+        assert(@intFromPtr(self) != 0);
+        assert(response_buf.len > 0);
+
+        if (!self.echo_body) return null;
+
+        const maybe_chunk = ctx.readBodyChunk(response_buf) catch |err| {
+            if (self.debug) {
+                std.debug.print("[{s}] nextChunk readBodyChunk failed: {s}\n", .{
+                    self.id,
+                    @errorName(err),
+                });
+            }
+            return err;
+        };
+        const chunk = maybe_chunk orelse return null;
+
+        if (self.debug and chunk.len > 0) {
+            std.debug.print("[{s}] nextChunk produced {d} bytes\n", .{
+                self.id,
+                chunk.len,
+            });
+        }
+
+        assert(chunk.len <= response_buf.len);
+        return chunk.len;
     }
 };
 

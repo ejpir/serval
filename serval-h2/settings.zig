@@ -24,6 +24,7 @@ pub const SettingId = enum(u16) {
     initial_window_size = 0x4,
     max_frame_size = 0x5,
     max_header_list_size = 0x6,
+    enable_connect_protocol = 0x8,
 };
 
 pub const Setting = struct {
@@ -42,6 +43,7 @@ pub const Settings = struct {
     initial_window_size_bytes: u32 = config.H2_INITIAL_WINDOW_SIZE_BYTES,
     max_frame_size_bytes: u32 = config.H2_MAX_FRAME_SIZE_BYTES,
     max_header_list_size_bytes: u32 = max_header_list_size_unbounded,
+    enable_connect_protocol: bool = true,
 };
 
 pub const Error = error{
@@ -145,12 +147,16 @@ fn applySetting(target: *Settings, setting: Setting) Error!void {
         .initial_window_size => target.initial_window_size_bytes = setting.value,
         .max_frame_size => target.max_frame_size_bytes = setting.value,
         .max_header_list_size => target.max_header_list_size_bytes = setting.value,
+        .enable_connect_protocol => target.enable_connect_protocol = setting.value == 1,
     }
 }
 
 fn validateSetting(setting: Setting) Error!void {
     switch (decodeSettingId(setting.id) orelse return) {
         .enable_push => {
+            if (setting.value > 1) return error.InvalidEnablePush;
+        },
+        .enable_connect_protocol => {
             if (setting.value > 1) return error.InvalidEnablePush;
         },
         .initial_window_size => {
@@ -173,6 +179,7 @@ fn decodeSettingId(raw_id: u16) ?SettingId {
         0x4 => .initial_window_size,
         0x5 => .max_frame_size,
         0x6 => .max_header_list_size,
+        0x8 => .enable_connect_protocol,
         else => null,
     };
 }
@@ -200,6 +207,7 @@ test "buildPayload round-trips settings" {
     const settings = [_]Setting{
         .{ .id = 0x2, .value = 0 },
         .{ .id = 0x4, .value = 65_535 },
+        .{ .id = 0x8, .value = 1 },
     };
     var payload: [settings.len * setting_size_bytes]u8 = undefined;
     var out: [config.H2_MAX_SETTINGS_PER_FRAME]Setting = undefined;
@@ -210,6 +218,7 @@ test "buildPayload round-trips settings" {
     try std.testing.expectEqual(@as(usize, settings.len), parsed.len);
     try std.testing.expectEqualDeep(settings[0], parsed[0]);
     try std.testing.expectEqualDeep(settings[1], parsed[1]);
+    try std.testing.expectEqualDeep(settings[2], parsed[2]);
 }
 
 test "validateFrame rejects ack payload" {
@@ -243,6 +252,7 @@ test "applySettings updates target state" {
         .{ .id = 0x2, .value = 0 },
         .{ .id = 0x3, .value = 32 },
         .{ .id = 0x4, .value = 70_000 },
+        .{ .id = 0x8, .value = 1 },
     };
     var settings = Settings{};
 
@@ -251,4 +261,5 @@ test "applySettings updates target state" {
     try std.testing.expect(!settings.enable_push);
     try std.testing.expectEqual(@as(u32, 32), settings.max_concurrent_streams);
     try std.testing.expectEqual(@as(u32, 70_000), settings.initial_window_size_bytes);
+    try std.testing.expect(settings.enable_connect_protocol);
 }

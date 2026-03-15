@@ -16,6 +16,7 @@ const net = @import("serval-net");
 const tls = @import("serval-tls");
 const serval_client = @import("serval-client");
 const serval_core = @import("serval-core");
+const closeFd = serval_core.closeFd;
 
 const DnsResolver = net.DnsResolver;
 const HttpClient = serval_client.Client;
@@ -743,7 +744,7 @@ fn readFileIntoBuffer(path: []const u8, buffer: []u8) !usize {
             else => err,
         };
     };
-    defer posix.close(fd);
+    defer closeFd(fd);
 
     var total_read: usize = 0;
     var iteration: u32 = 0;

@@ -18,7 +18,9 @@ const HeaderMap = serval_core.types.HeaderMap;
 
 /// Global connection counter for unique connection IDs.
 /// TigerStyle: Module-level state with atomic access, monotonic ordering sufficient.
-var global_connection_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+/// u32 to support 32-bit targets (e.g. arm-linux-musleabihf) where 64-bit atomics
+/// are not available. Wraps after ~4 billion connections which is acceptable.
+var global_connection_id: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
 
 /// Result of processing a single HTTP request.
 /// TigerStyle: Explicit enum for control flow, no magic booleans.
@@ -38,7 +40,7 @@ pub const ProcessResult = enum {
 pub fn nextConnectionId() u64 {
     // Postcondition: returned ID is unique (monotonic counter)
     const id = global_connection_id.fetchAdd(1, .monotonic);
-    return id;
+    return @intCast(id);
 }
 
 /// Check if client requested connection close (RFC 9112).

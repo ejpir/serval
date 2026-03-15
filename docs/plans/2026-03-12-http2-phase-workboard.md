@@ -42,8 +42,11 @@ Related execution plan:
   - Completed for terminated-h2 handlers: ALPN `h2` now dispatches directly to terminated h2 runtime over TLS
   - Result: dedicated TLS conformance target now passes `h2spec` 145/145
   - Remaining: mixed-offer frontend policy is still conservative (`http/1.1` preferred) until full mixed-traffic rollout criteria are closed
-- [ ] P1-B: Ensure h2-negotiated connections always emit server SETTINGS first
-- [ ] P1-C: Add targeted regression test for mixed ALPN client + non-gRPC route behavior
+- [x] P1-B: Ensure h2-negotiated connections always emit server SETTINGS first
+  - Covered by integration regression: TLS ALPN h2 generic frontend validates first inbound frame is non-ACK SETTINGS before response frames
+- [x] P1-C: Add targeted regression test for mixed ALPN client + non-gRPC route behavior
+  - Added TLS ALPN h2 generic frontend non-gRPC route regression (h2 request to HTTP upstream forwarding path)
+  - Existing ALPN policy unit coverage in `serval-tls/ssl.zig` continues to validate mixed-offer selection (`prefer_http11` vs `prefer_h2`)
 
 ### Exit gate
 - [ ] h2spec connection/setup chapters green
@@ -58,14 +61,17 @@ Related execution plan:
   - Implemented: unknown frame types map to `.extension` and are ignored in client/server runtime receive paths
 - [x] P2-B: Peer max-frame-size outbound enforcement audit/fixes (B5)
   - Implemented: peer max-frame-aware response DATA chunking plus outbound HEADERS/trailers fragmentation via bounded HEADERS+CONTINUATION emission in client request and terminated server response paths
-- [ ] P2-C: Error-code mapping audit for protocol vs flow-control violations
+- [x] P2-C: Error-code mapping audit for protocol vs flow-control violations
+  - Server runtime now classifies stream DATA window exhaustion as `StreamFlowControlError` without mutating connection window state
+  - GOAWAY mapping now explicitly treats `StreamFlowControlError` as `FLOW_CONTROL_ERROR`
 
 ### Exit gate
 - [~] h2spec frame/stream/flow-control chapters green
   - Cleartext h2c target: 145/145 passed (0 skipped, 0 failed)
   - TLS h2 conformance target: 145/145 passed (0 skipped, 0 failed)
   - Remaining work is rollout/policy hardening for mixed-traffic frontend behavior, not protocol conformance on the dedicated target
-- [ ] parser/state-machine fuzz invariants green
+- [x] parser/state-machine fuzz invariants green
+  - Added deterministic randomized runtime frame-sequence invariant test (bounded, fixed-seed) in `serval-server/h2/runtime.zig`
 
 ---
 
@@ -90,7 +96,11 @@ Related execution plan:
 ### Open implementation queue
 - [ ] P4-A: Stream-binding correctness audit under churn
 - [ ] P4-B: Deterministic cancellation/reset propagation audit
-- [ ] P4-C: Remove remaining retry-masked correctness paths
+- [~] P4-C: Remove remaining retry-masked correctness paths
+  - Removed bridge `sendDownstreamData` retry-on-`ConnectionClosing` behavior; now fail-closed, drop binding, and close affected session generation
+  - ALPN `h2` frontend dispatch now falls back to generic h2 when terminated hooks are absent (prevents h1 parsing on negotiated h2 connections)
+  - Added targeted runtime/bridge warning logs for frame-level protocol failures and connection-closing send path failures
+  - Remaining stream-churn cleanup on graceful GOAWAY paths stays open under P4-A/P4-B
 
 ### Exit gate
 - [ ] grpc-go/grpcurl/NetBird client interop stable under churn + soak

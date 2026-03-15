@@ -162,6 +162,40 @@ pub fn forwardUpgradeResponse(
     };
 }
 
+pub fn receiveUpgradeResponse(
+    io: Io,
+    upstream_conn: *Connection,
+    is_pooled: bool,
+    expected_accept_key: []const u8,
+) ForwardError!UpgradeResponseResult {
+    assert(upstream_conn.get_fd() >= 0);
+    assert(expected_accept_key.len == serval_websocket.websocket_accept_key_size_bytes);
+
+    var header_buffer: [config.MAX_HEADER_SIZE_BYTES]u8 = std.mem.zeroes([config.MAX_HEADER_SIZE_BYTES]u8);
+    const headers = try receiveHeaders(upstream_conn, io, &header_buffer, is_pooled);
+    const header_len: usize = headers.header_len;
+    const header_end: usize = headers.header_end;
+
+    const header_block = header_buffer[0..header_end];
+    const status = parseStatusCode(header_block) orelse return ForwardError.InvalidResponse;
+    if (status != 101) {
+        return .{
+            .status = status,
+            .response_bytes = header_len,
+            .upgraded = false,
+        };
+    }
+
+    serval_websocket.validateServerResponse(status, header_block, expected_accept_key) catch {
+        return ForwardError.InvalidResponse;
+    };
+    return .{
+        .status = status,
+        .response_bytes = header_len,
+        .upgraded = true,
+    };
+}
+
 fn forwardBufferedBody(
     upstream_conn: *Connection,
     client_socket: *Socket,

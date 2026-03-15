@@ -9,6 +9,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 const config = @import("serval-core").config;
+const log = @import("serval-core").log.scoped(.client_h2_runtime);
 const types = @import("serval-core").types;
 const h2 = @import("serval-h2");
 const session = @import("session.zig");
@@ -211,7 +212,20 @@ pub const Runtime = struct {
         assert(@intFromPtr(self) != 0);
         assert(stream_id > 0);
 
-        const stream = self.state.getStream(stream_id) orelse return error.StreamNotFound;
+        const stream = self.state.getStream(stream_id) orelse {
+            log.warn(
+                "client h2 runtime: missing stream in writeRequestDataFrame stream={d} active={d} last_local={d} last_remote={d} payload={d} end_stream={any}",
+                .{
+                    stream_id,
+                    self.state.streams.active_count,
+                    self.state.streams.last_local_stream_id,
+                    self.state.streams.last_remote_stream_id,
+                    payload.len,
+                    end_stream,
+                },
+            );
+            return error.StreamNotFound;
+        };
         if (!stream.localCanSend()) return error.InvalidDataStream;
 
         if (payload.len > self.state.peer_settings.max_frame_size_bytes) return error.FrameTooLarge;
@@ -347,7 +361,19 @@ fn handleHeaders(self: *Runtime, header: h2.FrameHeader, payload: []const u8) Er
     if ((header.flags & h2.flags_padded) != 0) return error.UnsupportedPadding;
     if ((header.flags & h2.flags_priority) != 0) return error.UnsupportedPriority;
 
-    const stream = self.state.getStream(header.stream_id) orelse return error.StreamNotFound;
+    const stream = self.state.getStream(header.stream_id) orelse {
+        log.warn(
+            "client h2 runtime: missing stream in response HEADERS stream={d} active={d} last_local={d} last_remote={d} flags=0x{x}",
+            .{
+                header.stream_id,
+                self.state.streams.active_count,
+                self.state.streams.last_local_stream_id,
+                self.state.streams.last_remote_stream_id,
+                header.flags,
+            },
+        );
+        return error.StreamNotFound;
+    };
     if (!stream.remoteCanSend()) return error.InvalidHeadersStream;
 
     const end_stream = (header.flags & h2.flags_end_stream) != 0;
@@ -497,7 +523,20 @@ fn handleData(self: *Runtime, header: h2.FrameHeader, payload: []const u8) Error
 
     if (header.stream_id == 0) return error.InvalidDataStream;
 
-    const stream = self.state.getStream(header.stream_id) orelse return error.StreamNotFound;
+    const stream = self.state.getStream(header.stream_id) orelse {
+        log.warn(
+            "client h2 runtime: missing stream in response DATA stream={d} active={d} last_local={d} last_remote={d} flags=0x{x} len={d}",
+            .{
+                header.stream_id,
+                self.state.streams.active_count,
+                self.state.streams.last_local_stream_id,
+                self.state.streams.last_remote_stream_id,
+                header.flags,
+                header.length,
+            },
+        );
+        return error.StreamNotFound;
+    };
     if (!stream.remoteCanSend()) return error.InvalidDataStream;
 
     const payload_len: u32 = @intCast(payload.len);
@@ -533,7 +572,25 @@ fn handleWindowUpdate(self: *Runtime, header: h2.FrameHeader, payload: []const u
     if (header.stream_id == 0) {
         try self.state.incrementSendWindow(increment);
     } else {
-        try self.state.incrementStreamSendWindow(header.stream_id, increment);
+        self.state.incrementStreamSendWindow(header.stream_id, increment) catch |err| switch (err) {
+            error.StreamNotFound => {
+                log.warn(
+                    "client h2 runtime: missing stream in WINDOW_UPDATE stream={d} active={d} last_local={d} last_remote={d} increment={d}",
+                    .{
+                        header.stream_id,
+                        self.state.streams.active_count,
+                        self.state.streams.last_local_stream_id,
+                        self.state.streams.last_remote_stream_id,
+                        increment,
+                    },
+                );
+                if (header.stream_id > self.state.streams.last_remote_stream_id) {
+                    return error.InvalidStreamId;
+                }
+                return .none;
+            },
+            else => return err,
+        };
     }
 
     return .none;
@@ -544,7 +601,22 @@ fn handleRstStream(self: *Runtime, header: h2.FrameHeader, payload: []const u8) 
     assert(header.frame_type == .rst_stream);
 
     const error_code_raw = try h2.parseRstStreamFrame(header, payload);
-    try self.state.resetStream(header.stream_id);
+    self.state.resetStream(header.stream_id) catch |err| switch (err) {
+        error.StreamNotFound => {
+            log.warn(
+                "client h2 runtime: missing stream in RST_STREAM stream={d} active={d} last_local={d} last_remote={d} error_code_raw={d}",
+                .{
+                    header.stream_id,
+                    self.state.streams.active_count,
+                    self.state.streams.last_local_stream_id,
+                    self.state.streams.last_remote_stream_id,
+                    error_code_raw,
+                },
+            );
+            return err;
+        },
+        else => return err,
+    };
     self.response_states.remove(header.stream_id);
     return .{ .stream_reset = .{ .stream_id = header.stream_id, .error_code_raw = error_code_raw } };
 }

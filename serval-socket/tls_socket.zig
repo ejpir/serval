@@ -13,6 +13,8 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const posix = std.posix;
+const serval_core = @import("serval-core");
+const closeFd = serval_core.closeFd;
 const tls = @import("serval-tls");
 const TLSStream = tls.TLSStream;
 const ssl = tls.ssl;
@@ -189,7 +191,7 @@ pub const TLSSocket = struct {
         self.stream.close();
 
         // Close underlying fd (TLSStream.close() doesn't close it)
-        posix.close(self.fd);
+        closeFd(self.fd);
 
         // Mark as closed
         self.fd = -1;
@@ -209,6 +211,7 @@ fn map_tls_error(err: anyerror) SocketError {
         error.HandshakeFailed => SocketError.TLSError,
         error.SslRead => SocketError.TLSError,
         error.SslWrite => SocketError.TLSError,
+        error.WouldBlock => SocketError.TLSError,
         else => SocketError.Unexpected,
     };
 }
@@ -242,6 +245,7 @@ test "map_tls_error maps known errors to TLSError" {
     try std.testing.expectEqual(SocketError.TLSError, map_tls_error(error.HandshakeFailed));
     try std.testing.expectEqual(SocketError.TLSError, map_tls_error(error.SslRead));
     try std.testing.expectEqual(SocketError.TLSError, map_tls_error(error.SslWrite));
+    try std.testing.expectEqual(SocketError.TLSError, map_tls_error(error.WouldBlock));
 }
 
 test "map_tls_error maps unknown errors to Unexpected" {

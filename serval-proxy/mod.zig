@@ -13,6 +13,7 @@ pub const Protocol = types.Protocol;
 pub const tunnel = @import("tunnel.zig");
 pub const TunnelStats = tunnel.TunnelStats;
 pub const TunnelTermination = tunnel.Termination;
+pub const h1 = @import("h1/mod.zig");
 
 pub const h2 = @import("h2/mod.zig");
 pub const H2Binding = h2.Binding;

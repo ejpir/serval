@@ -20,7 +20,11 @@ pub const fd_t = std.posix.fd_t;
 pub const socket_t = std.posix.socket_t;
 pub const socklen_t = std.posix.socklen_t;
 
-pub const close = std.posix.close;
+pub fn close(fd: fd_t) void {
+    std.debug.assert(fd >= 0);
+    _ = std.os.linux.close(fd);
+}
+
 pub const kill = std.posix.kill;
 pub const read = std.posix.read;
 pub const setsockopt = std.posix.setsockopt;

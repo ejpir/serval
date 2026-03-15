@@ -28,19 +28,23 @@ pub fn selectTlsAlpnDispatchActionFromAlpn(
     frontend_mode: config.TlsH2FrontendMode,
     has_terminated_h2_handler: bool,
 ) TlsDispatchAction {
-    if (frontend_mode == .disabled) return .continue_h1;
-
     const negotiated = alpn orelse return .continue_h1;
     if (!std.mem.eql(u8, negotiated, "h2")) return .continue_h1;
 
-    if (frontend_mode == .generic and !has_terminated_h2_handler) {
-        return .generic_h2;
-    }
-
+    // RFC 9113 / ALPN invariant:
+    // once ALPN negotiates h2, frontend must not continue with h1 parsing.
+    // If no terminated handler exists, generic frontend h2 is the fallback path.
     if (has_terminated_h2_handler and frontend_mode != .disabled) {
         return .terminated_h2;
     }
 
+    if (!has_terminated_h2_handler) {
+        return .generic_h2;
+    }
+
+    // terminated handler exists but frontend mode explicitly disabled.
+    // keep h1 path for now (legacy rollout mode), but no-h2 ALPN selection should
+    // be enforced at TLS policy level to avoid protocol mismatch.
     return .continue_h1;
 }
 
@@ -56,6 +60,16 @@ test "selectTlsAlpnDispatchAction keeps h1 when mode disabled" {
 
 test "selectTlsAlpnDispatchAction routes generic h2 without terminated hooks" {
     const action = selectTlsAlpnDispatchActionFromAlpn("h2", .generic, false);
+    try std.testing.expectEqual(TlsDispatchAction.generic_h2, action);
+}
+
+test "selectTlsAlpnDispatchAction routes generic h2 fallback for terminated_only without hooks" {
+    const action = selectTlsAlpnDispatchActionFromAlpn("h2", .terminated_only, false);
+    try std.testing.expectEqual(TlsDispatchAction.generic_h2, action);
+}
+
+test "selectTlsAlpnDispatchAction routes generic h2 fallback for disabled without hooks" {
+    const action = selectTlsAlpnDispatchActionFromAlpn("h2", .disabled, false);
     try std.testing.expectEqual(TlsDispatchAction.generic_h2, action);
 }
 

@@ -15,6 +15,7 @@ const assert = std.debug.assert;
 const core = @import("serval-core");
 const config = core.config;
 const types = core.types;
+const log = core.log.scoped(.proxy);
 
 const h2 = @import("serval-h2");
 const serval_client = @import("serval-client");
@@ -156,9 +157,54 @@ pub const StreamBridge = struct {
         const session = self.sessions.getByGeneration(binding.upstream_index, binding.upstream_session_generation) orelse return error.SessionNotFound;
 
         session.sendRequestData(binding.upstream_stream_id, payload, end_stream) catch |err| switch (err) {
+            error.ConnectionClosed => {
+                if (!end_stream) return err;
+
+                log.warn(
+                    "h2 bridge: downstream={d} upstream={d} idx={d} gen={d} final sendRequestData saw ConnectionClosed; preserving binding for in-flight response",
+                    .{
+                        downstream_stream_id,
+                        binding.upstream_stream_id,
+                        binding.upstream_index,
+                        binding.upstream_session_generation,
+                    },
+                );
+                return;
+            },
             error.ConnectionClosing => {
-                const retry_session = self.sessions.getByGeneration(binding.upstream_index, binding.upstream_session_generation) orelse return err;
-                try retry_session.sendRequestData(binding.upstream_stream_id, payload, end_stream);
+                if (end_stream) {
+                    log.warn(
+                        "h2 bridge: downstream={d} upstream={d} idx={d} gen={d} final sendRequestData saw ConnectionClosing; goaway_received={any} last_stream_id={d} preserving binding",
+                        .{
+                            downstream_stream_id,
+                            binding.upstream_stream_id,
+                            binding.upstream_index,
+                            binding.upstream_session_generation,
+                            session.h2.runtime.state.goaway_received,
+                            session.h2.runtime.state.peer_goaway_last_stream_id,
+                        },
+                    );
+                    return;
+                }
+
+                log.warn(
+                    "h2 bridge: downstream={d} upstream={d} idx={d} gen={d} sendRequestData failed with ConnectionClosing; goaway_received={any} last_stream_id={d} failing closed",
+                    .{
+                        downstream_stream_id,
+                        binding.upstream_stream_id,
+                        binding.upstream_index,
+                        binding.upstream_session_generation,
+                        session.h2.runtime.state.goaway_received,
+                        session.h2.runtime.state.peer_goaway_last_stream_id,
+                    },
+                );
+
+                _ = self.binding_table.removeByDownstream(downstream_stream_id) catch |remove_err| switch (remove_err) {
+                    error.BindingNotFound => return err,
+                    else => return remove_err,
+                };
+                self.sessions.closeGeneration(binding.upstream_index, binding.upstream_session_generation);
+                return err;
             },
             else => return err,
         };
@@ -202,14 +248,19 @@ pub const StreamBridge = struct {
         return self.mapReceiveAction(upstream_index, session.generation, action);
     }
 
-    pub fn receiveForDownstream(self: *StreamBridge, downstream_stream_id: u32) Error!ReceiveAction {
+    pub fn receiveForDownstream(
+        self: *StreamBridge,
+        io: Io,
+        timeout: Io.Timeout,
+        downstream_stream_id: u32,
+    ) Error!ReceiveAction {
         assert(@intFromPtr(self) != 0);
         assert(downstream_stream_id > 0);
 
         const binding = self.binding_table.getByDownstream(downstream_stream_id) orelse return error.BindingNotFound;
         const session = self.sessions.getByGeneration(binding.upstream_index, binding.upstream_session_generation) orelse return error.SessionNotFound;
 
-        const action = try session.receiveActionHandlingControl();
+        const action = try session.receiveActionHandlingControlTimeout(io, timeout);
         return self.mapReceiveAction(binding.upstream_index, binding.upstream_session_generation, action);
     }
 
@@ -491,6 +542,41 @@ test "StreamBridge keeps bindings on no-error connection_close" {
     }
 
     try std.testing.expectEqual(@as(u16, 1), bridge.activeBindingCount());
+}
+
+test "StreamBridge keeps all bindings on no-error connection_close" {
+    var dns_resolver: @import("serval-net").DnsResolver = undefined;
+    @import("serval-net").DnsResolver.init(&dns_resolver, .{});
+    var client = serval_client.Client.init(std.testing.allocator, &dns_resolver, null, false);
+    var sessions = serval_client.H2UpstreamSessionPool.init();
+    defer sessions.deinit();
+
+    var bridge = StreamBridge.init(&client, &sessions);
+    defer bridge.deinit();
+
+    const upstream_index: config.UpstreamIndex = 9;
+    try bridge.binding_table.put(.{
+        .downstream_stream_id = 17,
+        .upstream_stream_id = 1,
+        .upstream_index = upstream_index,
+        .upstream_session_generation = 3,
+    });
+    try bridge.binding_table.put(.{
+        .downstream_stream_id = 19,
+        .upstream_stream_id = 3,
+        .upstream_index = upstream_index,
+        .upstream_session_generation = 3,
+    });
+
+    _ = try bridge.mapReceiveAction(upstream_index, 3, .{ .connection_close = .{
+        .last_stream_id = 1,
+        .error_code_raw = @intFromEnum(h2.ErrorCode.no_error),
+        .debug_data = "graceful",
+    } });
+
+    try std.testing.expect(bridge.binding_table.getByDownstream(17) != null);
+    try std.testing.expect(bridge.binding_table.getByDownstream(19) != null);
+    try std.testing.expectEqual(@as(u16, 2), bridge.activeBindingCount());
 }
 
 test "StreamBridge clears only matching generation bindings on error connection_close" {

@@ -185,6 +185,31 @@ pub const BindingTable = struct {
         return removed_count;
     }
 
+    pub fn removeAllForUpstreamSessionAboveLastStreamId(
+        self: *BindingTable,
+        upstream_index: config.UpstreamIndex,
+        upstream_session_generation: u32,
+        last_stream_id: u32,
+    ) u16 {
+        assert(@intFromPtr(self) != 0);
+        assert(upstream_session_generation > 0);
+
+        var removed_count: u16 = 0;
+        for (self.slots, 0..) |slot, index| {
+            if (!slot.used) continue;
+            if (slot.binding.upstream_index != upstream_index) continue;
+            if (slot.binding.upstream_session_generation != upstream_session_generation) continue;
+            if (slot.binding.upstream_stream_id <= last_stream_id) continue;
+
+            self.slots[index] = .{};
+            assert(self.count > 0);
+            self.count -= 1;
+            removed_count += 1;
+        }
+
+        return removed_count;
+    }
+
     fn allocSlot(self: *const BindingTable) ?usize {
         if (self.count >= config.H2_MAX_CONCURRENT_STREAMS) return null;
 
@@ -290,4 +315,21 @@ test "BindingTable removes all bindings for one upstream session generation" {
     try std.testing.expectEqual(@as(u16, 1), removed_count);
     try std.testing.expect(table.getByDownstream(1) == null);
     try std.testing.expect(table.getByDownstream(3) != null);
+}
+
+test "BindingTable removes only streams above GOAWAY last_stream_id for one session" {
+    var table = BindingTable.init();
+    try table.put(.{ .downstream_stream_id = 1, .upstream_stream_id = 1, .upstream_index = 2, .upstream_session_generation = 9 });
+    try table.put(.{ .downstream_stream_id = 3, .upstream_stream_id = 3, .upstream_index = 2, .upstream_session_generation = 9 });
+    try table.put(.{ .downstream_stream_id = 5, .upstream_stream_id = 5, .upstream_index = 2, .upstream_session_generation = 9 });
+    try table.put(.{ .downstream_stream_id = 7, .upstream_stream_id = 1, .upstream_index = 2, .upstream_session_generation = 10 });
+
+    const removed_count = table.removeAllForUpstreamSessionAboveLastStreamId(2, 9, 1);
+    try std.testing.expectEqual(@as(u16, 2), removed_count);
+
+    try std.testing.expect(table.getByDownstream(1) != null);
+    try std.testing.expect(table.getByDownstream(3) == null);
+    try std.testing.expect(table.getByDownstream(5) == null);
+    try std.testing.expect(table.getByDownstream(7) != null);
+    try std.testing.expectEqual(@as(u16, 2), table.count);
 }

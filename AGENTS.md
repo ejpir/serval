@@ -229,7 +229,7 @@
 </quality-standards>
 
 <compiler>
-  <path>/usr/local/zig-x86_64-linux-0.16.0-dev.2565+684032671/zig</path>
+  <path>/usr/local/zig-x86_64-linux-0.16.0-dev.2821+3edaef9e0/zig</path>
 </compiler>
 
 <commands>
