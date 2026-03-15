@@ -49,8 +49,8 @@ The forwarding surface in [forwarder.zig](/home/nick/repos/serval/serval-proxy/f
 | `Forwarder.init(...)` | Initialize a forwarder with pool, tracer, DNS config, and TLS verification policy |
 | `Forwarder.forward(...)` | Main HTTP request forwarding path |
 | `Forwarder.forwardWebSocket(...)` | HTTP/1 upgrade forwarding followed by tunnel relay |
-| `Forwarder.forwardGrpcH2c(...)` | Prior-knowledge cleartext h2 frontend -> bounded h2 upstream bridge |
-| `Forwarder.forwardGrpcH2cUpgrade(...)` | Inbound `Upgrade: h2c` frontend -> bounded h2 upstream bridge |
+| `Forwarder.forwardGrpcH2c(...)` | Prior-knowledge cleartext h2 entry -> bounded h2 upstream bridge |
+| `Forwarder.forwardGrpcH2cUpgrade(...)` | Inbound `Upgrade: h2c` entry -> bounded h2 upstream bridge |
 
 ## File Layout
 
@@ -102,8 +102,8 @@ non-stream-aware h2 WebSocket upgrade case.
 
 The current h2 implementation is intentionally bounded and focused:
 
-- cleartext frontend entry supports both prior knowledge and inbound
-  `Upgrade: h2c`
+- downstream entry supports TLS ALPN `h2`, cleartext prior knowledge, and
+  inbound `Upgrade: h2c`
 - upstream support currently covers both cleartext `.h2c` and TLS `.h2`
 - the active stream-aware bridge is gRPC-focused
 - downstream streams are mapped to upstream stream ids through a fixed-capacity
@@ -196,7 +196,7 @@ strategy or policy failures.
 | TLS/userspace-copy fallback | Complete |
 | WebSocket HTTP/1 upgrade forwarding | Complete |
 | Bidirectional upgraded tunnel relay | Complete |
-| gRPC over HTTP/2 proxying | In progress, with stream-aware bridge active for cleartext frontend entry paths and upstream support for both `.h2c` and TLS `.h2` |
+| gRPC over HTTP/2 proxying | In progress, with stream-aware bridge active for downstream TLS ALPN `h2`, cleartext prior-knowledge, and cleartext `Upgrade: h2c` entry paths, plus upstream support for both `.h2c` and TLS `.h2` |
 | Generic stream-aware HTTP/2 proxying | In progress |
 
 ## TigerStyle Notes

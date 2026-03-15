@@ -1,6 +1,6 @@
 # Serval Architecture
 
-Serval is a modular HTTP reverse proxy library written in Zig, following TigerStyle principles. Current transport support is HTTP/1.1 plus an initial gRPC-over-HTTP/2 proxy slice for cleartext frontend entry paths.
+Serval is a modular HTTP reverse proxy library written in Zig, following TigerStyle principles. Current transport support is HTTP/1.1 plus an initial gRPC-over-HTTP/2 proxy slice for downstream TLS ALPN `h2`, cleartext prior-knowledge, and cleartext `Upgrade: h2c` entry paths.
 
 ## Philosophy
 
@@ -161,7 +161,7 @@ Standalone:
 | serval-metrics | Observability | `NoopMetrics`, `PrometheusMetrics`, `RealTimeMetrics` |
 | serval-tracing | Distributed tracing interface | `NoopTracer`, `SpanHandle` |
 | serval-otel | OpenTelemetry tracing | `Tracer`, `Span`, `OTLPExporter`, `BatchingProcessor` |
-| serval-server | HTTP/1.1 server + early HTTP/2 dispatch (h2c + TLS ALPN h2 for terminated handlers and configurable generic frontend adapter) | `Server`, `MinimalServer`, `servePlainH2Connection`, `serveTlsH2Connection` |
+| serval-server | HTTP/1.1 server + early HTTP/2 dispatch (h2c + TLS ALPN h2 for terminated handlers and configurable generic h2 adapter) | `Server`, `MinimalServer`, `servePlainH2Connection`, `serveTlsH2Connection` |
 | serval-lb | Load balancing | `LbHandler` (health-aware round-robin with background probing) |
 | serval-router | Content-based routing | `Router`, `Route`, `RouteMatcher`, `PathMatch`, `PoolConfig` |
 | serval-k8s-gateway | Gateway API types + translation | `GatewayConfig`, `HTTPRoute`, `translateToJson` |
@@ -861,7 +861,7 @@ pub const WeightedHandler = struct {
 | Chunked transfer encoding | serval-http, serval-proxy, serval-server | Parsing, forwarding, and direct response |
 | WebSocket proxy tunneling | serval-websocket, serval-proxy, serval-server | RFC 6455 handshake validation, HTTP/1.1 upgrade forwarding, bidirectional relay |
 | Native WebSocket endpoint serving | serval-websocket, serval-server | RFC 6455 handshake acceptance, frame parsing, message-oriented server sessions |
-| gRPC over HTTP/2 proxying (prior knowledge + inbound upgrade) | serval-h2, serval-grpc, serval-proxy, serval-server | Cleartext frontend entry paths now use a bounded stream-aware bridge in both entry paths, with upstream support for both cleartext `.h2c` and TLS `.h2` (stream mapping + reused upstream sessions + reset mapping + GOAWAY `last_stream_id`-aware active-stream handling + fail-closed `grpc-status` enforcement); non-h2 targets use legacy tunnel fallback |
+| gRPC over HTTP/2 proxying (TLS ALPN `h2`, prior knowledge, + inbound upgrade) | serval-h2, serval-grpc, serval-proxy, serval-server | Downstream TLS `h2`, cleartext prior-knowledge, and cleartext `Upgrade: h2c` entry paths now use a bounded stream-aware bridge, with upstream support for both cleartext `.h2c` and TLS `.h2` (stream mapping + reused upstream sessions + reset mapping + GOAWAY `last_stream_id`-aware active-stream handling + fail-closed `grpc-status` enforcement); non-h2 targets use legacy tunnel fallback |
 | Terminated HTTP/2 connection runtime primitives | serval-h2, serval-server | Bounded SETTINGS/ACK/PING/RST_STREAM/GOAWAY handling plus streaming HEADERS/DATA callbacks on plain and TLS streams, including DATA-driven connection+stream WINDOW_UPDATE replenishment and main accept-loop dispatch for prior-knowledge, `Upgrade: h2c`, and TLS ALPN `h2` terminated entry paths |
 | TLS termination | serval-tls, serval-server | Client TLS (server-side), upstream TLS (client-side) |
 | kTLS kernel offload | serval-tls | OpenSSL native + BoringSSL manual, automatic fallback |

@@ -27,8 +27,9 @@ byte tunnel is not sufficient once Serval needs to:
 
 The bridge is active for:
 
-- cleartext frontend prior-knowledge HTTP/2
-- cleartext frontend `Upgrade: h2c`
+- downstream TLS with ALPN `h2`
+- downstream cleartext prior-knowledge HTTP/2
+- downstream cleartext `Upgrade: h2c`
 - upstream `.h2c` cleartext targets
 - upstream `.h2` TLS targets
 
@@ -39,7 +40,7 @@ HTTP/2 proxy for arbitrary request/response traffic.
 
 | Module | Ownership |
 |------|---------|
-| `serval-server` | Detect frontend h2 entry path, validate/parse first request, choose bridge vs fallback, own downstream connection runtime |
+| `serval-server` | Detect downstream h2 entry path, validate/parse first request, choose bridge vs fallback, own downstream connection runtime |
 | `serval-h2` | Frame, preface, HPACK, settings, flow-control, and upgrade helpers |
 | `serval-grpc` | Validate gRPC request/response metadata and wire framing rules |
 | `serval-proxy` | Own the downstream-to-upstream stream bridge and forwarding mechanics |
@@ -72,7 +73,24 @@ That means Serval explicitly:
 
 ## Entry Paths
 
-### 1. Prior-knowledge cleartext HTTP/2
+### 1. Downstream TLS with ALPN `h2`
+
+Flow:
+
+1. `serval-server` accepts a TLS connection.
+2. TLS negotiates ALPN `h2`.
+3. The server h2 runtime starts on the negotiated TLS stream.
+4. Serval parses the first request HEADERS with bounded HPACK decode.
+5. `serval-grpc` validates that the request is actually gRPC when it is routed
+   into the active bridge path.
+6. The normal handler runs `selectUpstream()` on the request view.
+7. If the selected upstream protocol is `.h2c` or `.h2`, Serval enters bridge
+   mode.
+8. `serval-proxy/h2/bridge.zig` acquires or reuses an upstream session.
+9. Downstream stream ids are bound to upstream stream ids and the connection
+   continues in stream-aware mode.
+
+### 2. Downstream cleartext prior-knowledge HTTP/2
 
 Flow:
 
@@ -87,7 +105,7 @@ Flow:
 8. Downstream stream ids are bound to upstream stream ids and the connection
    continues in stream-aware mode.
 
-### 2. Cleartext `Upgrade: h2c`
+### 3. Downstream cleartext `Upgrade: h2c`
 
 Flow:
 
@@ -101,8 +119,8 @@ Flow:
 7. The bridge then continues in the same stream-aware model as prior-knowledge
    entry.
 
-The bridge is intentionally the same logical model for both entry paths. The
-only difference is how the downstream connection reached HTTP/2 mode.
+The bridge is intentionally the same logical model for all three entry paths.
+The difference is only how the downstream connection reached HTTP/2 mode.
 
 ## Downstream to Upstream Stream Binding
 
@@ -186,7 +204,8 @@ Today Serval still has two broad proxy behaviors for HTTP/2-related traffic.
 
 Used when:
 
-- frontend entry is h2 prior knowledge or `Upgrade: h2c`
+- downstream entry is TLS ALPN `h2`, cleartext prior knowledge, or
+  `Upgrade: h2c`
 - the request is in the supported bridge scope
 - the selected upstream protocol is `.h2c` or `.h2`
 
@@ -245,9 +264,9 @@ Those are still tracked as next-phase work.
 Start here, in order:
 
 1. `serval-server/h1/server.zig`
-   frontend entry detection, upgrade handling, and bridge handoff
+   downstream entry detection, upgrade handling, and bridge handoff
 2. `serval-server/frontend/generic_h2.zig`
-   generic frontend h2 dispatch and bridge/tunnel selection
+   generic h2 dispatch and bridge/tunnel selection
 3. `serval-proxy/h2/bridge.zig`
    downstream/upstream bridge orchestration
 4. `serval-proxy/h2/bindings.zig`

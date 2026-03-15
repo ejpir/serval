@@ -4,7 +4,7 @@ HTTP/1.1 server implementation for serval. Like Pingora's `server` + `apps` modu
 
 Provides generic HTTP server infrastructure with protocol-specific implementations organized by version (h1/ today, gRPC-oriented HTTP/2 ingress/proxy handoff for prior-knowledge and `Upgrade: h2c`, and an early `h2/` connection/runtime submodule for future generic stream-aware transport).
 
-The terminated `h2/server.zig` path now receives `std.Io` from all frontend entry points and flips accepted/upgraded h2 sockets into nonblocking mode before entering the frame loop. Plain h2 reads/writes go through `std.Io` socket helpers, TLS h2 reads use readiness-yield + retry rather than blocking `SSL_read()` directly, and h1 plain-socket reads now stay on `std.Io` as well so connection fibers can yield and shutdown cleanly.
+The terminated `h2/server.zig` path now receives `std.Io` from all downstream h2 entry points and flips accepted/upgraded h2 sockets into nonblocking mode before entering the frame loop. Plain h2 reads/writes go through `std.Io` socket helpers, TLS h2 reads use readiness-yield + retry rather than blocking `SSL_read()` directly, and h1 plain-socket reads now stay on `std.Io` as well so connection fibers can yield and shutdown cleanly.
 
 ## Module Structure
 
@@ -15,7 +15,7 @@ lib/serval-server/
 ├── frontend/          # Protocol dispatch/adaptation helpers
 │   ├── mod.zig        # Frontend module exports
 │   ├── dispatch.zig   # TLS ALPN h2 dispatch policy selection
-│   └── generic_h2.zig # Generic TLS h2 frontend adapter (non-terminated handlers)
+│   └── generic_h2.zig # Generic TLS h2 adapter (non-terminated handlers)
 ├── h1/                # HTTP/1.1 implementation
 │   ├── mod.zig        # H1 module exports
 │   ├── server.zig     # Generic Server struct with connection handling
@@ -242,8 +242,8 @@ Canonical bridge writeup:
 
 Current support now has five HTTP/2 inbound behaviors:
 - **TLS ALPN `h2` + terminated handler**: when ALPN negotiates `h2` and the handler implements `handleH2Headers` + `handleH2Data`, `Server` dispatches the TLS stream directly into `h2/server.zig` (terminated runtime over TLS)
-- **ALPN rollout policy knobs**: `Config.alpn_mixed_offer_policy` controls mixed-offer ALPN selection (`prefer_http11` vs `prefer_h2`) and `Config.tls_h2_frontend_mode` keeps frontend h2 dispatch explicit (`disabled`, `terminated_only`, `generic`); when ALPN has already negotiated `h2` and no terminated h2 hooks exist, server falls back to generic frontend h2 dispatch to avoid invalid h1 parsing on an h2 connection
-- **generic frontend WebSocket over h2**: generic TLS h2 frontend now advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL`, accepts RFC 8441 Extended CONNECT with `:protocol=websocket`, upgrades to an h1 backend WebSocket upstream, and relays stream DATA bidirectionally on the h2 stream
+- **ALPN rollout policy knobs**: `Config.alpn_mixed_offer_policy` controls mixed-offer ALPN selection (`prefer_http11` vs `prefer_h2`) and `Config.tls_h2_frontend_mode` keeps downstream TLS h2 dispatch explicit (`disabled`, `terminated_only`, `generic`); when ALPN has already negotiated `h2` and no terminated h2 hooks exist, server falls back to generic TLS h2 dispatch to avoid invalid h1 parsing on an h2 connection
+- **generic WebSocket over h2**: generic TLS h2 dispatch now advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL`, accepts RFC 8441 Extended CONNECT with `:protocol=websocket`, upgrades to an h1 backend WebSocket upstream, and relays stream DATA bidirectionally on the h2 stream
 - **prior knowledge + terminated handler**: when the handler implements `handleH2Headers` + `handleH2Data`, `Server` detects the client preface on a plain connection and dispatches the accepted socket into `h2/server.zig`
 - **prior knowledge + proxy bridge/tunnel**: for upstream protocol `.h2c` (cleartext) or `.h2` (TLS), Serval routes through a bounded stream-aware bridge (downstream stream ↔ upstream stream mapping, response frame mapping, upstream reset fail-closed downstream reset, missing `grpc-status` fail-closed as downstream `RST_STREAM(PROTOCOL_ERROR)`, and `GOAWAY(NO_ERROR,last_stream_id>=active_stream)` no longer aborting that active stream); prior-knowledge detection now emits server SETTINGS as soon as the client preface is complete (before waiting for first HEADERS) to interoperate with grpc-go/grpcurl clients that wait for server SETTINGS before sending RPC headers; for non-h2 upstreams it still falls back to transparent byte tunneling
 - **`Upgrade: h2c` + terminated handler**: on cleartext connections with explicit h2 handler callbacks, Serval sends `101 Switching Protocols`, replays the upgraded request into stream 1 in the terminated runtime, accepts an optional post-101 client preface, then continues in full HTTP/2 frame mode
@@ -304,7 +304,7 @@ The mod.zig would dispatch based on negotiated protocol (via ALPN or h2c preface
 | TLS response forwarding | ✅ Complete |
 | WebSocket upgrade proxy handoff | ✅ Complete |
 | Native WebSocket endpoint serving | ✅ Complete |
-| gRPC over h2 proxy handoff (prior knowledge + inbound upgrade) | ✅ Stream-aware bridge active for `.h2c` (cleartext) and `.h2` (TLS) upstreams in both entry paths, including GOAWAY `last_stream_id`-aware active-stream handling, stale-binding retirement plus round-robin upstream-action scanning, and fail-closed `grpc-status` enforcement; background h2 bridge/websocket readers now use `std.Io.Group.concurrent()` instead of `Group.async()` so the per-connection h2 startup path cannot be hijacked by eager inline task execution; legacy tunnel fallback remains for non-h2 targets |
+| gRPC over h2 proxy handoff (TLS ALPN `h2`, prior knowledge, + inbound upgrade) | ✅ Stream-aware bridge active for downstream TLS `h2`, cleartext prior-knowledge, and cleartext `Upgrade: h2c` entry, with `.h2c` (cleartext) and `.h2` (TLS) upstream support; includes GOAWAY `last_stream_id`-aware active-stream handling, stale-binding retirement plus round-robin upstream-action scanning, and fail-closed `grpc-status` enforcement; background h2 bridge/websocket readers now use `std.Io.Group.concurrent()` instead of `Group.async()` so the per-connection h2 startup path cannot be hijacked by eager inline task execution; legacy tunnel fallback remains for non-h2 targets |
 | HTTP/2 full stream-aware stack | ⏳ In progress (current implementation is gRPC-focused; broader generic h2 stream-aware server/proxy behavior is still pending) |
 | Native gRPC endpoints | ❌ Not implemented (high priority) |
 | Daemon mode | ❌ Not implemented |
