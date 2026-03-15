@@ -506,7 +506,7 @@ zig build run-echo-backend -- --help
 | Chunked encoding | Complete |
 | WebSocket proxy tunneling | Complete |
 | Native WebSocket endpoint serving | Complete |
-| gRPC over h2c proxying (prior knowledge + inbound upgrade) | In progress (stream-aware gRPC bridge active for cleartext `.h2c` and TLS `.h2` upstreams) |
+| gRPC over HTTP/2 proxying (prior knowledge + inbound upgrade) | In progress (stream-aware gRPC bridge active for cleartext frontend entry paths, with upstream support for both cleartext `.h2c` and TLS `.h2`) |
 | Content-based routing | Complete |
 | Path rewriting | Complete |
 | K8s Gateway API types | Complete |

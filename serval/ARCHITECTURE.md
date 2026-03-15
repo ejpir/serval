@@ -1,6 +1,6 @@
 # Serval Architecture
 
-Serval is a modular HTTP reverse proxy library written in Zig, following TigerStyle principles. Current transport support is HTTP/1.1 plus an initial gRPC-over-h2c proxy slice.
+Serval is a modular HTTP reverse proxy library written in Zig, following TigerStyle principles. Current transport support is HTTP/1.1 plus an initial gRPC-over-HTTP/2 proxy slice for cleartext frontend entry paths.
 
 ## Philosophy
 
@@ -399,7 +399,7 @@ upgrade path instead of the normal request/response forwarding path:
 6. If upstream returns a non-`101` response, it is forwarded as plain HTTP and the connection closes
 7. If upstream returns a valid `101 Switching Protocols`, `serval-proxy/tunnel.zig` switches to bidirectional byte relay and the upgraded upstream connection is never returned to the HTTP pool
 
-### gRPC over h2c Prior-Knowledge + Upgrade Flow
+### gRPC over HTTP/2 Prior-Knowledge + Upgrade Flow
 
 The current gRPC slice supports two **cleartext HTTP/2** inbound entry paths with an explicit,
 fail-closed handoff.
@@ -858,7 +858,7 @@ pub const WeightedHandler = struct {
 | Chunked transfer encoding | serval-http, serval-proxy, serval-server | Parsing, forwarding, and direct response |
 | WebSocket proxy tunneling | serval-websocket, serval-proxy, serval-server | RFC 6455 handshake validation, HTTP/1.1 upgrade forwarding, bidirectional relay |
 | Native WebSocket endpoint serving | serval-websocket, serval-server | RFC 6455 handshake acceptance, frame parsing, message-oriented server sessions |
-| gRPC over h2c proxying (prior knowledge + inbound upgrade) | serval-h2, serval-grpc, serval-proxy, serval-server | Cleartext h2c upstreams now use a bounded stream-aware bridge in both entry paths (stream mapping + reused upstream sessions + reset mapping + GOAWAY `last_stream_id`-aware active-stream handling + fail-closed `grpc-status` enforcement); non-h2c targets use legacy tunnel fallback |
+| gRPC over HTTP/2 proxying (prior knowledge + inbound upgrade) | serval-h2, serval-grpc, serval-proxy, serval-server | Cleartext frontend entry paths now use a bounded stream-aware bridge in both entry paths, with upstream support for both cleartext `.h2c` and TLS `.h2` (stream mapping + reused upstream sessions + reset mapping + GOAWAY `last_stream_id`-aware active-stream handling + fail-closed `grpc-status` enforcement); non-h2 targets use legacy tunnel fallback |
 | Terminated HTTP/2 connection runtime primitives | serval-h2, serval-server | Bounded SETTINGS/ACK/PING/RST_STREAM/GOAWAY handling plus streaming HEADERS/DATA callbacks on plain and TLS streams, including DATA-driven connection+stream WINDOW_UPDATE replenishment and main accept-loop dispatch for prior-knowledge, `Upgrade: h2c`, and TLS ALPN `h2` terminated entry paths |
 | TLS termination | serval-tls, serval-server | Client TLS (server-side), upstream TLS (client-side) |
 | kTLS kernel offload | serval-tls | OpenSSL native + BoringSSL manual, automatic fallback |
