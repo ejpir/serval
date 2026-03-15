@@ -16,6 +16,10 @@ The h2 transport adapter now translates TLS `WantRead` / `WantWrite` signals
 from `serval-tls` back into the client session's existing bounded retry model,
 so higher-level h2 session logic stays transport-agnostic.
 
+The client h2 runtime also treats duplicate/late upstream `RST_STREAM` frames
+for already-retired known streams as idempotent control noise instead of
+surfacing them as repeated missing-stream errors.
+
 `H2Runtime` remains socket-agnostic; `H2ClientConnection` is the concrete socket-owning driver. `H2UpstreamSessionPool` is the first reusable higher-level lifecycle wrapper that connects, handshakes, caches, and returns stream-capable upstream sessions.
 
 **Layer:** 2 (Infrastructure) - alongside serval-pool, serval-prober, serval-health

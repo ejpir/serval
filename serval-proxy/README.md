@@ -106,6 +106,11 @@ tunnel relay:
   runtimes instead of relying only on opportunistic `Group.async()` execution
 - distinguishes TLS read `WantRead` vs `WantWrite` in the upgraded tunnel so
   downstream TLS backpressure waits on the correct readiness condition
+- maps plain-socket upgraded-tunnel write resets (`BrokenPipe`,
+  `ConnectionResetByPeer`) to peer-closed termination instead of collapsing
+  them into generic internal transport errors
+- logs exact plain upgraded-tunnel write/flush error names before falling back
+  to generic `client_error` / `upstream_error` classification
 
 The tunnel implementation is shared by upgraded proxy paths, including the
 non-stream-aware h2 WebSocket upgrade case.
@@ -134,6 +139,9 @@ The fix was to:
   available
 - preserve `WantRead` vs `WantWrite` through `serval-tls` so the tunnel waits
   on the correct readiness condition
+- replace the plain upgraded upstream relay write path with a direct bounded
+  nonblocking `write(2)` loop instead of Zig's buffered stream writer on a
+  nonblocking fd
 
 This is an upgraded-tunnel transport issue, not a WebSocket handshake issue.
 

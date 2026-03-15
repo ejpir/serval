@@ -162,6 +162,8 @@ The underlying fix was in Serval's upgraded tunnel transport:
   threaded runtimes
 - preserve TLS `WantRead` vs `WantWrite` instead of flattening both into one
   generic idle path
+- write to the plain relay backend with a direct bounded nonblocking `write(2)`
+  loop instead of a buffered writer wrapper on a nonblocking fd
 
 If a future relay regression looks similar, start with the capture helper above
 and compare the first post-`101` frames on the plain `proxy -> relay` hop.

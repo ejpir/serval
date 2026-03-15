@@ -603,8 +603,24 @@ fn handleRstStream(self: *Runtime, header: h2.FrameHeader, payload: []const u8) 
     const error_code_raw = try h2.parseRstStreamFrame(header, payload);
     self.state.resetStream(header.stream_id) catch |err| switch (err) {
         error.StreamNotFound => {
-            log.warn(
-                "client h2 runtime: missing stream in RST_STREAM stream={d} active={d} last_local={d} last_remote={d} error_code_raw={d}",
+            if (header.stream_id > self.state.streams.last_local_stream_id and
+                header.stream_id > self.state.streams.last_remote_stream_id)
+            {
+                log.warn(
+                    "client h2 runtime: missing unknown stream in RST_STREAM stream={d} active={d} last_local={d} last_remote={d} error_code_raw={d}",
+                    .{
+                        header.stream_id,
+                        self.state.streams.active_count,
+                        self.state.streams.last_local_stream_id,
+                        self.state.streams.last_remote_stream_id,
+                        error_code_raw,
+                    },
+                );
+                return error.InvalidStreamId;
+            }
+
+            log.debug(
+                "client h2 runtime: ignoring duplicate/late RST_STREAM for retired stream={d} active={d} last_local={d} last_remote={d} error_code_raw={d}",
                 .{
                     header.stream_id,
                     self.state.streams.active_count,
@@ -613,7 +629,7 @@ fn handleRstStream(self: *Runtime, header: h2.FrameHeader, payload: []const u8) 
                     error_code_raw,
                 },
             );
-            return err;
+            return .none;
         },
         else => return err,
     };
@@ -1434,6 +1450,46 @@ test "Runtime handles upstream RST_STREAM and clears stream state" {
     }
 
     try std.testing.expect(runtime.state.getStream(request_headers.stream_id) == null);
+}
+
+test "Runtime ignores duplicate upstream RST_STREAM for retired known stream" {
+    var runtime = try Runtime.init();
+    var request = try makeGrpcRequest("/svc.Method/Foo");
+    defer request.headers.deinit();
+
+    var preface_buf: [256]u8 = undefined;
+    _ = try runtime.writeClientPrefaceAndSettings(&preface_buf);
+
+    var settings_frame: [64]u8 = undefined;
+    const settings = try h2.buildFrameHeader(settings_frame[0..h2.frame_header_size_bytes], .{
+        .length = 0,
+        .frame_type = .settings,
+        .flags = 0,
+        .stream_id = 0,
+    });
+    const settings_header = try h2.parseFrameHeader(settings[0..h2.frame_header_size_bytes]);
+    const settings_action = try runtime.receiveFrame(settings_header, settings[h2.frame_header_size_bytes..]);
+    try std.testing.expect(settings_action == .send_settings_ack);
+
+    var header_buf: [config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+    const request_write = try runtime.writeRequestHeadersFrame(&header_buf, &request, null, false);
+    try std.testing.expectEqual(@as(u32, 1), request_write.stream_id);
+
+    var rst_buf: [64]u8 = undefined;
+    const rst_frame = try h2.buildRstStreamFrame(&rst_buf, request_write.stream_id, @intFromEnum(h2.ErrorCode.cancel));
+    const rst_header = try h2.parseFrameHeader(rst_frame[0..h2.frame_header_size_bytes]);
+
+    const first_action = try runtime.receiveFrame(rst_header, rst_frame[h2.frame_header_size_bytes..]);
+    switch (first_action) {
+        .stream_reset => |reset| {
+            try std.testing.expectEqual(request_write.stream_id, reset.stream_id);
+            try std.testing.expectEqual(@as(u32, @intFromEnum(h2.ErrorCode.cancel)), reset.error_code_raw);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const second_action = try runtime.receiveFrame(rst_header, rst_frame[h2.frame_header_size_bytes..]);
+    try std.testing.expect(second_action == .none);
 }
 
 test "Runtime tracks GOAWAY bound and rejects new streams above last_stream_id" {

@@ -256,8 +256,8 @@ fn relayDirection(
     const timeout = timeoutForMilliseconds(timeout_ms);
     if (initial_bytes.len > 0) {
         writeAllSocket(destination, io, timeout, initial_bytes, write_side) catch |err| {
-            logTunnelFailure(shared, io, "initial_write_failed", read_side, write_side, err, source, destination);
             shared.finishTermination(mapFailureToTermination(err), io);
+            logTunnelFailure(shared, io, "initial_write_failed", read_side, write_side, err, source, destination);
             return;
         };
         shared.noteProgress(read_side, @intCast(initial_bytes.len), io);
@@ -288,8 +288,8 @@ fn relayDirection(
         }
 
         writeAllSocket(destination, io, timeout, relay_buf[0..bytes_read], write_side) catch |err| {
-            logTunnelFailure(shared, io, "write_failed", read_side, write_side, err, source, destination);
             shared.finishTermination(mapFailureToTermination(err), io);
+            logTunnelFailure(shared, io, "write_failed", read_side, write_side, err, source, destination);
             return;
         };
         shared.noteProgress(read_side, bytes_read, io);
@@ -346,10 +346,39 @@ fn writeAllSocket(
 
     return switch (socket.*) {
         .plain => |plain| {
-            var writer_buf: [config.SERVER_WRITE_BUFFER_SIZE_BYTES]u8 = undefined;
-            var writer = rawStreamForFd(plain.fd).writer(io, &writer_buf);
-            writer.interface.writeAll(data) catch return errorFailure(side);
-            writer.interface.flush() catch return errorFailure(side);
+            var written: usize = 0;
+            var writes: u32 = 0;
+            while (written < data.len and writes < Socket.max_write_iterations_count) : (writes += 1) {
+                const rc = std.c.write(plain.fd, data[written..].ptr, data.len - written);
+                const errno_code = std.c.errno(rc);
+                switch (errno_code) {
+                    .SUCCESS => {
+                        const n: usize = @intCast(rc);
+                        if (n == 0) return closeFailure(side);
+                        written += n;
+                    },
+                    .INTR => continue,
+                    .AGAIN => {
+                        std.Io.sleep(io, timeout.duration.raw, timeout.duration.clock) catch return errorFailure(side);
+                        continue;
+                    },
+                    .PIPE, .CONNRESET, .NOTCONN => return closeFailure(side),
+                    else => {
+                        std.log.warn(
+                            "tunnel: plain write failed phase=write side={s} fd={d} errno={s} rc={d}",
+                            .{ @tagName(side), plain.fd, @tagName(errno_code), rc },
+                        );
+                        return errorFailure(side);
+                    },
+                }
+            }
+            if (written < data.len) {
+                std.log.warn(
+                    "tunnel: plain write failed phase=write side={s} fd={d} errno=max_writes rc={d}",
+                    .{ @tagName(side), plain.fd, written },
+                );
+                return errorFailure(side);
+            }
         },
         .tls => |*tls_socket| {
             var sent: usize = 0;

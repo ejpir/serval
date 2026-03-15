@@ -49,7 +49,7 @@ $ZIG_BIN build clean 2>/dev/null || true
 BUILD_LOG="$(mktemp)"
 trap 'rm -f "$BUILD_LOG"' EXIT
 if ! "$ZIG_BIN" build build-netbird-proxy \
-    -Doptimize=Debug \
+    -Doptimize=ReleaseFast \
     -Dtarget="$TARGET" \
     -Dopenssl-include-dir="$STAGING_DIR/usr/include" \
     -Dopenssl-lib-dir="$STAGING_DIR/usr/lib" \
