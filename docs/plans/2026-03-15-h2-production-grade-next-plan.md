@@ -59,6 +59,11 @@ These are no longer theoretical and must inform the next plan:
    - Upstream bridge reader could keep revisiting stale bindings and starve later work on the same connection.
    - Fixed by round-robin scan plus stale-binding retirement.
 
+4. Relay upgraded-tunnel transport bug
+   - NetBird Android relay traffic exposed an upgraded-tunnel transport bug after `101 Switching Protocols`.
+   - The immediate fixes are now in place, but the structural cleanup is tracked separately in:
+     - [docs/plans/2026-03-15-relay-tunnel-fiber-cleanup-plan.md](/home/nick/repos/serval/docs/plans/2026-03-15-relay-tunnel-fiber-cleanup-plan.md)
+
 These fixes are necessary, but they are not sufficient to call the h2 stack production-grade.
 
 ## What "Production-Grade" Means Here
@@ -321,6 +326,13 @@ Why this matters:
   - the protocol driver still used a read path that treated `WouldBlock` as unreachable
 - the tactical retry-loop fix is necessary and should stay until this cleanup lands
 - this cleanup is what turns the fix from "safe patch" into "clean production transport design"
+
+Related focused follow-up:
+
+- [docs/plans/2026-03-15-relay-tunnel-fiber-cleanup-plan.md](/home/nick/repos/serval/docs/plans/2026-03-15-relay-tunnel-fiber-cleanup-plan.md)
+  covers the upgraded relay tunnel specifically, including the March 2026
+  NetBird Android regression, the concurrency/readiness fixes already applied,
+  and the remaining symmetric fiber/readiness cleanup work.
 
 ### C2. Better observability
 
