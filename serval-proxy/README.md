@@ -94,9 +94,48 @@ tunnel relay:
 - closes upgraded connections instead of returning them to the HTTP pool
 - treats reset/closed-peer tunnel write termination as an explicit peer-closed
   outcome, not as an internal assertion failure
+- emits route-scoped WebSocket upgrade diagnostics plus side-aware tunnel
+  closure/failure logs so long-lived relay paths can be compared against other
+  reverse proxies during field debugging
+- emits focused RFC 6455 request/response header diagnostics for upgraded proxy
+  paths, including subprotocol/extension negotiation without dumping raw
+  `Sec-WebSocket-Key` or accept-key secrets
+- emits byte-count and duration summaries on tunnel close/failure paths so
+  upgraded relay sessions can be compared at the first post-`101` traffic phase
+- runs the downstream client reader as a real concurrent task in threaded
+  runtimes instead of relying only on opportunistic `Group.async()` execution
+- distinguishes TLS read `WantRead` vs `WantWrite` in the upgraded tunnel so
+  downstream TLS backpressure waits on the correct readiness condition
 
 The tunnel implementation is shared by upgraded proxy paths, including the
 non-stream-aware h2 WebSocket upgrade case.
+
+#### NetBird relay note
+
+The Android NetBird relay regression reproduced in March 2026 was not an HTTP
+upgrade bug. The failing shape was:
+
+- `101 Switching Protocols` succeeded
+- the first post-upgrade relay exchange (`91` bytes downstream-to-upstream,
+  `35` bytes upstream-to-downstream) succeeded
+- then the downstream TLS side stopped forwarding follow-up frames, so the
+  relay backend closed after its idle window
+
+The root cause was the combination of:
+
+- using `std.Io.Group.async()` for the long-lived downstream relay reader
+  instead of true concurrent work in threaded runtimes
+- collapsing TLS `SSL_ERROR_WANT_READ` and `SSL_ERROR_WANT_WRITE` into one
+  generic idle/backpressure bucket
+
+The fix was to:
+
+- run the downstream relay reader with `std.Io.Group.concurrent()` when
+  available
+- preserve `WantRead` vs `WantWrite` through `serval-tls` so the tunnel waits
+  on the correct readiness condition
+
+This is an upgraded-tunnel transport issue, not a WebSocket handshake issue.
 
 ### HTTP/2 / gRPC forwarding
 

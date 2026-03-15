@@ -402,7 +402,7 @@ pub fn GenericTlsH2FrontendHandler(
             );
             var connect_result = client.connect(upstream.?, self.io) catch return error.UpstreamConnectFailed;
 
-            serval_proxy_h1.sendUpgradeRequest(&connect_result.conn, self.io, &upgrade_request, null) catch {
+            serval_proxy_h1.sendUpgradeRequest(&connect_result.conn, self.io, &upgrade_request, null, .{}) catch {
                 connect_result.conn.close();
                 return error.UpstreamSendFailed;
             };
@@ -789,7 +789,7 @@ fn readSomeConnection(conn: *Connection, io: Io, timeout: Io.Timeout, out: []u8)
         .tls => |*tls_socket| blk: {
             if (!tls_socket.has_pending_read()) try waitUntilReadable(tls_socket.fd, io, timeout);
             const n = tls_socket.stream.read(out) catch |err| switch (err) {
-                error.WouldBlock => return error.Timeout,
+                error.WantRead, error.WantWrite => return error.Timeout,
                 error.ConnectionReset => return error.ConnectionClosed,
                 else => return error.ReadFailed,
             };

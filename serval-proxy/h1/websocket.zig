@@ -9,6 +9,7 @@ const Io = std.Io;
 
 const serval_core = @import("serval-core");
 const config = serval_core.config;
+const debugLog = serval_core.debugLog;
 const types = serval_core.types;
 
 const serval_http = @import("serval-http");
@@ -44,6 +45,12 @@ const Connection = pool_mod.Connection;
 
 const Request = types.Request;
 
+pub const ForwardedHeaders = struct {
+    host: []const u8 = "",
+    proto: []const u8 = "",
+    client_ip: []const u8 = "",
+};
+
 pub const UpgradeResponseResult = struct {
     status: u16,
     response_bytes: u64,
@@ -54,6 +61,7 @@ pub fn buildUpgradeRequestBuffer(
     buffer: []u8,
     request: *const Request,
     effective_path: ?[]const u8,
+    forwarded: ForwardedHeaders,
 ) ?usize {
     const path = effective_path orelse request.path;
     assert(path.len > 0);
@@ -93,6 +101,15 @@ pub fn buildUpgradeRequestBuffer(
     pos = appendLiteral(buffer, pos, "Connection: Upgrade\r\n") orelse return null;
     pos = appendLiteral(buffer, pos, "Upgrade: websocket\r\n") orelse return null;
     pos = appendLiteral(buffer, pos, VIA_HEADER) orelse return null;
+    if (forwarded.client_ip.len > 0) {
+        pos = appendHeader(buffer, pos, "X-Forwarded-For", forwarded.client_ip) orelse return null;
+    }
+    if (forwarded.host.len > 0) {
+        pos = appendHeader(buffer, pos, "X-Forwarded-Host", forwarded.host) orelse return null;
+    }
+    if (forwarded.proto.len > 0) {
+        pos = appendHeader(buffer, pos, "X-Forwarded-Proto", forwarded.proto) orelse return null;
+    }
     pos = appendLiteral(buffer, pos, "\r\n") orelse return null;
 
     assert(pos <= buffer.len);
@@ -104,14 +121,16 @@ pub fn sendUpgradeRequest(
     io: Io,
     request: *const Request,
     effective_path: ?[]const u8,
+    forwarded: ForwardedHeaders,
 ) ForwardError!void {
     const path = effective_path orelse request.path;
     assert(path.len > 0);
 
     var buffer: [config.MAX_HEADER_SIZE_BYTES]u8 = std.mem.zeroes([config.MAX_HEADER_SIZE_BYTES]u8);
-    const header_len = buildUpgradeRequestBuffer(&buffer, request, effective_path) orelse
+    const header_len = buildUpgradeRequestBuffer(&buffer, request, effective_path, forwarded) orelse
         return ForwardError.SendFailed;
 
+    logUpgradeRequestHeaders(request, path, forwarded);
     try sendBuffer(conn, io, buffer[0..header_len]);
 }
 
@@ -139,6 +158,7 @@ pub fn forwardUpgradeResponse(
         serval_websocket.validateServerResponse(status, header_block, expected_accept_key) catch {
             return ForwardError.InvalidResponse;
         };
+        logUpgradeResponseHeaders(status, header_block);
         try sendBuffer(&client_conn, io, header_buffer[0..header_len]);
         return .{
             .status = status,
@@ -189,6 +209,7 @@ pub fn receiveUpgradeResponse(
     serval_websocket.validateServerResponse(status, header_block, expected_accept_key) catch {
         return ForwardError.InvalidResponse;
     };
+    logUpgradeResponseHeaders(status, header_block);
     return .{
         .status = status,
         .response_bytes = header_len,
@@ -234,6 +255,83 @@ fn appendLiteral(buffer: []u8, pos: usize, literal: []const u8) ?usize {
     return pos + literal.len;
 }
 
+fn appendHeader(buffer: []u8, pos: usize, name: []const u8, value: []const u8) ?usize {
+    assert(pos <= buffer.len);
+    assert(name.len > 0);
+
+    const needed = name.len + 2 + value.len + 2;
+    if (pos + needed > buffer.len) return null;
+
+    @memcpy(buffer[pos..][0..name.len], name);
+    var next_pos = pos + name.len;
+    @memcpy(buffer[next_pos..][0..2], ": ");
+    next_pos += 2;
+    @memcpy(buffer[next_pos..][0..value.len], value);
+    next_pos += value.len;
+    @memcpy(buffer[next_pos..][0..2], "\r\n");
+    return next_pos + 2;
+}
+
+fn logUpgradeRequestHeaders(request: *const Request, path: []const u8, forwarded: ForwardedHeaders) void {
+    assert(path.len > 0);
+
+    const host = request.headers.get("Host") orelse "";
+    const origin = request.headers.get("Origin") orelse "";
+    const user_agent = request.headers.get("User-Agent") orelse "";
+    const connection = request.headers.get("Connection") orelse "";
+    const upgrade = request.headers.get("Upgrade") orelse "";
+    const version = request.headers.get("Sec-WebSocket-Version") orelse "";
+    const protocol = request.headers.get("Sec-WebSocket-Protocol") orelse "";
+    const extensions = request.headers.get("Sec-WebSocket-Extensions") orelse "";
+    const key = request.headers.get("Sec-WebSocket-Key") orelse "";
+
+    debugLog(
+        "websocket request headers path={s} host={s} origin={s} user_agent={s} connection={s} upgrade={s} ws_version={s} ws_protocol={s} ws_extensions={s} ws_key_len={d}",
+        .{
+            path,
+            host,
+            origin,
+            user_agent,
+            connection,
+            upgrade,
+            version,
+            protocol,
+            extensions,
+            key.len,
+        },
+    );
+    debugLog("websocket forwarded headers path={s} xff={s} xfh={s} xfp={s}", .{
+        path,
+        forwarded.client_ip,
+        forwarded.host,
+        forwarded.proto,
+    });
+}
+
+fn logUpgradeResponseHeaders(status: u16, raw_headers: []const u8) void {
+    assert(status > 0);
+
+    const connection = serval_websocket.getHeaderValue(raw_headers, "Connection") orelse "";
+    const upgrade = serval_websocket.getHeaderValue(raw_headers, "Upgrade") orelse "";
+    const accept = serval_websocket.getHeaderValue(raw_headers, "Sec-WebSocket-Accept") orelse "";
+    const protocol = serval_websocket.getHeaderValue(raw_headers, "Sec-WebSocket-Protocol") orelse "";
+    const extensions = serval_websocket.getHeaderValue(raw_headers, "Sec-WebSocket-Extensions") orelse "";
+    const server = serval_websocket.getHeaderValue(raw_headers, "Server") orelse "";
+
+    debugLog(
+        "websocket response headers status={d} connection={s} upgrade={s} ws_accept_len={d} ws_protocol={s} ws_extensions={s} server={s}",
+        .{
+            status,
+            connection,
+            upgrade,
+            accept.len,
+            protocol,
+            extensions,
+            server,
+        },
+    );
+}
+
 test "buildUpgradeRequestBuffer preserves websocket headers and canonical upgrade hop-by-hop headers" {
     var buffer: [1024]u8 = undefined;
     var request = Request{
@@ -249,7 +347,7 @@ test "buildUpgradeRequestBuffer preserves websocket headers and canonical upgrad
     try request.headers.put("Sec-WebSocket-Version", "13");
     try request.headers.put("X-Test", "value");
 
-    const len = buildUpgradeRequestBuffer(&buffer, &request, null).?;
+    const len = buildUpgradeRequestBuffer(&buffer, &request, null, .{}).?;
     const output = buffer[0..len];
 
     try std.testing.expect(std.mem.indexOf(u8, output, "Connection: Upgrade\r\n") != null);
@@ -272,7 +370,7 @@ test "buildUpgradeRequestBuffer uses effective path" {
     try request.headers.put("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==");
     try request.headers.put("Sec-WebSocket-Version", "13");
 
-    const len = buildUpgradeRequestBuffer(&buffer, &request, "/chat").?;
+    const len = buildUpgradeRequestBuffer(&buffer, &request, "/chat", .{}).?;
     try std.testing.expect(std.mem.indexOf(u8, buffer[0..len], "GET /chat HTTP/1.1\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer[0..len], "/api/chat") == null);
 }

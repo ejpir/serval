@@ -38,7 +38,7 @@ No business logic, only protocol implementation. Sits alongside serval-http and 
 - `TLSStream` - Unified TLS stream interface
   - `initServer()` - Server-side TLS termination (accepts client connections)
   - `initClient()` - Client-side TLS origination (connects to HTTPS backends)
-  - `read()` - TLS read (decrypts incoming data, returns `error.WouldBlock` on nonblocking WANT_READ/WANT_WRITE)
+  - `read()` - TLS read (decrypts incoming data, returns `error.WantRead` / `error.WantWrite` on nonblocking SSL backpressure)
   - `write()` - TLS write (encrypts outgoing data)
   - `close()` - Quiet TLS shutdown for deterministic teardown without peer-close `SIGPIPE`
   - `isKtls()` - Check if kTLS kernel offload is active (zero overhead)
@@ -75,7 +75,10 @@ No business logic, only protocol implementation. Sits alongside serval-http and 
 - [x] Client SNI support
 - [x] Upstream certificate verification (optional via `verify_upstream`)
 - [x] Non-blocking read/write (SSL WANT_READ/WANT_WRITE mapped to retryable backpressure)
+- [x] Explicit `WantRead` vs `WantWrite` TLS read signaling for callers that
+  need direction-aware readiness handling
 - [x] Graceful shutdown (close_notify)
+- [x] Read-side diagnostics for `close_notify`, peer resets, and TLS protocol failures
 
 ### Phase 2 (Complete)
 - [x] kTLS kernel offload (manual key extraction + kernel crypto setup)

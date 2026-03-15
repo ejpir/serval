@@ -226,6 +226,10 @@ pub const H2_CLIENT_MAX_FRAME_COUNT: u32 = 1_048_576;
 /// TigerStyle: Explicit timeout bounds long-lived relay loops.
 pub const H2C_TUNNEL_IDLE_TIMEOUT_NS: u64 = time.secondsToNanos(3600);
 
+/// Maximum idle time for terminated downstream HTTP/2 connections.
+/// TigerStyle: Downstream h2/gRPC clients can legitimately stay quiet between RPCs.
+pub const H2_SERVER_IDLE_TIMEOUT_NS: u64 = time.secondsToNanos(3600);
+
 /// poll(2) timeout for h2c/gRPC tunnel relay.
 /// TigerStyle: Fixed interval keeps timeout checks responsive without busy-looping.
 pub const H2C_TUNNEL_POLL_TIMEOUT_MS: i32 = 1000;
@@ -708,4 +712,5 @@ test "Limits are sensible" {
     try std.testing.expectEqual(@as(u8, 64), MAX_HEADERS);
     try std.testing.expectEqual(@as(u32, 8192), MAX_HEADER_SIZE_BYTES);
     try std.testing.expectEqual(@as(u32, 8192), MAX_URI_LENGTH_BYTES);
+    try std.testing.expectEqual(time.secondsToNanos(3600), H2_SERVER_IDLE_TIMEOUT_NS);
 }

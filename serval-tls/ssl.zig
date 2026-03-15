@@ -430,6 +430,21 @@ pub fn createSsl(ctx: *SSL_CTX) !*SSL {
     return ssl_obj;
 }
 
+pub fn sslErrorName(err: c_int) []const u8 {
+    return switch (err) {
+        SSL_ERROR_NONE => "SSL_ERROR_NONE",
+        SSL_ERROR_SSL => "SSL_ERROR_SSL",
+        SSL_ERROR_WANT_READ => "SSL_ERROR_WANT_READ",
+        SSL_ERROR_WANT_WRITE => "SSL_ERROR_WANT_WRITE",
+        SSL_ERROR_WANT_X509_LOOKUP => "SSL_ERROR_WANT_X509_LOOKUP",
+        SSL_ERROR_SYSCALL => "SSL_ERROR_SYSCALL",
+        SSL_ERROR_ZERO_RETURN => "SSL_ERROR_ZERO_RETURN",
+        SSL_ERROR_WANT_CONNECT => "SSL_ERROR_WANT_CONNECT",
+        SSL_ERROR_WANT_ACCEPT => "SSL_ERROR_WANT_ACCEPT",
+        else => "SSL_ERROR_UNKNOWN",
+    };
+}
+
 pub fn printErrors() void {
     var err: c_ulong = ERR_get_error(); // S2: explicit type
     var iteration: u32 = 0;

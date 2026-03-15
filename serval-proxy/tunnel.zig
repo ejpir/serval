@@ -197,7 +197,7 @@ pub fn relayWithConfig(
         group.cancel(io);
     }
 
-    group.async(io, relayDirection, .{
+    group.concurrent(io, relayDirection, .{
         &shared,
         io,
         client_socket,
@@ -206,7 +206,21 @@ pub fn relayWithConfig(
         poll_timeout_ms,
         Side.client,
         Side.upstream,
-    });
+    }) catch {
+        // Evented test runtimes may not offer concurrent workers; keep the
+        // original async fallback there while using real concurrent work in
+        // the threaded server path.
+        group.async(io, relayDirection, .{
+            &shared,
+            io,
+            client_socket,
+            upstream_socket,
+            initial_client_to_upstream,
+            poll_timeout_ms,
+            Side.client,
+            Side.upstream,
+        });
+    };
 
     relayDirection(
         &shared,
@@ -239,9 +253,10 @@ fn relayDirection(
     assert(@intFromPtr(destination) != 0);
     assert(timeout_ms > 0);
 
-        const timeout = timeoutForMilliseconds(timeout_ms);
+    const timeout = timeoutForMilliseconds(timeout_ms);
     if (initial_bytes.len > 0) {
         writeAllSocket(destination, io, timeout, initial_bytes, write_side) catch |err| {
+            logTunnelFailure(shared, io, "initial_write_failed", read_side, write_side, err, source, destination);
             shared.finishTermination(mapFailureToTermination(err), io);
             return;
         };
@@ -255,21 +270,25 @@ fn relayDirection(
 
         const bytes_read = readSomeSocket(source, io, timeout, &relay_buf, read_side) catch |err| switch (err) {
             error.ClientClosed, error.UpstreamClosed => {
+                logTunnelClosure(shared, io, "read_closed", read_side, write_side, source, destination);
                 shared.markClosed(read_side, io);
                 return;
             },
             error.IdleTimeout => continue,
             else => {
+                logTunnelFailure(shared, io, "read_failed", read_side, write_side, err, source, destination);
                 shared.finishTermination(mapFailureToTermination(err), io);
                 return;
             },
         };
         if (bytes_read == 0) {
+            logTunnelClosure(shared, io, "read_eof", read_side, write_side, source, destination);
             shared.markClosed(read_side, io);
             return;
         }
 
         writeAllSocket(destination, io, timeout, relay_buf[0..bytes_read], write_side) catch |err| {
+            logTunnelFailure(shared, io, "write_failed", read_side, write_side, err, source, destination);
             shared.finishTermination(mapFailureToTermination(err), io);
             return;
         };
@@ -294,15 +313,23 @@ fn readSomeSocket(
             break :blk n;
         },
         .tls => |*tls_socket| blk: {
-            if (!tls_socket.has_pending_read()) {
-                waitUntilReadable(tls_socket.fd, io, timeout) catch |err| return mapReadableWaitError(side, err);
+            var read_attempts_count: u8 = 0;
+            while (read_attempts_count < 8) : (read_attempts_count += 1) {
+                if (!tls_socket.has_pending_read()) {
+                    waitUntilReadable(tls_socket.fd, io, timeout) catch |err| return mapReadableWaitError(side, err);
+                }
+                const n = tls_socket.stream.read(out) catch |err| switch (err) {
+                    error.WantRead => return error.IdleTimeout,
+                    error.WantWrite => {
+                        waitAfterTlsWouldBlock(tls_socket.fd, io, timeout) catch |wait_err| return mapWritableWaitError(side, wait_err);
+                        continue;
+                    },
+                    error.ConnectionReset => return closeFailure(side),
+                    else => return errorFailure(side),
+                };
+                break :blk n;
             }
-            const n = tls_socket.stream.read(out) catch |err| switch (err) {
-                error.WouldBlock => return error.IdleTimeout,
-                error.ConnectionReset => return closeFailure(side),
-                else => return errorFailure(side),
-            };
-            break :blk n;
+            return errorFailure(side);
         },
     };
 }
@@ -455,6 +482,70 @@ fn mapFailureToTermination(err: RelayFailure) Termination {
         error.UpstreamError => .upstream_error,
         error.IdleTimeout => .idle_timeout,
     };
+}
+
+fn logTunnelClosure(
+    shared: *RelayShared,
+    io: Io,
+    event: []const u8,
+    read_side: Side,
+    write_side: Side,
+    source: *const Socket,
+    destination: *const Socket,
+) void {
+    assert(@intFromPtr(shared) != 0);
+    assert(event.len > 0);
+    assert(@intFromPtr(source) != 0);
+    assert(@intFromPtr(destination) != 0);
+
+    const stats = shared.snapshot(io);
+    std.log.debug(
+        "tunnel: {s} read_side={s} write_side={s} source_fd={d} destination_fd={d} client_to_upstream_bytes={d} upstream_to_client_bytes={d} duration_ns={d} termination={s}",
+        .{
+            event,
+            @tagName(read_side),
+            @tagName(write_side),
+            source.get_fd(),
+            destination.get_fd(),
+            stats.client_to_upstream_bytes,
+            stats.upstream_to_client_bytes,
+            stats.duration_ns,
+            @tagName(stats.termination),
+        },
+    );
+}
+
+fn logTunnelFailure(
+    shared: *RelayShared,
+    io: Io,
+    event: []const u8,
+    read_side: Side,
+    write_side: Side,
+    err: RelayFailure,
+    source: *const Socket,
+    destination: *const Socket,
+) void {
+    assert(@intFromPtr(shared) != 0);
+    assert(event.len > 0);
+    assert(@intFromPtr(source) != 0);
+    assert(@intFromPtr(destination) != 0);
+
+    const stats = shared.snapshot(io);
+    std.log.warn(
+        "tunnel: {s} read_side={s} write_side={s} err={s} source_fd={d} destination_fd={d} client_to_upstream_bytes={d} upstream_to_client_bytes={d} duration_ns={d} termination={s}",
+        .{
+            event,
+            @tagName(read_side),
+            @tagName(write_side),
+            @errorName(err),
+            source.get_fd(),
+            destination.get_fd(),
+            stats.client_to_upstream_bytes,
+            stats.upstream_to_client_bytes,
+            stats.duration_ns,
+            @tagName(stats.termination),
+        },
+    );
 }
 
 test "relay forwards bytes in both directions" {

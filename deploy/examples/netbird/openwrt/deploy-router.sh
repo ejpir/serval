@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -eu
+set -euo pipefail
 
 # Deploy Serval netbird-proxy to OpenWrt router
 # Usage: ./deploy-router.sh [router-ip] [optional: zig-version-tag]
@@ -9,7 +9,8 @@ ZIG_VERSION="${2:-0.16.0-dev.2821+3edaef9e0}"
 ZIG_BIN="/usr/local/zig-x86_64-linux-${ZIG_VERSION}/zig"
 STAGING_DIR="/home/nick/repos/openwrt-suricata-build/openwrt-sdk-rockchip-armv8_gcc-14.3.0_musl.Linux-x86_64/staging_dir/target-aarch64_generic_musl"
 TARGET="aarch64-linux-musl"
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 
 # Color output
 RED='\033[0;31m'
@@ -35,6 +36,7 @@ log_info "Verifying prerequisites..."
 [ -x "$ZIG_BIN" ] || log_error "Zig not found: $ZIG_BIN"
 [ -d "$STAGING_DIR" ] || log_error "OpenWrt staging dir not found: $STAGING_DIR"
 [ -d "$REPO_ROOT" ] || log_error "Repo root not found: $REPO_ROOT"
+[ -f "$REPO_ROOT/build.zig" ] || log_error "build.zig not found under repo root: $REPO_ROOT"
 
 # Test router connectivity
 log_info "Testing router connectivity..."
@@ -44,12 +46,17 @@ ssh -o ConnectTimeout=5 "root@$ROUTER_IP" "echo ok" > /dev/null 2>&1 || log_erro
 log_info "Building netbird_proxy for $TARGET..."
 cd "$REPO_ROOT"
 $ZIG_BIN build clean 2>/dev/null || true
-$ZIG_BIN build build-netbird-proxy \
-    -Doptimize=ReleaseFast \
+BUILD_LOG="$(mktemp)"
+trap 'rm -f "$BUILD_LOG"' EXIT
+if ! "$ZIG_BIN" build build-netbird-proxy \
+    -Doptimize=Debug \
     -Dtarget="$TARGET" \
     -Dopenssl-include-dir="$STAGING_DIR/usr/include" \
     -Dopenssl-lib-dir="$STAGING_DIR/usr/lib" \
-    > /dev/null 2>&1
+    >"$BUILD_LOG" 2>&1; then
+    cat "$BUILD_LOG" >&2
+    log_error "Build failed"
+fi
 
 BINARY="$REPO_ROOT/zig-out/bin/netbird_proxy"
 [ -f "$BINARY" ] || log_error "Build failed: binary not found"

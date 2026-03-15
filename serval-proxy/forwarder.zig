@@ -35,6 +35,7 @@ const getLocalPortFromSocket = connect.getLocalPortFromSocket;
 const h1 = @import("h1/mod.zig");
 const sendRequest = h1.sendRequest;
 const sendUpgradeRequest = h1.sendUpgradeRequest;
+const ForwardedHeaders = h1.ForwardedHeaders;
 const methodToString = h1.methodToString;
 const streamRequestBody = h1.streamRequestBody;
 const forwardResponse = h1.forwardResponse;
@@ -243,12 +244,26 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             effective_path: ?[]const u8,
         ) ForwardError!ForwardResult {
             assert(upstream.port > 0);
+            assert(request.path.len > 0);
             const request_key = request.headers.get("Sec-WebSocket-Key") orelse return ForwardError.InvalidResponse;
+            const forwarded = ForwardedHeaders{
+                .host = request.headers.get("Host") orelse "",
+                .proto = if (client_tls != null) "https" else "http",
+                .client_ip = "",
+            };
 
             var accept_key_buf: [serval_websocket.websocket_accept_key_size_bytes]u8 = undefined;
             const expected_accept = serval_websocket.computeAcceptKey(request_key, &accept_key_buf) catch {
                 return ForwardError.InvalidResponse;
             };
+
+            debugLog("websocket forward start path={s} upstream={s}:{d} upstream_tls={any} protocol={s}", .{
+                request.path,
+                upstream.host,
+                upstream.port,
+                upstream.tls,
+                @tagName(upstream.http_protocol),
+            });
 
             const forward_span = self.tracer.startSpan("forward_websocket_upgrade", parent_span);
             errdefer self.tracer.endSpan(forward_span, "forward_error");
@@ -282,6 +297,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
                         pool_wait_ns,
                         forward_span,
                         effective_path,
+                        forwarded,
                     ) catch |err| {
                         if (err == ForwardError.StaleConnection and stale_retries + 1 < MAX_STALE_RETRIES) {
                             continue;
@@ -320,6 +336,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
                 pool_wait_ns,
                 forward_span,
                 effective_path,
+                forwarded,
             );
             self.tracer.endSpan(forward_span, null);
             return result;
@@ -415,6 +432,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             pool_wait_ns: u64,
             forward_span: SpanHandle,
             effective_path: ?[]const u8,
+            forwarded: ForwardedHeaders,
         ) ForwardError!ForwardResult {
             assert(upstream.port > 0);
 
@@ -453,6 +471,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
                 pool_wait_ns,
                 forward_span,
                 effective_path,
+                forwarded,
             );
         }
 
@@ -473,6 +492,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             pool_wait_ns: u64,
             forward_span: SpanHandle,
             effective_path: ?[]const u8,
+            forwarded: ForwardedHeaders,
         ) ForwardError!ForwardResult {
             var mutable_conn = conn;
             defer {
@@ -485,7 +505,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
 
             const send_span = self.tracer.startSpan("send_request", forward_span);
             const send_start_ns = time.monotonicNanos();
-            sendUpgradeRequest(&mutable_conn, io, request, effective_path) catch |err| {
+            sendUpgradeRequest(&mutable_conn, io, request, effective_path, forwarded) catch |err| {
                 self.tracer.endSpan(send_span, @errorName(err));
                 if (is_pooled and err == ForwardError.SendFailed) {
                     return ForwardError.StaleConnection;
@@ -517,6 +537,15 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             self.tracer.setIntAttribute(recv_span, "duration_ns", @intCast(recv_duration_ns));
             self.tracer.setIntAttribute(recv_span, "status", upgrade_result.status);
             self.tracer.endSpan(recv_span, null);
+
+            debugLog("websocket upgrade response path={s} status={d} upgraded={any} reused={any} upstream={s}:{d}", .{
+                request.path,
+                upgrade_result.status,
+                upgrade_result.upgraded,
+                is_pooled,
+                upstream.host,
+                upstream.port,
+            });
 
             var result = ForwardResult{
                 .status = upgrade_result.status,

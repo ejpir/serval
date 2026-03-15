@@ -370,7 +370,7 @@ fn readSome(socket: *Socket, maybe_io: ?Io, timeout: Io.Timeout, out: []u8) Erro
         .tls => |*tls_socket| blk: {
             if (tls_socket.has_pending_read()) {
                 const n = tls_socket.stream.read(out) catch |err| switch (err) {
-                    error.WouldBlock => return error.WouldBlock,
+                    error.WantRead, error.WantWrite => return error.WouldBlock,
                     else => return error.ReadFailed,
                 };
                 break :blk n;
@@ -380,7 +380,7 @@ fn readSome(socket: *Socket, maybe_io: ?Io, timeout: Io.Timeout, out: []u8) Erro
                 try waitUntilReadable(tls_socket.fd, io, timeout);
             }
             const n = tls_socket.stream.read(out) catch |err| switch (err) {
-                error.WouldBlock => return error.WouldBlock,
+                error.WantRead, error.WantWrite => return error.WouldBlock,
                 error.ConnectionReset => return error.ConnectionClosed,
                 else => return error.ReadFailed,
             };

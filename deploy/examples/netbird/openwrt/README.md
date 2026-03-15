@@ -108,3 +108,60 @@ curl -k https://192.168.1.1/healthz
 ```
 
 If hostname TLS is used, test with SNI (`--resolve`) rather than raw IP where applicable.
+
+## 7) Capture one peer-connect debug window
+
+When reproducing Android or relay-specific issues, capture one bounded window so
+proxy, relay, signal, and management logs can be compared against the same
+attempt:
+
+```sh
+deploy/examples/netbird/openwrt/capture-debug-window.sh \
+  --since 2026-03-15T15:55:40 \
+  --until 2026-03-15T15:56:40
+```
+
+Or start a bounded live capture now and trigger one connect attempt during it:
+
+```sh
+deploy/examples/netbird/openwrt/capture-debug-window.sh --duration-sec 60
+```
+
+To capture packets for direct Serval-vs-Caddy comparison during the same live
+window:
+
+```sh
+deploy/examples/netbird/openwrt/capture-debug-window.sh \
+  --duration-sec 60 \
+  --tcpdump \
+  --tcpdump-iface any \
+  --tcpdump-filter 'tcp port 443 or host 172.18.0.7'
+```
+
+The script writes a timestamped bundle under `./netbird-debug-captures/` with:
+
+- full router `logread`
+- focused proxy extracts for `/relay`, WebSocket upgrade, tunnel, TLS-read, and gRPC control-plane lines
+- `netbird-management-1`, `netbird-signal-1`, `netbird-relay-1`, and `netbird-coturn-1` container logs for the same time window
+- service status and `docker ps` snapshots
+- optional `router-tcpdump.pcap` plus `router-tcpdump-summary.txt` when `--tcpdump` is enabled
+
+## 8) Known relay debugging outcome
+
+The March 2026 Android NetBird peer-connect failure through Serval was narrowed
+down with these captures to the upgraded relay tunnel itself:
+
+- `/relay` upgraded successfully (`101`)
+- the first relay payload exchange succeeded
+- then the downstream TLS relay reader stopped forwarding the next client
+  frames, while Caddy continued to do so
+
+The underlying fix was in Serval's upgraded tunnel transport:
+
+- use `std.Io.Group.concurrent()` for the long-lived downstream relay reader in
+  threaded runtimes
+- preserve TLS `WantRead` vs `WantWrite` instead of flattening both into one
+  generic idle path
+
+If a future relay regression looks similar, start with the capture helper above
+and compare the first post-`101` frames on the plain `proxy -> relay` hop.

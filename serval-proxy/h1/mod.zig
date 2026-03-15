@@ -18,6 +18,7 @@ pub const eqlIgnoreCase = request.eqlIgnoreCase;
 
 pub const sendUpgradeRequest = websocket.sendUpgradeRequest;
 pub const buildUpgradeRequestBuffer = websocket.buildUpgradeRequestBuffer;
+pub const ForwardedHeaders = websocket.ForwardedHeaders;
 pub const forwardUpgradeResponse = websocket.forwardUpgradeResponse;
 
 pub const forwardResponse = response.forwardResponse;

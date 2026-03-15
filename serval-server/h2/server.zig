@@ -34,7 +34,7 @@ const upgrade_preamble_size_bytes: usize =
     config.H2_MAX_FRAME_SIZE_BYTES +
     config.H2_MAX_HEADER_BLOCK_SIZE_BYTES;
 const read_retry_sleep_ns: u64 = time.ns_per_ms;
-const read_stall_timeout_ns: u64 = 30 * time.ns_per_s;
+const read_stall_timeout_ns: u64 = config.H2_SERVER_IDLE_TIMEOUT_NS;
 const read_max_retry_count: u32 = 30_000;
 const write_retry_sleep_ns: u64 = time.ns_per_ms;
 const write_stall_timeout_ns: u64 = 30 * time.ns_per_s;
@@ -1933,7 +1933,7 @@ fn readSome(io_conn: *ConnectionIo, io: Io, out: []u8) Error!usize {
 
             while (retry_count < read_max_retry_count) : (retry_count += 1) {
                 const n: u32 = tls_stream.read(out) catch |err| switch (err) {
-                    error.WouldBlock => {
+                    error.WantRead, error.WantWrite => {
                         const now_ns = time.monotonicNanos();
                         const since_progress_ns = now_ns -| last_progress_ns;
                         if (since_progress_ns >= read_stall_timeout_ns) return error.ReadFailed;

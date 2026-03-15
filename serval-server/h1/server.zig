@@ -1525,16 +1525,16 @@ pub fn Server(
                     if (!binding_table.slots[index].used) continue;
                     const binding = binding_table.slots[index].binding;
                     self.upstream_reader_scan_cursor = @mod(cursor + 1, slot_count);
-                    log.debug(
-                        "h2 bridge: conn={d} waiting upstream action downstream_stream={d} upstream_stream={d} idx={d} gen={d}",
-                        .{
-                            self.connection_ctx.connection_id,
-                            binding.downstream_stream_id,
-                            binding.upstream_stream_id,
-                            binding.upstream_index,
-                            binding.upstream_session_generation,
-                        },
-                    );
+                    // log.debug(
+                    //     "h2 bridge: conn={d} waiting upstream action downstream_stream={d} upstream_stream={d} idx={d} gen={d}",
+                    //     .{
+                    //         self.connection_ctx.connection_id,
+                    //         binding.downstream_stream_id,
+                    //         binding.upstream_stream_id,
+                    //         binding.upstream_index,
+                    //         binding.upstream_session_generation,
+                    //     },
+                    // );
                     return self.bridge.receiveForDownstream(self.io, timeout, binding.downstream_stream_id) catch |err| switch (err) {
                         error.BindingNotFound => continue,
                         error.SessionNotFound => {

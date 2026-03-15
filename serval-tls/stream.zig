@@ -277,9 +277,39 @@ pub const TLSStream = struct {
                 if (n <= 0) {
                     const err = ssl.SSL_get_error(ssl_conn, n);
                     switch (err) {
-                        ssl.SSL_ERROR_ZERO_RETURN => return 0,
-                        ssl.SSL_ERROR_WANT_READ, ssl.SSL_ERROR_WANT_WRITE => return error.WouldBlock,
-                        else => return error.SslRead,
+                        ssl.SSL_ERROR_ZERO_RETURN => {
+                            log.info(
+                                "TLS read closed: reason=close_notify fd={d} cipher={s}",
+                                .{ self.fd, self.info.cipher() },
+                            );
+                            return 0;
+                        },
+                        ssl.SSL_ERROR_WANT_READ => return error.WantRead,
+                        ssl.SSL_ERROR_WANT_WRITE => return error.WantWrite,
+                        ssl.SSL_ERROR_SYSCALL => {
+                            log.warn(
+                                "TLS read failed: reason=peer_reset fd={d} cipher={s} ssl_error={s} ret={d}",
+                                .{ self.fd, self.info.cipher(), ssl.sslErrorName(err), n },
+                            );
+                            ssl.printErrors();
+                            return error.ConnectionReset;
+                        },
+                        ssl.SSL_ERROR_SSL => {
+                            log.warn(
+                                "TLS read failed: reason=tls_protocol fd={d} cipher={s} ssl_error={s} ret={d}",
+                                .{ self.fd, self.info.cipher(), ssl.sslErrorName(err), n },
+                            );
+                            ssl.printErrors();
+                            return error.SslRead;
+                        },
+                        else => {
+                            log.warn(
+                                "TLS read failed: reason=ssl_unexpected fd={d} cipher={s} ssl_error={s} ret={d}",
+                                .{ self.fd, self.info.cipher(), ssl.sslErrorName(err), n },
+                            );
+                            ssl.printErrors();
+                            return error.SslRead;
+                        },
                     }
                 }
                 const bytes_read: u32 = @intCast(n);
@@ -308,7 +338,7 @@ pub const TLSStream = struct {
                     // Nonblocking write can legitimately stall; caller retries with bounds.
                     return switch (err) {
                         error.BrokenPipe => error.ConnectionReset,
-                        error.WouldBlock => error.WouldBlock,
+                        error.WouldBlock => error.WantRead,
                         else => error.KtlsWrite,
                     };
                 };

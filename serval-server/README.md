@@ -4,7 +4,7 @@ HTTP/1.1 server implementation for serval. Like Pingora's `server` + `apps` modu
 
 Provides generic HTTP server infrastructure with protocol-specific implementations organized by version (h1/ today, gRPC-oriented HTTP/2 ingress/proxy handoff for prior-knowledge and `Upgrade: h2c`, and an early `h2/` connection/runtime submodule for future generic stream-aware transport).
 
-The terminated `h2/server.zig` path now receives `std.Io` from all downstream h2 entry points and flips accepted/upgraded h2 sockets into nonblocking mode before entering the frame loop. Plain h2 reads/writes use explicit bounded nonblocking retry loops over the fd, TLS h2 reads use readiness-yield + retry rather than blocking `SSL_read()` directly, and h1 plain-socket reads stay on `std.Io` so connection fibers can yield and shutdown cleanly.
+The terminated `h2/server.zig` path now receives `std.Io` from all downstream h2 entry points and flips accepted/upgraded h2 sockets into nonblocking mode before entering the frame loop. Plain h2 reads/writes use explicit bounded nonblocking retry loops over the fd, TLS h2 reads use readiness-yield + retry rather than blocking `SSL_read()` directly, and h1 plain-socket reads stay on `std.Io` so connection fibers can yield and shutdown cleanly. Downstream terminated h2 connections now use the long-lived `serval-core.config.H2_SERVER_IDLE_TIMEOUT_NS` bound instead of a hardcoded 30 second stall window, so quiet mobile gRPC clients are not forced to reconnect during normal idle periods. TLS read backpressure is now split into `WantRead` vs `WantWrite` so h2 and upgraded-tunnel call sites can wait on the correct fd readiness instead of flattening both cases into a generic idle retry.
 
 ## Module Structure
 
