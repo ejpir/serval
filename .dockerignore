@@ -1,0 +1,11 @@
+.git
+.zig-cache
+zig-cache
+zig-out
+.claude
+.entire
+.tmp_stdlib
+zig-pkg
+sframe_test
+DEPLOY.md
+Makefile

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -uo pipefail
 
 HOST="127.0.0.1"
 H2C_PORT="8080"
@@ -95,8 +95,45 @@ wait_for_port() {
 wait_for_port "$HOST" "$H2C_PORT"
 wait_for_port "$HOST" "$TLS_PORT"
 
+RUNNER_STATUS=0
 integration/h2_conformance_runner.sh \
   --host "$HOST" \
   --h2c-port "$H2C_PORT" \
   --tls-port "$TLS_PORT" \
-  --h2spec-timeout "$H2SPEC_TIMEOUT_SECONDS"
+  --h2spec-timeout "$H2SPEC_TIMEOUT_SECONDS" || RUNNER_STATUS=$?
+
+PLAIN_EXIT_STATUS=0
+TLS_EXIT_STATUS=0
+
+if kill -0 "${PLAIN_PID}" 2>/dev/null; then
+  kill "${PLAIN_PID}" 2>/dev/null || true
+  wait "${PLAIN_PID}" 2>/dev/null || true
+else
+  wait "${PLAIN_PID}" 2>/dev/null || PLAIN_EXIT_STATUS=$?
+fi
+
+if kill -0 "${TLS_PID}" 2>/dev/null; then
+  kill "${TLS_PID}" 2>/dev/null || true
+  wait "${TLS_PID}" 2>/dev/null || true
+else
+  wait "${TLS_PID}" 2>/dev/null || TLS_EXIT_STATUS=$?
+fi
+
+if [[ $RUNNER_STATUS -ne 0 || $PLAIN_EXIT_STATUS -ne 0 || $TLS_EXIT_STATUS -ne 0 ]]; then
+  echo "==== plain h2 conformance server log ====" >&2
+  cat "$PLAIN_LOG" >&2 || true
+  echo "==== tls h2 conformance server log ====" >&2
+  cat "$TLS_LOG" >&2 || true
+fi
+
+if [[ $PLAIN_EXIT_STATUS -ne 0 ]]; then
+  echo "ERROR: plain h2 conformance server exited unexpectedly (${PLAIN_EXIT_STATUS})" >&2
+fi
+
+if [[ $TLS_EXIT_STATUS -ne 0 ]]; then
+  echo "ERROR: tls h2 conformance server exited unexpectedly (${TLS_EXIT_STATUS})" >&2
+fi
+
+if [[ $RUNNER_STATUS -ne 0 || $PLAIN_EXIT_STATUS -ne 0 || $TLS_EXIT_STATUS -ne 0 ]]; then
+  exit 1
+fi

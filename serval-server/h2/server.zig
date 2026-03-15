@@ -1886,11 +1886,46 @@ fn readSome(io_conn: *ConnectionIo, io: Io, out: []u8) Error!usize {
 
     return switch (io_conn.*) {
         .plain_fd => |fd| blk: {
-            const message = rawStreamForFd(fd).socket.receive(io, out) catch |err| switch (err) {
-                error.ConnectionResetByPeer, error.SocketUnconnected, error.Canceled => return error.ConnectionClosed,
-                else => return error.ReadFailed,
-            };
-            break :blk message.data.len;
+            var retry_count: u32 = 0;
+            var last_progress_ns: u64 = time.monotonicNanos();
+
+            while (retry_count < read_max_retry_count) : (retry_count += 1) {
+                const rc = std.c.read(fd, out.ptr, out.len);
+                const errno_code = std.c.errno(rc);
+                switch (errno_code) {
+                    .SUCCESS => {
+                        last_progress_ns = time.monotonicNanos();
+                        break :blk @intCast(rc);
+                    },
+                    .INTR, .AGAIN => {
+                        const now_ns = time.monotonicNanos();
+                        const since_progress_ns = now_ns -| last_progress_ns;
+                        if (since_progress_ns >= read_stall_timeout_ns) {
+                            log.warn(
+                                "h2: readSome stalled transport=plain fd={d} retries={d} since_progress_ns={d}",
+                                .{ fd, retry_count + 1, since_progress_ns },
+                            );
+                            return error.ReadFailed;
+                        }
+                        std.Io.sleep(io, std.Io.Duration.fromNanoseconds(read_retry_sleep_ns), .awake) catch return error.ReadFailed;
+                        continue;
+                    },
+                    .CONNRESET, .NOTCONN => return error.ConnectionClosed,
+                    else => {
+                        log.warn(
+                            "h2: readSome failed transport=plain fd={d} errno={s} rc={d} bytes={d}",
+                            .{ fd, @tagName(errno_code), rc, out.len },
+                        );
+                        return error.ReadFailed;
+                    },
+                }
+            }
+
+            log.warn(
+                "h2: readSome exhausted retries transport=plain fd={d} retries={d}",
+                .{ fd, read_max_retry_count },
+            );
+            return error.ReadFailed;
         },
         .tls_stream => |tls_stream| blk: {
             var retry_count: u32 = 0;
@@ -2034,17 +2069,6 @@ fn setConnectionNonBlocking(io_conn: *const ConnectionIo) Error!void {
 
     const set_rc = posix.system.fcntl(fd, posix.F.SETFL, flags);
     if (posix.errno(set_rc) != .SUCCESS) return error.ReadFailed;
-}
-
-fn rawStreamForFd(fd: i32) Io.net.Stream {
-    assert(fd >= 0);
-
-    return .{
-        .socket = .{
-            .handle = fd,
-            .address = .{ .ip4 = .unspecified(0) },
-        },
-    };
 }
 
 fn buildResponseHeaderBlock(status: u16, headers: []const Header, out: []u8) Error![]const u8 {

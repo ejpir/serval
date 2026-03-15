@@ -4,7 +4,7 @@ HTTP/1.1 server implementation for serval. Like Pingora's `server` + `apps` modu
 
 Provides generic HTTP server infrastructure with protocol-specific implementations organized by version (h1/ today, gRPC-oriented HTTP/2 ingress/proxy handoff for prior-knowledge and `Upgrade: h2c`, and an early `h2/` connection/runtime submodule for future generic stream-aware transport).
 
-The terminated `h2/server.zig` path now receives `std.Io` from all downstream h2 entry points and flips accepted/upgraded h2 sockets into nonblocking mode before entering the frame loop. Plain h2 reads/writes go through `std.Io` socket helpers, TLS h2 reads use readiness-yield + retry rather than blocking `SSL_read()` directly, and h1 plain-socket reads now stay on `std.Io` as well so connection fibers can yield and shutdown cleanly.
+The terminated `h2/server.zig` path now receives `std.Io` from all downstream h2 entry points and flips accepted/upgraded h2 sockets into nonblocking mode before entering the frame loop. Plain h2 reads/writes use explicit bounded nonblocking retry loops over the fd, TLS h2 reads use readiness-yield + retry rather than blocking `SSL_read()` directly, and h1 plain-socket reads stay on `std.Io` so connection fibers can yield and shutdown cleanly.
 
 ## Module Structure
 
@@ -259,7 +259,7 @@ In main `h1/server.zig` terminated-h2 dispatch paths (prior-knowledge and upgrad
 The repository now includes the first Phase-B `h2/` building blocks:
 - `connection.zig` for bounded peer/local settings, GOAWAY bookkeeping, stream tables, and flow windows
 - `runtime.zig` for per-frame inbound HTTP/2 actions (`send_settings_ack`, request HEADERS/DATA dispatch, bounded HEADERS+CONTINUATION request-header reassembly, bounded HPACK dynamic-table/Huffman decode, ping ack, RST_STREAM, GOAWAY) with `server.zig` now replenishing connection+stream flow-control windows via WINDOW_UPDATE on inbound DATA, classifying stream DATA window exhaustion as stream-scoped flow-control failure without mutating connection-level window state
-- `server.zig` for a terminating HTTP/2 driver over plain fd and TLS streams that wires those runtime actions into a real frame loop with streaming callbacks, supports upgraded stream-1 bootstrap + optional post-101 client preface, uses bounded nonblocking control-frame write retries for deterministic GOAWAY/RST emission under backpressure, emits explicit write-failure diagnostics (transport/fd/errno-or-tls-error) on failure paths, and can now be reached from the main accept loop for cleartext prior-knowledge/upgrade paths and TLS ALPN `h2` dispatch
+- `server.zig` for a terminating HTTP/2 driver over plain fd and TLS streams that wires those runtime actions into a real frame loop with streaming callbacks, supports upgraded stream-1 bootstrap + optional post-101 client preface, uses bounded nonblocking read/write retries for deterministic frame progress plus GOAWAY/RST emission under backpressure, emits explicit transport/fd/errno-or-tls-error diagnostics on failure paths, and can now be reached from the main accept loop for cleartext prior-knowledge/upgrade paths and TLS ALPN `h2` dispatch
 
 Full stream-aware HTTP/2 support will continue expanding that `h2/` subdirectory toward
 this target organization:

@@ -15,7 +15,7 @@ jobs:
       - name: Setup Go (for hey)
         uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
+          go-version: "1.26.1"
 
       - name: Install curl, hey, and HTTP/2 conformance tools
         run: |
@@ -24,14 +24,15 @@ jobs:
           sudo apt-get install -y curl nghttp2-client
           go install github.com/rakyll/hey@v0.1.4
           go install github.com/summerwind/h2spec/cmd/h2spec@v2.2.1+incompatible
+          go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
-      - name: Install Zig 0.16.0-dev.2565+684032671
+      - name: Install upstream Zig for smoke CI
         run: |
           set -euxo pipefail
-          curl -L "https://ziglang.org/builds/zig-x86_64-linux-0.16.0-dev.2565+684032671.tar.xz" -o zig.tar.xz
+          curl -L "https://ziglang.org/builds/zig-x86_64-linux-0.16.0-dev.2821+3edaef9e0.tar.xz" -o zig.tar.xz
           tar -xf zig.tar.xz
-          echo "$GITHUB_WORKSPACE/zig-x86_64-linux-0.16.0-dev.2565+684032671" >> "$GITHUB_PATH"
+          echo "$GITHUB_WORKSPACE/zig-x86_64-linux-0.16.0-dev.2821+3edaef9e0" >> "$GITHUB_PATH"
 
       - name: Show Zig version
         run: zig version

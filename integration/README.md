@@ -28,6 +28,102 @@ which reduces memory-pressure flakiness when enabled:
 SERVAL_RUN_5GB_TEST=1 zig build test-integration
 ```
 
+## Containerized Test Environment
+
+To eliminate local/CI tool drift, the repository now includes a dedicated
+integration image at [integration/Dockerfile](/home/nick/repos/serval/integration/Dockerfile).
+
+The image installs the toolchain and external helpers required by the current
+integration and conformance suites:
+
+- your local custom Zig `0.16.0-dev.2821+3edaef9e0` build, bundled from the
+  host tarball so container runs use the same modified stdlib as local runs
+- Go `1.26.x`
+- `grpcurl`
+- `h2spec`
+- `nghttp`
+- `hey`
+- OpenSSL build dependencies for Serval's TLS-linked binaries
+
+Build the image and run the default verification set:
+
+```bash
+integration/run_in_docker.sh
+```
+
+That wrapper builds the image, mounts the current repository, and runs:
+
+```bash
+zig build && zig build test && zig build test-integration && integration/h2_conformance_ci.sh --h2spec-timeout 1
+```
+
+The container is started with:
+
+```bash
+--security-opt seccomp=unconfined
+--ulimit memlock=-1
+--cap-add IPC_LOCK
+```
+
+by default, because parts of the integration suite use `std.Io.Evented` and can
+fail under Docker's default runtime limits when `io_uring` setup is blocked by
+seccomp or by low memlock allowance.
+
+By default it expects the custom Zig archive at:
+
+```bash
+/usr/local/zig-x86_64-linux-0.16.0-dev.2821+3edaef9e0.tar.xz
+```
+
+But if the installed toolchain directory exists, the wrapper now prefers
+repacking the live directory tree:
+
+```bash
+/usr/local/zig-x86_64-linux-0.16.0-dev.2821+3edaef9e0
+```
+
+That avoids stale-archive drift when the local Zig stdlib has been patched after
+the original tarball was created.
+
+Override that path if needed:
+
+```bash
+SERVAL_CUSTOM_ZIG_ARCHIVE=/path/to/custom-zig.tar.xz integration/run_in_docker.sh
+```
+
+Or point directly at a custom installed Zig directory:
+
+```bash
+SERVAL_CUSTOM_ZIG_DIR=/path/to/zig-x86_64-linux-custom integration/run_in_docker.sh
+```
+
+Override the container security option if you need a different runtime policy:
+
+```bash
+SERVAL_DOCKER_SECURITY_OPT=seccomp=unconfined integration/run_in_docker.sh
+```
+
+You can also override the extra resource/capability settings explicitly:
+
+```bash
+SERVAL_DOCKER_MEMLOCK_ULIMIT=memlock=-1 \
+SERVAL_DOCKER_CAP_ADD=IPC_LOCK \
+integration/run_in_docker.sh
+```
+
+This custom-toolchain container path is the release-grade environment when your
+local Zig includes stdlib changes. GitHub Actions can still run an upstream-Zig
+smoke CI path, but it does not automatically reproduce host-local stdlib
+modifications unless that custom toolchain is published and wired in
+explicitly.
+
+You can also run arbitrary commands inside the same image, which is useful for
+release builds after the integration gates pass:
+
+```bash
+integration/run_in_docker.sh bash -lc 'zig build -Doptimize=ReleaseFast'
+```
+
 ## Prerequisites
 
 ### Build Binaries First
@@ -53,6 +149,11 @@ Example grpcurl install:
 ```bash
 GOBIN="$HOME/.local/bin" go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest
 ```
+
+If you use the containerized environment above, these tools are already
+installed and the grpc-go module cache is prewarmed for the versions used by the
+process-level interop tests. The container currently pins Go `1.26.x` because
+the external tool install set now requires a newer Go toolchain than `1.23`.
 
 ### HTTP/2 Conformance Tools (Optional, recommended)
 

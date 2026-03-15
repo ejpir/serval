@@ -90,6 +90,30 @@ run_section() {
   fi
 }
 
+run_nghttp_section() {
+  local label="$1"
+  shift
+
+  echo "==> ${label}"
+
+  local output
+  if ! output="$("$@" 2>&1)"; then
+    OVERALL_EXIT=1
+    printf '%s\n' "$output"
+    echo "SECTION FAILED: ${label}" >&2
+    return
+  fi
+
+  printf '%s\n' "$output"
+  if [[ "$output" == *"Could not connect"* ]] || [[ "$output" == *"Some requests were not processed"* ]]; then
+    OVERALL_EXIT=1
+    echo "SECTION FAILED: ${label}" >&2
+    return
+  fi
+
+  echo "SECTION OK: ${label}"
+}
+
 if [[ "$HAVE_H2SPEC" == "1" ]]; then
   run_section "h2spec cleartext h2c (${HOST}:${H2C_PORT})" h2spec -h "$HOST" -p "$H2C_PORT" -o "$H2SPEC_TIMEOUT_SECONDS"
 
@@ -98,8 +122,8 @@ if [[ "$HAVE_H2SPEC" == "1" ]]; then
 fi
 
 if [[ "$HAVE_NGHTTP" == "1" ]]; then
-  run_section "nghttp cleartext check" nghttp -nv "http://${HOST}:${H2C_PORT}/healthz"
-  run_section "nghttp TLS check" nghttp -nv "https://${HOST}:${TLS_PORT}/healthz"
+  run_nghttp_section "nghttp cleartext check" nghttp -nv "http://${HOST}:${H2C_PORT}/healthz"
+  run_nghttp_section "nghttp TLS check" nghttp -nv "https://${HOST}:${TLS_PORT}/healthz"
 fi
 
 echo "HTTP/2 conformance runner completed."
