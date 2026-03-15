@@ -478,6 +478,7 @@
 -    _ = fd;
 -    _ = data;
 -    return error.NetworkDown;
++
 +    var iovecs_buffer: [max_iovecs_len]iovec = undefined;
 +    var i: usize = 0;
 +    for (data) |buf| {
@@ -520,6 +521,7 @@
 -    _ = data;
 -    _ = splat;
 -    return error.NetworkDown;
++
 +    var iovecs: [max_iovecs_len]iovec_const = undefined;
 +    var msg: linux.msghdr_const = .{
 +        .name = null,
@@ -533,6 +535,7 @@
 +    addBuf(&iovecs, &msg.iovlen, header);
 +    for (data[0 .. data.len - 1]) |bytes| addBuf(&iovecs, &msg.iovlen, bytes);
 +    const pattern = data[data.len - 1];
++
 +    var splat_backup_buffer: [splat_buffer_size]u8 = undefined;
 +    if (iovecs.len - msg.iovlen != 0) switch (splat) {
 +        0 => {},
@@ -552,9 +555,12 @@
 +                }
 +                addBuf(&iovecs, &msg.iovlen, splat_buffer[0..@min(remaining_splat, splat_buffer.len)]);
 +            },
-+            else => for (0..@min(splat, iovecs.len - msg.iovlen)) |_| addBuf(&iovecs, &msg.iovlen, pattern),
++            else => for (0..@min(splat, iovecs.len - msg.iovlen)) |_| {
++                addBuf(&iovecs, &msg.iovlen, pattern);
++            },
 +        },
 +    };
++
 +    var cancel_region: CancelRegion = .init();
 +    defer cancel_region.deinit();
 +    return ev.netWriteMsg(&cancel_region, handle, &msg, linux.MSG.NOSIGNAL) catch |err| switch (err) {
