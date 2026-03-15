@@ -45,6 +45,13 @@ integration and conformance suites:
 - `hey`
 - OpenSSL build dependencies for Serval's TLS-linked binaries
 
+The repository also carries the required stdlib patch for
+`lib/std/Io/Uring.zig` at
+[zig-0.16.0-dev.2821+3edaef9e0-uring.patch](/home/nick/repos/serval/integration/toolchains/zig-0.16.0-dev.2821+3edaef9e0-uring.patch).
+Both the Docker image build and GitHub Actions Zig install path apply that
+patch if the installed toolchain does not already contain it, so the pipeline
+does not depend on an accidentally pre-patched host install.
+
 Build the image and run the default verification set:
 
 ```bash
@@ -113,9 +120,10 @@ integration/run_in_docker.sh
 
 This custom-toolchain container path is the release-grade environment when your
 local Zig includes stdlib changes. GitHub Actions can still run an upstream-Zig
-smoke CI path, but it does not automatically reproduce host-local stdlib
-modifications unless that custom toolchain is published and wired in
-explicitly.
+smoke CI path, but it now reapplies the committed `Uring.zig` patch after Zig
+download so the current pipeline stays aligned with the Serval-required stdlib
+delta. Longer term, the full custom Zig toolchain still needs to be published
+as a first-class artifact rather than patched ad hoc at install time.
 
 You can also run arbitrary commands inside the same image, which is useful for
 release builds after the integration gates pass:

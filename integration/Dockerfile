@@ -24,6 +24,7 @@ RUN apt-get update && \
         git \
         libssl-dev \
         nghttp2-client \
+        patch \
         pkg-config \
         xz-utils && \
     rm -rf /var/lib/apt/lists/*
@@ -33,11 +34,15 @@ RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go
     rm /tmp/go.tar.gz
 
 COPY ${ZIG_ARCHIVE} /tmp/zig.tar.xz
+COPY integration/toolchains/zig-0.16.0-dev.2821+3edaef9e0-uring.patch /tmp/zig-uring.patch
 
 RUN tar -C /usr/local -xf /tmp/zig.tar.xz && \
+    if ! grep -q "const BatchNetReceivePending" "/usr/local/zig-x86_64-linux-${ZIG_VERSION}/lib/std/Io/Uring.zig"; then \
+        patch -p0 -d /usr/local < /tmp/zig-uring.patch; \
+    fi && \
     ln -s /usr/local/zig-x86_64-linux-${ZIG_VERSION}/zig /usr/local/bin/zig && \
     ln -s /usr/local/zig-x86_64-linux-${ZIG_VERSION} /usr/local/zig && \
-    rm /tmp/zig.tar.xz
+    rm /tmp/zig.tar.xz /tmp/zig-uring.patch
 
 RUN mkdir -p "${GOCACHE}" "${GOMODCACHE}" "${ZIG_GLOBAL_CACHE_DIR}"
 

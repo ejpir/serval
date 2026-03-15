@@ -1,0 +1,680 @@
+--- zig-x86_64-linux-0.16.0-dev.2821+3edaef9e0/lib/std/Io/Uring.zig
++++ zig-x86_64-linux-0.16.0-dev.2821+3edaef9e0/lib/std/Io/Uring.zig
+@@ -769,16 +769,16 @@
+             .random = random,
+             .randomSecure = randomSecure,
+ 
+-            .netListenIp = netListenIpUnavailable,
+-            .netAccept = netAcceptUnavailable,
++            .netListenIp = netListenIp,
++            .netAccept = netAccept,
+             .netBindIp = netBindIp,
+-            .netConnectIp = netConnectIpUnavailable,
++            .netConnectIp = netConnectIp,
+             .netListenUnix = netListenUnixUnavailable,
+             .netConnectUnix = netConnectUnixUnavailable,
+             .netSocketCreatePair = netSocketCreatePairUnavailable,
+-            .netSend = netSendUnavailable,
+-            .netRead = netReadUnavailable,
+-            .netWrite = netWriteUnavailable,
++            .netSend = netSend,
++            .netRead = netRead,
++            .netWrite = netWrite,
+             .netWriteFile = netWriteFileUnavailable,
+             .netClose = netClose,
+             .netShutdown = netShutdown,
+@@ -2306,6 +2306,13 @@
+     }
+ }
+ 
++const BatchNetReceivePending = struct {
++    message: *net.IncomingMessage,
++    storage: PosixAddress,
++    iov: iovec,
++    msg: linux.msghdr,
++};
++
+ /// If `concurrency` is false, `error.ConcurrencyUnavailable` is unreachable.
+ fn batchDrainSubmitted(
+     ev: *Evented,
+@@ -2387,8 +2394,62 @@
+             else
+                 .{ .device_io_control = try ev.deviceIoControl(try maybe_sync.enterSync(ev), o) },
+             .net_receive => |o| {
+-                _ = o;
+-                @panic("TODO implement batchDrainSubmitted for net_receive");
++                if (o.message_buffer.len == 0 or o.data_buffer.len == 0) {
++                    break :result .{ .net_receive = .{ null, 0 } };
++                }
++                const pending_state = std.heap.page_allocator.create(BatchNetReceivePending) catch
++                    return error.ConcurrencyUnavailable;
++                errdefer std.heap.page_allocator.destroy(pending_state);
++                pending_state.* = .{
++                    .message = &o.message_buffer[0],
++                    .storage = undefined,
++                    .iov = .{
++                        .base = o.data_buffer.ptr,
++                        .len = o.data_buffer.len,
++                    },
++                    .msg = .{
++                        .name = undefined,
++                        .namelen = @sizeOf(PosixAddress),
++                        .iov = undefined,
++                        .iovlen = 1,
++                        .control = undefined,
++                        .controllen = o.message_buffer[0].control.len,
++                        .flags = undefined,
++                    },
++                };
++                pending_state.msg.name = &pending_state.storage.any;
++                pending_state.msg.iov = (&pending_state.iov)[0..1];
++                pending_state.msg.control = if (o.message_buffer[0].control.len == 0)
++                    null
++                else
++                    o.message_buffer[0].control.ptr;
++
++                storage.* = .{ .pending = .{
++                    .node = .{ .prev = batch.pending.tail, .next = .none },
++                    .tag = .net_receive,
++                    .userdata = undefined,
++                } };
++                storage.pending.userdata[3] = @intFromPtr(pending_state);
++                thread.enqueue().* = .{
++                    .opcode = .RECVMSG,
++                    .flags = 0,
++                    .ioprio = 0,
++                    .fd = o.socket_handle,
++                    .off = 0,
++                    .addr = @intFromPtr(&pending_state.msg),
++                    .len = 0,
++                    .rw_flags = linux.MSG.NOSIGNAL |
++                        @as(u32, if (o.flags.oob) linux.MSG.OOB else 0) |
++                        @as(u32, if (o.flags.peek) linux.MSG.PEEK else 0) |
++                        @as(u32, if (o.flags.trunc) linux.MSG.TRUNC else 0),
++                    .user_data = @intFromPtr(&storage.pending.userdata) | 0b10,
++                    .buf_index = 0,
++                    .personality = 0,
++                    .splice_fd_in = 0,
++                    .addr3 = 0,
++                    .resv = 0,
++                };
++                break :result null;
+             },
+         })) |result| {
+             switch (batch.completed.tail) {
+@@ -2490,7 +2551,51 @@
+                     },
+                 },
+                 .device_io_control => unreachable,
+-                .net_receive => @panic("TODO"),
++                .net_receive => net_receive_result: {
++                    const pending_state: *BatchNetReceivePending =
++                        @alignCast(@as(*align(1) BatchNetReceivePending, @ptrFromInt(pending.userdata[3])));
++                    defer std.heap.page_allocator.destroy(pending_state);
++                    break :net_receive_result .{
++                        .net_receive = switch (completion.errno()) {
++                            .SUCCESS => receive_result: {
++                                const data = pending_state.iov.base[0..@intCast(completion.result)];
++                                pending_state.message.* = .{
++                                    .from = addressFromPosix(&pending_state.storage),
++                                    .data = data,
++                                    .control = if (pending_state.msg.control) |ptr|
++                                        @as([*]u8, @ptrCast(ptr))[0..pending_state.msg.controllen]
++                                    else
++                                        pending_state.message.control,
++                                    .flags = .{
++                                        .eor = pending_state.msg.flags & linux.MSG.EOR != 0,
++                                        .trunc = pending_state.msg.flags & linux.MSG.TRUNC != 0,
++                                        .ctrunc = pending_state.msg.flags & linux.MSG.CTRUNC != 0,
++                                        .oob = pending_state.msg.flags & linux.MSG.OOB != 0,
++                                        .errqueue = pending_state.msg.flags & linux.MSG.ERRQUEUE != 0,
++                                    },
++                                };
++                                break :receive_result .{ null, 1 };
++                            },
++                            .INTR => .{ null, 0 },
++                            .CANCELED => break :net_receive_result null,
++                            .BADF => .{ errnoBug(.BADF), 0 },
++                            .NFILE => .{ error.SystemFdQuotaExceeded, 0 },
++                            .MFILE => .{ error.ProcessFdQuotaExceeded, 0 },
++                            .FAULT => .{ errnoBug(.FAULT), 0 },
++                            .INVAL => .{ errnoBug(.INVAL), 0 },
++                            .NOBUFS => .{ error.SystemResources, 0 },
++                            .NOMEM => .{ error.SystemResources, 0 },
++                            .NOTCONN => .{ error.SocketUnconnected, 0 },
++                            .NOTSOCK => .{ errnoBug(.NOTSOCK), 0 },
++                            .MSGSIZE => .{ error.MessageOversize, 0 },
++                            .PIPE => .{ error.SocketUnconnected, 0 },
++                            .OPNOTSUPP => .{ errnoBug(.OPNOTSUPP), 0 },
++                            .CONNRESET => .{ error.ConnectionResetByPeer, 0 },
++                            .NETDOWN => .{ error.NetworkDown, 0 },
++                            else => |err| .{ unexpectedErrno(err), 0 },
++                        },
++                    };
++                },
+             })) |result| {
+                 switch (batch.completed.tail) {
+                     .none => batch.completed.head = index,
+@@ -4199,7 +4304,7 @@
+     const dir_path_posix = try pathToPosix(dir_path, &path_buffer);
+     var sync: CancelRegion.Sync = try .init(ev);
+     defer sync.deinit(ev);
+-    return ev.chdir(&sync, dir_path_posix);
++    return chdir(&sync, dir_path_posix);
+ }
+ 
+ fn processReplace(userdata: ?*anyopaque, options: process.ReplaceOptions) process.ReplaceError {
+@@ -4950,26 +5055,92 @@
+     };
+ }
+ 
+-fn netListenIpUnavailable(
++fn netListenIp(
+     userdata: ?*anyopaque,
+     address: net.IpAddress,
+     options: net.IpAddress.ListenOptions,
+ ) net.IpAddress.ListenError!net.Server {
+     const ev: *Evented = @ptrCast(@alignCast(userdata));
+-    _ = ev;
+-    _ = address;
+-    _ = options;
+-    return error.NetworkDown;
++    const family = posixAddressFamily(&address);
++    var maybe_sync: CancelRegion.Sync.Maybe = .{ .cancel_region = .init() };
++    defer maybe_sync.deinit(ev);
++    const socket_fd = try ev.socket(&maybe_sync.cancel_region, family, .{
++        .mode = options.mode,
++        .protocol = options.protocol,
++    });
++    errdefer ev.closeAsync(socket_fd);
++
++    if (options.reuse_address) {
++        try ev.setsockopt(&maybe_sync.cancel_region, socket_fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, 1);
++        if (@hasDecl(linux.SO, "REUSEPORT")) {
++            try ev.setsockopt(&maybe_sync.cancel_region, socket_fd, linux.SOL.SOCKET, linux.SO.REUSEPORT, 1);
++        }
++    }
++
++    var storage: PosixAddress = undefined;
++    var addr_len = addressToPosix(&address, &storage);
++    try ev.bind(&maybe_sync.cancel_region, socket_fd, &storage.any, addr_len);
++    try ev.listen(&maybe_sync.cancel_region, socket_fd, options.kernel_backlog);
++    try ev.getsockname(try maybe_sync.enterSync(ev), socket_fd, &storage.any, &addr_len);
++    return .{ .socket = .{
++        .handle = socket_fd,
++        .address = addressFromPosix(&storage),
++    } };
+ }
+ 
+-fn netAcceptUnavailable(
++fn netAccept(
+     userdata: ?*anyopaque,
+     listen_handle: net.Socket.Handle,
+ ) net.Server.AcceptError!net.Stream {
+     const ev: *Evented = @ptrCast(@alignCast(userdata));
+-    _ = ev;
+-    _ = listen_handle;
+-    return error.NetworkDown;
++    var cancel_region: CancelRegion = .init();
++    defer cancel_region.deinit();
++    var storage: PosixAddress = undefined;
++    var addr_len: linux.socklen_t = @sizeOf(PosixAddress);
++
++    while (true) {
++        const thread = try cancel_region.awaitIoUring();
++        thread.enqueue().* = .{
++            .opcode = .ACCEPT,
++            .flags = 0,
++            .ioprio = 0,
++            .fd = listen_handle,
++            .off = @intFromPtr(&addr_len),
++            .addr = @intFromPtr(&storage.any),
++            .len = 0,
++            .rw_flags = linux.SOCK.CLOEXEC,
++            .user_data = @intFromPtr(cancel_region.fiber),
++            .buf_index = 0,
++            .personality = 0,
++            .splice_fd_in = 0,
++            .addr3 = 0,
++            .resv = 0,
++        };
++        ev.yield(null, .nothing);
++        const completion = cancel_region.completion();
++        switch (completion.errno()) {
++            .SUCCESS => return .{ .socket = .{
++                .handle = completion.result,
++                .address = addressFromPosix(&storage),
++            } },
++            .INTR, .CANCELED => {},
++            .AGAIN => |err| return errnoBug(err),
++            .BADF => |err| return errnoBug(err),
++            .CONNABORTED => return error.ConnectionAborted,
++            .FAULT => |err| return errnoBug(err),
++            .INVAL => return error.SocketNotListening,
++            .NOTSOCK => |err| return errnoBug(err),
++            .MFILE => return error.ProcessFdQuotaExceeded,
++            .NFILE => return error.SystemFdQuotaExceeded,
++            .NOBUFS => return error.SystemResources,
++            .NOMEM => return error.SystemResources,
++            .OPNOTSUPP => |err| return errnoBug(err),
++            .PROTO => return error.ProtocolFailure,
++            .PERM => return error.BlockedByFirewall,
++            .NETDOWN => return error.NetworkDown,
++            else => |err| return unexpectedErrno(err),
++        }
++    }
+ }
+ 
+ fn netBindIp(
+@@ -4993,16 +5164,30 @@
+     };
+ }
+ 
+-fn netConnectIpUnavailable(
++fn netConnectIp(
+     userdata: ?*anyopaque,
+     address: *const net.IpAddress,
+     options: net.IpAddress.ConnectOptions,
+ ) net.IpAddress.ConnectError!net.Stream {
++    if (options.timeout != .none) return error.OptionUnsupported;
+     const ev: *Evented = @ptrCast(@alignCast(userdata));
+-    _ = ev;
+-    _ = address;
+-    _ = options;
+-    return error.NetworkDown;
++    const family = posixAddressFamily(address);
++    var maybe_sync: CancelRegion.Sync.Maybe = .{ .cancel_region = .init() };
++    defer maybe_sync.deinit(ev);
++    const socket_fd = try ev.socket(&maybe_sync.cancel_region, family, .{
++        .mode = options.mode,
++        .protocol = options.protocol,
++    });
++    errdefer ev.closeAsync(socket_fd);
++
++    var storage: PosixAddress = undefined;
++    var addr_len = addressToPosix(address, &storage);
++    try ev.connect(&maybe_sync.cancel_region, socket_fd, &storage.any, addr_len);
++    try ev.getsockname(try maybe_sync.enterSync(ev), socket_fd, &storage.any, &addr_len);
++    return .{ .socket = .{
++        .handle = socket_fd,
++        .address = addressFromPosix(&storage),
++    } };
+ }
+ 
+ fn netListenUnixUnavailable(
+@@ -5036,18 +5221,98 @@
+     return error.OperationUnsupported;
+ }
+ 
+-fn netSendUnavailable(
++fn netSend(
+     userdata: ?*anyopaque,
+     handle: net.Socket.Handle,
+     messages: []net.OutgoingMessage,
+     flags: net.SendFlags,
+ ) struct { ?net.Socket.SendError, usize } {
+     const ev: *Evented = @ptrCast(@alignCast(userdata));
+-    _ = ev;
+-    _ = handle;
+-    _ = messages;
+-    _ = flags;
+-    return .{ error.NetworkDown, 0 };
++    const msg_flags: u32 =
++        @as(u32, if (@hasDecl(linux.MSG, "CONFIRM") and flags.confirm) linux.MSG.CONFIRM else 0) |
++        @as(u32, if (@hasDecl(linux.MSG, "DONTROUTE") and flags.dont_route) linux.MSG.DONTROUTE else 0) |
++        @as(u32, if (@hasDecl(linux.MSG, "EOR") and flags.eor) linux.MSG.EOR else 0) |
++        @as(u32, if (@hasDecl(linux.MSG, "OOB") and flags.oob) linux.MSG.OOB else 0) |
++        @as(u32, if (@hasDecl(linux.MSG, "FASTOPEN") and flags.fastopen) linux.MSG.FASTOPEN else 0) |
++        linux.MSG.NOSIGNAL;
++
++    var cancel_region: CancelRegion = .init();
++    defer cancel_region.deinit();
++    var i: usize = 0;
++    while (i < messages.len) : (i += 1) {
++        netSendOne(ev, &cancel_region, handle, &messages[i], msg_flags) catch |err| return .{ err, i };
++    }
++    return .{ null, i };
++}
++
++fn netSendOne(
++    ev: *Evented,
++    cancel_region: *CancelRegion,
++    handle: net.Socket.Handle,
++    message: *net.OutgoingMessage,
++    flags: u32,
++) net.Socket.SendError!void {
++    var addr: PosixAddress = undefined;
++    var iov: iovec_const = .{ .base = message.data_ptr, .len = message.data_len };
++    const msg: linux.msghdr_const = .{
++        .name = &addr.any,
++        .namelen = addressToPosix(message.address, &addr),
++        .iov = (&iov)[0..1],
++        .iovlen = 1,
++        .control = if (message.control.len == 0) null else message.control.ptr,
++        .controllen = message.control.len,
++        .flags = 0,
++    };
++
++    while (true) {
++        const thread = try cancel_region.awaitIoUring();
++        thread.enqueue().* = .{
++            .opcode = .SENDMSG,
++            .flags = 0,
++            .ioprio = 0,
++            .fd = handle,
++            .off = 0,
++            .addr = @intFromPtr(&msg),
++            .len = 1,
++            .rw_flags = flags,
++            .user_data = @intFromPtr(cancel_region.fiber),
++            .buf_index = 0,
++            .personality = 0,
++            .splice_fd_in = 0,
++            .addr3 = 0,
++            .resv = 0,
++        };
++        ev.yield(null, .nothing);
++        const completion = cancel_region.completion();
++        switch (completion.errno()) {
++            .SUCCESS => {
++                message.data_len = @intCast(completion.result);
++                return;
++            },
++            .INTR, .CANCELED => {},
++            .ACCES => return error.AccessDenied,
++            .ALREADY => return error.FastOpenAlreadyInProgress,
++            .BADF => |err| return errnoBug(err),
++            .CONNRESET => return error.ConnectionResetByPeer,
++            .DESTADDRREQ => |err| return errnoBug(err),
++            .FAULT => |err| return errnoBug(err),
++            .INVAL => |err| return errnoBug(err),
++            .ISCONN => |err| return errnoBug(err),
++            .MSGSIZE => return error.MessageOversize,
++            .NOBUFS => return error.SystemResources,
++            .NOMEM => return error.SystemResources,
++            .NOTSOCK => |err| return errnoBug(err),
++            .OPNOTSUPP => |err| return errnoBug(err),
++            .PIPE => return error.SocketUnconnected,
++            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
++            .HOSTUNREACH => return error.HostUnreachable,
++            .NETUNREACH => return error.NetworkUnreachable,
++            .NOTCONN => return error.SocketUnconnected,
++            .NETDOWN => return error.NetworkDown,
++            .CONNREFUSED => return error.ConnectionRefused,
++            else => |err| return unexpectedErrno(err),
++        }
++    }
+ }
+ 
+ fn netReceive(
+@@ -5139,19 +5404,97 @@
+     }
+ }
+ 
+-fn netReadUnavailable(
++fn netWriteMsg(
++    ev: *Evented,
++    cancel_region: *CancelRegion,
++    handle: net.Socket.Handle,
++    msg: *const linux.msghdr_const,
++    flags: u32,
++) net.Stream.Writer.Error!usize {
++    while (true) {
++        const thread = try cancel_region.awaitIoUring();
++        thread.enqueue().* = .{
++            .opcode = .SENDMSG,
++            .flags = 0,
++            .ioprio = 0,
++            .fd = handle,
++            .off = 0,
++            .addr = @intFromPtr(msg),
++            .len = 1,
++            .rw_flags = flags,
++            .user_data = @intFromPtr(cancel_region.fiber),
++            .buf_index = 0,
++            .personality = 0,
++            .splice_fd_in = 0,
++            .addr3 = 0,
++            .resv = 0,
++        };
++        ev.yield(null, .nothing);
++        const completion = cancel_region.completion();
++        switch (completion.errno()) {
++            .SUCCESS => return @intCast(completion.result),
++            .INTR, .CANCELED => {},
++            .ACCES => |err| return errnoBug(err),
++            .AGAIN => |err| return errnoBug(err),
++            .ALREADY => return error.FastOpenAlreadyInProgress,
++            .BADF => |err| return errnoBug(err),
++            .CONNRESET => return error.ConnectionResetByPeer,
++            .DESTADDRREQ => return error.SocketNotBound,
++            .FAULT => |err| return errnoBug(err),
++            .INVAL => |err| return errnoBug(err),
++            .ISCONN => |err| return errnoBug(err),
++            .MSGSIZE => |err| return errnoBug(err),
++            .NOBUFS => return error.SystemResources,
++            .NOMEM => return error.SystemResources,
++            .NOTSOCK => |err| return errnoBug(err),
++            .OPNOTSUPP => |err| return errnoBug(err),
++            .PIPE => return error.SocketUnconnected,
++            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
++            .HOSTUNREACH => return error.HostUnreachable,
++            .NETUNREACH => return error.NetworkUnreachable,
++            .NOTCONN => return error.SocketUnconnected,
++            .NETDOWN => return error.NetworkDown,
++            .CONNREFUSED => return error.ConnectionRefused,
++            else => |err| return unexpectedErrno(err),
++        }
++    }
++}
++
++fn netRead(
+     userdata: ?*anyopaque,
+     fd: net.Socket.Handle,
+     data: [][]u8,
+ ) net.Stream.Reader.Error!usize {
+     const ev: *Evented = @ptrCast(@alignCast(userdata));
+-    _ = ev;
+-    _ = fd;
+-    _ = data;
+-    return error.NetworkDown;
++    var iovecs_buffer: [max_iovecs_len]iovec = undefined;
++    var i: usize = 0;
++    for (data) |buf| {
++        if (i >= iovecs_buffer.len) break;
++        if (buf.len == 0) continue;
++        iovecs_buffer[i] = .{ .base = buf.ptr, .len = buf.len };
++        i += 1;
++    }
++    if (i == 0) return 0;
++
++    var cancel_region: CancelRegion = .init();
++    defer cancel_region.deinit();
++    return ev.preadv(&cancel_region, fd, iovecs_buffer[0..i], null) catch |err| switch (err) {
++        error.Canceled => return error.Canceled,
++        error.AccessDenied => return error.AccessDenied,
++        error.ConnectionResetByPeer => return error.ConnectionResetByPeer,
++        error.SocketUnconnected => return error.SocketUnconnected,
++        error.SystemResources => return error.SystemResources,
++        error.WouldBlock => return errnoBug(.AGAIN),
++        error.InputOutput => return unexpectedErrno(.IO),
++        error.IsDir => return errnoBug(.ISDIR),
++        error.NotOpenForReading => return errnoBug(.BADF),
++        error.LockViolation => return errnoBug(.AGAIN),
++        error.Unexpected => return error.Unexpected,
++    };
+ }
+ 
+-fn netWriteUnavailable(
++fn netWrite(
+     userdata: ?*anyopaque,
+     handle: net.Socket.Handle,
+     header: []const u8,
+@@ -5159,12 +5502,62 @@
+     splat: usize,
+ ) net.Stream.Writer.Error!usize {
+     const ev: *Evented = @ptrCast(@alignCast(userdata));
+-    _ = ev;
+-    _ = handle;
+-    _ = header;
+-    _ = data;
+-    _ = splat;
+-    return error.NetworkDown;
++    var iovecs: [max_iovecs_len]iovec_const = undefined;
++    var msg: linux.msghdr_const = .{
++        .name = null,
++        .namelen = 0,
++        .iov = &iovecs,
++        .iovlen = 0,
++        .control = null,
++        .controllen = 0,
++        .flags = 0,
++    };
++    addBuf(&iovecs, &msg.iovlen, header);
++    for (data[0 .. data.len - 1]) |bytes| addBuf(&iovecs, &msg.iovlen, bytes);
++    const pattern = data[data.len - 1];
++    var splat_backup_buffer: [splat_buffer_size]u8 = undefined;
++    if (iovecs.len - msg.iovlen != 0) switch (splat) {
++        0 => {},
++        1 => addBuf(&iovecs, &msg.iovlen, pattern),
++        else => switch (pattern.len) {
++            0 => {},
++            1 => {
++                const splat_buffer = &splat_backup_buffer;
++                const memset_len = @min(splat_buffer.len, splat);
++                const buf = splat_buffer[0..memset_len];
++                @memset(buf, pattern[0]);
++                addBuf(&iovecs, &msg.iovlen, buf);
++                var remaining_splat = splat - buf.len;
++                while (remaining_splat > splat_buffer.len and iovecs.len - msg.iovlen != 0) {
++                    addBuf(&iovecs, &msg.iovlen, splat_buffer);
++                    remaining_splat -= splat_buffer.len;
++                }
++                addBuf(&iovecs, &msg.iovlen, splat_buffer[0..@min(remaining_splat, splat_buffer.len)]);
++            },
++            else => for (0..@min(splat, iovecs.len - msg.iovlen)) |_| addBuf(&iovecs, &msg.iovlen, pattern),
++        },
++    };
++    var cancel_region: CancelRegion = .init();
++    defer cancel_region.deinit();
++    return ev.netWriteMsg(&cancel_region, handle, &msg, linux.MSG.NOSIGNAL) catch |err| switch (err) {
++        error.Canceled => return error.Canceled,
++        error.FastOpenAlreadyInProgress => return error.FastOpenAlreadyInProgress,
++        error.ConnectionResetByPeer => return error.ConnectionResetByPeer,
++        error.SystemResources => return error.SystemResources,
++        error.NetworkUnreachable => return error.NetworkUnreachable,
++        error.HostUnreachable => return error.HostUnreachable,
++        error.NetworkDown => return error.NetworkDown,
++        error.ConnectionRefused => return error.ConnectionRefused,
++        error.AddressFamilyUnsupported => return error.AddressFamilyUnsupported,
++        error.SocketUnconnected => return error.SocketUnconnected,
++        error.SocketNotBound => return error.SocketNotBound,
++        else => |e| return e,
++    };
+ }
+ 
+ fn netWriteFileUnavailable(
+@@ -5305,6 +5698,59 @@
+     }
+ }
+ 
++fn connect(
++    ev: *Evented,
++    cancel_region: *CancelRegion,
++    socket_fd: fd_t,
++    addr: *const linux.sockaddr,
++    addr_len: linux.socklen_t,
++) net.IpAddress.ConnectError!void {
++    while (true) {
++        const thread = try cancel_region.awaitIoUring();
++        thread.enqueue().* = .{
++            .opcode = .CONNECT,
++            .flags = 0,
++            .ioprio = 0,
++            .fd = socket_fd,
++            .off = addr_len,
++            .addr = @intFromPtr(addr),
++            .len = 0,
++            .rw_flags = 0,
++            .user_data = @intFromPtr(cancel_region.fiber),
++            .buf_index = 0,
++            .personality = 0,
++            .splice_fd_in = 0,
++            .addr3 = 0,
++            .resv = 0,
++        };
++        ev.yield(null, .nothing);
++        switch (cancel_region.errno()) {
++            .SUCCESS => return,
++            .INTR, .CANCELED => {},
++            .ADDRNOTAVAIL => return error.AddressUnavailable,
++            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
++            .AGAIN, .INPROGRESS => return error.WouldBlock,
++            .ALREADY => return error.ConnectionPending,
++            .CONNREFUSED => return error.ConnectionRefused,
++            .CONNRESET => return error.ConnectionResetByPeer,
++            .HOSTUNREACH => return error.HostUnreachable,
++            .NETUNREACH => return error.NetworkUnreachable,
++            .TIMEDOUT => return error.Timeout,
++            .ACCES => return error.AccessDenied,
++            .NETDOWN => return error.NetworkDown,
++            .BADF => |err| return errnoBug(err),
++            .CONNABORTED => |err| return errnoBug(err),
++            .FAULT => |err| return errnoBug(err),
++            .ISCONN => |err| return errnoBug(err),
++            .NOENT => |err| return errnoBug(err),
++            .NOTSOCK => |err| return errnoBug(err),
++            .PERM => |err| return errnoBug(err),
++            .PROTOTYPE => |err| return errnoBug(err),
++            else => |err| return unexpectedErrno(err),
++        }
++    }
++}
++
+ fn chdir(sync: *CancelRegion.Sync, path: [*:0]const u8) ChdirError!void {
+     while (true) {
+         try sync.cancel_region.await(.nothing);
+@@ -5528,6 +5974,43 @@
+             else => |err| return unexpectedErrno(err),
+         }
+     }
++}
++
++fn listen(
++    ev: *Evented,
++    cancel_region: *CancelRegion,
++    socket_fd: fd_t,
++    backlog: u31,
++) net.IpAddress.ListenError!void {
++    while (true) {
++        const thread = try cancel_region.awaitIoUring();
++        thread.enqueue().* = .{
++            .opcode = .LISTEN,
++            .flags = 0,
++            .ioprio = 0,
++            .fd = socket_fd,
++            .off = 0,
++            .addr = 0,
++            .len = backlog,
++            .rw_flags = 0,
++            .user_data = @intFromPtr(cancel_region.fiber),
++            .buf_index = 0,
++            .personality = 0,
++            .splice_fd_in = 0,
++            .addr3 = 0,
++            .resv = 0,
++        };
++        ev.yield(null, .nothing);
++        switch (cancel_region.errno()) {
++            .SUCCESS => return,
++            .INTR, .CANCELED => {},
++            .ADDRINUSE => return error.AddressInUse,
++            .BADF => |err| return errnoBug(err),
++            .NOTSOCK => |err| return errnoBug(err),
++            .OPNOTSUPP => |err| return errnoBug(err),
++            else => |err| return unexpectedErrno(err),
++        }
++    }
+ }
+ 
+ fn linkat(

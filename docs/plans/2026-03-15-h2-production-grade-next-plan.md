@@ -238,7 +238,91 @@ Acceptance:
 
 ## Cross-Cutting Work Required for Both Tracks
 
-### C1. Better observability
+### C1. Transport readiness cleanup
+
+Current state:
+
+- `serval-server/h2/server.zig` now uses bounded nonblocking retry loops for:
+  - plain fd reads
+  - plain fd writes
+  - TLS reads
+  - TLS writes
+- This is the correct immediate safety fix.
+- It is not the desired end-state architecture.
+
+Why this remains TODO:
+
+- protocol code is still partially owning transport readiness policy
+- plain and TLS paths still have separate retry mechanics inside the protocol driver
+- sleep/retry behavior is harder to reason about than an explicit readiness contract
+- future terminated protocol code (`h1`, `h2`, websocket-over-h2, future protocols) should not each reinvent `WouldBlock` handling
+
+Target end state:
+
+- add a lower-layer bounded transport/readiness adapter for terminated server protocols
+- move plain-fd nonblocking read/write readiness handling into that adapter
+- move TLS `WouldBlock` / retry handling into that adapter as well
+- make terminated protocol drivers consume a transport API that returns only:
+  - bytes read or written
+  - clean EOF / connection closed
+  - bounded timeout / stall failure
+  - explicit fatal transport failure
+- maintain the invariant:
+  - terminated protocol drivers must not see raw `WouldBlock`
+  - terminated protocol drivers must not contain ad hoc sleep/retry loops
+
+Required work:
+
+1. Define the transport contract
+   - one bounded adapter API for terminated server drivers
+   - explicit semantics for:
+     - partial read
+     - partial write
+     - EOF
+     - peer reset
+     - timeout/stall
+     - cancellation/shutdown
+
+2. Implement plain transport readiness there
+   - own nonblocking fd reads/writes
+   - own readiness wait or equivalent bounded retry behavior
+   - centralize logging for errno/fd/transport diagnostics
+
+3. Implement TLS transport readiness there
+   - own `SSL_read` / `SSL_write` `WouldBlock` handling
+   - preserve current bounded stall timeout behavior
+   - make TLS and plain surface the same high-level contract upward
+
+4. Refactor terminated protocol drivers to use the adapter
+   - `serval-server/h2/server.zig`
+   - relevant terminated `h1` read/write paths
+   - any websocket-over-h2 terminated data path still carrying protocol-local retry logic
+
+5. Add regression and stress coverage specifically for readiness behavior
+   - partial frame arrival over many short reads
+   - repeated `EAGAIN`
+   - repeated TLS `WouldBlock`
+   - peer stall until timeout
+   - interleaving one stalled stream/connection with healthy concurrent work
+   - shutdown/cancel during readiness wait
+
+Acceptance:
+
+- no terminated protocol driver contains transport-local sleep/retry loops
+- no terminated protocol driver directly maps raw `WouldBlock`
+- the same adapter semantics are used for both plain and TLS terminated paths
+- external conformance and integration tests still pass
+- churn/stall tests prove one stalled connection does not panic or starve unrelated work
+
+Why this matters:
+
+- the recent plain h2 conformance crash was caused by exactly this architectural leak:
+  - the socket was flipped nonblocking
+  - the protocol driver still used a read path that treated `WouldBlock` as unreachable
+- the tactical retry-loop fix is necessary and should stay until this cleanup lands
+- this cleanup is what turns the fix from "safe patch" into "clean production transport design"
+
+### C2. Better observability
 
 Required:
 - add high-signal structured logs/counters for:
@@ -256,7 +340,7 @@ Acceptance:
   - stream-level
   - upstream-session-level
 
-### C2. Stronger test shapes
+### C3. Stronger test shapes
 
 Required:
 - unit tests for state machines
@@ -264,13 +348,13 @@ Required:
 - churn/soak tests for long-lived streams
 - concurrency tests with 2, 8, 32, and mixed clients
 - failure-injection cases:
-  - upstream close
-  - downstream close
-  - partial headers
-  - mid-stream reset
-  - GOAWAY during active calls
+- upstream close
+- downstream close
+- partial headers
+- mid-stream reset
+- GOAWAY during active calls
 
-### C3. Explicit operational limits
+### C4. Explicit operational limits
 
 Required:
 - revisit and document:
@@ -284,7 +368,56 @@ Required:
 Acceptance:
 - limits are explicit, justified, and tested
 
-### C4. Documentation and architecture alignment
+### C5. Custom Zig toolchain maintenance and publication
+
+Current state:
+
+- Serval currently depends on a locally patched Zig toolchain.
+- At least one required stdlib delta lives in the custom tree (`Io/Uring.zig`).
+- The Docker integration image can now bundle the live installed Zig directory to avoid stale tarball drift.
+- GitHub Actions still uses upstream Zig as a smoke path, not the exact production toolchain.
+
+Why this remains TODO:
+
+- a host-local `/usr/local/...` patch is not a production distribution strategy
+- the archived tarball can drift from the installed tree if `Uring.zig` or other stdlib files are patched later
+- CI, release, and local runs are still not guaranteed to use the exact same Zig bits
+- future stdlib patches can become invisible regressions if they are not versioned and published deliberately
+
+Required work:
+
+1. Define the custom Zig source of truth
+   - record exactly which Zig upstream revision we fork from
+   - record the Serval-specific patch set, including `Io/Uring.zig`
+   - keep the patch set reproducible as committed source, not only as a mutable host install
+
+2. Add a repeatable toolchain build/publish flow
+   - build the patched Zig toolchain deterministically
+   - produce a versioned archive/artifact
+   - publish it somewhere CI and release jobs can consume explicitly
+
+3. Pin CI and release environments to the published custom toolchain
+   - GitHub Actions should stop silently testing only upstream Zig for production gates
+   - the integration container should be able to fetch or consume the published Serval Zig artifact directly
+   - release builds should use the same published custom toolchain as integration verification
+
+4. Add drift detection
+   - fail if the installed custom tree and archived/published artifact differ unexpectedly
+   - fail if local stdlib patches exist that are not reflected in the published toolchain source/artifact
+
+5. Document the patch policy
+   - what kinds of stdlib patches are allowed
+   - how `Uring.zig` and any future stdlib deltas are reviewed
+   - when a local patch should instead be upstreamed or moved into Serval-owned code
+
+Acceptance:
+
+- `Io/Uring.zig` and all other Serval-required Zig patches are tracked in committed, reviewable source form
+- CI, local container runs, and release builds can all use the same published custom Zig artifact
+- there is no silent drift between `/usr/local` and the artifact used for integration/release
+- rebuilding the Serval Zig toolchain is a documented, repeatable process
+
+### C6. Documentation and architecture alignment
 
 Update:
 - `serval-server/README.md`
