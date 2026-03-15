@@ -58,10 +58,11 @@ Build the image and run the default verification set:
 integration/run_in_docker.sh
 ```
 
-That wrapper builds the image, mounts the current repository, and runs:
+That wrapper builds the image, mounts the current repository, and runs the
+Docker/CI verification set in `ReleaseFast`:
 
 ```bash
-zig build && zig build test && zig build test-integration && integration/h2_conformance_ci.sh --h2spec-timeout 1
+zig build -Doptimize=ReleaseFast && zig build test -Doptimize=ReleaseFast && zig build test-integration -Doptimize=ReleaseFast && integration/h2_conformance_ci.sh --h2spec-timeout 1
 ```
 
 The container is started with:
