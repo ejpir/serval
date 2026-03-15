@@ -98,7 +98,7 @@ kubectl rollout restart daemonset/serval-router
 | `examples/k3d/k3d-build-images.sh` | Build Zig binaries, create Docker images, import to k3d |
 | `examples/k3s/deploy-k3s.sh` | Full deployment with prereq checks, status, cleanup (k3s) |
 | `examples/k3s/build-and-load.sh` | Quick rebuild helper for iterating on single component (k3s) |
-| `examples/netbird/openwrt/build-openwrt-netbird-proxy.sh` | Cross-build `netbird_proxy` for OpenWrt ARM with OpenSSL staging paths |
+| `deploy-router.sh` | Build and deploy the NetBird/OpenWrt router bundle, including `netbird_proxy` and router-side install/update steps |
 
 ## k3s Quick Start
 
