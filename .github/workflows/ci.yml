@@ -12,39 +12,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Go (for hey)
-        uses: actions/setup-go@v5
-        with:
-          go-version: "1.26.1"
-
-      - name: Install curl, hey, and HTTP/2 conformance tools
+      - name: Download Zig toolchain archive for Docker build
         run: |
           set -euxo pipefail
-          sudo apt-get update
-          sudo apt-get install -y curl nghttp2-client patch
-          go install github.com/rakyll/hey@v0.1.4
-          go install github.com/summerwind/h2spec/cmd/h2spec@v2.2.1+incompatible
-          go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          curl -L "https://ziglang.org/builds/zig-x86_64-linux-0.16.0-dev.2821+3edaef9e0.tar.xz" \
+            -o "${RUNNER_TEMP}/zig-x86_64-linux-0.16.0-dev.2821+3edaef9e0.tar.xz"
 
-      - name: Install Zig and apply Serval Uring patch
+      - name: Show Docker runtime
         run: |
           set -euxo pipefail
-          curl -L "https://ziglang.org/builds/zig-x86_64-linux-0.16.0-dev.2821+3edaef9e0.tar.xz" -o zig.tar.xz
-          tar -xf zig.tar.xz
-          if ! grep -q "const BatchNetReceivePending" "$GITHUB_WORKSPACE/zig-x86_64-linux-0.16.0-dev.2821+3edaef9e0/lib/std/Io/Uring.zig"; then
-            patch -p0 -d "$GITHUB_WORKSPACE" < integration/toolchains/zig-0.16.0-dev.2821+3edaef9e0-uring.patch
-          fi
-          echo "$GITHUB_WORKSPACE/zig-x86_64-linux-0.16.0-dev.2821+3edaef9e0" >> "$GITHUB_PATH"
+          docker info --format '{{json .SecurityOptions}}'
 
-      - name: Show Zig version
-        run: zig version
-
-      - name: Build
-        run: zig build
-
-      - name: Run integration tests
-        run: zig build test-integration
-
-      - name: Run HTTP/2 conformance gate (h2c + TLS)
-        run: integration/h2_conformance_ci.sh --h2spec-timeout 1
+      - name: Run build, integration, and conformance gates in Docker
+        env:
+          SERVAL_CUSTOM_ZIG_ARCHIVE: ${{ runner.temp }}/zig-x86_64-linux-0.16.0-dev.2821+3edaef9e0.tar.xz
+        run: |
+          set -euxo pipefail
+          bash integration/run_in_docker.sh
