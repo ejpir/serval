@@ -1,33 +1,212 @@
 # serval-h2
 
-Minimal HTTP/2 (`h2c`) protocol helpers for serval.
+Bounded HTTP/2 protocol helpers for Serval.
 
 ## Layer
 
 Layer 1 (Protocol).
 
-## Current Scope
+`serval-h2` owns protocol parsing, encoding, and state-machine primitives. It
+does not own socket lifecycles, accept loops, or the full server/proxy runtime.
 
-This first slice provides bounded helpers for:
-- HTTP/2 frame header parsing/encoding
-- SETTINGS frame/payload parsing, validation, and state application
-- control-frame parsing/encoding for SETTINGS ACK, PING, WINDOW_UPDATE, RST_STREAM, and GOAWAY
-- explicit stream state transitions, per-stream window bookkeeping, and fixed-capacity stream tables
+## Purpose
+
+This module is the shared protocol toolbox for:
+
+- server-side HTTP/2 ingress
+- outbound HTTP/2 client/session code
+- h2c upgrade handling
+- stream-aware proxy transport
+
+Current responsibilities:
+
+- frame header parsing/encoding
 - client connection preface detection
-- `Upgrade: h2c` request detection, validation, and `HTTP2-Settings` decoding
-- bounded HPACK decoding/encoding including static-table and dynamic-table indexed fields, indexed names, literal header blocks, dynamic-table size updates, and Huffman string decoding
-- request-header decoding for stream-aware server/client runtimes with strict pseudo-header ordering, duplicate detection, CONNECT constraints, connection-specific header rejection, and `te=trailers` enforcement
-- request-header decoding now also accepts RFC 8441 Extended CONNECT (`:protocol`) for WebSocket-over-h2 while keeping classic CONNECT constraints for non-extended requests
-- initial request parsing for h2c prior-knowledge connection routing, including bounded HEADERS+CONTINUATION reassembly
-- HTTP/1.1 upgrade-request translation into an upstream prior-knowledge h2c preamble
-- SETTINGS helpers now encode/decode `SETTINGS_ENABLE_CONNECT_PROTOCOL` (0x8) so frontends can explicitly advertise Extended CONNECT support
+- SETTINGS parsing/encoding/validation/application
+- control-frame parsing/encoding for ACK, PING, WINDOW_UPDATE, RST_STREAM, GOAWAY
+- bounded HPACK decoding and bounded header-block encoding helpers
+- Huffman string decoding used by HPACK
+- request-header decoding with RFC 9113 validation
+- explicit stream state transitions and fixed-capacity stream tables
+- flow-control window primitives
+- `Upgrade: h2c` detection, validation, and preamble generation
+- initial-request parsing for prior-knowledge routing/bootstrap
 
-## Not in this module
+## Public Exports
+
+### Framing and Preface
+
+| Symbol | Description |
+|--------|-------------|
+| `FrameType` | HTTP/2 frame type enum |
+| `FrameHeader` | Parsed/encoded frame header |
+| `FrameError` | Frame-parse errors |
+| `parseFrameHeader(raw)` | Parse frame header |
+| `buildFrameHeader(out, header)` | Encode frame header |
+| `frame_header_size_bytes` | Header size constant |
+| `flags_end_stream`, `flags_ack`, `flags_end_headers`, `flags_padded`, `flags_priority` | Common frame flags |
+| `client_connection_preface` | RFC 9113 client preface bytes |
+| `looksLikeClientConnectionPreface(raw)` | Full preface detection |
+| `looksLikeClientConnectionPrefacePrefix(raw)` | Prefix detection |
+
+### HPACK
+
+| Symbol | Description |
+|--------|-------------|
+| `HeaderField` | HPACK header field |
+| `HpackDecoder` | Bounded decoder with dynamic-table state |
+| `HpackError` | HPACK decode/encode errors |
+| `decodeHeaderBlock(raw)` | Decode using fresh decoder |
+| `decodeHeaderBlockWithDecoder(decoder, raw)` | Decode using caller-owned decoder |
+| `encodeLiteralHeaderWithoutIndexing(...)` | Bounded literal encode helper |
+| `encodeLiteralHeaderWithIncrementalIndexing(...)` | Bounded literal + index encode helper |
+| `encodeIndexedHeaderField(...)` | Encode indexed field |
+
+### SETTINGS and Control Frames
+
+| Symbol | Description |
+|--------|-------------|
+| `SettingId`, `Setting`, `Settings`, `SettingsError` | SETTINGS types/errors |
+| `parseSettingsFrame`, `validateSettingsFrame`, `parseSettingsPayload`, `buildSettingsPayload`, `applySettings` | SETTINGS helpers |
+| `ErrorCode`, `GoAway`, `ControlError` | Control-frame types/errors |
+| `buildSettingsAckFrame` | Encode SETTINGS ACK |
+| `parsePingFrame`, `buildPingFrame` | PING helpers |
+| `parseWindowUpdateFrame`, `buildWindowUpdateFrame` | WINDOW_UPDATE helpers |
+| `parseRstStreamFrame`, `buildRstStreamFrame` | RST_STREAM helpers |
+| `parseGoAwayFrame`, `buildGoAwayFrame` | GOAWAY helpers |
+
+### Flow Control and Streams
+
+| Symbol | Description |
+|--------|-------------|
+| `FlowControlError` | Flow-control primitive errors |
+| `Window` | Per-window bookkeeping |
+| `ConnectionFlowControl` | Connection-level flow-control bookkeeping |
+| `StreamRole`, `StreamState`, `H2Stream`, `StreamTable`, `StreamError` | Stream state machine and fixed-capacity stream table |
+
+### Request Decode / Upgrade
+
+| Symbol | Description |
+|--------|-------------|
+| `RequestHead` | Decoded HTTP/2 request head |
+| `InitialRequest` | Initial request + bootstrap parse result |
+| `InitialRequestError` | Request/initial parse errors |
+| `decodeRequestHeaderBlock(...)` | Decode request header block |
+| `decodeRequestHeaderBlockWithDecoder(...)` | Decode request block with caller-owned decoder |
+| `parseInitialRequest(...)` | Parse initial request from prior-knowledge bytes |
+| `H2cUpgradeError` | h2c upgrade validation/build errors |
+| `looksLikeUpgradeRequest(request)` | Detect HTTP/1.1 `Upgrade: h2c` |
+| `validateUpgradeRequest(request)` | Strict upgrade request validation |
+| `buildUpgradeResponse(out)` | Build `101 Switching Protocols` response |
+| `buildPriorKnowledgePreambleFromUpgrade(...)` | Build upstream prior-knowledge preamble from upgrade request |
+| `h2c_upgrade_response` | Static upgrade response bytes |
+
+## File Layout
+
+| File | Purpose |
+|------|---------|
+| `mod.zig` | Public API re-exports |
+| `frame.zig` | Frame header parsing/encoding |
+| `preface.zig` | Client preface detection |
+| `settings.zig` | SETTINGS helpers |
+| `control.zig` | ACK/PING/WINDOW_UPDATE/RST_STREAM/GOAWAY helpers |
+| `flow_control.zig` | Window bookkeeping primitives |
+| `stream.zig` | Stream state machine and table |
+| `hpack.zig` | HPACK decode/encode helpers |
+| `huffman.zig` | HPACK Huffman decoding helpers |
+| `request.zig` | Request-head decode and initial request parsing |
+| `upgrade.zig` | `Upgrade: h2c` detection/validation/build helpers |
+
+## Current Protocol Scope
+
+### Request decoding
+
+`request.zig` now enforces the main correctness rules needed by server/client
+runtimes:
+
+- pseudo-header ordering
+- duplicate pseudo-header rejection
+- CONNECT constraints
+- Extended CONNECT (`:protocol`) acceptance for WebSocket-over-h2
+- connection-specific header rejection
+- `te=trailers` enforcement
+
+### HPACK
+
+HPACK support is bounded and explicit:
+
+- dynamic-table decode state is supported
+- bounded header-block decode is supported
+- bounded literal/indexed field encoding helpers exist
+- this is not a general-purpose compression tuning module
+
+### Upgrade and prior-knowledge bootstrap
+
+`upgrade.zig` and `request.zig` provide the protocol glue needed by higher
+layers to:
+
+- accept and validate `Upgrade: h2c`
+- parse prior-knowledge h2 connections
+- translate upgrade requests into upstream prior-knowledge preambles
+
+### Flow control and stream state
+
+`flow_control.zig` and `stream.zig` provide primitives used by higher runtimes.
+They are not, by themselves, a complete multiplexed connection runtime.
+
+## Scope Boundaries
+
+### In this module
+
+- RFC 9113 / h2c protocol primitives
+- HPACK decode/encode helpers
+- stream state and flow-control primitives
+- request-head validation
+- upgrade bootstrap helpers
+
+### Not in this module
 
 - socket ownership
 - accept loops
-- full stream multiplexing runtime
-- HPACK dynamic-table encoding policies (decoder side is bounded and supported)
-- full HPACK compression strategy/tuning beyond minimal bounded helpers
+- complete server runtime ownership
+- complete outbound session ownership
+- proxy stream binding tables
 
-The module now provides bounded flow-control and control-frame primitives, but not a complete connection runtime. Those larger pieces remain future work; unsupported features fail closed.
+Those live in:
+
+- `serval-server/h2`
+- `serval-client/h2`
+- `serval-proxy/h2`
+
+## Developer Notes
+
+- If a feature is pure HTTP/2 protocol logic and reusable by both client and
+  server runtimes, it belongs here.
+- If a feature needs connection/task ownership, it likely belongs in
+  `serval-server`, `serval-client`, or `serval-proxy`.
+- Keep unsupported features fail-closed rather than partially permissive.
+- Keep all structures bounded and fixed-capacity.
+
+## Current Status
+
+What is complete here:
+
+- bounded HTTP/2 framing helpers
+- bounded SETTINGS/control-frame helpers
+- bounded HPACK decode + helper encoding
+- bounded request-head validation
+- stream/flow-control primitives
+- h2c upgrade bootstrap helpers
+
+What is still broader-work-in-progress in the stack:
+
+- full generic stream-aware proxying
+- complete production-grade multiplexed runtime behavior across all traffic classes
+
+## TigerStyle Compliance
+
+- Explicit bounded parsing/encoding
+- Fixed-capacity stream/state tables
+- Fail-closed protocol validation
+- No socket ownership in protocol layer
+- Reusable primitives shared by client/server/proxy code

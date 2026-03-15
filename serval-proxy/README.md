@@ -1,169 +1,205 @@
 # serval-proxy
 
-Async upstream forwarding with zero-copy body transfer and connection pooling.
+Mechanics-layer upstream forwarding for Serval.
 
-## Purpose
+`serval-proxy` owns how traffic is forwarded once a strategy layer has already
+selected an upstream. That includes upstream connect/reuse, HTTP/1 request and
+response forwarding, WebSocket upgrade/tunnel relay, and the current bounded
+HTTP/2 stream bridge used for gRPC proxying.
 
-Handles request forwarding to backend servers using async `Io.net.Stream` I/O integrated with io_uring. Uses Linux splice() for zero-copy body transfer where possible, with fallback to userspace copy.
+## Layer
 
-## Exports
+- Layer 3: mechanics
+- Responsibility: connection management, forward-path I/O, protocol-specific
+  forwarding mechanics
+- Non-responsibility: route matching, load-balancing policy, gateway policy
 
-- `Forwarder` - Request forwarder (generic over Pool type)
-- `ForwardError` - Error enum for forward failures
-- `ForwardResult` - Success result with status and bytes
-- `BodyInfo` - Request body metadata for streaming
-- `Protocol` - Wire protocol enum (h1, h2)
-- `TunnelStats` - WebSocket tunnel relay statistics
-- `TunnelTermination` - Tunnel shutdown reason
-- `H2StreamBridge` - Stream-aware h2 downstream↔upstream binding and action mapping helper
+## Public API
 
-## Usage
+Top-level exports from [mod.zig](/home/nick/repos/serval/serval-proxy/mod.zig):
 
-```zig
-const proxy = @import("serval-proxy");
-const pool_mod = @import("serval-pool");
-const tracing = @import("serval-tracing");
-const net = @import("serval-net");
+| Export | Purpose |
+|------|---------|
+| `Forwarder` | Main forwarding engine generic over pool and tracer types |
+| `ForwardError` | Bounded forwarding error set used by proxy operations |
+| `ForwardResult` | Result metadata for a completed forward |
+| `BodyInfo` | Request-body forwarding metadata |
+| `Protocol` | Upstream protocol enum (`.http1`, `.h2c`, `.h2`, etc. via shared core type) |
+| `TunnelStats` | Bytes/termination summary for bidirectional upgraded tunnels |
+| `TunnelTermination` | Explicit tunnel shutdown reason |
+| `h1` | HTTP/1 forwarding helpers |
+| `h2` | HTTP/2 bridge primitives |
+| `H2Binding` | Downstream/upstream stream binding record |
+| `H2BindingTable` | Fixed-capacity binding table |
+| `H2BindingError` | Binding table error set |
+| `H2StreamBridge` | Stream-aware downstream-to-upstream h2 bridge |
+| `H2StreamBridgeError` | h2 bridge error set |
+| `H2StreamBridgeOpenResult` | Open-stream result from the bridge |
+| `H2StreamBridgeReceiveAction` | Mapped action returned from upstream receive |
 
-var pool = pool_mod.SimplePool.init();
-var tracer = tracing.NoopTracer{};
-// DnsConfig{} uses default TTL (60s) and timeout (5s) values
-var forwarder = proxy.Forwarder(pool_mod.SimplePool, tracing.NoopTracer).init(&pool, &tracer, true, null, net.DnsConfig{});
+## Main Developer Entry Points
 
-// Forward using async stream I/O
-// client_tls: pass TLS stream for encrypted client connections, null for plaintext
-const result = forwarder.forward(io, client_stream, client_tls, &request, &upstream, body_info, span) catch |err| {
-    // Handle ForwardError
-};
-// result.status, result.response_bytes, result.connection_reused
-```
+The forwarding surface in [forwarder.zig](/home/nick/repos/serval/serval-proxy/forwarder.zig):
 
-## ForwardError
+| Function | Purpose |
+|------|---------|
+| `Forwarder.init(...)` | Initialize a forwarder with pool, tracer, DNS config, and TLS verification policy |
+| `Forwarder.forward(...)` | Main HTTP request forwarding path |
+| `Forwarder.forwardWebSocket(...)` | HTTP/1 upgrade forwarding followed by tunnel relay |
+| `Forwarder.forwardGrpcH2c(...)` | Prior-knowledge cleartext h2 frontend -> bounded h2 upstream bridge |
+| `Forwarder.forwardGrpcH2cUpgrade(...)` | Inbound `Upgrade: h2c` frontend -> bounded h2 upstream bridge |
 
-```zig
-pub const ForwardError = error{
-    ConnectFailed,      // Could not connect to upstream
-    InvalidAddress,     // Bad upstream host/port
-    SendFailed,         // Failed to send request
-    RecvFailed,         // Failed to receive response
-    StaleConnection,    // Pooled connection was closed
-    HeadersTooLarge,    // Response headers exceed buffer
-    InvalidResponse,    // Malformed HTTP response
-    SpliceFailed,       // Zero-copy transfer failed
-};
-```
-
-## ForwardResult
-
-```zig
-pub const ForwardResult = struct {
-    // Core response metadata
-    status: u16,              // HTTP status code
-    response_bytes: u64,      // Total bytes sent to client
-    connection_reused: bool,  // Whether pool connection was reused
-
-    // Timing breakdown (nanoseconds)
-    dns_duration_ns: u64,         // DNS resolution time
-    tcp_connect_duration_ns: u64, // TCP handshake time
-    send_duration_ns: u64,        // Request send time
-    recv_duration_ns: u64,        // Response receive time
-    pool_wait_ns: u64,            // Time waiting for pool connection
-    upstream_local_port: u16,     // Local port used for upstream
-};
-```
-
-Timing fields default to 0 for backward compatibility. Use these for detailed Pingora-style request logging.
-
-## Files
+## File Layout
 
 | File | Purpose |
 |------|---------|
-| `mod.zig` | Public API re-exports |
-| `types.zig` | ForwardError, ForwardResult, BodyInfo, Protocol |
-| `forwarder.zig` | Forwarder struct, pool coordination, timing |
-| `connect.zig` | Connection wrapper (delegates to serval-client) |
-| `h1/mod.zig` | HTTP/1.1 module exports |
-| `h1/request.zig` | HTTP/1.1 request adapter (delegates to serval-client) |
-| `h1/response.zig` | HTTP/1.1 response receiving, header parsing |
-| `h1/body.zig` | HTTP/1.1 splice/copy body streaming |
-| `h1/chunked.zig` | Chunked transfer encoding forwarding |
-| `h1/websocket.zig` | Dedicated HTTP/1.1 WebSocket upgrade request/response handling |
-| `h2/mod.zig` | HTTP/2 proxy primitive exports |
-| `h2/bindings.zig` | Fixed-capacity downstream↔upstream stream binding table |
-| `h2/bridge.zig` | Initial stream-aware bridge using `serval-client` h2 upstream sessions |
-| `tunnel.zig` | Bidirectional byte relay after successful upgrade |
+| `mod.zig` | Public re-exports |
+| `types.zig` | Shared proxy result/body/protocol types |
+| `connect.zig` | Upstream connect helpers and local-port inspection |
+| `forwarder.zig` | Main orchestration and protocol dispatch |
+| `tunnel.zig` | Bidirectional tunnel relay for upgraded connections |
+| `h1/mod.zig` | HTTP/1 forwarding exports |
+| `h1/request.zig` | HTTP/1 request serialization and send helpers |
+| `h1/response.zig` | HTTP/1 response header/body forwarding |
+| `h1/body.zig` | Fixed-length request/response body forwarding |
+| `h1/chunked.zig` | Bounded chunked transfer forwarding |
+| `h1/websocket.zig` | HTTP/1 WebSocket upgrade request/response forwarding |
+| `h2/mod.zig` | HTTP/2 bridge exports |
+| `h2/bindings.zig` | Fixed-capacity downstream/upstream stream binding table |
+| `h2/bridge.zig` | Current stream-aware h2 bridge over `serval-client` upstream sessions |
+
+## Current Scope
+
+### HTTP/1 forwarding
+
+The production-complete path today is the traditional HTTP/1 forwarding path:
+
+- upstream connect/reuse through `serval-pool`
+- request serialization through `serval-client`-shared request helpers
+- response header parsing and body forwarding
+- bounded chunked transfer forwarding
+- splice-based zero-copy body forwarding when plaintext/raw-fd paths permit it
+- userspace-copy fallback when zero-copy is not possible
+
+### WebSocket upgrade and tunnel relay
+
+`serval-proxy` owns the HTTP/1 upgrade forwarding path and the post-upgrade
+tunnel relay:
+
+- validates and forwards the upgrade handshake
+- relays bytes bidirectionally after `101 Switching Protocols`
+- closes upgraded connections instead of returning them to the HTTP pool
+- treats reset/closed-peer tunnel write termination as an explicit peer-closed
+  outcome, not as an internal assertion failure
+
+The tunnel implementation is shared by upgraded proxy paths, including the
+non-stream-aware h2 WebSocket upgrade case.
+
+### HTTP/2 / gRPC forwarding
+
+The current h2 implementation is intentionally bounded and focused:
+
+- cleartext frontend entry supports both prior knowledge and inbound
+  `Upgrade: h2c`
+- upstream support currently covers both cleartext `.h2c` and TLS `.h2`
+- the active stream-aware bridge is gRPC-focused
+- downstream streams are mapped to upstream stream ids through a fixed-capacity
+  binding table
+- upstream receive events are converted into explicit actions for downstream
+  response headers, DATA, trailers, resets, or connection-close handling
+- upstream GOAWAY handling is session-generation-aware and respects
+  `last_stream_id`
+
+This is enough for the current gRPC-over-HTTP/2 proxy path, but it is not yet a
+generic “all HTTP/2 traffic” forwarding stack.
+
+## Known Boundaries
+
+`serval-proxy` does not currently provide:
+
+- a fully generic stream-aware h2 proxy for arbitrary HTTP/2 request/response
+  traffic
+- full end-to-end generic h2-to-h2 proxying outside the current gRPC-focused
+  path
+- route selection or balancing policy
+- HTTP/2 framing ownership outside the bridge/helper integration already
+  provided by `serval-h2` and `serval-client`
+
+When adding new behavior, keep strategy in layer 4 and keep protocol mechanics
+here.
+
+## Result and Error Model
+
+### `ForwardResult`
+
+`ForwardResult` captures outcome metadata for request forwarding, including:
+
+- `status`
+- `response_bytes`
+- `connection_reused`
+- timing fields such as DNS, connect, send, receive, and pool wait durations
+- `upstream_local_port`
+
+This struct is used for access logging, metrics, and request-level observability
+without forcing callers to parse protocol-specific internals.
+
+### `ForwardError`
+
+`ForwardError` is the bounded error set returned by forward operations for
+transport/protocol failures such as:
+
+- connect failure
+- invalid upstream address
+- send/receive failure
+- stale pooled connection
+- invalid or oversized response headers
+- splice/forwarding failure
+
+Keep additions explicit and protocol-mechanical. Do not overload this set with
+strategy or policy failures.
 
 ## Dependencies
 
-- `serval-core` - Core types, config, logging
-- `serval-net` - Socket abstraction, DNS resolver
-- `serval-pool` - Connection pooling
-- `serval-tracing` - Distributed tracing interface
-- `serval-http` - HTTP/1.1 parser
-- `serval-websocket` - RFC 6455 handshake validation helpers
-- `serval-h2` - HTTP/2 / h2c frame and initial-request helpers
-- `serval-grpc` - gRPC metadata and message-envelope helpers
-- `serval-tls` - TLS termination/origination
-- `serval-client` - HTTP/1.1 client request building (shared implementation)
+- `serval-core` for shared config/types/logging
+- `serval-net` for socket and DNS abstraction
+- `serval-pool` for connection reuse
+- `serval-client` for upstream client/session primitives
+- `serval-http` for HTTP/1 parsing
+- `serval-h2` for h2 framing/state helpers
+- `serval-grpc` for gRPC request/response validation helpers
+- `serval-websocket` for RFC 6455 handshake helpers
+- `serval-tls` for upstream and client-side TLS
+- `serval-tracing` for tracing integration
 
-**Protocol Abstraction:** HTTP/1.1 specific code is isolated in `h1/` subdirectory.
-Current gRPC h2 support is split by upstream protocol:
-- `.h2c` + `tls=false` and `.h2` + `tls=true` use the stream-aware
-  `h2/bridge.zig` path for both prior-knowledge and inbound `Upgrade: h2c`
-  entry (bounded downstream↔upstream stream bindings, upstream-session reuse,
-  mapped response/reset actions)
-- non-h2 upstream targets continue to use existing fallback behavior
-  (legacy translation+tunnel path where applicable)
+## Developer Notes
 
-Full stream-aware h2 support remains in progress. The repository now includes
-bounded `h2/` primitives for that migration:
-- `h2/bindings.zig` fixed-capacity downstream-stream ↔ upstream-stream ids
-- `h2/bridge.zig` stream-aware bridge that opens/reuses upstream h2 sessions
-  through `serval-client` and maps upstream receive actions back to downstream ids
-
-## Features
-
-- **Async I/O** - Uses `Io.net.Stream` for non-blocking upstream connections
-- **io_uring integration** - Connect, send, and receive via io_uring batch submission
-- **TLS support** - Client-side TLS for encrypted responses, upstream TLS for backend connections
-- Connection pooling integration
-- Stale connection retry (Pingora-style)
-- Zero-copy with splice() when available (plaintext only, extracts raw fd from stream)
-- splice forwarding now uses bounded EAGAIN/EINTR retries with stall timeouts and exact pipe-drain verification before counting bytes forwarded
-- Userspace copy for TLS paths (both client and upstream)
-- Content-Length body forwarding
-- Response streaming to client
-- WebSocket upgrade forwarding with RFC 6455 handshake validation
-- Bidirectional tunnel relay after `101 Switching Protocols`
-- Tunnel relay now runs as two cooperative `std.Io` fibers instead of a raw `poll(2)` loop; the same nonblocking relay path is reused by upgraded h2 WebSocket proxying
-- Tunnel relay now treats downstream/upstream write-side connection resets as closed-peer termination instead of an internal proxy error, avoiding assertion failures during TLS tunnel cleanup
-- gRPC over h2 stream-aware bridging for prior-knowledge and `Upgrade: h2c` entry when upstream protocol is `.h2c` (cleartext) or `.h2` (TLS), including fail-closed invalid responses (`grpc-status` required), GOAWAY `last_stream_id`-aware active-stream handling, session-generation-aware binding across upstream rollover, and fail-closed downstream DATA forwarding when upstream transitions to `ConnectionClosing` (no retry masking)
-- Legacy translation+tunnel fallback for non-h2 upstream targets where full stream-aware proxying does not apply
-- Upgraded/tunneled connections are closed instead of being returned to the HTTP pool
+- Treat `Forwarder` as the orchestration surface. New forwarding features should
+  usually extend existing protocol-specific helpers rather than add a second
+  top-level orchestrator.
+- Keep loops bounded and cleanup explicit. The tunnel and h2 bridge paths are
+  long-lived and must fail closed on protocol confusion or connection loss.
+- Do not widen the current h2 scope in documentation unless the generic
+  stream-aware path is actually implemented and tested.
+- Pooling and session reuse are part of the mechanics contract here; upgraded
+  and tunneled connections must not be silently returned to the plain HTTP pool.
 
 ## Implementation Status
 
-| Feature | Status |
-|---------|--------|
-| Basic forwarding | Complete |
-| Connection pooling | Complete |
-| Stale connection retry | Complete |
-| splice() zero-copy | Complete |
-| Userspace copy fallback | Complete |
-| Content-Length bodies | Complete |
-| Chunked transfer encoding | Complete |
-| Request body forwarding | Complete |
-| Client TLS responses | Complete |
-| Upstream TLS | Complete |
-| WebSocket proxy tunnel | Complete |
-| gRPC over h2 proxying | Stream-aware bridge active for both prior-knowledge and inbound upgrade when upstream is `.h2c` (cleartext) or `.h2` (TLS), including GOAWAY `last_stream_id`-aware active-stream handling |
-| HTTP/2 stream-aware bridge primitives (`h2/bindings` + `h2/bridge`) | Initial slice complete |
-| HTTP/2 full stream-aware upstream support | In progress (current implementation is gRPC-focused; broader generic h2 upstream support is still pending) |
+| Capability | Status |
+|------|---------|
+| HTTP/1 upstream forwarding | Complete |
+| Connection pooling / stale retry | Complete |
+| Plaintext zero-copy splice path | Complete |
+| TLS/userspace-copy fallback | Complete |
+| WebSocket HTTP/1 upgrade forwarding | Complete |
+| Bidirectional upgraded tunnel relay | Complete |
+| gRPC over HTTP/2 proxying | In progress, with stream-aware bridge active for cleartext frontend entry paths and upstream support for both `.h2c` and TLS `.h2` |
+| Generic stream-aware HTTP/2 proxying | In progress |
 
-## TigerStyle Compliance
+## TigerStyle Notes
 
-- Bounded loops with explicit iteration limits
-- Zero runtime allocation (fixed buffers)
-- Explicit u64 for body lengths
-- Assertions on preconditions
-- RFC 9112 compliant (Connection: close handling noted)
+- fixed-capacity binding tables instead of unbounded maps
+- explicit termination enums for tunnel shutdown
+- bounded retries for splice/body forwarding
+- no hidden protocol fallback in the gRPC h2 bridge path
+- cleanup-first handling for stale pooled or upgraded connections
