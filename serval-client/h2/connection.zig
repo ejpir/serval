@@ -42,6 +42,7 @@ pub const Error = error{
 
 pub const ClientConnection = struct {
     socket: *Socket,
+    io: ?Io = null,
     runtime: runtime_mod.Runtime,
     recv_buf: [read_buffer_size_bytes]u8 = undefined,
     recv_len: usize = 0,
@@ -49,11 +50,20 @@ pub const ClientConnection = struct {
     frame_count: u32 = 0,
 
     pub fn init(socket: *Socket) Error!ClientConnection {
+        return initMaybeIo(socket, null);
+    }
+
+    pub fn initWithIo(socket: *Socket, io: Io) Error!ClientConnection {
+        return initMaybeIo(socket, io);
+    }
+
+    fn initMaybeIo(socket: *Socket, io: ?Io) Error!ClientConnection {
         assert(@intFromPtr(socket) != 0);
         assert(socket.get_fd() >= 0);
 
         return .{
             .socket = socket,
+            .io = io,
             .runtime = try runtime_mod.Runtime.init(),
         };
     }
@@ -349,9 +359,22 @@ pub const ClientConnection = struct {
     fn writeAll(self: *ClientConnection, data: []const u8) Error!void {
         assert(@intFromPtr(self) != 0);
 
-        self.socket.write_all(data) catch |err| {
-            return mapWriteError(err);
-        };
+        switch (self.socket.*) {
+            .plain => |plain| {
+                if (self.io) |io| {
+                    var write_buf: [config.STREAM_WRITE_BUFFER_SIZE_BYTES]u8 = undefined;
+                    var writer = rawStreamForFd(plain.fd).writer(io, &write_buf);
+                    writer.interface.writeAll(data) catch return mapIoWriteError(writer.err orelse error.WriteFailed);
+                    writer.interface.flush() catch return mapIoWriteError(writer.err orelse error.WriteFailed);
+                    return;
+                }
+
+                self.socket.write_all(data) catch |err| return mapWriteError(err);
+            },
+            .tls => {
+                self.socket.write_all(data) catch |err| return mapWriteError(err);
+            },
+        }
     }
 };
 
@@ -362,7 +385,18 @@ fn readSome(socket: *Socket, maybe_io: ?Io, timeout: Io.Timeout, out: []u8) Erro
     return switch (socket.*) {
         .plain => |*plain| blk: {
             if (maybe_io) |io| {
-                try waitUntilReadable(plain.fd, io, timeout);
+                if (timeout != .none) {
+                    try waitUntilReadable(plain.fd, io, timeout);
+                }
+                var bufs: [1][]u8 = .{out};
+                const n = io.vtable.netRead(io.userdata, plain.fd, &bufs) catch |err| switch (err) {
+                    error.ConnectionResetByPeer,
+                    error.SocketUnconnected,
+                    => return error.ConnectionClosed,
+                    error.SystemResources => return error.WouldBlock,
+                    else => return error.ReadFailed,
+                };
+                break :blk @intCast(n);
             }
             const n = plain.read(out) catch |err| return mapReadError(err);
             break :blk n;
@@ -437,6 +471,25 @@ fn mapWriteError(err: SocketError) Error {
     };
 }
 
+fn mapIoReadError(err: anyerror) Error {
+    return switch (err) {
+        error.ConnectionResetByPeer,
+        error.SocketUnconnected,
+        => error.ConnectionClosed,
+        else => error.ReadFailed,
+    };
+}
+
+fn mapIoWriteError(err: anyerror) Error {
+    return switch (err) {
+        error.ConnectionResetByPeer,
+        error.BrokenPipe,
+        error.SocketUnconnected,
+        => error.ConnectionClosed,
+        else => error.WriteFailed,
+    };
+}
+
 fn appendFrame(
     out: []u8,
     frame_type: h2.FrameType,
@@ -498,25 +551,10 @@ fn readExact(fd: i32, out: []u8) !void {
 
 fn writeAllFd(fd: i32, data: []const u8) !void {
     assert(fd >= 0);
+    if (data.len == 0) return;
 
-    var offset: usize = 0;
-    var writes: usize = 0;
-    const max_writes: usize = data.len + 32;
-
-    while (offset < data.len and writes < max_writes) : (writes += 1) {
-        const rc = std.c.write(fd, data[offset..].ptr, data.len - offset);
-        switch (std.c.errno(rc)) {
-            .SUCCESS => {
-                const n: usize = @intCast(rc);
-                if (n == 0) return error.WriteFailed;
-                offset += n;
-            },
-            .INTR => continue,
-            else => return error.WriteFailed,
-        }
-    }
-
-    if (offset < data.len) return error.WriteFailed;
+    var socket = Socket.Plain.init_client(fd);
+    socket.write_all(data) catch return error.WriteFailed;
 }
 
 fn testSocketPair(domain: u32, sock_type: u32, protocol: u32) ![2]posix.socket_t {

@@ -10,6 +10,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const posix = std.posix;
+const Io = std.Io;
 
 const proxy_types = @import("../types.zig");
 const ForwardError = proxy_types.ForwardError;
@@ -43,6 +44,15 @@ pub fn forwardChunkedBodyWithPreread(
     dest: *Socket,
     pre_read: []const u8,
 ) ForwardError!u64 {
+    return forwardChunkedBodyWithPrereadIo(source, dest, pre_read, null);
+}
+
+pub fn forwardChunkedBodyWithPrereadIo(
+    source: *Socket,
+    dest: *Socket,
+    pre_read: []const u8,
+    maybe_io: ?Io,
+) ForwardError!u64 {
     // Precondition: valid socket file descriptors.
     assert(source.get_fd() >= 0);
     assert(dest.get_fd() >= 0);
@@ -64,7 +74,7 @@ pub fn forwardChunkedBodyWithPreread(
     // Main loop: process one chunk per iteration (bounded).
     while (chunk_iterations < MAX_CHUNK_ITERATIONS) : (chunk_iterations += 1) {
         // Ensure buffer has enough data to parse chunk header.
-        buffer_len = try ensureBufferHasChunkHeader(source, &buffer, buffer_len);
+        buffer_len = try ensureBufferHasChunkHeader(source, &buffer, buffer_len, maybe_io);
 
         // Parse chunk size from buffer.
         const parse_result = parseChunkSize(buffer[0..buffer_len]) catch |err| {
@@ -75,9 +85,7 @@ pub fn forwardChunkedBodyWithPreread(
         const header_consumed: u32 = @intCast(parse_result.consumed);
 
         // Forward chunk header (size + extensions + CRLF) to destination.
-        dest.write_all(buffer[0..header_consumed]) catch {
-            return ForwardError.SendFailed;
-        };
+        try socketWriteAll(dest, buffer[0..header_consumed], maybe_io);
         total_forwarded += header_consumed;
 
         // Consume header from buffer.
@@ -86,12 +94,12 @@ pub fn forwardChunkedBodyWithPreread(
         // Check for last chunk (size 0).
         if (isLastChunk(chunk_size)) {
             // Forward trailing CRLF after last chunk.
-            total_forwarded += try forwardTrailerSection(source, dest, &buffer, &buffer_len);
+            total_forwarded += try forwardTrailerSection(source, dest, &buffer, &buffer_len, maybe_io);
             break;
         }
 
         // Forward chunk data + trailing CRLF.
-        total_forwarded += try forwardChunkData(source, dest, chunk_size, &buffer, &buffer_len);
+        total_forwarded += try forwardChunkData(source, dest, chunk_size, &buffer, &buffer_len, maybe_io);
     }
 
     // Postcondition: forwarded some bytes or detected empty chunked body.
@@ -107,7 +115,15 @@ pub fn forwardChunkedBody(
     source: *Socket,
     dest: *Socket,
 ) ForwardError!u64 {
-    return forwardChunkedBodyWithPreread(source, dest, &.{});
+    return forwardChunkedBodyWithPrereadIo(source, dest, &.{}, null);
+}
+
+pub fn forwardChunkedBodyIo(
+    source: *Socket,
+    dest: *Socket,
+    io: Io,
+) ForwardError!u64 {
+    return forwardChunkedBodyWithPrereadIo(source, dest, &.{}, io);
 }
 
 // =============================================================================
@@ -121,6 +137,7 @@ fn ensureBufferHasChunkHeader(
     source: *Socket,
     buffer: *[CHUNK_BUFFER_SIZE_BYTES]u8,
     buffer_len: u32,
+    maybe_io: ?Io,
 ) ForwardError!u32 {
     assert(source.get_fd() >= 0);
 
@@ -132,7 +149,7 @@ fn ensureBufferHasChunkHeader(
     const max_read_iterations: u32 = 64;
 
     while (current_len < min_header_bytes and read_iterations < max_read_iterations) : (read_iterations += 1) {
-        const bytes_read = try recvToBuffer(source, buffer, current_len);
+        const bytes_read = try recvToBuffer(source, buffer, current_len, maybe_io);
         if (bytes_read == 0) return ForwardError.RecvFailed; // Unexpected EOF.
         current_len += bytes_read;
     }
@@ -153,6 +170,7 @@ fn forwardChunkData(
     chunk_size: u64,
     buffer: *[CHUNK_BUFFER_SIZE_BYTES]u8,
     buffer_len: *u32,
+    maybe_io: ?Io,
 ) ForwardError!u64 {
     assert(source.get_fd() >= 0);
     assert(dest.get_fd() >= 0);
@@ -164,19 +182,17 @@ fn forwardChunkData(
     // Forward any buffered data first.
     if (buffer_len.* > 0) {
         const to_send: u32 = @intCast(@min(buffer_len.*, bytes_remaining));
-        dest.write_all(buffer[0..to_send]) catch {
-            return ForwardError.SendFailed;
-        };
+        try socketWriteAll(dest, buffer[0..to_send], maybe_io);
         forwarded_bytes += to_send;
         bytes_remaining -= to_send;
         shiftBuffer(buffer, buffer_len, to_send);
     }
 
     // Forward remaining chunk data directly from source.
-    forwarded_bytes += try forwardBytes(source, dest, bytes_remaining, buffer);
+    forwarded_bytes += try forwardBytes(source, dest, bytes_remaining, buffer, maybe_io);
 
     // Forward trailing CRLF after chunk data.
-    forwarded_bytes += try forwardCRLF(source, dest, buffer, buffer_len);
+    forwarded_bytes += try forwardCRLF(source, dest, buffer, buffer_len, maybe_io);
 
     assert(forwarded_bytes == chunk_size + 2);
     return forwarded_bytes;
@@ -191,6 +207,7 @@ fn forwardBytes(
     dest: *Socket,
     length_bytes: u64,
     buffer: *[CHUNK_BUFFER_SIZE_BYTES]u8,
+    maybe_io: ?Io,
 ) ForwardError!u64 {
     assert(source.get_fd() >= 0);
     assert(dest.get_fd() >= 0);
@@ -204,16 +221,12 @@ fn forwardBytes(
         const to_read: usize = @intCast(@min(remaining_bytes, CHUNK_BUFFER_SIZE_BYTES));
 
         // Read from source socket.
-        const n = source.read(buffer[0..to_read]) catch {
-            return ForwardError.RecvFailed;
-        };
+        const n = try socketRead(source, buffer[0..to_read], maybe_io);
 
         if (n == 0) return ForwardError.RecvFailed; // Unexpected EOF.
 
         // Write to destination socket.
-        dest.write_all(buffer[0..n]) catch {
-            return ForwardError.SendFailed;
-        };
+        try socketWriteAll(dest, buffer[0..n], maybe_io);
         forwarded_bytes += n;
         remaining_bytes -= n;
     }
@@ -229,6 +242,7 @@ fn forwardCRLF(
     dest: *Socket,
     buffer: *[CHUNK_BUFFER_SIZE_BYTES]u8,
     buffer_len: *u32,
+    maybe_io: ?Io,
 ) ForwardError!u64 {
     assert(source.get_fd() >= 0);
     assert(dest.get_fd() >= 0);
@@ -237,7 +251,7 @@ fn forwardCRLF(
     var iterations: u32 = 0;
     const max_iterations: u32 = 8;
     while (buffer_len.* < 2 and iterations < max_iterations) : (iterations += 1) {
-        const bytes_read = try recvToBuffer(source, buffer, buffer_len.*);
+        const bytes_read = try recvToBuffer(source, buffer, buffer_len.*, maybe_io);
         if (bytes_read == 0) return ForwardError.RecvFailed;
         buffer_len.* += bytes_read;
     }
@@ -249,9 +263,7 @@ fn forwardCRLF(
         return ForwardError.InvalidResponse;
     }
 
-    dest.write_all(buffer[0..2]) catch {
-        return ForwardError.SendFailed;
-    };
+    try socketWriteAll(dest, buffer[0..2], maybe_io);
     shiftBuffer(buffer, buffer_len, 2);
 
     // CRLF is exactly 2 bytes.
@@ -267,6 +279,7 @@ fn forwardTrailerSection(
     dest: *Socket,
     buffer: *[CHUNK_BUFFER_SIZE_BYTES]u8,
     buffer_len: *u32,
+    maybe_io: ?Io,
 ) ForwardError!u64 {
     assert(source.get_fd() >= 0);
     assert(dest.get_fd() >= 0);
@@ -279,7 +292,7 @@ fn forwardTrailerSection(
     while (iterations < max_iterations) : (iterations += 1) {
         // Ensure buffer has data to scan.
         if (buffer_len.* < 2) {
-            const bytes_read = try recvToBuffer(source, buffer, buffer_len.*);
+            const bytes_read = try recvToBuffer(source, buffer, buffer_len.*, maybe_io);
             if (bytes_read == 0) return ForwardError.RecvFailed;
             buffer_len.* += bytes_read;
         }
@@ -287,9 +300,7 @@ fn forwardTrailerSection(
         // Check for empty line (end of trailers).
         if (buffer_len.* >= 2 and buffer[0] == '\r' and buffer[1] == '\n') {
             // Forward final CRLF and done.
-            dest.write_all(buffer[0..2]) catch {
-                return ForwardError.SendFailed;
-            };
+            try socketWriteAll(dest, buffer[0..2], maybe_io);
             shiftBuffer(buffer, buffer_len, 2);
             forwarded_bytes += 2;
             break;
@@ -303,7 +314,7 @@ fn forwardTrailerSection(
             shiftBuffer(buffer, buffer_len, to_discard);
         } else {
             // Need more data to find line end.
-            const bytes_read = try recvToBuffer(source, buffer, buffer_len.*);
+            const bytes_read = try recvToBuffer(source, buffer, buffer_len.*, maybe_io);
             if (bytes_read == 0) return ForwardError.RecvFailed;
             buffer_len.* += bytes_read;
         }
@@ -320,6 +331,7 @@ fn recvToBuffer(
     source: *Socket,
     buffer: *[CHUNK_BUFFER_SIZE_BYTES]u8,
     offset: u32,
+    maybe_io: ?Io,
 ) ForwardError!u32 {
     assert(source.get_fd() >= 0);
     assert(offset < CHUNK_BUFFER_SIZE_BYTES);
@@ -327,13 +339,64 @@ fn recvToBuffer(
     const space_remaining = CHUNK_BUFFER_SIZE_BYTES - offset;
 
     // Read from socket via Socket abstraction.
-    const n = source.read(buffer[offset..]) catch {
-        return ForwardError.RecvFailed;
-    };
+    const n = try socketRead(source, buffer[offset..], maybe_io);
 
     // Postcondition: read within buffer bounds.
     assert(n <= space_remaining);
     return @intCast(n);
+}
+
+fn socketRead(source: *Socket, out: []u8, maybe_io: ?Io) ForwardError!u32 {
+    assert(source.get_fd() >= 0);
+    assert(out.len > 0);
+
+    if (maybe_io) |io| {
+        switch (source.*) {
+            .plain => {
+                const fd = source.get_fd();
+                var bufs: [1][]u8 = .{out};
+                const n = io.vtable.netRead(io.userdata, fd, &bufs) catch {
+                    return ForwardError.RecvFailed;
+                };
+                return @intCast(n);
+            },
+            .tls => {},
+        }
+    }
+
+    const n = source.read(out) catch {
+        return ForwardError.RecvFailed;
+    };
+    return n;
+}
+
+fn socketWriteAll(dest: *Socket, data: []const u8, maybe_io: ?Io) ForwardError!void {
+    assert(dest.get_fd() >= 0);
+    if (data.len == 0) return;
+
+    if (maybe_io) |io| {
+        switch (dest.*) {
+            .plain => {
+                const fd = dest.get_fd();
+                var sent: usize = 0;
+                while (sent < data.len) {
+                    const pending = data[sent..];
+                    const slices = [_][]const u8{pending};
+                    const n = io.vtable.netWrite(io.userdata, fd, &.{}, &slices, 1) catch {
+                        return ForwardError.SendFailed;
+                    };
+                    if (n == 0) return ForwardError.SendFailed;
+                    sent += n;
+                }
+                return;
+            },
+            .tls => {},
+        }
+    }
+
+    dest.write_all(data) catch {
+        return ForwardError.SendFailed;
+    };
 }
 
 /// Shift buffer contents left by `count` bytes.

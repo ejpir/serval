@@ -346,39 +346,26 @@ fn writeAllSocket(
 
     return switch (socket.*) {
         .plain => |plain| {
-            var written: usize = 0;
-            var writes: u32 = 0;
-            while (written < data.len and writes < Socket.max_write_iterations_count) : (writes += 1) {
-                const rc = std.c.write(plain.fd, data[written..].ptr, data.len - written);
-                const errno_code = std.c.errno(rc);
-                switch (errno_code) {
-                    .SUCCESS => {
-                        const n: usize = @intCast(rc);
-                        if (n == 0) return closeFailure(side);
-                        written += n;
-                    },
-                    .INTR => continue,
-                    .AGAIN => {
-                        std.Io.sleep(io, timeout.duration.raw, timeout.duration.clock) catch return errorFailure(side);
-                        continue;
-                    },
-                    .PIPE, .CONNRESET, .NOTCONN => return closeFailure(side),
-                    else => {
-                        std.log.warn(
-                            "tunnel: plain write failed phase=write side={s} fd={d} errno={s} rc={d}",
-                            .{ @tagName(side), plain.fd, @tagName(errno_code), rc },
-                        );
-                        return errorFailure(side);
-                    },
-                }
-            }
-            if (written < data.len) {
-                std.log.warn(
-                    "tunnel: plain write failed phase=write side={s} fd={d} errno=max_writes rc={d}",
-                    .{ @tagName(side), plain.fd, written },
-                );
-                return errorFailure(side);
-            }
+            var write_buf: [config.SERVER_WRITE_BUFFER_SIZE_BYTES]u8 = undefined;
+            var writer = rawStreamForFd(plain.fd).writer(io, &write_buf);
+            writer.interface.writeAll(data) catch {
+                const write_err = writer.err orelse error.Unexpected;
+                return switch (write_err) {
+                    error.ConnectionResetByPeer,
+                    error.SocketUnconnected,
+                    => closeFailure(side),
+                    else => errorFailure(side),
+                };
+            };
+            writer.interface.flush() catch {
+                const flush_err = writer.err orelse error.Unexpected;
+                return switch (flush_err) {
+                    error.ConnectionResetByPeer,
+                    error.SocketUnconnected,
+                    => closeFailure(side),
+                    else => errorFailure(side),
+                };
+            };
         },
         .tls => |*tls_socket| {
             var sent: usize = 0;

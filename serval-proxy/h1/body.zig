@@ -19,7 +19,7 @@ const request_mod = @import("request.zig");
 const sendBuffer = request_mod.sendBuffer;
 
 const chunked_transfer = @import("chunked.zig");
-const forwardChunkedBody = chunked_transfer.forwardChunkedBody;
+const forwardChunkedBodyIo = chunked_transfer.forwardChunkedBodyIo;
 
 const core = @import("serval-core");
 const closeFd = core.closeFd;
@@ -42,13 +42,15 @@ const SPLICE_F_MOVE: u32 = 1;
 
 /// SPLICE_F_MORE: More data will be coming (enables TCP cork optimization).
 const SPLICE_F_MORE: u32 = 4;
+/// SPLICE_F_NONBLOCK: Non-blocking splice operation.
+const SPLICE_F_NONBLOCK: u32 = 2;
 
-/// Retry sleep after EAGAIN in splice loops.
-const SPLICE_RETRY_SLEEP_NS: u64 = serval_time.ns_per_ms;
 /// Max no-progress interval before failing splice loops.
 const SPLICE_STALL_TIMEOUT_NS: u64 = 120 * serval_time.ns_per_s;
 /// Explicit bound on EAGAIN retries in splice loops.
 const SPLICE_MAX_RETRY_COUNT: u32 = 240_000;
+/// Poll timeout used when waiting for splice readability/writability.
+const SPLICE_POLL_TIMEOUT_MS: i32 = 250;
 
 // =============================================================================
 // Platform-Specific Body Forwarding
@@ -56,18 +58,29 @@ const SPLICE_MAX_RETRY_COUNT: u32 = 240_000;
 
 /// Forward response body using zero-copy splice (Linux) or buffered copy.
 /// Uses Socket abstraction for unified TLS/plaintext handling.
+/// When Io is provided, uses fiber-safe copy (io_uring-backed netRead/netWrite)
+/// to avoid blocking the fiber scheduler during concurrent body streaming.
 /// TigerStyle: Explicit TLS check via is_tls(), splice only for both plain.
 pub fn forwardBody(
     upstream: *Socket,
     client: *Socket,
     length_bytes: u64,
+    io: ?Io,
 ) ForwardError!u64 {
     // Precondition: sockets have valid fds.
     assert(upstream.get_fd() >= 0);
     assert(client.get_fd() >= 0);
 
-    // Zero-copy splice only if BOTH sockets are plain (no TLS).
-    // TigerStyle: Explicit check, splice cannot work with encrypted data.
+    // When Io is available, use fiber-safe copy path (io_uring-backed netRead/netWrite).
+    // This avoids blocking the fiber scheduler with raw splice poll(), which deadlocks
+    // when running concurrently with the body-streaming background fiber on large payloads.
+    if (io) |runtime_io| {
+        const result = try forwardBodyCopyFiber(upstream, client, length_bytes, runtime_io);
+        assert(result <= length_bytes);
+        return result;
+    }
+
+    // No Io: use zero-copy splice (non-concurrent path only).
     if (!upstream.is_tls() and !client.is_tls()) {
         if (comptime builtin.os.tag == .linux) {
             const result = try forwardBodySplice(upstream.get_fd(), client.get_fd(), length_bytes);
@@ -131,6 +144,22 @@ fn forwardBodySplice(upstream_fd: i32, client_fd: i32, length_bytes: u64) Forwar
         closeFd(pipe_fds[1]);
     }
 
+    var upstream_flags = getFdFlags(upstream_fd) catch return ForwardError.SpliceFailed;
+    var client_flags = getFdFlags(client_fd) catch return ForwardError.SpliceFailed;
+    var pipe_read_flags = getFdFlags(pipe_fds[0]) catch return ForwardError.SpliceFailed;
+    var pipe_write_flags = getFdFlags(pipe_fds[1]) catch return ForwardError.SpliceFailed;
+    defer {
+        setFdFlags(upstream_fd, upstream_flags) catch {};
+        setFdFlags(client_fd, client_flags) catch {};
+        setFdFlags(pipe_fds[0], pipe_read_flags) catch {};
+        setFdFlags(pipe_fds[1], pipe_write_flags) catch {};
+    }
+
+    setFdNonBlocking(upstream_fd, &upstream_flags) catch return ForwardError.SpliceFailed;
+    setFdNonBlocking(client_fd, &client_flags) catch return ForwardError.SpliceFailed;
+    setFdNonBlocking(pipe_fds[0], &pipe_read_flags) catch return ForwardError.SpliceFailed;
+    setFdNonBlocking(pipe_fds[1], &pipe_write_flags) catch return ForwardError.SpliceFailed;
+
     var forwarded_bytes: u64 = 0;
     // TigerStyle: explicit worst-case bound (1 byte forward progress per iteration).
     const max_iterations: u64 = length_bytes +| 1024;
@@ -143,7 +172,7 @@ fn forwardBodySplice(upstream_fd: i32, client_fd: i32, length_bytes: u64) Forwar
         const chunk_size: usize = @intCast(@min(remaining_bytes, SPLICE_CHUNK_SIZE_BYTES));
 
         // Splice from upstream to pipe
-        const to_pipe = spliceSyscall(upstream_fd, pipe_fds[1], chunk_size, SPLICE_F_MOVE | SPLICE_F_MORE);
+        const to_pipe = spliceSyscall(upstream_fd, pipe_fds[1], chunk_size, SPLICE_F_MOVE | SPLICE_F_MORE | SPLICE_F_NONBLOCK);
 
         if (to_pipe == 0) break;
         if (to_pipe < 0) {
@@ -156,7 +185,7 @@ fn forwardBodySplice(upstream_fd: i32, client_fd: i32, length_bytes: u64) Forwar
                 {
                     return ForwardError.SpliceFailed;
                 }
-                serval_time.sleep(SPLICE_RETRY_SLEEP_NS);
+                _ = waitForSpliceReady(upstream_fd, pipe_fds[1], posix.POLL.IN, posix.POLL.OUT, SPLICE_POLL_TIMEOUT_MS);
                 continue;
             }
             return ForwardError.SpliceFailed;
@@ -177,7 +206,10 @@ fn forwardBodySplice(upstream_fd: i32, client_fd: i32, length_bytes: u64) Forwar
         // to avoid TCP cork delay. SPLICE_F_MORE tells kernel to expect more data,
         // which can cause ~200ms delay waiting for the cork timeout.
         const is_last_chunk = (forwarded_bytes + to_pipe_bytes >= length_bytes);
-        const splice_flags: u32 = if (is_last_chunk) SPLICE_F_MOVE else SPLICE_F_MOVE | SPLICE_F_MORE;
+        const splice_flags: u32 = if (is_last_chunk)
+            SPLICE_F_MOVE | SPLICE_F_NONBLOCK
+        else
+            SPLICE_F_MOVE | SPLICE_F_MORE | SPLICE_F_NONBLOCK;
 
         while (pipe_sent_bytes < to_pipe_bytes and pipe_iterations < max_pipe_iterations) : (pipe_iterations += 1) {
             const from_pipe = spliceSyscall(pipe_fds[0], client_fd, @intCast(to_pipe_bytes - pipe_sent_bytes), splice_flags);
@@ -192,7 +224,7 @@ fn forwardBodySplice(upstream_fd: i32, client_fd: i32, length_bytes: u64) Forwar
                     {
                         return ForwardError.SpliceFailed;
                     }
-                    serval_time.sleep(SPLICE_RETRY_SLEEP_NS);
+                    _ = waitForSpliceReady(pipe_fds[0], client_fd, posix.POLL.IN, posix.POLL.OUT, SPLICE_POLL_TIMEOUT_MS);
                     continue;
                 }
                 return ForwardError.SpliceFailed;
@@ -213,6 +245,54 @@ fn forwardBodySplice(upstream_fd: i32, client_fd: i32, length_bytes: u64) Forwar
 
     assert(forwarded_bytes <= length_bytes);
     return forwarded_bytes;
+}
+
+fn waitForSpliceReady(
+    read_fd: i32,
+    write_fd: i32,
+    read_events: i16,
+    write_events: i16,
+    timeout_ms: i32,
+) bool {
+    assert(read_fd >= 0);
+    assert(write_fd >= 0);
+    assert(timeout_ms >= 0);
+
+    var poll_fds = [_]posix.pollfd{
+        .{ .fd = read_fd, .events = read_events, .revents = 0 },
+        .{ .fd = write_fd, .events = write_events, .revents = 0 },
+    };
+
+    const polled = posix.poll(&poll_fds, timeout_ms) catch return false;
+    if (polled == 0) return false;
+    if ((poll_fds[0].revents & (posix.POLL.ERR | posix.POLL.NVAL)) != 0) return false;
+    if ((poll_fds[1].revents & (posix.POLL.ERR | posix.POLL.NVAL)) != 0) return false;
+    return true;
+}
+
+fn getFdFlags(fd: i32) !usize {
+    assert(fd >= 0);
+
+    const flags = posix.system.fcntl(fd, posix.F.GETFL, @as(usize, 0));
+    if (flags < 0) return error.Unexpected;
+    return @intCast(flags);
+}
+
+fn setFdFlags(fd: i32, flags: usize) !void {
+    assert(fd >= 0);
+
+    const result = posix.system.fcntl(fd, posix.F.SETFL, flags);
+    if (result < 0) return error.Unexpected;
+}
+
+fn setFdNonBlocking(fd: i32, flags: *usize) !void {
+    assert(fd >= 0);
+    assert(@intFromPtr(flags) != 0);
+
+    const nonblock_flag = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
+    if ((flags.* & nonblock_flag) != 0) return;
+    flags.* |= nonblock_flag;
+    try setFdFlags(fd, flags.*);
 }
 
 // =============================================================================
@@ -325,11 +405,12 @@ fn streamContentLengthBody(
         total_sent += initial_body.len;
     }
 
-    // Stream remaining bytes using zero-copy when possible.
+    // Stream remaining bytes in a fiber-friendly way for concurrent
+    // request/response forwarding. Plain sockets use io.vtable netRead/netWrite
+    // to avoid blocking the I/O worker.
     const remaining = content_length - bytes_already_read;
     if (remaining > 0) {
-        // Direction is client -> upstream for request bodies.
-        const forwarded = try forwardBody(client, upstream, remaining);
+        const forwarded = try forwardBodyCopyFiber(client, upstream, remaining, io);
         if (forwarded != remaining) return ForwardError.RecvFailed;
         total_sent += forwarded;
     }
@@ -337,6 +418,63 @@ fn streamContentLengthBody(
     // Postcondition: content-length bodies must be forwarded exactly.
     assert(total_sent == content_length);
     return total_sent;
+}
+
+fn forwardBodyCopyFiber(
+    source: *Socket,
+    dest: *Socket,
+    length_bytes: u64,
+    io: Io,
+) ForwardError!u64 {
+    assert(source.get_fd() >= 0);
+    assert(dest.get_fd() >= 0);
+
+    const source_plain = switch (source.*) {
+        .plain => true,
+        .tls => false,
+    };
+    const dest_plain = switch (dest.*) {
+        .plain => true,
+        .tls => false,
+    };
+    if (!source_plain or !dest_plain) {
+        return forwardBodyCopy(source, dest, length_bytes);
+    }
+
+    const source_fd = source.get_fd();
+    const dest_fd = dest.get_fd();
+
+    var buffer: [COPY_CHUNK_SIZE_BYTES]u8 = std.mem.zeroes([COPY_CHUNK_SIZE_BYTES]u8);
+    var forwarded_bytes: u64 = 0;
+    const max_iterations: u64 = length_bytes +| 1024;
+    var iterations: u64 = 0;
+
+    while (forwarded_bytes < length_bytes and iterations < max_iterations) : (iterations += 1) {
+        const remaining_bytes = length_bytes - forwarded_bytes;
+        const to_read: usize = @intCast(@min(remaining_bytes, buffer.len));
+
+        var read_bufs: [1][]u8 = .{buffer[0..to_read]};
+        const n = io.vtable.netRead(io.userdata, source_fd, &read_bufs) catch return ForwardError.RecvFailed;
+        if (n == 0) break;
+
+        var sent: usize = 0;
+        while (sent < n) {
+            const pending = buffer[sent..n];
+            const write_slices = [_][]const u8{pending};
+            const written = io.vtable.netWrite(io.userdata, dest_fd, &.{}, &write_slices, 1) catch return ForwardError.SendFailed;
+            if (written == 0) return ForwardError.SendFailed;
+            sent += written;
+        }
+
+        forwarded_bytes += n;
+    }
+
+    if (forwarded_bytes < length_bytes and iterations >= max_iterations) {
+        return ForwardError.RecvFailed;
+    }
+
+    assert(forwarded_bytes <= length_bytes);
+    return forwarded_bytes;
 }
 
 /// Stream chunked request body from client to upstream.
@@ -370,7 +508,7 @@ fn streamChunkedRequestBody(
 
     // Stream remaining chunks from client to upstream using Socket abstraction.
     // Direction: client (source) -> upstream (destination).
-    total_sent += try forwardChunkedBody(client, upstream);
+    total_sent += try forwardChunkedBodyIo(client, upstream, io);
 
     // Postcondition: total_sent includes initial_body plus chunked stream bytes.
     // Minimum chunked body is "0\r\n\r\n" (5 bytes) if no initial_body.

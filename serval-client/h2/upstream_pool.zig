@@ -240,7 +240,7 @@ pub const UpstreamSessionPool = struct {
             slot.active_session = null;
         }
 
-        session.h2 = try connection_mod.ClientConnection.init(&session.connection.socket);
+        session.h2 = try connection_mod.ClientConnection.initWithIo(&session.connection.socket, io);
         try session.h2.sendClientPrefaceAndSettings();
         session.last_used_ns = time.monotonicNanos();
 

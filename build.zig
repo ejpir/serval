@@ -720,6 +720,114 @@ pub fn build(b: *std.Build) void {
     );
     integration_test_64_step.dependOn(&run_integration_test_64.step);
 
+    const integration_test_32 = b.addTest(.{
+        .name = "integration_test_32",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: terminated h2 server replenishes flow-control windows for multi-frame request"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_32);
+    const run_integration_test_32 = b.addRunArtifact(integration_test_32);
+
+    const integration_test_32_step = b.step(
+        "test-integration-32",
+        "Run integration test 32 (terminated h2 server replenishes flow-control windows for multi-frame request)",
+    );
+    integration_test_32_step.dependOn(&run_integration_test_32.step);
+
+    const integration_test_5 = b.addTest(.{
+        .name = "integration_test_5",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: echo backend responds with chunked encoding"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_5);
+    const run_integration_test_5 = b.addRunArtifact(integration_test_5);
+
+    const integration_test_5_step = b.step(
+        "test-integration-5",
+        "Run integration test 5 (echo backend responds with chunked encoding)",
+    );
+    integration_test_5_step.dependOn(&run_integration_test_5.step);
+
+    const integration_test_2 = b.addTest(.{
+        .name = "integration_test_2",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: lb forwards to single backend"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_2);
+    const run_integration_test_2 = b.addRunArtifact(integration_test_2);
+
+    const integration_test_2_step = b.step(
+        "test-integration-2",
+        "Run integration test 2 (lb forwards to single backend)",
+    );
+    integration_test_2_step.dependOn(&run_integration_test_2.step);
+
+    const integration_test_38 = b.addTest(.{
+        .name = "integration_test_38",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: grpcurl tls unary interop against grpc h2 proxy"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_38);
+    const run_integration_test_38 = b.addRunArtifact(integration_test_38);
+
+    const integration_test_38_step = b.step(
+        "test-integration-38",
+        "Run integration test 38 (grpcurl tls unary interop against grpc h2 proxy)",
+    );
+    integration_test_38_step.dependOn(&run_integration_test_38.step);
+
+    const integration_test_78 = b.addTest(.{
+        .name = "integration_test_78",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: lb forwards 1MB payload correctly"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_78);
+    const run_integration_test_78 = b.addRunArtifact(integration_test_78);
+
+    const integration_test_78_step = b.step(
+        "test-integration-78",
+        "Run integration test 78 (lb forwards 1MB payload correctly)",
+    );
+    integration_test_78_step.dependOn(&run_integration_test_78.step);
+
+    const integration_test_77 = b.addTest(.{
+        .name = "integration_test_77",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: lb forwards 100KB payload correctly"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_77);
+    const run_integration_test_77 = b.addRunArtifact(integration_test_77);
+
+    const integration_test_77_step = b.step(
+        "test-integration-77",
+        "Run integration test 77 (lb forwards 100KB payload correctly)",
+    );
+    integration_test_77_step.dependOn(&run_integration_test_77.step);
+
+    const gdb_integration_test_32 = b.addSystemCommand(&.{
+        "sudo",
+        "gdb",
+        "-batch",
+        "-ex",
+        "set pagination off",
+        "-ex",
+        "run",
+        "--args",
+    });
+    gdb_integration_test_32.addFileArg(integration_test_32.getEmittedBin());
+
+    const integration_test_32_gdb_step = b.step(
+        "test-integration-32-gdb",
+        "Run integration test 32 under sudo gdb and print a backtrace on failure",
+    );
+    integration_test_32_gdb_step.dependOn(&gdb_integration_test_32.step);
+
     // =========================================================================
     // Examples
     // =========================================================================
@@ -897,7 +1005,15 @@ pub fn build(b: *std.Build) void {
     // Ensure echo_backend is rebuilt before integration tests run.
     // The test harness spawns ./zig-out/bin/echo_backend directly.
     run_integration_tests.step.dependOn(&build_echo_backend.step);
+    run_integration_test_2.step.dependOn(&build_echo_backend.step);
+    run_integration_test_32.step.dependOn(&build_echo_backend.step);
+    run_integration_test_5.step.dependOn(&build_echo_backend.step);
     run_integration_test_64.step.dependOn(&build_echo_backend.step);
+    run_integration_test_77.step.dependOn(&build_echo_backend.step);
+    run_integration_test_78.step.dependOn(&build_echo_backend.step);
+    run_integration_test_2.step.dependOn(&build_lb_example.step);
+    run_integration_test_77.step.dependOn(&build_lb_example.step);
+    run_integration_test_78.step.dependOn(&build_lb_example.step);
 
     const build_echo_backend_step = b.step("build-echo-backend", "Build echo backend");
     build_echo_backend_step.dependOn(&build_echo_backend.step);

@@ -30,8 +30,7 @@ const body_transfer = @import("body.zig");
 const forwardBody = body_transfer.forwardBody;
 
 const chunked_transfer = @import("chunked.zig");
-const forwardChunkedBody = chunked_transfer.forwardChunkedBody;
-const forwardChunkedBodyWithPreread = chunked_transfer.forwardChunkedBodyWithPreread;
+const forwardChunkedBodyWithPrereadIo = chunked_transfer.forwardChunkedBodyWithPrereadIo;
 
 const pool_mod = @import("serval-pool").pool;
 const Connection = pool_mod.Connection;
@@ -181,10 +180,10 @@ pub fn forwardResponse(
         return ForwardError.InvalidResponse;
     }
 
-    const content_length = parseContentLength(header_buffer[0..headers.header_len]);
+    const content_length = parseContentLength(header_buffer[0..headers.header_end]);
 
     // Detect body transfer mode: chunked or content-length based.
-    const is_chunked = isChunkedResponse(header_buffer[0..headers.header_len]);
+    const is_chunked = isChunkedResponse(header_buffer[0..headers.header_end]);
 
     debugLog("recv: headers received fd={d} status={d} content_length={?d} chunked={}", .{ upstream_conn.get_fd(), status, content_length, is_chunked });
 
@@ -206,22 +205,21 @@ pub fn forwardResponse(
         // Chunked transfer encoding: forward chunks until final chunk.
         // TigerStyle: Use Socket abstraction for unified TLS/plaintext handling.
         debugLog("recv: forwarding chunked body pre_read={d}", .{pre_read_body.len});
-        total_body_bytes += try forwardChunkedBodyWithPreread(upstream_socket, client_socket, pre_read_body);
+        total_body_bytes += try forwardChunkedBodyWithPrereadIo(upstream_socket, client_socket, pre_read_body, io);
     } else if (content_length) |length| {
         // Content-Length based: forward exact number of bytes.
         // First, send any pre-read body bytes to client.
         if (pre_read_body.len > 0) {
             debugLog("recv: forwarding pre-read body bytes={d}", .{pre_read_body.len});
-            client_socket.write_all(pre_read_body) catch {
-                return ForwardError.SendFailed;
-            };
+            try sendBuffer(&client_conn, io, pre_read_body);
             total_body_bytes += pre_read_body.len;
         }
         if (length > body_already_read_bytes) {
             const remaining = length - body_already_read_bytes;
             debugLog("recv: forwarding body remaining={d}", .{remaining});
-            // TigerStyle: Use Socket abstraction for unified TLS/plaintext handling.
-            total_body_bytes += try forwardBody(upstream_socket, client_socket, remaining);
+            // Fiber-safe: pass io so forwardBody uses io_uring-backed netRead/netWrite
+            // instead of raw splice+poll, avoiding deadlock with concurrent body streaming.
+            total_body_bytes += try forwardBody(upstream_socket, client_socket, remaining, io);
         }
     }
     // else: No body (e.g., 204, 304) or connection-close semantics.

@@ -134,18 +134,18 @@
 +                            },
 +                            .INTR => .{ null, 0 },
 +                            .CANCELED => break :net_receive_result null,
-+                            .BADF => .{ errnoBug(.BADF), 0 },
++                            .BADF => .{ errnoBug(.BADF), 0 }, // File descriptor used after closed.
 +                            .NFILE => .{ error.SystemFdQuotaExceeded, 0 },
 +                            .MFILE => .{ error.ProcessFdQuotaExceeded, 0 },
-+                            .FAULT => .{ errnoBug(.FAULT), 0 },
-+                            .INVAL => .{ errnoBug(.INVAL), 0 },
++                            .FAULT => .{ errnoBug(.FAULT), 0 }, // Invalid pointer.
++                            .INVAL => .{ errnoBug(.INVAL), 0 }, // Invalid argument.
 +                            .NOBUFS => .{ error.SystemResources, 0 },
 +                            .NOMEM => .{ error.SystemResources, 0 },
 +                            .NOTCONN => .{ error.SocketUnconnected, 0 },
-+                            .NOTSOCK => .{ errnoBug(.NOTSOCK), 0 },
++                            .NOTSOCK => .{ errnoBug(.NOTSOCK), 0 }, // Handle is not a socket.
 +                            .MSGSIZE => .{ error.MessageOversize, 0 },
 +                            .PIPE => .{ error.SocketUnconnected, 0 },
-+                            .OPNOTSUPP => .{ errnoBug(.OPNOTSUPP), 0 },
++                            .OPNOTSUPP => .{ errnoBug(.OPNOTSUPP), 0 }, // Flags not supported by socket type.
 +                            .CONNRESET => .{ error.ConnectionResetByPeer, 0 },
 +                            .NETDOWN => .{ error.NetworkDown, 0 },
 +                            else => |err| .{ unexpectedErrno(err), 0 },
@@ -246,17 +246,17 @@
 +                .address = addressFromPosix(&storage),
 +            } },
 +            .INTR, .CANCELED => {},
-+            .AGAIN => |err| return errnoBug(err),
-+            .BADF => |err| return errnoBug(err),
++            .AGAIN => |err| return errnoBug(err), // io_uring handles EAGAIN internally.
++            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
 +            .CONNABORTED => return error.ConnectionAborted,
-+            .FAULT => |err| return errnoBug(err),
++            .FAULT => |err| return errnoBug(err), // Invalid `addr` pointer.
 +            .INVAL => return error.SocketNotListening,
-+            .NOTSOCK => |err| return errnoBug(err),
++            .NOTSOCK => |err| return errnoBug(err), // `listen_handle` is not a socket.
 +            .MFILE => return error.ProcessFdQuotaExceeded,
 +            .NFILE => return error.SystemFdQuotaExceeded,
 +            .NOBUFS => return error.SystemResources,
 +            .NOMEM => return error.SystemResources,
-+            .OPNOTSUPP => |err| return errnoBug(err),
++            .OPNOTSUPP => |err| return errnoBug(err), // Socket type does not support accept.
 +            .PROTO => return error.ProtocolFailure,
 +            .PERM => return error.BlockedByFirewall,
 +            .NETDOWN => return error.NetworkDown,
@@ -383,24 +383,24 @@
 +            .INTR, .CANCELED => {},
 +            .ACCES => return error.AccessDenied,
 +            .ALREADY => return error.FastOpenAlreadyInProgress,
-+            .BADF => |err| return errnoBug(err),
++            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
 +            .CONNRESET => return error.ConnectionResetByPeer,
-+            .DESTADDRREQ => |err| return errnoBug(err),
-+            .FAULT => |err| return errnoBug(err),
-+            .INVAL => |err| return errnoBug(err),
-+            .ISCONN => |err| return errnoBug(err),
++            .DESTADDRREQ => |err| return errnoBug(err), // Address is always provided in msghdr.
++            .FAULT => |err| return errnoBug(err), // Invalid pointer.
++            .INVAL => |err| return errnoBug(err), // Invalid argument.
++            .ISCONN => |err| return errnoBug(err), // Connected socket with destination address.
 +            .MSGSIZE => return error.MessageOversize,
 +            .NOBUFS => return error.SystemResources,
 +            .NOMEM => return error.SystemResources,
-+            .NOTSOCK => |err| return errnoBug(err),
-+            .OPNOTSUPP => |err| return errnoBug(err),
++            .NOTSOCK => |err| return errnoBug(err), // `handle` is not a socket.
++            .OPNOTSUPP => |err| return errnoBug(err), // Flags not supported by socket type.
 +            .PIPE => return error.SocketUnconnected,
 +            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
 +            .HOSTUNREACH => return error.HostUnreachable,
 +            .NETUNREACH => return error.NetworkUnreachable,
 +            .NOTCONN => return error.SocketUnconnected,
 +            .NETDOWN => return error.NetworkDown,
-+            .CONNREFUSED => return error.ConnectionRefused,
++            .CONNREFUSED => return error.ConnectionRefused, // Valid for datagram sendmsg after ICMP unreachable.
 +            else => |err| return unexpectedErrno(err),
 +        }
 +    }
@@ -442,20 +442,20 @@
 +        switch (completion.errno()) {
 +            .SUCCESS => return @intCast(completion.result),
 +            .INTR, .CANCELED => {},
-+            .ACCES => |err| return errnoBug(err),
-+            .AGAIN => |err| return errnoBug(err),
++            .ACCES => |err| return errnoBug(err), // Connected stream socket, no permission check.
++            .AGAIN => |err| return errnoBug(err), // io_uring handles EAGAIN internally.
 +            .ALREADY => return error.FastOpenAlreadyInProgress,
-+            .BADF => |err| return errnoBug(err),
++            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
 +            .CONNRESET => return error.ConnectionResetByPeer,
-+            .DESTADDRREQ => return error.SocketNotBound,
-+            .FAULT => |err| return errnoBug(err),
-+            .INVAL => |err| return errnoBug(err),
-+            .ISCONN => |err| return errnoBug(err),
-+            .MSGSIZE => |err| return errnoBug(err),
++            .DESTADDRREQ => |err| return errnoBug(err), // Stream socket is already connected.
++            .FAULT => |err| return errnoBug(err), // Invalid pointer.
++            .INVAL => |err| return errnoBug(err), // Invalid argument.
++            .ISCONN => |err| return errnoBug(err), // Already connected.
++            .MSGSIZE => |err| return errnoBug(err), // Stream socket has no message size limit.
 +            .NOBUFS => return error.SystemResources,
 +            .NOMEM => return error.SystemResources,
-+            .NOTSOCK => |err| return errnoBug(err),
-+            .OPNOTSUPP => |err| return errnoBug(err),
++            .NOTSOCK => |err| return errnoBug(err), // `handle` is not a socket.
++            .OPNOTSUPP => |err| return errnoBug(err), // Flags not supported by socket type.
 +            .PIPE => return error.SocketUnconnected,
 +            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
 +            .HOSTUNREACH => return error.HostUnreachable,
@@ -533,33 +533,40 @@
 +        .flags = 0,
 +    };
 +    addBuf(&iovecs, &msg.iovlen, header);
-+    for (data[0 .. data.len - 1]) |bytes| addBuf(&iovecs, &msg.iovlen, bytes);
-+    const pattern = data[data.len - 1];
++    if (data.len > 0) {
++        for (data[0 .. data.len - 1]) |bytes| addBuf(&iovecs, &msg.iovlen, bytes);
++    } else {
++        assert(splat == 0);
++    }
 +
 +    var splat_backup_buffer: [splat_buffer_size]u8 = undefined;
-+    if (iovecs.len - msg.iovlen != 0) switch (splat) {
-+        0 => {},
-+        1 => addBuf(&iovecs, &msg.iovlen, pattern),
-+        else => switch (pattern.len) {
++    if (data.len > 0 and iovecs.len - msg.iovlen != 0) {
++        const pattern = data[data.len - 1];
++        switch (splat) {
 +            0 => {},
-+            1 => {
-+                const splat_buffer = &splat_backup_buffer;
-+                const memset_len = @min(splat_buffer.len, splat);
-+                const buf = splat_buffer[0..memset_len];
-+                @memset(buf, pattern[0]);
-+                addBuf(&iovecs, &msg.iovlen, buf);
-+                var remaining_splat = splat - buf.len;
-+                while (remaining_splat > splat_buffer.len and iovecs.len - msg.iovlen != 0) {
-+                    addBuf(&iovecs, &msg.iovlen, splat_buffer);
-+                    remaining_splat -= splat_buffer.len;
-+                }
-+                addBuf(&iovecs, &msg.iovlen, splat_buffer[0..@min(remaining_splat, splat_buffer.len)]);
++            1 => addBuf(&iovecs, &msg.iovlen, pattern),
++            else => switch (pattern.len) {
++                0 => {},
++                1 => {
++                    const splat_buffer = &splat_backup_buffer;
++                    const memset_len = @min(splat_buffer.len, splat);
++                    const buf = splat_buffer[0..memset_len];
++                    @memset(buf, pattern[0]);
++                    addBuf(&iovecs, &msg.iovlen, buf);
++                    var remaining_splat = splat - buf.len;
++                    while (remaining_splat > splat_buffer.len and iovecs.len - msg.iovlen != 0) {
++                        assert(buf.len == splat_buffer.len);
++                        addBuf(&iovecs, &msg.iovlen, splat_buffer);
++                        remaining_splat -= splat_buffer.len;
++                    }
++                    addBuf(&iovecs, &msg.iovlen, splat_buffer[0..@min(remaining_splat, splat_buffer.len)]);
++                },
++                else => for (0..@min(splat, iovecs.len - msg.iovlen)) |_| {
++                    addBuf(&iovecs, &msg.iovlen, pattern);
++                },
 +            },
-+            else => for (0..@min(splat, iovecs.len - msg.iovlen)) |_| {
-+                addBuf(&iovecs, &msg.iovlen, pattern);
-+            },
-+        },
-+    };
++        }
++    }
 +
 +    var cancel_region: CancelRegion = .init();
 +    defer cancel_region.deinit();
@@ -574,7 +581,6 @@
 +        error.ConnectionRefused => return error.ConnectionRefused,
 +        error.AddressFamilyUnsupported => return error.AddressFamilyUnsupported,
 +        error.SocketUnconnected => return error.SocketUnconnected,
-+        error.SocketNotBound => return error.SocketNotBound,
 +        else => |e| return e,
 +    };
  }
@@ -615,8 +621,8 @@
 +            .INTR, .CANCELED => {},
 +            .ADDRNOTAVAIL => return error.AddressUnavailable,
 +            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
-+            .AGAIN, .INPROGRESS => return error.WouldBlock,
-+            .ALREADY => return error.ConnectionPending,
++            .AGAIN, .INPROGRESS => |err| return errnoBug(err), // io_uring handles EINPROGRESS via FAST_POLL.
++            .ALREADY => |err| return errnoBug(err), // Previous connect should have completed via CQE.
 +            .CONNREFUSED => return error.ConnectionRefused,
 +            .CONNRESET => return error.ConnectionResetByPeer,
 +            .HOSTUNREACH => return error.HostUnreachable,
@@ -624,14 +630,14 @@
 +            .TIMEDOUT => return error.Timeout,
 +            .ACCES => return error.AccessDenied,
 +            .NETDOWN => return error.NetworkDown,
-+            .BADF => |err| return errnoBug(err),
-+            .CONNABORTED => |err| return errnoBug(err),
-+            .FAULT => |err| return errnoBug(err),
-+            .ISCONN => |err| return errnoBug(err),
-+            .NOENT => |err| return errnoBug(err),
-+            .NOTSOCK => |err| return errnoBug(err),
-+            .PERM => |err| return errnoBug(err),
-+            .PROTOTYPE => |err| return errnoBug(err),
++            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
++            .CONNABORTED => |err| return errnoBug(err), // Connection aborted during connect.
++            .FAULT => |err| return errnoBug(err), // Invalid `addr` pointer.
++            .ISCONN => |err| return errnoBug(err), // Socket is already connected.
++            .NOENT => |err| return errnoBug(err), // Invalid address path.
++            .NOTSOCK => |err| return errnoBug(err), // `socket_fd` is not a socket.
++            .PERM => |err| return errnoBug(err), // Firewall rules prevent connection.
++            .PROTOTYPE => |err| return errnoBug(err), // Socket type mismatch.
 +            else => |err| return unexpectedErrno(err),
 +        }
 +    }
@@ -675,9 +681,9 @@
 +            .SUCCESS => return,
 +            .INTR, .CANCELED => {},
 +            .ADDRINUSE => return error.AddressInUse,
-+            .BADF => |err| return errnoBug(err),
-+            .NOTSOCK => |err| return errnoBug(err),
-+            .OPNOTSUPP => |err| return errnoBug(err),
++            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
++            .NOTSOCK => |err| return errnoBug(err), // `socket_fd` is not a socket.
++            .OPNOTSUPP => |err| return errnoBug(err), // Socket type does not support listen.
 +            else => |err| return unexpectedErrno(err),
 +        }
 +    }

@@ -997,6 +997,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
                 result: ForwardError!u64 = 0,
 
                 fn run(bctx: *@This()) Io.Cancelable!void {
+                    debugLog("send: body stream task start", .{});
                     bctx.result = streamRequestBody(
                         bctx.client,
                         bctx.upstream,
@@ -1004,6 +1005,11 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
                         bctx.io,
                         bctx.body_info,
                     );
+                    if (bctx.result) |bytes_sent| {
+                        debugLog("send: body stream task complete bytes={d}", .{bytes_sent});
+                    } else |err| {
+                        debugLog("send: body stream task failed err={s}", .{@errorName(err)});
+                    }
                 }
             };
 

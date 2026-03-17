@@ -880,6 +880,17 @@ pub const TestClient = struct {
                         if (body_received >= content_length) break;
                     }
                 }
+
+                // Chunked responses can complete before peer close.
+                if (findHeader(resp_buf[0..header_end], "Transfer-Encoding")) |te| {
+                    if (containsIgnoreCase(te, "chunked")) {
+                        var decode_probe_buf: [MAX_DECODED_BODY_SIZE_BYTES]u8 = undefined;
+                        const body_start = header_end + 4;
+                        if (body_start <= total and decodeChunkedBody(resp_buf[body_start..total], &decode_probe_buf) != null) {
+                            break;
+                        }
+                    }
+                }
             }
         }
 
@@ -894,7 +905,7 @@ pub const TestClient = struct {
         // Check for chunked Transfer-Encoding and decode if present
         var decoded_buf: [MAX_DECODED_BODY_SIZE_BYTES]u8 = undefined;
         if (findHeader(data, "Transfer-Encoding")) |te| {
-            if (std.mem.indexOf(u8, te, "chunked") != null) {
+            if (containsIgnoreCase(te, "chunked")) {
                 // Decode chunked body
                 const decoded = decodeChunkedBody(body_slice, &decoded_buf) orelse
                     return error.InvalidChunkedEncoding;
@@ -939,12 +950,12 @@ pub const TestClient = struct {
     pub fn findHeader(data: []const u8, name: []const u8) ?[]const u8 {
         var iter = std.mem.splitSequence(u8, data, "\r\n");
         while (iter.next()) |line| {
-            if (std.mem.startsWith(u8, line, name)) {
-                const colon_idx = std.mem.indexOf(u8, line, ":") orelse continue;
-                var value = line[colon_idx + 1 ..];
-                if (value.len > 0 and value[0] == ' ') value = value[1..];
-                return value;
-            }
+            const colon_idx = std.mem.indexOf(u8, line, ":") orelse continue;
+            const header_name = std.mem.trim(u8, line[0..colon_idx], " ");
+            if (!std.ascii.eqlIgnoreCase(header_name, name)) continue;
+
+            const value = std.mem.trim(u8, line[colon_idx + 1 ..], " ");
+            return value;
         }
         return null;
     }
@@ -1022,6 +1033,17 @@ pub const TestClient = struct {
                         if (body_received >= content_length) break;
                     }
                 }
+
+                // Chunked responses can complete before peer close.
+                if (findHeader(resp_buf[0..header_end], "Transfer-Encoding")) |te| {
+                    if (containsIgnoreCase(te, "chunked")) {
+                        var decode_probe_buf: [MAX_DECODED_BODY_SIZE_BYTES]u8 = undefined;
+                        const body_start = header_end + 4;
+                        if (body_start <= total and decodeChunkedBody(resp_buf[body_start..total], &decode_probe_buf) != null) {
+                            break;
+                        }
+                    }
+                }
             }
         }
 
@@ -1036,7 +1058,7 @@ pub const TestClient = struct {
         // Check for chunked Transfer-Encoding and decode if present
         var decoded_buf: [MAX_DECODED_BODY_SIZE_BYTES]u8 = undefined;
         if (findHeader(data, "Transfer-Encoding")) |te| {
-            if (std.mem.indexOf(u8, te, "chunked") != null) {
+            if (containsIgnoreCase(te, "chunked")) {
                 // Decode chunked body
                 const decoded = decodeChunkedBody(body_slice, &decoded_buf) orelse
                     return error.InvalidChunkedEncoding;
@@ -1199,6 +1221,7 @@ pub const TestClient = struct {
         var last_recv_progress_ns: u64 = monotonic_now_ns();
         var headers_end: ?usize = null;
         var expected_total_len: ?usize = null;
+        var response_is_chunked: bool = false;
 
         std.debug.print("[DEBUG {s}] waiting for response...\n", .{debug_label});
         while (read_count < POST_LARGE_MAX_READS) : (read_count += 1) {
@@ -1232,18 +1255,24 @@ pub const TestClient = struct {
                 if (std.mem.indexOf(u8, resp_data.items, "\r\n\r\n")) |idx| {
                     headers_end = idx + 4;
                     const header_slice = resp_data.items[0..idx];
-                    if (std.mem.indexOf(u8, header_slice, "Content-Length: ")) |cl_start| {
-                        const value_start = cl_start + "Content-Length: ".len;
-                        if (std.mem.indexOfPos(u8, header_slice, value_start, "\r\n")) |value_end| {
-                            const content_length = std.fmt.parseInt(usize, header_slice[value_start..value_end], 10) catch 0;
-                            expected_total_len = headers_end.? + content_length;
-                        }
+                    if (findHeader(header_slice, "Content-Length")) |content_length_text| {
+                        const content_length = std.fmt.parseInt(usize, content_length_text, 10) catch 0;
+                        expected_total_len = headers_end.? + content_length;
+                    }
+                    if (findHeader(header_slice, "Transfer-Encoding")) |te_value| {
+                        response_is_chunked = containsIgnoreCase(te_value, "chunked");
                     }
                 }
             }
 
             if (expected_total_len) |need_len| {
                 if (resp_data.items.len >= need_len) break;
+            }
+
+            if (response_is_chunked) {
+                if (headers_end) |body_start| {
+                    if (body_start <= resp_data.items.len and chunkedBodyComplete(resp_data.items[body_start..])) break;
+                }
             }
         }
 
@@ -1258,7 +1287,7 @@ pub const TestClient = struct {
         defer if (decoded_body_buf.len > 0) self.allocator.free(decoded_body_buf);
 
         if (findHeader(data, "Transfer-Encoding")) |te| {
-            if (std.mem.indexOf(u8, te, "chunked") != null) {
+            if (containsIgnoreCase(te, "chunked")) {
                 decoded_body_buf = try self.allocator.alloc(u8, body_slice.len);
                 body_slice = decodeChunkedBody(body_slice, decoded_body_buf) orelse
                     return error.InvalidChunkedEncoding;
@@ -1349,6 +1378,43 @@ pub const TestClient = struct {
 
         // Hit max chunks without finding terminator - malformed
         return null;
+    }
+
+    fn chunkedBodyComplete(data: []const u8) bool {
+        var pos: usize = 0;
+        while (pos < data.len) {
+            const line_end = std.mem.indexOfPos(u8, data, pos, "\r\n") orelse return false;
+            const size_text = data[pos..line_end];
+
+            const semicolon = std.mem.indexOf(u8, size_text, ";");
+            const size_part = if (semicolon) |idx| size_text[0..idx] else size_text;
+            if (size_part.len == 0) return false;
+
+            const chunk_size = std.fmt.parseInt(usize, size_part, 16) catch return false;
+            pos = line_end + 2;
+
+            if (chunk_size == 0) {
+                if (pos + 2 > data.len) return false;
+                return std.mem.eql(u8, data[pos .. pos + 2], "\r\n");
+            }
+
+            if (pos + chunk_size + 2 > data.len) return false;
+            if (!std.mem.eql(u8, data[pos + chunk_size .. pos + chunk_size + 2], "\r\n")) return false;
+            pos += chunk_size + 2;
+        }
+        return false;
+    }
+
+    fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+        if (needle.len == 0) return true;
+        if (haystack.len < needle.len) return false;
+
+        var index: usize = 0;
+        const last_start = haystack.len - needle.len;
+        while (index <= last_start) : (index += 1) {
+            if (std.ascii.eqlIgnoreCase(haystack[index .. index + needle.len], needle)) return true;
+        }
+        return false;
     }
 };
 

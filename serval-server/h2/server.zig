@@ -10,7 +10,6 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const Io = std.Io;
-const posix = std.posix;
 
 const serval_core = @import("serval-core");
 const config = serval_core.config;
@@ -33,8 +32,6 @@ const upgrade_preamble_size_bytes: usize =
     (2 * h2.frame_header_size_bytes) +
     config.H2_MAX_FRAME_SIZE_BYTES +
     config.H2_MAX_HEADER_BLOCK_SIZE_BYTES;
-const read_retry_sleep_ns: u64 = time.ns_per_ms;
-const read_stall_timeout_ns: u64 = config.H2_SERVER_IDLE_TIMEOUT_NS;
 const read_max_retry_count: u32 = 30_000;
 const write_retry_sleep_ns: u64 = time.ns_per_ms;
 const write_stall_timeout_ns: u64 = 30 * time.ns_per_s;
@@ -690,8 +687,17 @@ fn serveConnectionWithInitialBytesOptions(
     var response_states = ResponseStateTable{};
     var stream_trackers = StreamTrackerTable{};
     var connection_mutex: Io.Mutex = .init;
+    var plain_read_buf: [config.STREAM_READ_BUFFER_SIZE_BYTES]u8 = undefined;
+    var plain_reader: Io.net.Stream.Reader = undefined;
+    var maybe_plain_reader: ?*Io.net.Stream.Reader = null;
+    switch (io_conn.*) {
+        .plain_fd => |fd| {
+            plain_reader = rawStreamForFd(fd).reader(io, &plain_read_buf);
+            maybe_plain_reader = &plain_reader;
+        },
+        .tls_stream => {},
+    }
 
-    try setConnectionNonBlocking(io_conn);
     log.debug("server: conn={d} h2 server driver start initial_bytes={d} settings_already_sent={}", .{
         connection_id,
         initial_bytes.len,
@@ -726,7 +732,7 @@ fn serveConnectionWithInitialBytesOptions(
         buffer_len = initial_bytes.len;
     }
 
-    try fillBuffer(io_conn, io, &recv_buf, &buffer_len, h2.client_connection_preface.len);
+    try fillBuffer(io_conn, maybe_plain_reader, io, &recv_buf, &buffer_len, h2.client_connection_preface.len);
     if (!h2.looksLikeClientConnectionPreface(recv_buf[0..buffer_len])) return error.InvalidPreface;
     try runtime.receiveClientPreface();
     discardPrefix(&recv_buf, &buffer_len, h2.client_connection_preface.len);
@@ -757,7 +763,7 @@ fn serveConnectionWithInitialBytesOptions(
             frame_count,
             buffer_len,
         });
-        const have_frame = ensureFrame(io_conn, io, &recv_buf, &buffer_len) catch |err| {
+        const have_frame = ensureFrame(io_conn, maybe_plain_reader, io, &recv_buf, &buffer_len) catch |err| {
             try sendRuntimeErrorGoAway(&runtime, io_conn, io, runtime.state.local_goaway_last_stream_id, err);
             closeAllTrackedStreams(
                 Handler,
@@ -792,7 +798,7 @@ fn serveConnectionWithInitialBytesOptions(
             return err;
         };
         const frame_len: usize = h2.frame_header_size_bytes + header.length;
-        try fillBuffer(io_conn, io, &recv_buf, &buffer_len, frame_len);
+        try fillBuffer(io_conn, maybe_plain_reader, io, &recv_buf, &buffer_len, frame_len);
         log.debug("server: conn={d} h2 parsed frame count={d} type={s} stream={d} flags=0x{x} payload_bytes={d} buffered_bytes={d}", .{
             connection_id,
             frame_count,
@@ -911,13 +917,13 @@ pub fn serveUpgradedConnection(
     assert(initial_client_h2_bytes.len <= read_buffer_size_bytes);
 
     var io_conn = ConnectionIo.initPlain(fd);
+    var plain_read_buf: [config.STREAM_READ_BUFFER_SIZE_BYTES]u8 = undefined;
+    var plain_reader = rawStreamForFd(fd).reader(io, &plain_read_buf);
 
     var runtime = try runtime_mod.Runtime.init();
     var response_states = ResponseStateTable{};
     var stream_trackers = StreamTrackerTable{};
     var connection_mutex: Io.Mutex = .init;
-    try setConnectionNonBlocking(&io_conn);
-
     var settings_buf: [runtime_mod.initial_settings_frame_buffer_size_bytes]u8 = undefined;
     const initial_settings = try runtime.writeInitialSettingsFrame(&settings_buf);
     try writeAll(&io_conn, io, initial_settings);
@@ -1025,6 +1031,7 @@ pub fn serveUpgradedConnection(
         Handler,
         handler,
         &io_conn,
+        &plain_reader,
         io,
         connection_id,
         &runtime,
@@ -1051,7 +1058,7 @@ pub fn serveUpgradedConnection(
         buffer_len = initial_client_h2_bytes.len;
     }
 
-    consumeOptionalUpgradeClientPreface(&io_conn, io, &recv_buf, &buffer_len) catch |err| {
+    consumeOptionalUpgradeClientPreface(&io_conn, &plain_reader, io, &recv_buf, &buffer_len) catch |err| {
         try sendRuntimeErrorGoAway(&runtime, &io_conn, io, 0, err);
         closeAllTrackedStreams(Handler, handler, connection_id, &stream_trackers, .connection_close, @intFromEnum(mapGoAwayError(err)));
         return err;
@@ -1059,7 +1066,7 @@ pub fn serveUpgradedConnection(
 
     var frame_count: u32 = 0;
     while (frame_count < config.H2_SERVER_MAX_FRAME_COUNT) : (frame_count += 1) {
-        const have_frame = ensureFrame(&io_conn, io, &recv_buf, &buffer_len) catch |err| {
+        const have_frame = ensureFrame(&io_conn, &plain_reader, io, &recv_buf, &buffer_len) catch |err| {
             try sendRuntimeErrorGoAway(&runtime, &io_conn, io, runtime.state.local_goaway_last_stream_id, err);
             closeAllTrackedStreams(
                 Handler,
@@ -1092,7 +1099,7 @@ pub fn serveUpgradedConnection(
             return err;
         };
         const frame_len: usize = h2.frame_header_size_bytes + header.length;
-        try fillBuffer(&io_conn, io, &recv_buf, &buffer_len, frame_len);
+        try fillBuffer(&io_conn, &plain_reader, io, &recv_buf, &buffer_len, frame_len);
 
         const payload = recv_buf[h2.frame_header_size_bytes..frame_len];
         const action = runtime.receiveFrame(header, payload) catch |err| {
@@ -1526,6 +1533,7 @@ fn processUpgradeBody(
     comptime Handler: type,
     handler: *Handler,
     io_conn: *ConnectionIo,
+    plain_reader: *Io.net.Stream.Reader,
     io: Io,
     connection_id: u64,
     runtime: *runtime_mod.Runtime,
@@ -1536,6 +1544,7 @@ fn processUpgradeBody(
 ) Error!void {
     assert(@intFromPtr(handler) != 0);
     assert(@intFromPtr(io_conn) != 0);
+    assert(@intFromPtr(plain_reader) != 0);
 
     var initial_cursor: usize = 0;
     var remaining: u64 = remaining_body_bytes;
@@ -1564,7 +1573,7 @@ fn processUpgradeBody(
     var body_buf: [config.H2_MAX_FRAME_SIZE_BYTES]u8 = undefined;
     while (remaining > 0) {
         const max_read: usize = @intCast(@min(remaining, config.H2_MAX_FRAME_SIZE_BYTES));
-        const n = try readSome(io_conn, io, body_buf[0..max_read]);
+        const n = try readSome(io_conn, plain_reader, io, body_buf[0..max_read]);
         if (n == 0) return error.ConnectionClosed;
 
         const read_bytes: u64 = @intCast(n);
@@ -1809,19 +1818,25 @@ fn mapGoAwayError(err: anyerror) h2.ErrorCode {
     };
 }
 
-fn consumeOptionalUpgradeClientPreface(io_conn: *ConnectionIo, io: Io, recv_buf: *[read_buffer_size_bytes]u8, buffer_len: *usize) Error!void {
+fn consumeOptionalUpgradeClientPreface(
+    io_conn: *ConnectionIo,
+    maybe_plain_reader: ?*Io.net.Stream.Reader,
+    io: Io,
+    recv_buf: *[read_buffer_size_bytes]u8,
+    buffer_len: *usize,
+) Error!void {
     assert(@intFromPtr(io_conn) != 0);
     assert(buffer_len.* <= recv_buf.len);
 
     if (buffer_len.* == 0) {
-        const n = try readIntoBuffer(io_conn, io, recv_buf, buffer_len);
+        const n = try readIntoBuffer(io_conn, maybe_plain_reader, io, recv_buf, buffer_len);
         if (n == 0) return;
     }
 
     if (buffer_len.* == 0) return;
     if (!h2.looksLikeClientConnectionPrefacePrefix(recv_buf[0..1])) return;
 
-    fillBuffer(io_conn, io, recv_buf, buffer_len, h2.client_connection_preface.len) catch |err| switch (err) {
+    fillBuffer(io_conn, maybe_plain_reader, io, recv_buf, buffer_len, h2.client_connection_preface.len) catch |err| switch (err) {
         error.ConnectionClosed => return error.InvalidPreface,
         else => return err,
     };
@@ -1830,40 +1845,59 @@ fn consumeOptionalUpgradeClientPreface(io_conn: *ConnectionIo, io: Io, recv_buf:
     discardPrefix(recv_buf, buffer_len, h2.client_connection_preface.len);
 }
 
-fn ensureFrame(io_conn: *ConnectionIo, io: Io, recv_buf: *[read_buffer_size_bytes]u8, buffer_len: *usize) Error!bool {
+fn ensureFrame(
+    io_conn: *ConnectionIo,
+    maybe_plain_reader: ?*Io.net.Stream.Reader,
+    io: Io,
+    recv_buf: *[read_buffer_size_bytes]u8,
+    buffer_len: *usize,
+) Error!bool {
     assert(@intFromPtr(io_conn) != 0);
     assert(@intFromPtr(recv_buf) != 0);
 
     if (buffer_len.* == 0) {
-        const n = try readIntoBuffer(io_conn, io, recv_buf, buffer_len);
+        const n = try readIntoBuffer(io_conn, maybe_plain_reader, io, recv_buf, buffer_len);
         if (n == 0) return false;
     }
 
-    try fillBuffer(io_conn, io, recv_buf, buffer_len, h2.frame_header_size_bytes);
+    try fillBuffer(io_conn, maybe_plain_reader, io, recv_buf, buffer_len, h2.frame_header_size_bytes);
     const header = try h2.parseFrameHeader(recv_buf[0..h2.frame_header_size_bytes]);
     const frame_len: usize = h2.frame_header_size_bytes + header.length;
-    try fillBuffer(io_conn, io, recv_buf, buffer_len, frame_len);
+    try fillBuffer(io_conn, maybe_plain_reader, io, recv_buf, buffer_len, frame_len);
     return true;
 }
 
-fn fillBuffer(io_conn: *ConnectionIo, io: Io, recv_buf: *[read_buffer_size_bytes]u8, buffer_len: *usize, needed_len: usize) Error!void {
+fn fillBuffer(
+    io_conn: *ConnectionIo,
+    maybe_plain_reader: ?*Io.net.Stream.Reader,
+    io: Io,
+    recv_buf: *[read_buffer_size_bytes]u8,
+    buffer_len: *usize,
+    needed_len: usize,
+) Error!void {
     assert(@intFromPtr(io_conn) != 0);
     assert(needed_len <= recv_buf.len);
 
     var reads: usize = 0;
     while (buffer_len.* < needed_len and reads < recv_buf.len) : (reads += 1) {
-        const n = try readIntoBuffer(io_conn, io, recv_buf, buffer_len);
+        const n = try readIntoBuffer(io_conn, maybe_plain_reader, io, recv_buf, buffer_len);
         if (n == 0) return error.ConnectionClosed;
     }
 
     if (buffer_len.* < needed_len) return error.ReadFailed;
 }
 
-fn readIntoBuffer(io_conn: *ConnectionIo, io: Io, recv_buf: *[read_buffer_size_bytes]u8, buffer_len: *usize) Error!usize {
+fn readIntoBuffer(
+    io_conn: *ConnectionIo,
+    maybe_plain_reader: ?*Io.net.Stream.Reader,
+    io: Io,
+    recv_buf: *[read_buffer_size_bytes]u8,
+    buffer_len: *usize,
+) Error!usize {
     assert(@intFromPtr(io_conn) != 0);
     assert(buffer_len.* <= recv_buf.len);
 
-    const n = try readSome(io_conn, io, recv_buf[buffer_len.*..]);
+    const n = try readSome(io_conn, maybe_plain_reader, io, recv_buf[buffer_len.*..]);
     buffer_len.* += n;
     return n;
 }
@@ -1880,70 +1914,46 @@ fn discardPrefix(recv_buf: *[read_buffer_size_bytes]u8, buffer_len: *usize, pref
     buffer_len.* -= prefix_len;
 }
 
-fn readSome(io_conn: *ConnectionIo, io: Io, out: []u8) Error!usize {
+fn readSome(
+    io_conn: *ConnectionIo,
+    maybe_plain_reader: ?*Io.net.Stream.Reader,
+    io: Io,
+    out: []u8,
+) Error!usize {
     assert(@intFromPtr(io_conn) != 0);
     assert(out.len > 0);
 
     return switch (io_conn.*) {
         .plain_fd => |fd| blk: {
-            var retry_count: u32 = 0;
-            var last_progress_ns: u64 = time.monotonicNanos();
-
-            while (retry_count < read_max_retry_count) : (retry_count += 1) {
-                const rc = std.c.read(fd, out.ptr, out.len);
-                const errno_code = std.c.errno(rc);
-                switch (errno_code) {
-                    .SUCCESS => {
-                        last_progress_ns = time.monotonicNanos();
-                        break :blk @intCast(rc);
-                    },
-                    .INTR, .AGAIN => {
-                        const now_ns = time.monotonicNanos();
-                        const since_progress_ns = now_ns -| last_progress_ns;
-                        if (since_progress_ns >= read_stall_timeout_ns) {
-                            log.warn(
-                                "h2: readSome stalled transport=plain fd={d} retries={d} since_progress_ns={d}",
-                                .{ fd, retry_count + 1, since_progress_ns },
-                            );
-                            return error.ReadFailed;
-                        }
-                        std.Io.sleep(io, std.Io.Duration.fromNanoseconds(read_retry_sleep_ns), .awake) catch return error.ReadFailed;
-                        continue;
-                    },
-                    .CONNRESET, .NOTCONN => return error.ConnectionClosed,
-                    else => {
-                        log.warn(
-                            "h2: readSome failed transport=plain fd={d} errno={s} rc={d} bytes={d}",
-                            .{ fd, @tagName(errno_code), rc, out.len },
-                        );
-                        return error.ReadFailed;
-                    },
-                }
-            }
-
-            log.warn(
-                "h2: readSome exhausted retries transport=plain fd={d} retries={d}",
-                .{ fd, read_max_retry_count },
-            );
-            return error.ReadFailed;
+            _ = maybe_plain_reader;
+            var bufs: [1][]u8 = .{out};
+            const n = io.vtable.netRead(io.userdata, fd, &bufs) catch |read_err| {
+                return switch (read_err) {
+                    error.ConnectionResetByPeer,
+                    error.SocketUnconnected,
+                    => error.ConnectionClosed,
+                    else => error.ReadFailed,
+                };
+            };
+            break :blk n;
         },
         .tls_stream => |tls_stream| blk: {
             var retry_count: u32 = 0;
-            var last_progress_ns: u64 = time.monotonicNanos();
-
             while (retry_count < read_max_retry_count) : (retry_count += 1) {
+                if (!tls_stream.hasPendingRead()) {
+                    waitUntilReadable(tls_stream.fd, io) catch |err| switch (err) {
+                        error.ConnectionResetByPeer,
+                        error.SocketUnconnected,
+                        => return error.ConnectionClosed,
+                        else => return error.ReadFailed,
+                    };
+                }
+
                 const n: u32 = tls_stream.read(out) catch |err| switch (err) {
-                    error.WantRead, error.WantWrite => {
-                        const now_ns = time.monotonicNanos();
-                        const since_progress_ns = now_ns -| last_progress_ns;
-                        if (since_progress_ns >= read_stall_timeout_ns) return error.ReadFailed;
-                        std.Io.sleep(io, std.Io.Duration.fromNanoseconds(read_retry_sleep_ns), .awake) catch return error.ReadFailed;
-                        continue;
-                    },
+                    error.WantRead, error.WantWrite => continue,
                     error.ConnectionReset => return error.ConnectionClosed,
                     else => return error.ReadFailed,
                 };
-                last_progress_ns = time.monotonicNanos();
                 break :blk @intCast(n);
             }
 
@@ -1952,25 +1962,51 @@ fn readSome(io_conn: *ConnectionIo, io: Io, out: []u8) Error!usize {
     };
 }
 
-fn writeSome(io_conn: *ConnectionIo, out: []const u8) Error!usize {
+fn waitUntilReadable(fd: i32, io: Io) anyerror!void {
+    assert(fd >= 0);
+
+    var messages: [1]Io.net.IncomingMessage = .{Io.net.IncomingMessage.init};
+    var peek_buf: [1]u8 = undefined;
+    const maybe_err, _ = rawStreamForFd(fd).socket.receiveManyTimeout(
+        io,
+        &messages,
+        &peek_buf,
+        .{ .peek = true },
+        .none,
+    );
+    if (maybe_err) |err| return err;
+}
+
+fn writeSome(io_conn: *ConnectionIo, io: Io, out: []const u8) Error!usize {
     assert(@intFromPtr(io_conn) != 0);
 
     return switch (io_conn.*) {
         .plain_fd => |fd| blk: {
-            const rc = std.c.write(fd, out.ptr, out.len);
-            const errno_code = std.c.errno(rc);
-            switch (errno_code) {
-                .SUCCESS => break :blk @intCast(rc),
-                .INTR, .AGAIN => return error.WouldBlock,
-                .PIPE, .CONNRESET => return error.ConnectionClosed,
-                else => {
-                    log.warn(
-                        "h2: writeSome failed transport=plain fd={d} errno={s} rc={d} bytes={d}",
-                        .{ fd, @tagName(errno_code), rc, out.len },
-                    );
-                    return error.WriteFailed;
-                },
+            var write_buf: [config.SERVER_WRITE_BUFFER_SIZE_BYTES]u8 = undefined;
+            var writer = rawStreamForFd(fd).writer(io, &write_buf);
+            writer.interface.writeAll(out) catch {
+                const write_err = writer.err orelse error.Unexpected;
+                return switch (write_err) {
+                    error.SystemResources => error.WouldBlock,
+                    error.ConnectionResetByPeer,
+                    error.SocketUnconnected,
+                    => error.ConnectionClosed,
+                    else => error.WriteFailed,
+                };
+            };
+            if (writer.interface.buffered().len > 0) {
+                writer.interface.flush() catch {
+                    const flush_err = writer.err orelse error.Unexpected;
+                    return switch (flush_err) {
+                        error.SystemResources => error.WouldBlock,
+                        error.ConnectionResetByPeer,
+                        error.SocketUnconnected,
+                        => error.ConnectionClosed,
+                        else => error.WriteFailed,
+                    };
+                };
             }
+            break :blk out.len;
         },
         .tls_stream => |tls_stream| blk: {
             const n: u32 = tls_stream.write(out) catch |err| switch (err) {
@@ -1985,6 +2021,16 @@ fn writeSome(io_conn: *ConnectionIo, out: []const u8) Error!usize {
                 },
             };
             break :blk @intCast(n);
+        },
+    };
+}
+
+fn rawStreamForFd(fd: i32) Io.net.Stream {
+    assert(fd >= 0);
+    return .{
+        .socket = .{
+            .handle = fd,
+            .address = .{ .ip4 = .unspecified(0) },
         },
     };
 }
@@ -2019,7 +2065,7 @@ fn writeAll(io_conn: *ConnectionIo, io: Io, data: []const u8) Error!void {
     var last_progress_ns: u64 = time.monotonicNanos();
 
     while (written < data.len and writes < max_writes) : (writes += 1) {
-        const n = writeSome(io_conn, data[written..]) catch |err| switch (err) {
+        const n = writeSome(io_conn, io, data[written..]) catch |err| switch (err) {
             error.WouldBlock => {
                 retry_count += 1;
                 const now_ns = time.monotonicNanos();
@@ -2057,18 +2103,6 @@ fn writeAll(io_conn: *ConnectionIo, io: Io, data: []const u8) Error!void {
         );
         return error.WriteFailed;
     }
-}
-
-fn setConnectionNonBlocking(io_conn: *const ConnectionIo) Error!void {
-    const fd = connectionIoFd(io_conn);
-    const rc = posix.system.fcntl(fd, posix.F.GETFL, @as(usize, 0));
-    if (posix.errno(rc) != .SUCCESS) return error.ReadFailed;
-
-    var flags: usize = @intCast(rc);
-    flags |= @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
-
-    const set_rc = posix.system.fcntl(fd, posix.F.SETFL, flags);
-    if (posix.errno(set_rc) != .SUCCESS) return error.ReadFailed;
 }
 
 fn buildResponseHeaderBlock(status: u16, headers: []const Header, out: []u8) Error![]const u8 {

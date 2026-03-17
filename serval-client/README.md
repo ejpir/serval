@@ -15,6 +15,10 @@ Current code also includes an `h2/` subdirectory with bounded outbound HTTP/2 pr
 The h2 transport adapter now translates TLS `WantRead` / `WantWrite` signals
 from `serval-tls` back into the client session's existing bounded retry model,
 so higher-level h2 session logic stays transport-agnostic.
+For plain sockets, the connection driver uses `std.Io` stream writer/reader
+when an `Io` context is provided (the upstream session-pool path), keeping
+outbound h2 operations fiber-schedulable instead of issuing raw blocking
+syscalls from the protocol driver.
 
 The client h2 runtime also treats duplicate/late upstream `RST_STREAM` frames
 for already-retired known streams as idempotent control noise instead of

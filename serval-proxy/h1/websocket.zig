@@ -239,7 +239,7 @@ fn forwardBufferedBody(
             sent += pre_read_body.len;
         }
         if (length > sent) {
-            sent += try forwardBody(&upstream_conn.socket, client_socket, length - sent);
+            sent += try forwardBody(&upstream_conn.socket, client_socket, length - sent, null);
         }
         return sent;
     }

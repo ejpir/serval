@@ -81,7 +81,11 @@ const CONNECTION_RECV_BUFFER_SIZE_BYTES = if (REQUEST_BUFFER_SIZE_BYTES > H2C_IN
     REQUEST_BUFFER_SIZE_BYTES
 else
     H2C_INITIAL_READ_BUFFER_SIZE_BYTES;
-const PLAIN_STREAM_READER_BUFFER_SIZE_BYTES: usize = 1;
+// Must be 0: a non-zero reader buffer causes readv to steal bytes into the
+// reader's internal buffer. The body-forwarding fiber reads directly from the
+// socket (bypassing the reader), so those stolen bytes are never seen — causing
+// an off-by-N EOF on Content-Length bodies.
+const PLAIN_STREAM_READER_BUFFER_SIZE_BYTES: usize = 0;
 const DIRECT_RESPONSE_BUFFER_SIZE_BYTES = config.DIRECT_RESPONSE_BUFFER_SIZE_BYTES;
 const DIRECT_REQUEST_BODY_SIZE_BYTES = config.DIRECT_REQUEST_BODY_SIZE_BYTES;
 
@@ -1507,7 +1511,9 @@ pub fn Server(
                 self.bridge_mutex.lockUncancelable(self.io);
                 defer self.bridge_mutex.unlock(self.io);
 
-                if (self.bridge.activeBindingCount() == 0) return error.WouldBlock;
+                if (self.bridge.activeBindingCount() == 0) {
+                    return error.WouldBlock;
+                }
 
                 const timeout: Io.Timeout = .{ .duration = .{
                     .raw = Io.Duration.fromMilliseconds(upstream_read_timeout_ms),
@@ -2400,7 +2406,7 @@ pub fn Server(
             // Get mutable pointer to TLS stream for I/O operations (if TLS is active)
             // TigerStyle: Mutable pointer needed for forwarder to write TLS responses.
             const maybe_tls_ptr: ?*TLSStream = if (maybe_tls_stream) |*tls| tls else null;
-            var plain_reader_buf: [1]u8 = undefined;
+            var plain_reader_buf: [PLAIN_STREAM_READER_BUFFER_SIZE_BYTES]u8 = undefined;
             var plain_stream_reader = stream.reader(io_mut, &plain_reader_buf);
             const maybe_plain_reader: ?*Io.net.Stream.Reader = if (maybe_tls_ptr == null) &plain_stream_reader else null;
 
@@ -2621,6 +2627,9 @@ pub fn Server(
                             tracer.setIntAttribute(span_handle, "http.response.status_code", @intCast(resp.status));
                             tracer.endSpan(span_handle, null);
                             buffer_offset += parser.headers_end + body_length_for_offset;
+                            const should_close = clientWantsClose(&parser.request.headers) or
+                                request_count >= cfg.max_requests_per_connection;
+                            if (should_close) return;
                             continue;
                         },
                         .reject => |reject| {
@@ -2631,6 +2640,9 @@ pub fn Server(
                             tracer.setIntAttribute(span_handle, "http.response.status_code", @intCast(reject.status));
                             tracer.endSpan(span_handle, reject.reason);
                             buffer_offset += parser.headers_end + body_length_for_offset;
+                            const should_close = clientWantsClose(&parser.request.headers) or
+                                request_count >= cfg.max_requests_per_connection;
+                            if (should_close) return;
                             continue;
                         },
                         .stream => |stream_resp| {
@@ -2719,6 +2731,9 @@ pub fn Server(
                                     tracer.endSpan(span_handle, null);
                                 }
                                 buffer_offset += parser.headers_end + body_length_for_offset;
+                                const should_close = clientWantsClose(&parser.request.headers) or
+                                    request_count >= cfg.max_requests_per_connection;
+                                if (should_close) return;
                                 continue;
                             }
                         },
