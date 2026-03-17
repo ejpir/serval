@@ -1,0 +1,32 @@
+{
+  "cli_version": "0.4.3",
+  "checkpoint_id": "b0e787c3593c",
+  "session_id": "54c7df5d-0b21-4606-aec1-cf90311a6367",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-17T13:21:43.016643063Z",
+  "branch": "main",
+  "checkpoints_count": 8,
+  "files_touched": [
+    "docs/plans/2026-03-16-uring-networking-pr-quality.md",
+    "experiments/tls-poc/boringssl"
+  ],
+  "agent": "Claude Code",
+  "transcript_identifier_at_start": "d55e5630-8729-4616-9567-452651223ecc",
+  "token_usage": {
+    "input_tokens": 11219,
+    "cache_creation_tokens": 190618,
+    "cache_read_tokens": 2945310,
+    "output_tokens": 33175,
+    "api_call_count": 36
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-17T13:21:42.717742307Z",
+    "agent_lines": 0,
+    "human_added": 30371334,
+    "human_modified": 405,
+    "human_removed": 0,
+    "total_committed": 30371739,
+    "agent_percentage": 0
+  },
+  "transcript_path": ".claude/projects/-home-nick-repos-serval/54c7df5d-0b21-4606-aec1-cf90311a6367.jsonl"
+}
