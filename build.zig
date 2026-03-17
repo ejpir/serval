@@ -735,6 +735,21 @@ pub fn build(b: *std.Build) void {
     );
     integration_test_32_step.dependOn(&run_integration_test_32.step);
 
+    const integration_test_34 = b.addTest(.{
+        .name = "integration_test_34",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: grpc h2 prior-knowledge unary request is proxied to tls h2 upstream"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_34);
+    const run_integration_test_34 = b.addRunArtifact(integration_test_34);
+
+    const integration_test_34_step = b.step(
+        "test-integration-34",
+        "Run integration test 34 (grpc h2 prior-knowledge unary request is proxied to tls h2 upstream)",
+    );
+    integration_test_34_step.dependOn(&run_integration_test_34.step);
+
     const integration_test_5 = b.addTest(.{
         .name = "integration_test_5",
         .root_module = integration_tests_mod,
@@ -1007,6 +1022,7 @@ pub fn build(b: *std.Build) void {
     run_integration_tests.step.dependOn(&build_echo_backend.step);
     run_integration_test_2.step.dependOn(&build_echo_backend.step);
     run_integration_test_32.step.dependOn(&build_echo_backend.step);
+    run_integration_test_34.step.dependOn(&build_echo_backend.step);
     run_integration_test_5.step.dependOn(&build_echo_backend.step);
     run_integration_test_64.step.dependOn(&build_echo_backend.step);
     run_integration_test_77.step.dependOn(&build_echo_backend.step);

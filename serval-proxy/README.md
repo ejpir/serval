@@ -145,6 +145,38 @@ The fix was to:
 
 This is an upgraded-tunnel transport issue, not a WebSocket handshake issue.
 
+#### gRPC prior-knowledge h2 -> TLS h2 tunnel startup note (integration 34)
+
+A separate regression (integration test `34/98`) showed a startup deadlock in
+raw gRPC h2 prior-knowledge tunnel mode when forwarding to a TLS h2 upstream.
+
+Failing shape:
+
+- downstream client sent the full prior-knowledge+h2 unary request preface
+- upstream TLS handshake completed successfully
+- no upstream application data was observed after handshake
+- tunnel then stalled until downstream timeout
+
+Root cause:
+
+- relay startup order let the foreground path block on upstream read before the
+  downstream initial bytes were guaranteed to be flushed upstream
+
+Fix:
+
+- make client->upstream relay the foreground path so initial request bytes are
+  always pushed first
+- run upstream->client relay as the concurrent background path
+- keep plain-socket relay I/O fiber-safe (`io.vtable.netRead/netWrite`) and TLS
+  relay I/O on the socket/TLS blocking path
+
+Tradeoff:
+
+- this is a tactical reliability fix; startup ordering is intentionally
+  directional to prevent deadlock in raw tunnel bootstrap
+- longer-term cleanup target is a symmetric relay state machine with explicit
+  startup phase + steady-state phase
+
 ### HTTP/2 / gRPC forwarding
 
 The current h2 implementation is intentionally bounded and focused:
