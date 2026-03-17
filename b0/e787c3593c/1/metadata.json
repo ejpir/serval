@@ -1,0 +1,36 @@
+{
+  "cli_version": "0.4.3",
+  "checkpoint_id": "b0e787c3593c",
+  "session_id": "9ecfccbf-9db6-4ae0-ab05-2ac28be681ea",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-17T13:22:06.064390776Z",
+  "branch": "main",
+  "checkpoints_count": 6,
+  "files_touched": [
+    "experiments/tls-poc/boringssl",
+    "integration/harness.zig",
+    "serval-core/posix_compat.zig",
+    "serval-proxy/h1/body.zig",
+    "serval-proxy/h1/response.zig",
+    "serval-server/h1/server.zig"
+  ],
+  "agent": "Claude Code",
+  "transcript_identifier_at_start": "9e142d5c-a5a5-48f2-8efb-ce2fb4147364",
+  "token_usage": {
+    "input_tokens": 441,
+    "cache_creation_tokens": 684844,
+    "cache_read_tokens": 42539189,
+    "output_tokens": 170614,
+    "api_call_count": 406
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-17T13:21:59.205944974Z",
+    "agent_lines": 0,
+    "human_added": 21181752,
+    "human_modified": 343,
+    "human_removed": 0,
+    "total_committed": 21181752,
+    "agent_percentage": 0
+  },
+  "transcript_path": ".claude/projects/-home-nick-repos-serval/9ecfccbf-9db6-4ae0-ab05-2ac28be681ea.jsonl"
+}
