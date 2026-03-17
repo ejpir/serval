@@ -46,10 +46,19 @@ const RelayFailure = error{
     UpstreamError,
 };
 
+const RelayPhase = enum {
+    startup,
+    steady_state,
+    closing,
+};
+
 const RelayShared = struct {
     mutex: Io.Mutex = .init,
     stats: TunnelStats = .{},
     start_ns: u64,
+    phase: RelayPhase = .startup,
+    client_startup_done: bool = false,
+    upstream_startup_done: bool = false,
     first_close: ?Termination = null,
     final_termination: ?Termination = null,
 
@@ -91,6 +100,32 @@ const RelayShared = struct {
         defer self.mutex.unlock(io);
 
         if (self.final_termination == null) self.final_termination = termination;
+        self.phase = .closing;
+    }
+
+    fn noteStartupComplete(self: *RelayShared, side: Side, io: Io) void {
+        assert(@intFromPtr(self) != 0);
+
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+
+        switch (side) {
+            .client => self.client_startup_done = true,
+            .upstream => self.upstream_startup_done = true,
+        }
+
+        if (self.client_startup_done and self.upstream_startup_done and self.phase == .startup) {
+            self.phase = .steady_state;
+        }
+    }
+
+    fn loadPhase(self: *RelayShared, io: Io) RelayPhase {
+        assert(@intFromPtr(self) != 0);
+
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+
+        return self.phase;
     }
 
     fn snapshot(self: *RelayShared, io: Io) TunnelStats {
@@ -149,9 +184,11 @@ fn relayImpl(
     var group: Io.Group = .init;
     defer group.cancel(io);
 
+    // Run both directions with the same relay state machine. One side is
+    // attached as a concurrent fiber; the other runs on the current fiber.
+    // Startup gating keeps the model symmetric (both sides complete startup
+    // before either enters steady-state forwarding).
     // Background fiber: upstream → client.
-    // Keep this side concurrent so response forwarding can proceed while
-    // foreground pushes request bytes upstream.
     group.concurrent(io, relayDirection, .{
         &shared,
         io,
@@ -205,6 +242,11 @@ fn relayDirection(
         shared.noteProgress(read_side, @intCast(initial_bytes.len), io);
     }
 
+    // Startup phase: each direction declares its pre-buffer flush complete.
+    // Steady-state starts only after both sides complete startup.
+    shared.noteStartupComplete(read_side, io);
+    try waitForSteadyState(shared, io);
+
     var relay_buf: [config.COPY_CHUNK_SIZE_BYTES]u8 = undefined;
     while (true) {
         try std.Io.checkCancel(io);
@@ -226,6 +268,21 @@ fn relayDirection(
             return;
         };
         shared.noteProgress(read_side, bytes_read, io);
+    }
+}
+
+fn waitForSteadyState(shared: *RelayShared, io: Io) Io.Cancelable!void {
+    assert(@intFromPtr(shared) != 0);
+
+    const startup_poll_sleep_ms: u64 = 1;
+    while (true) {
+        try std.Io.checkCancel(io);
+
+        const phase = shared.loadPhase(io);
+        switch (phase) {
+            .startup => try std.Io.sleep(io, Io.Duration.fromMilliseconds(startup_poll_sleep_ms), .awake),
+            .steady_state, .closing => return,
+        }
     }
 }
 

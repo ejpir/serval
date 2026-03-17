@@ -164,18 +164,22 @@ Root cause:
 
 Fix:
 
-- make client->upstream relay the foreground path so initial request bytes are
-  always pushed first
-- run upstream->client relay as the concurrent background path
+- move tunnel relay to an explicit fiber state machine with phases:
+  `startup` -> `steady_state` -> `closing`
+- both directions now follow the same startup contract:
+  flush initial bytes, mark startup complete, then wait for both sides before
+  entering steady-state forwarding
+- keep one direction attached via `std.Io.Group.concurrent()` and the other on
+  the current fiber, but with symmetric startup gating (no directional startup
+  race)
 - keep plain-socket relay I/O fiber-safe (`io.vtable.netRead/netWrite`) and TLS
-  relay I/O on the socket/TLS blocking path
+  relay I/O on the socket/TLS path
 
-Tradeoff:
+Outcome:
 
-- this is a tactical reliability fix; startup ordering is intentionally
-  directional to prevent deadlock in raw tunnel bootstrap
-- longer-term cleanup target is a symmetric relay state machine with explicit
-  startup phase + steady-state phase
+- integration `34/98` no longer stalls after upstream TLS handshake
+- startup behavior is explicit and testable, and steady-state relay remains
+  bidirectional until close/error/cancel
 
 ### HTTP/2 / gRPC forwarding
 
