@@ -32,6 +32,18 @@ const DEFAULT_ZITADEL_HTTP_SPEC: []const u8 = "h2c://zitadel:8080";
 
 const NETBIRD_HEALTH_BODY: []const u8 = "ok\n";
 
+const DEFAULT_ACME_DIRECTORY_URL: []const u8 = "https://acme-v02.api.letsencrypt.org/directory";
+const DEFAULT_ACME_STATE_DIR: []const u8 = "/var/lib/netbird-proxy/acme";
+const DEFAULT_ACME_CHALLENGE_BIND_HOST: []const u8 = "0.0.0.0";
+const DEFAULT_ACME_CHALLENGE_PORT: u16 = 80;
+
+const ACME_CERT_PATH_BUF_SIZE_BYTES: usize = 1024;
+const ACME_KEY_PATH_BUF_SIZE_BYTES: usize = 1024;
+const ACME_BOOTSTRAP_CONF_PATH_BUF_SIZE_BYTES: usize = 1024;
+const ACME_BOOTSTRAP_CERT_PEM_BUF_SIZE_BYTES: usize = 8192;
+const ACME_BOOTSTRAP_KEY_PEM_BUF_SIZE_BYTES: usize = 4096;
+const ACME_SCHEDULER_CHECK_INTERVAL_MS: u32 = 60_000;
+
 const NetbirdExtra = struct {
     cert: ?[]const u8 = null,
     key: ?[]const u8 = null,
@@ -43,6 +55,14 @@ const NetbirdExtra = struct {
     @"dashboard-http": ?[]const u8 = null,
     @"zitadel-http": ?[]const u8 = null,
     @"insecure-skip-verify": bool = false,
+
+    @"acme-enabled": bool = false,
+    @"acme-directory": ?[]const u8 = null,
+    @"acme-email": ?[]const u8 = null,
+    @"acme-state-dir": ?[]const u8 = null,
+    @"acme-domain": ?[]const u8 = null,
+    @"acme-challenge-host": ?[]const u8 = null,
+    @"acme-challenge-port": ?[]const u8 = null,
 };
 
 const NetbirdProxyConfig = struct {
@@ -61,6 +81,15 @@ const NetbirdProxyConfig = struct {
     relay_http_spec: []const u8 = DEFAULT_RELAY_HTTP_SPEC,
     dashboard_http_spec: []const u8 = DEFAULT_DASHBOARD_HTTP_SPEC,
     zitadel_http_spec: []const u8 = DEFAULT_ZITADEL_HTTP_SPEC,
+
+    acme_enabled: bool = false,
+    acme_directory_url: []const u8 = DEFAULT_ACME_DIRECTORY_URL,
+    acme_contact_email: []const u8 = "",
+    acme_state_dir_path: []const u8 = DEFAULT_ACME_STATE_DIR,
+    acme_domain: []const u8 = "",
+    acme_challenge_bind_host: []const u8 = DEFAULT_ACME_CHALLENGE_BIND_HOST,
+    acme_challenge_bind_port: u16 = DEFAULT_ACME_CHALLENGE_PORT,
+    acme_renew_before_ns: u64 = serval.config.ACME_DEFAULT_RENEW_BEFORE_NS,
 };
 
 const ParsedUpstreamSpec = struct {
@@ -187,7 +216,7 @@ const NetbirdProxyHandler = struct {
 
         const role = resolveRouteRole(request.path);
         const upstream = self.upstreams.get(role);
-        
+
         const protocol = switch (upstream.http_protocol) {
             .h1 => if (upstream.tls) "https" else "http",
             .h2c => "h2c",
@@ -439,6 +468,34 @@ fn parseConfigLine(
         cfg.zitadel_http_spec = value;
         return;
     }
+    if (std.mem.eql(u8, key, "acme_enabled")) {
+        cfg.acme_enabled = try parseBoolean(value);
+        return;
+    }
+    if (std.mem.eql(u8, key, "acme_directory_url")) {
+        cfg.acme_directory_url = value;
+        return;
+    }
+    if (std.mem.eql(u8, key, "acme_contact_email")) {
+        cfg.acme_contact_email = value;
+        return;
+    }
+    if (std.mem.eql(u8, key, "acme_state_dir_path")) {
+        cfg.acme_state_dir_path = value;
+        return;
+    }
+    if (std.mem.eql(u8, key, "acme_domain")) {
+        cfg.acme_domain = value;
+        return;
+    }
+    if (std.mem.eql(u8, key, "acme_challenge_bind_host")) {
+        cfg.acme_challenge_bind_host = try parseListenHost(value);
+        return;
+    }
+    if (std.mem.eql(u8, key, "acme_challenge_bind_port")) {
+        cfg.acme_challenge_bind_port = try parsePort(value);
+        return;
+    }
 
     return error.UnknownConfigKey;
 }
@@ -492,6 +549,151 @@ fn printRouteMatrix() void {
     std.debug.print("  /*                                -> dashboard_http\n", .{});
 }
 
+const AcmeChallengeThreadCtx = struct {
+    runtime_config: *const serval.AcmeRuntimeConfig,
+    challenge_store: *serval.AcmeHttp01Store,
+    bind_host: []const u8,
+    shutdown: *std.atomic.Value(bool),
+};
+
+fn acmeChallengeServerThread(ctx: *AcmeChallengeThreadCtx) void {
+    assert(@intFromPtr(ctx) != 0);
+    assert(@intFromPtr(ctx.runtime_config) != 0);
+    assert(@intFromPtr(ctx.challenge_store) != 0);
+    assert(@intFromPtr(ctx.shutdown) != 0);
+
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+
+    var listener = serval.server.AcmeChallengeListener.init(
+        ctx.runtime_config,
+        ctx.challenge_store,
+        ctx.bind_host,
+    ) catch |err| {
+        std.debug.print("error: failed to init ACME challenge listener: {s}\n", .{@errorName(err)});
+        return;
+    };
+
+    listener.run(threaded.io(), ctx.shutdown, null) catch |err| {
+        if (ctx.shutdown.load(.acquire)) return;
+        std.debug.print("error: ACME challenge listener failed: {s}\n", .{@errorName(err)});
+    };
+}
+
+fn AcmeIssueThreadCtx(comptime ServerType: type) type {
+    return struct {
+        server: *ServerType,
+        cfg: *const NetbirdProxyConfig,
+        hook_provider: *serval.acme.AcmeTlsAlpnHookProvider,
+        shutdown: *std.atomic.Value(bool),
+    };
+}
+
+fn ensureBootstrapTlsCredentials(
+    cfg: *NetbirdProxyConfig,
+    cert_path_buf: *[ACME_CERT_PATH_BUF_SIZE_BYTES]u8,
+    key_path_buf: *[ACME_KEY_PATH_BUF_SIZE_BYTES]u8,
+    conf_path_buf: *[ACME_BOOTSTRAP_CONF_PATH_BUF_SIZE_BYTES]u8,
+) !void {
+    _ = conf_path_buf;
+    assert(@intFromPtr(cfg) != 0);
+
+    if (cfg.cert_path != null and cfg.key_path != null) return;
+    if (!cfg.acme_enabled) return error.MissingTlsCredentials;
+    if (cfg.acme_domain.len == 0) return error.InvalidAcmeDomain;
+
+    const cert_path = std.fmt.bufPrint(cert_path_buf, "{s}/bootstrap/fullchain.pem", .{cfg.acme_state_dir_path}) catch return error.BootstrapPathTooLong;
+    const key_path = std.fmt.bufPrint(key_path_buf, "{s}/bootstrap/privkey.pem", .{cfg.acme_state_dir_path}) catch return error.BootstrapPathTooLong;
+
+    const bootstrap_parent = std.fs.path.dirname(cert_path) orelse return error.BootstrapPathTooLong;
+    std.Io.Dir.cwd().createDirPath(std.Options.debug_io, bootstrap_parent) catch return error.BootstrapPathTooLong;
+
+    var io_threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer io_threaded.deinit();
+
+    var cert_pem_buf: [ACME_BOOTSTRAP_CERT_PEM_BUF_SIZE_BYTES]u8 = undefined;
+    var key_pem_buf: [ACME_BOOTSTRAP_KEY_PEM_BUF_SIZE_BYTES]u8 = undefined;
+    const materials = serval.acme.bootstrap_cert.generateMaterials(
+        io_threaded.io(),
+        cfg.acme_domain,
+        &cert_pem_buf,
+        &key_pem_buf,
+    ) catch |err| {
+        std.debug.print("error: bootstrap cert generation failed: {s}\n", .{@errorName(err)});
+        return error.BootstrapPathTooLong;
+    };
+
+    std.Io.Dir.cwd().writeFile(std.Options.debug_io, .{ .sub_path = cert_path, .data = materials.cert_pem }) catch {
+        return error.BootstrapPathTooLong;
+    };
+    std.Io.Dir.cwd().writeFile(std.Options.debug_io, .{ .sub_path = key_path, .data = materials.key_pem }) catch {
+        return error.BootstrapPathTooLong;
+    };
+
+    cfg.cert_path = cert_path;
+    cfg.key_path = key_path;
+}
+
+fn acmeIssueThread(comptime ServerType: type, thread_ctx: *AcmeIssueThreadCtx(ServerType)) void {
+    assert(@intFromPtr(thread_ctx) != 0);
+    assert(@intFromPtr(thread_ctx.server) != 0);
+    assert(@intFromPtr(thread_ctx.cfg) != 0);
+    assert(@intFromPtr(thread_ctx.hook_provider) != 0);
+    assert(@intFromPtr(thread_ctx.shutdown) != 0);
+
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1500), .awake) catch return;
+
+    const acme_cfg = serval.config.AcmeConfig{
+        .enabled = true,
+        .directory_url = thread_ctx.cfg.acme_directory_url,
+        .contact_email = thread_ctx.cfg.acme_contact_email,
+        .state_dir_path = thread_ctx.cfg.acme_state_dir_path,
+        .challenge_bind_port = thread_ctx.cfg.acme_challenge_bind_port,
+        .renew_before_ns = thread_ctx.cfg.acme_renew_before_ns,
+        .domains = &.{thread_ctx.cfg.acme_domain},
+    };
+    const ActivationCtx = struct {
+        server: *ServerType,
+    };
+    var activation_ctx = ActivationCtx{ .server = thread_ctx.server };
+
+    const ActivationCallbacks = struct {
+        fn activate(ctx_raw: *anyopaque, cert_path: []const u8, key_path: []const u8) serval.acme.AcmeActivationResult {
+            const ctx: *ActivationCtx = @ptrCast(@alignCast(ctx_raw));
+            _ = ctx.server.reloadServerTlsFromPemFiles(cert_path, key_path) catch |err| {
+                std.debug.print("error: ACME cert issued but TLS reload failed: {s}\n", .{@errorName(err)});
+                return .transient_failure;
+            };
+            return .success;
+        }
+    };
+
+    var acme_cfg_managed = acme_cfg;
+    acme_cfg_managed.poll_interval_ms = ACME_SCHEDULER_CHECK_INTERVAL_MS;
+
+    var managed_renewer = serval.acme.AcmeManagedRenewer.initFromAcmeConfig(.{
+        .allocator = std.heap.page_allocator,
+        .acme_config = acme_cfg_managed,
+        .hook_provider = thread_ctx.hook_provider,
+        .activate_ctx = @ptrCast(&activation_ctx),
+        .activate_fn = ActivationCallbacks.activate,
+        .verify_tls = true,
+    }, io) catch |err| {
+        std.debug.print("error: ACME managed renewer init failed: {s}\n", .{@errorName(err)});
+        return;
+    };
+    defer managed_renewer.deinit();
+
+    managed_renewer.run(io, thread_ctx.shutdown) catch |err| {
+        if (thread_ctx.shutdown.load(.acquire)) return;
+        std.debug.print("error: ACME renewer exited: {s}\n", .{@errorName(err)});
+    };
+}
+
 pub fn main(process_init: std.process.Init) !void {
     var args = cli.Args(NetbirdExtra).init("netbird_proxy", VERSION, process_init.minimal.args);
     switch (args.parse()) {
@@ -538,13 +740,47 @@ pub fn main(process_init: std.process.Init) !void {
         cfg.verify_upstream = false;
     }
 
+    if (args.extra.@"acme-enabled") {
+        cfg.acme_enabled = true;
+    }
+    if (args.extra.@"acme-directory") |value| cfg.acme_directory_url = value;
+    if (args.extra.@"acme-email") |value| cfg.acme_contact_email = value;
+    if (args.extra.@"acme-state-dir") |value| cfg.acme_state_dir_path = value;
+    if (args.extra.@"acme-domain") |value| cfg.acme_domain = value;
+    if (args.extra.@"acme-challenge-host") |value| cfg.acme_challenge_bind_host = try parseListenHost(value);
+    if (args.extra.@"acme-challenge-port") |value| cfg.acme_challenge_bind_port = try parsePort(value);
+
     if (args.port != 8080 or !saw_listen_port_in_file) {
         cfg.listen_port = args.port;
     }
 
+    if (cfg.acme_enabled and cfg.acme_domain.len == 0) {
+        std.debug.print("error: ACME enabled but acme_domain is empty\n", .{});
+        return error.InvalidAcmeDomain;
+    }
+    if (cfg.acme_enabled and cfg.acme_contact_email.len == 0) {
+        std.debug.print("error: ACME enabled but acme_contact_email is empty\n", .{});
+        return error.InvalidAcmeContact;
+    }
+
+    var bootstrap_cert_path_buf: [ACME_CERT_PATH_BUF_SIZE_BYTES]u8 = undefined;
+    var bootstrap_key_path_buf: [ACME_KEY_PATH_BUF_SIZE_BYTES]u8 = undefined;
+    var bootstrap_conf_path_buf: [ACME_BOOTSTRAP_CONF_PATH_BUF_SIZE_BYTES]u8 = undefined;
+
     if (cfg.cert_path == null or cfg.key_path == null) {
-        std.debug.print("error: TLS frontend requires both --cert and --key (or cert_path/key_path in --config file)\n", .{});
-        return error.MissingTlsCredentials;
+        ensureBootstrapTlsCredentials(
+            &cfg,
+            &bootstrap_cert_path_buf,
+            &bootstrap_key_path_buf,
+            &bootstrap_conf_path_buf,
+        ) catch |err| {
+            std.debug.print(
+                "error: TLS frontend requires cert/key bootstrap and ACME bootstrap generation failed: {s}\n",
+                .{@errorName(err)},
+            );
+            return error.MissingTlsCredentials;
+        };
+        std.debug.print("generated bootstrap TLS cert/key for ACME startup\n", .{});
     }
 
     const signal_grpc_idx: UpstreamIndex = 0;
@@ -594,6 +830,19 @@ pub fn main(process_init: std.process.Init) !void {
     var io_threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
     defer io_threaded.deinit();
 
+    var maybe_tls_alpn_hook_provider: ?serval.acme.AcmeTlsAlpnHookProvider = null;
+    if (cfg.acme_enabled) {
+        maybe_tls_alpn_hook_provider = serval.acme.AcmeTlsAlpnHookProvider.init();
+        try maybe_tls_alpn_hook_provider.?.install();
+    }
+    defer {
+        if (maybe_tls_alpn_hook_provider) |*provider| {
+            provider.uninstall() catch |err| {
+                std.debug.print("warn: failed to uninstall ACME TLS-ALPN hook provider: {s}\n", .{@errorName(err)});
+            };
+        }
+    }
+
     var shutdown = std.atomic.Value(bool).init(false);
 
     const tls_config = serval.config.TlsConfig{
@@ -608,6 +857,13 @@ pub fn main(process_init: std.process.Init) !void {
     std.debug.print("Upstream verify: {}\n", .{cfg.verify_upstream});
     std.debug.print("TLS h2 frontend mode: {s}\n", .{@tagName(cfg.tls_h2_frontend_mode)});
     std.debug.print("ALPN mixed-offer policy: {s}\n", .{@tagName(cfg.alpn_mixed_offer_policy)});
+    std.debug.print("ACME enabled: {}\n", .{cfg.acme_enabled});
+    if (cfg.acme_enabled) {
+        std.debug.print("ACME directory: {s}\n", .{cfg.acme_directory_url});
+        std.debug.print("ACME domain: {s}\n", .{cfg.acme_domain});
+        std.debug.print("ACME challenge bind: {s}:{d}\n", .{ cfg.acme_challenge_bind_host, cfg.acme_challenge_bind_port });
+        std.debug.print("TLS-ALPN hook provider installed (awaiting challenge cert activation)\n", .{});
+    }
     std.debug.print("Upstreams:\n", .{});
     printUpstream("signal_grpc", upstreams.signal_grpc);
     printUpstream("management_grpc", upstreams.management_grpc);
@@ -640,7 +896,33 @@ pub fn main(process_init: std.process.Init) !void {
         serval.net.DnsConfig{},
     );
 
-    try server.run(io_threaded.io(), &shutdown, null);
+    var maybe_acme_issue_ctx: ?AcmeIssueThreadCtx(ServerType) = null;
+    var maybe_acme_issue_thread: ?std.Thread = null;
+    if (cfg.acme_enabled) {
+        if (maybe_tls_alpn_hook_provider) |*provider| {
+            maybe_acme_issue_ctx = .{
+                .server = &server,
+                .cfg = &cfg,
+                .hook_provider = provider,
+                .shutdown = &shutdown,
+            };
+
+            const AcmeIssueThreadRunner = struct {
+                fn run(ctx: *AcmeIssueThreadCtx(ServerType)) void {
+                    acmeIssueThread(ServerType, ctx);
+                }
+            };
+
+            maybe_acme_issue_thread = try std.Thread.spawn(.{}, AcmeIssueThreadRunner.run, .{&maybe_acme_issue_ctx.?});
+        }
+    }
+    defer if (maybe_acme_issue_thread) |thread| thread.join();
+
+    server.run(io_threaded.io(), &shutdown, null) catch |err| {
+        shutdown.store(true, .release);
+        return err;
+    };
+    shutdown.store(true, .release);
 }
 
 test "parseTlsH2FrontendMode supports all valid values" {
@@ -681,6 +963,76 @@ test "parseConfigLine parses listen_host" {
     try parseConfigLine(&cfg, "listen_host=::", &saw_listen_port);
     try std.testing.expectEqualStrings("::", cfg.listen_host);
     try std.testing.expect(!saw_listen_port);
+}
+
+test "parseConfigLine parses acme keys" {
+    var cfg = NetbirdProxyConfig{};
+    var saw_listen_port = false;
+
+    try parseConfigLine(&cfg, "acme_enabled=true", &saw_listen_port);
+    try parseConfigLine(&cfg, "acme_directory_url=https://acme-v02.api.letsencrypt.org/directory", &saw_listen_port);
+    try parseConfigLine(&cfg, "acme_contact_email=ops@coreworks.be", &saw_listen_port);
+    try parseConfigLine(&cfg, "acme_state_dir_path=/var/lib/netbird-proxy/acme", &saw_listen_port);
+    try parseConfigLine(&cfg, "acme_domain=netbird.coreworks.be", &saw_listen_port);
+    try parseConfigLine(&cfg, "acme_challenge_bind_host=0.0.0.0", &saw_listen_port);
+    try parseConfigLine(&cfg, "acme_challenge_bind_port=80", &saw_listen_port);
+
+    try std.testing.expect(cfg.acme_enabled);
+    try std.testing.expectEqualStrings("https://acme-v02.api.letsencrypt.org/directory", cfg.acme_directory_url);
+    try std.testing.expectEqualStrings("ops@coreworks.be", cfg.acme_contact_email);
+    try std.testing.expectEqualStrings("/var/lib/netbird-proxy/acme", cfg.acme_state_dir_path);
+    try std.testing.expectEqualStrings("netbird.coreworks.be", cfg.acme_domain);
+    try std.testing.expectEqualStrings("0.0.0.0", cfg.acme_challenge_bind_host);
+    try std.testing.expectEqual(@as(u16, 80), cfg.acme_challenge_bind_port);
+}
+
+test "ensureBootstrapTlsCredentials generates cert and key when acme enabled" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var state_buf: [1200]u8 = undefined;
+    const state_path = std.fmt.bufPrint(&state_buf, "{s}/state", .{tmp.sub_path[0..]}) catch unreachable;
+
+    var cfg = NetbirdProxyConfig{
+        .acme_enabled = true,
+        .acme_domain = "netbird.coreworks.be",
+        .acme_state_dir_path = state_path,
+    };
+
+    var cert_path_buf: [ACME_CERT_PATH_BUF_SIZE_BYTES]u8 = undefined;
+    var key_path_buf: [ACME_KEY_PATH_BUF_SIZE_BYTES]u8 = undefined;
+    var conf_path_buf: [ACME_BOOTSTRAP_CONF_PATH_BUF_SIZE_BYTES]u8 = undefined;
+
+    try ensureBootstrapTlsCredentials(&cfg, &cert_path_buf, &key_path_buf, &conf_path_buf);
+
+    try std.testing.expect(cfg.cert_path != null);
+    try std.testing.expect(cfg.key_path != null);
+
+    var cert_read_buf: [4096]u8 = undefined;
+    const cert_read = try std.Io.Dir.cwd().readFile(std.Options.debug_io, cfg.cert_path.?, &cert_read_buf);
+    try std.testing.expect(std.mem.startsWith(u8, cert_read, "-----BEGIN CERTIFICATE-----\n"));
+
+    var key_read_buf: [4096]u8 = undefined;
+    const key_read = try std.Io.Dir.cwd().readFile(std.Options.debug_io, cfg.key_path.?, &key_read_buf);
+    try std.testing.expect(std.mem.startsWith(u8, key_read, "-----BEGIN EC PRIVATE KEY-----\n"));
+}
+
+test "ensureBootstrapTlsCredentials keeps explicit cert and key untouched" {
+    var cfg = NetbirdProxyConfig{
+        .acme_enabled = true,
+        .acme_domain = "netbird.coreworks.be",
+        .acme_state_dir_path = "/tmp/unused",
+        .cert_path = "/tmp/explicit-cert.pem",
+        .key_path = "/tmp/explicit-key.pem",
+    };
+
+    var cert_path_buf: [ACME_CERT_PATH_BUF_SIZE_BYTES]u8 = undefined;
+    var key_path_buf: [ACME_KEY_PATH_BUF_SIZE_BYTES]u8 = undefined;
+    var conf_path_buf: [ACME_BOOTSTRAP_CONF_PATH_BUF_SIZE_BYTES]u8 = undefined;
+
+    try ensureBootstrapTlsCredentials(&cfg, &cert_path_buf, &key_path_buf, &conf_path_buf);
+    try std.testing.expectEqualStrings("/tmp/explicit-cert.pem", cfg.cert_path.?);
+    try std.testing.expectEqualStrings("/tmp/explicit-key.pem", cfg.key_path.?);
 }
 
 test "resolveRouteRole keeps caddy-compatible zitadel paths on zitadel_http" {

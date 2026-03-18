@@ -124,7 +124,9 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "serval-core", .module = serval_core_module },
             .{ .name = "serval-http", .module = serval_http_module },
+            .{ .name = "serval-net", .module = serval_net_module },
             .{ .name = "serval-socket", .module = serval_socket_module },
+            .{ .name = "serval-tls", .module = serval_tls_module },
         },
     });
 
@@ -220,6 +222,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "serval-metrics", .module = serval_metrics_module },
             .{ .name = "serval-tracing", .module = serval_tracing_module },
             .{ .name = "serval-tls", .module = serval_tls_module },
+            .{ .name = "serval-acme", .module = serval_acme_module },
         },
     });
 
@@ -547,8 +550,10 @@ pub fn build(b: *std.Build) void {
     acme_tests_mod.linkSystemLibrary("crypto", .{});
     acme_tests_mod.addImport("serval-core", serval_core_module);
     acme_tests_mod.addImport("serval-http", serval_http_module);
+    acme_tests_mod.addImport("serval-net", serval_net_module);
     acme_tests_mod.addImport("serval-socket", serval_socket_module);
     acme_tests_mod.addImport("serval-client", serval_client_module);
+    acme_tests_mod.addImport("serval-tls", serval_tls_module);
     const acme_tests = b.addTest(.{
         .name = "acme_tests",
         .root_module = acme_tests_mod,
@@ -626,6 +631,7 @@ pub fn build(b: *std.Build) void {
     server_tests_mod.addImport("serval-metrics", serval_metrics_module);
     server_tests_mod.addImport("serval-tracing", serval_tracing_module);
     server_tests_mod.addImport("serval-tls", serval_tls_module);
+    server_tests_mod.addImport("serval-acme", serval_acme_module);
     const server_tests = b.addTest(.{
         .name = "server_tests",
         .root_module = server_tests_mod,
@@ -704,6 +710,13 @@ pub fn build(b: *std.Build) void {
 
     const integration_test_step = b.step("test-integration", "Run integration tests");
     integration_test_step.dependOn(&run_integration_tests.step);
+
+    const acme_pebble_smoke = b.addSystemCommand(&.{
+        "bash",
+        "integration/acme_pebble_smoke.sh",
+    });
+    const test_acme_pebble_step = b.step("test-acme-pebble", "Run Docker Pebble ACME smoke test");
+    test_acme_pebble_step.dependOn(&acme_pebble_smoke.step);
 
     const integration_test_64 = b.addTest(.{
         .name = "integration_test_64",
@@ -825,6 +838,29 @@ pub fn build(b: *std.Build) void {
     );
     integration_test_77_step.dependOn(&run_integration_test_77.step);
 
+    const acme_issue_once_mod = b.createModule(.{
+        .root_source_file = b.path("integration/acme_issue_once.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    acme_issue_once_mod.linkSystemLibrary("ssl", .{});
+    acme_issue_once_mod.linkSystemLibrary("crypto", .{});
+    acme_issue_once_mod.addImport("serval-core", serval_core_module);
+    acme_issue_once_mod.addImport("serval-net", serval_net_module);
+    acme_issue_once_mod.addImport("serval-client", serval_client_module);
+    acme_issue_once_mod.addImport("serval-tls", serval_tls_module);
+    acme_issue_once_mod.addImport("serval-acme", serval_acme_module);
+
+    const acme_issue_once = b.addExecutable(.{
+        .name = "acme_issue_once",
+        .root_module = acme_issue_once_mod,
+    });
+    force_llvm_lld(acme_issue_once);
+    const run_acme_issue_once = b.addRunArtifact(acme_issue_once);
+    const run_acme_issue_once_step = b.step("run-acme-issue-once", "Run one ACME issuance cycle against configured ACME directory");
+    run_acme_issue_once_step.dependOn(&run_acme_issue_once.step);
+
     const gdb_integration_test_32 = b.addSystemCommand(&.{
         "sudo",
         "gdb",
@@ -938,6 +974,7 @@ pub fn build(b: *std.Build) void {
     netbird_proxy_mod.addImport("serval", serval_module);
     netbird_proxy_mod.addImport("serval-cli", serval_cli_module);
     netbird_proxy_mod.addImport("serval-tls", serval_tls_module);
+    netbird_proxy_mod.addImport("serval-client", serval_client_module);
     const netbird_proxy = b.addExecutable(.{
         .name = "netbird_proxy",
         .root_module = netbird_proxy_mod,
@@ -953,6 +990,30 @@ pub fn build(b: *std.Build) void {
 
     const build_netbird_proxy_step = b.step("build-netbird-proxy", "Build NetBird reverse-proxy example");
     build_netbird_proxy_step.dependOn(&build_netbird_proxy.step);
+
+    const netbird_proxy_tests_mod = b.createModule(.{
+        .root_source_file = b.path("examples/netbird_proxy.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    netbird_proxy_tests_mod.linkSystemLibrary("ssl", .{});
+    netbird_proxy_tests_mod.linkSystemLibrary("crypto", .{});
+    apply_optional_openssl_paths(netbird_proxy_tests_mod, openssl_include_dir, openssl_lib_dir);
+    netbird_proxy_tests_mod.addImport("serval", serval_module);
+    netbird_proxy_tests_mod.addImport("serval-cli", serval_cli_module);
+    netbird_proxy_tests_mod.addImport("serval-tls", serval_tls_module);
+    netbird_proxy_tests_mod.addImport("serval-client", serval_client_module);
+    const netbird_proxy_tests = b.addTest(.{
+        .name = "netbird_proxy_tests",
+        .root_module = netbird_proxy_tests_mod,
+    });
+    force_llvm_lld(netbird_proxy_tests);
+    const run_netbird_proxy_tests = b.addRunArtifact(netbird_proxy_tests);
+
+    const netbird_proxy_test_step = b.step("test-netbird-proxy", "Run NetBird reverse-proxy example tests");
+    netbird_proxy_test_step.dependOn(&run_netbird_proxy_tests.step);
+    test_step.dependOn(&run_netbird_proxy_tests.step);
 
     const run_netbird_proxy_step = b.step("run-netbird-proxy", "Run NetBird reverse-proxy example");
     run_netbird_proxy_step.dependOn(&run_netbird_proxy.step);
