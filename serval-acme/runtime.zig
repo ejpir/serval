@@ -1,7 +1,7 @@
 //! ACME automated issuance runtime.
 //!
 //! Drives account/order/authz/finalize/download flow with bounded polling,
-//! HTTP-01 store publish/cleanup, atomic persistence, and optional TLS reload.
+//! TLS-ALPN-01 challenge activation, atomic persistence, and optional TLS reload.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -9,7 +9,6 @@ const Io = std.Io;
 
 const core = @import("serval-core");
 const config = core.config;
-const time = core.time;
 const HeaderMap = core.HeaderMap;
 const Method = core.Method;
 
@@ -21,7 +20,6 @@ const acme_types = @import("types.zig");
 const signer_mod = @import("signer.zig");
 const csr_mod = @import("csr.zig");
 const storage = @import("storage.zig");
-const store_mod = @import("http01_store.zig");
 const tls_alpn_hook_mod = @import("tls_alpn_hook.zig");
 const tls_alpn_cert_mod = @import("tls_alpn_cert.zig");
 
@@ -34,14 +32,14 @@ const ssl = serval_tls.ssl;
 
 pub const Error = error{
     InvalidRuntimeConfig,
-    MissingHttp01Challenge,
+    MissingTlsAlpnHookProvider,
     MissingTlsAlpn01Challenge,
     AuthorizationInvalid,
     AuthorizationPollExceeded,
     OrderPollExceeded,
     MissingCertificateUrl,
     CertResponseEmpty,
-} || client.Error || wire.Error || transport.Error || transport.ExecuteOperationError || signer_mod.Error || csr_mod.Error || storage.Error || store_mod.Error || tls_alpn_hook_mod.Error || tls_alpn_cert_mod.Error || serval_tls.ReloadableServerCtxError || serval_tls.ssl.CreateServerCtxFromPemFilesError || Io.Cancelable;
+} || client.Error || wire.Error || transport.Error || transport.ExecuteOperationError || signer_mod.Error || csr_mod.Error || storage.Error || tls_alpn_hook_mod.Error || tls_alpn_cert_mod.Error || serval_tls.ReloadableServerCtxError || serval_tls.ssl.CreateServerCtxFromPemFilesError || Io.Cancelable;
 
 pub const WorkBuffers = struct {
     header_buf: []u8,
@@ -58,7 +56,6 @@ pub fn runIssuanceOnce(
     runtime_config: *const acme_types.RuntimeConfig,
     acme_client: *Client,
     signer: *const signer_mod.AccountSigner,
-    challenge_store: *store_mod.Http01Store,
     io: Io,
     work: WorkBuffers,
     tls_manager: ?*ReloadableServerCtx,
@@ -67,10 +64,10 @@ pub fn runIssuanceOnce(
     assert(@intFromPtr(runtime_config) != 0);
     assert(@intFromPtr(acme_client) != 0);
     assert(@intFromPtr(signer) != 0);
-    assert(@intFromPtr(challenge_store) != 0);
 
     if (!runtime_config.enabled) return error.InvalidRuntimeConfig;
     if (runtime_config.domain_count == 0) return error.InvalidRuntimeConfig;
+    if (tls_alpn_hook_provider == null) return error.MissingTlsAlpnHookProvider;
 
     const directory = try fetchDirectory(runtime_config, acme_client, io, work.header_buf, work.body_buf);
     var flow_ctx = orchestration.FlowContext.init(&directory);
@@ -124,7 +121,8 @@ pub fn runIssuanceOnce(
         else => return error.InvalidOrderStatus,
     };
 
-    // 4) authorize each authz URL using HTTP-01 publish/poll
+    // 4) authorize each authz URL using TLS-ALPN-01
+    const hook_provider = tls_alpn_hook_provider orelse return error.MissingTlsAlpnHookProvider;
     var auth_idx: u8 = 0;
     while (auth_idx < initial_order.authorization_count) : (auth_idx += 1) {
         const auth_url = initial_order.authorization_urls[auth_idx];
@@ -133,11 +131,10 @@ pub fn runIssuanceOnce(
             runtime_config,
             acme_client,
             signer,
-            challenge_store,
             io,
             work,
             &auth_url,
-            tls_alpn_hook_provider,
+            hook_provider,
         );
     }
 
@@ -246,69 +243,29 @@ fn authorizeChallenge(
     runtime_config: *const acme_types.RuntimeConfig,
     acme_client: *Client,
     signer: *const signer_mod.AccountSigner,
-    challenge_store: *store_mod.Http01Store,
     io: Io,
     work: WorkBuffers,
     auth_url: *const client.Url,
-    tls_alpn_hook_provider: ?*tls_alpn_hook_mod.TlsAlpnHookProvider,
+    hook_provider: *tls_alpn_hook_mod.TlsAlpnHookProvider,
 ) Error!void {
     const auth = try fetchAuthorization(flow_ctx, acme_client, signer, io, work, auth_url);
     if (auth.status == .valid) return;
 
     const host = auth.identifier_dns.slice();
 
-    if (tls_alpn_hook_provider) |provider| {
-        const challenge = auth.firstTlsAlpn01Challenge() orelse return error.MissingTlsAlpn01Challenge;
-        return try authorizeTlsAlpn01(
-            flow_ctx,
-            runtime_config,
-            acme_client,
-            signer,
-            io,
-            work,
-            auth_url,
-            host,
-            challenge,
-            provider,
-        );
-    }
-
-    const challenge = auth.firstHttp01Challenge() orelse return error.MissingHttp01Challenge;
-    return try authorizeHttp01(
+    const challenge = auth.firstTlsAlpn01Challenge() orelse return error.MissingTlsAlpn01Challenge;
+    return try authorizeTlsAlpn01(
         flow_ctx,
         runtime_config,
         acme_client,
         signer,
-        challenge_store,
         io,
         work,
         auth_url,
         host,
         challenge,
+        hook_provider,
     );
-}
-
-fn authorizeHttp01(
-    flow_ctx: *orchestration.FlowContext,
-    runtime_config: *const acme_types.RuntimeConfig,
-    acme_client: *Client,
-    signer: *const signer_mod.AccountSigner,
-    challenge_store: *store_mod.Http01Store,
-    io: Io,
-    work: WorkBuffers,
-    auth_url: *const client.Url,
-    host: []const u8,
-    challenge: *const client.AuthorizationChallenge,
-) Error!void {
-    var key_auth_buf: [config.ACME_MAX_HTTP01_KEY_AUTHORIZATION_BYTES]u8 = undefined;
-    const key_auth = try signer.computeKeyAuthorization(challenge.token(), &key_auth_buf);
-
-    const expires_at_ns = time.monotonicNanos() +| time.secondsToNanos(300);
-    try challenge_store.upsert(host, challenge.token(), key_auth, expires_at_ns);
-    defer _ = challenge_store.remove(host, challenge.token());
-
-    try notifyChallengeReady(flow_ctx, acme_client, signer, io, work, &challenge.url);
-    try pollAuthorizationValid(flow_ctx, runtime_config, acme_client, signer, io, work, auth_url);
 }
 
 fn authorizeTlsAlpn01(

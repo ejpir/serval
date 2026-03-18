@@ -8,14 +8,6 @@ pub const CertState = types.CertState;
 pub const RuntimeConfig = types.RuntimeConfig;
 pub const TypesError = types.Error;
 
-pub const http01_store = @import("http01_store.zig");
-pub const Http01Store = http01_store.Http01Store;
-pub const Http01StoreError = http01_store.Error;
-pub const ChallengeView = http01_store.ChallengeView;
-
-pub const http01_handler = @import("http01_handler.zig");
-pub const AcmeHttp01Handler = http01_handler.Http01Handler;
-
 pub const backoff = @import("backoff.zig");
 pub const AcmeBackoff = backoff.BoundedBackoff;
 pub const AcmeBackoffError = backoff.Error;
@@ -132,8 +124,6 @@ pub const AcmeManagerError = manager.Error;
 
 test {
     _ = @import("types.zig");
-    _ = @import("http01_store.zig");
-    _ = @import("http01_handler.zig");
     _ = @import("backoff.zig");
     _ = @import("client.zig");
     _ = @import("jws.zig");

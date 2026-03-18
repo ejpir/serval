@@ -16,7 +16,6 @@ const signer_mod = @import("signer.zig");
 const runtime = @import("runtime.zig");
 const scheduler_mod = @import("scheduler.zig");
 const backoff_mod = @import("backoff.zig");
-const store_mod = @import("http01_store.zig");
 const hook_mod = @import("tls_alpn_hook.zig");
 
 const serval_client = @import("serval-client");
@@ -46,13 +45,12 @@ pub const Params = struct {
     runtime_config: *const types.RuntimeConfig,
     acme_client: *Client,
     signer: *const signer_mod.AccountSigner,
-    challenge_store: *store_mod.Http01Store,
     work: runtime.WorkBuffers,
     cert_current_path: []const u8,
     parse_buffers: ParseBuffers,
     check_interval_ms: u32,
     backoff: backoff_mod.BoundedBackoff,
-    hook_provider: ?*hook_mod.TlsAlpnHookProvider,
+    hook_provider: *hook_mod.TlsAlpnHookProvider,
     activate_ctx: *anyopaque,
     activate_fn: ActivateFn,
 };
@@ -69,7 +67,7 @@ pub const ManagedParams = struct {
     allocator: std.mem.Allocator,
     runtime_config: *const types.RuntimeConfig,
     check_interval_ms: u32,
-    hook_provider: ?*hook_mod.TlsAlpnHookProvider,
+    hook_provider: *hook_mod.TlsAlpnHookProvider,
     activate_ctx: *anyopaque,
     activate_fn: ActivateFn,
     verify_tls: bool = true,
@@ -78,7 +76,7 @@ pub const ManagedParams = struct {
 pub const ManagedFromAcmeConfigParams = struct {
     allocator: std.mem.Allocator,
     acme_config: config.AcmeConfig,
-    hook_provider: ?*hook_mod.TlsAlpnHookProvider,
+    hook_provider: *hook_mod.TlsAlpnHookProvider,
     activate_ctx: *anyopaque,
     activate_fn: ActivateFn,
     verify_tls: bool = true,
@@ -96,13 +94,12 @@ pub const Renewer = struct {
     runtime_config: *const types.RuntimeConfig,
     acme_client: *Client,
     signer: *const signer_mod.AccountSigner,
-    challenge_store: *store_mod.Http01Store,
     work: runtime.WorkBuffers,
     cert_current_path: []const u8,
     parse_buffers: ParseBuffers,
     check_interval_ms: u32,
     backoff: backoff_mod.BoundedBackoff,
-    hook_provider: ?*hook_mod.TlsAlpnHookProvider,
+    hook_provider: *hook_mod.TlsAlpnHookProvider,
     activate_ctx: *anyopaque,
     activate_fn: ActivateFn,
 
@@ -112,14 +109,12 @@ pub const Renewer = struct {
         assert(@intFromPtr(params.runtime_config) != 0);
         assert(@intFromPtr(params.acme_client) != 0);
         assert(@intFromPtr(params.signer) != 0);
-        assert(@intFromPtr(params.challenge_store) != 0);
         assert(@intFromPtr(params.activate_ctx) != 0);
 
         return .{
             .runtime_config = params.runtime_config,
             .acme_client = params.acme_client,
             .signer = params.signer,
-            .challenge_store = params.challenge_store,
             .work = params.work,
             .cert_current_path = params.cert_current_path,
             .parse_buffers = params.parse_buffers,
@@ -169,7 +164,6 @@ pub const Renewer = struct {
             self.runtime_config,
             self.acme_client,
             self.signer,
-            self.challenge_store,
             io,
             self.work,
             null,
@@ -196,7 +190,7 @@ pub const Renewer = struct {
 pub const ManagedRenewer = struct {
     runtime_config: types.RuntimeConfig,
     check_interval_ms: u32,
-    hook_provider: ?*hook_mod.TlsAlpnHookProvider,
+    hook_provider: *hook_mod.TlsAlpnHookProvider,
     activate_ctx: *anyopaque,
     activate_fn: ActivateFn,
 
@@ -204,7 +198,6 @@ pub const ManagedRenewer = struct {
     client_ctx: ?*ssl.SSL_CTX,
     acme_client: Client,
     signer: signer_mod.AccountSigner,
-    challenge_store: store_mod.Http01Store,
     backoff: backoff_mod.BoundedBackoff,
 
     cert_current_path_len: u16,
@@ -248,7 +241,6 @@ pub const ManagedRenewer = struct {
         service.client_ctx = client_ctx;
         service.acme_client = Client.init(params.allocator, &service.dns_resolver, client_ctx, params.verify_tls);
         service.signer = signer_mod.AccountSigner.generate(io);
-        service.challenge_store = store_mod.Http01Store.init();
         service.backoff = try backoff_mod.BoundedBackoff.init(
             service.runtime_config.fail_backoff_min_ms,
             service.runtime_config.fail_backoff_max_ms,
@@ -308,7 +300,6 @@ pub const ManagedRenewer = struct {
             .runtime_config = &self.runtime_config,
             .acme_client = &self.acme_client,
             .signer = &self.signer,
-            .challenge_store = &self.challenge_store,
             .work = .{
                 .header_buf = &self.header_buf,
                 .body_buf = &self.body_buf,
@@ -412,6 +403,7 @@ test "ManagedRenewer initFromAcmeConfig validates ACME config" {
     defer io_threaded.deinit();
 
     var activation_flag: u8 = 0;
+    var hook_provider = hook_mod.TlsAlpnHookProvider.init();
     const Callbacks = struct {
         fn activate(_: *anyopaque, _: []const u8, _: []const u8) ActivationResult {
             return .success;
@@ -429,7 +421,7 @@ test "ManagedRenewer initFromAcmeConfig validates ACME config" {
     try std.testing.expectError(error.InvalidDomainCount, ManagedRenewer.initFromAcmeConfig(.{
         .allocator = std.testing.allocator,
         .acme_config = bad_cfg,
-        .hook_provider = null,
+        .hook_provider = &hook_provider,
         .activate_ctx = @ptrCast(&activation_flag),
         .activate_fn = Callbacks.activate,
         .verify_tls = true,

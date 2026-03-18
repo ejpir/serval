@@ -10,11 +10,6 @@ Layer 2 (Infrastructure).
 
 - Explicit ACME certificate lifecycle state enum (`CertState`)
 - Runtime-validated fixed-capacity ACME config copy (`RuntimeConfig`)
-- Bounded HTTP-01 challenge token store (`Http01Store`)
-- ACME HTTP-01 direct-response handler (`http01_handler.zig`):
-  - strict method/path/host validation
-  - token lookup against bounded challenge store
-  - deterministic 200/404/405/500 direct responses
 - Bounded exponential backoff helper (`backoff.zig`):
   - fixed min/max range validation
   - deterministic capped jitter
@@ -52,8 +47,7 @@ Layer 2 (Infrastructure).
   - automated issuance entrypoint (`runAutomatedIssuanceOnce`) using runtime flow
 - ACME runtime issuance flow (`runtime.zig`):
   - directory fetch -> nonce -> account -> order -> authz/challenge -> finalize -> cert download
-  - HTTP-01 publish/poll/cleanup against bounded challenge store
-  - optional TLS-ALPN-01 challenge path (when `AcmeTlsAlpnHookProvider` is installed)
+  - TLS-ALPN-01 challenge activation/poll/cleanup via hook provider
   - atomic cert/key persistence and optional TLS hot-activation
 - ACME CSR helper (`csr.zig`):
   - generates P-256 key + PKCS#10 CSR DER for configured SAN list fully in-process (no openssl)
@@ -73,7 +67,7 @@ Layer 2 (Infrastructure).
   - caller supplies only activation callback (`cert_path`,`key_path`)
   - supports optional TLS-ALPN hook provider for ALPN challenge flow
 - ACME managed renewer (`renewer.zig`):
-  - owns/initializes DNS resolver, ACME client, signer, challenge store, and work buffers
+  - owns/initializes DNS resolver, ACME client, signer, and work buffers
   - init-time setup only; no hidden runtime allocations in `run`
   - explicit `deinit` frees owned TLS client context
   - convenience `initFromAcmeConfig(...)` accepts `serval-core.config.AcmeConfig` directly
@@ -82,7 +76,7 @@ Layer 2 (Infrastructure).
 
 - TLS-ALPN-01 hook integration is intentionally isolated:
   - install `AcmeTlsAlpnHookProvider` once at process startup
-  - pass `?*AcmeTlsAlpnHookProvider` to runtime/manager issuance entrypoints
+  - pass `*AcmeTlsAlpnHookProvider` to issuance entrypoints
   - runtime activates per-challenge temporary TLS context only during challenge validation
 - Bootstrap-first startup flow is supported:
   - generate short-lived bootstrap cert (`bootstrap_cert.zig`)
@@ -93,4 +87,4 @@ Layer 2 (Infrastructure).
 ## Not in this slice yet
 
 - Persistent journal/recovery
-- Dedicated challenge listener lifecycle orchestration in the manager (listener helper exists in `serval-server`)
+- Manager-internal persistence journal/recovery and replay-safe crash restart sequence

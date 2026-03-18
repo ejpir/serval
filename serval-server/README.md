@@ -49,6 +49,10 @@ not implemented yet.
 
 Protocol implementations are isolated in subdirectories (h1/, h2/) with a neutral `frontend/` dispatch layer to keep ALPN/protocol routing decisions outside protocol-specific drivers.
 
+ACME challenge handling is TLS-ALPN-01 based and is integrated via TLS hook
+providers (`serval-acme/tls_alpn_hook.zig`) instead of a dedicated HTTP
+challenge listener.
+
 ## Handler Hooks
 
 The server calls handler hooks at specific points in the request lifecycle. `selectUpstream` remains required today; all other hooks are optional, including the native WebSocket pair `selectWebSocket` + `handleWebSocket`.

@@ -9,14 +9,22 @@ const assert = std.debug.assert;
 
 const core = @import("serval-core");
 const config = core.config;
+const time = core.time;
 
 const acme_types = @import("types.zig");
+const backoff = @import("backoff.zig");
 const client = @import("client.zig");
 const orchestration = @import("orchestration.zig");
 const transport = @import("transport.zig");
+const signer_mod = @import("signer.zig");
+const runtime = @import("runtime.zig");
+const storage = @import("storage.zig");
 
 const serval_client = @import("serval-client");
 const Client = serval_client.Client;
+
+const serval_tls = @import("serval-tls");
+const ReloadableServerCtx = serval_tls.ReloadableServerCtx;
 
 pub const Error = error{
     InvalidTransitionLimit,
@@ -128,6 +136,8 @@ pub const Manager = struct {
     flow_ctx: orchestration.FlowContext,
     max_transitions_per_tick: u8 = config.ACME_MAX_TRANSITIONS_PER_TICK,
     upstream_idx: config.UpstreamIndex = 0,
+    retry_backoff: backoff.BoundedBackoff,
+    backoff_wait_until_ns: u64 = 0,
     consecutive_failures: u16 = 0,
     last_response_assessment: ?orchestration.ResponseAssessment = null,
     last_error_assessment: ?orchestration.ErrorAssessment = null,
@@ -135,10 +145,16 @@ pub const Manager = struct {
     pub fn init(directory: *const client.Directory, upstream_idx: config.UpstreamIndex) Manager {
         assert(@intFromPtr(directory) != 0);
 
+        const retry_backoff = backoff.BoundedBackoff.init(
+            config.ACME_DEFAULT_FAIL_BACKOFF_MIN_MS,
+            config.ACME_DEFAULT_FAIL_BACKOFF_MAX_MS,
+        ) catch unreachable;
+
         return .{
             .state = .idle,
             .flow_ctx = orchestration.FlowContext.init(directory),
             .upstream_idx = upstream_idx,
+            .retry_backoff = retry_backoff,
         };
     }
 
@@ -146,9 +162,41 @@ pub const Manager = struct {
         assert(@intFromPtr(self) != 0);
 
         self.state = .fetch_nonce;
+        self.backoff_wait_until_ns = 0;
         self.consecutive_failures = 0;
         self.last_error_assessment = null;
         self.last_response_assessment = null;
+    }
+
+    pub fn runAutomatedIssuanceOnce(
+        self: *Manager,
+        runtime_config: *const acme_types.RuntimeConfig,
+        signer: *const signer_mod.AccountSigner,
+        client_ptr: *Client,
+        io: Io,
+        work: runtime.WorkBuffers,
+        tls_manager: ?*ReloadableServerCtx,
+        tls_alpn_hook_provider: ?*@import("tls_alpn_hook.zig").TlsAlpnHookProvider,
+    ) (Error || runtime.Error)!storage.PersistedPaths {
+        assert(@intFromPtr(self) != 0);
+        assert(@intFromPtr(runtime_config) != 0);
+        assert(@intFromPtr(signer) != 0);
+        assert(@intFromPtr(client_ptr) != 0);
+
+        self.state = .fetch_nonce;
+        const persisted = try runtime.runIssuanceOnce(
+            runtime_config,
+            client_ptr,
+            signer,
+            io,
+            work,
+            tls_manager,
+            tls_alpn_hook_provider,
+        );
+        self.state = .idle;
+        self.consecutive_failures = 0;
+        self.last_error_assessment = null;
+        return persisted;
     }
 
     pub fn runTick(
@@ -217,6 +265,16 @@ pub const Manager = struct {
     ) Error!StepOutcome {
         assert(@intFromPtr(self) != 0);
         assert(@intFromPtr(signed_bodies) != 0);
+
+        if (self.state == .backoff_wait) {
+            const now_ns = time.monotonicNanos();
+            if (self.backoff_wait_until_ns == 0 or now_ns >= self.backoff_wait_until_ns) {
+                self.state = .fetch_nonce;
+                self.backoff_wait_until_ns = 0;
+                return .executed_state_changed;
+            }
+            return .skipped;
+        }
 
         const operation = self.operationForState() orelse return .skipped;
         const signed_body = try signed_bodies.bodyForOperation(operation);
@@ -398,9 +456,24 @@ pub const Manager = struct {
         assert(@intFromPtr(self) != 0);
 
         switch (disposition) {
-            .refresh_nonce => self.state = .fetch_nonce,
-            .backoff => self.state = .backoff_wait,
-            .fatal => self.state = .fatal,
+            .refresh_nonce => {
+                self.backoff_wait_until_ns = 0;
+                self.state = .fetch_nonce;
+            },
+            .backoff => {
+                const now_ns = time.monotonicNanos();
+                const seed = (@as(u64, self.consecutive_failures) << 32) ^ now_ns;
+                self.backoff_wait_until_ns = self.retry_backoff.nextRetryDeadlineNs(
+                    now_ns,
+                    self.consecutive_failures,
+                    seed,
+                );
+                self.state = .backoff_wait;
+            },
+            .fatal => {
+                self.backoff_wait_until_ns = 0;
+                self.state = .fatal;
+            },
         }
     }
 };
@@ -749,4 +822,34 @@ test "Manager idle state does not execute steps" {
     try std.testing.expect(!result.did_work);
     try std.testing.expectEqual(@as(u8, 0), result.transitions_executed);
     try std.testing.expectEqual(acme_types.CertState.idle, result.state);
+}
+
+test "Manager backoff_wait transitions to fetch_nonce when deadline passes" {
+    var directory = client.Directory{};
+    try directory.new_nonce_url.set("https://acme.example/new-nonce");
+    try directory.new_account_url.set("https://acme.example/new-account");
+    try directory.new_order_url.set("https://acme.example/new-order");
+
+    var manager = Manager.init(&directory, 0);
+    manager.max_transitions_per_tick = 1;
+    manager.state = .backoff_wait;
+    manager.backoff_wait_until_ns = 1;
+
+    const steps = [_]ScriptStep{};
+    var script_executor = ScriptExecutor{ .steps = &steps };
+
+    const signed_bodies = SignedBodies{};
+    var header_buf: [256]u8 = undefined;
+    var body_buf: [256]u8 = undefined;
+    const result = try manager.runTickWithExecutor(
+        script_executor.asExecutor(),
+        &signed_bodies,
+        undefined,
+        &header_buf,
+        &body_buf,
+    );
+
+    try std.testing.expect(result.did_work);
+    try std.testing.expectEqual(@as(u8, 1), result.transitions_executed);
+    try std.testing.expectEqual(acme_types.CertState.fetch_nonce, result.state);
 }

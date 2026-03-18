@@ -22,7 +22,6 @@ pub const Error = error{
     PollIntervalOutOfRange,
     BackoffRangeInvalid,
     RenewBeforeOutOfRange,
-    InvalidChallengePort,
 };
 
 /// Explicit certificate lifecycle states.
@@ -35,7 +34,6 @@ pub const CertState = enum(u8) {
     ensure_account,
     create_order,
     fetch_authorizations,
-    publish_http01,
     notify_challenge_ready,
     poll_authorization,
     finalize_order,
@@ -79,7 +77,6 @@ pub const DomainName = struct {
 /// externally-owned string slices after initialization.
 pub const RuntimeConfig = struct {
     enabled: bool = false,
-    challenge_bind_port: u16 = core_config.ACME_DEFAULT_HTTP01_PORT,
     renew_before_ns: u64 = core_config.ACME_DEFAULT_RENEW_BEFORE_NS,
     poll_interval_ms: u32 = core_config.ACME_DEFAULT_POLL_INTERVAL_MS,
     fail_backoff_min_ms: u32 = core_config.ACME_DEFAULT_FAIL_BACKOFF_MIN_MS,
@@ -103,11 +100,9 @@ pub const RuntimeConfig = struct {
         if (cfg.fail_backoff_min_ms > cfg.fail_backoff_max_ms) return error.BackoffRangeInvalid;
         if (cfg.renew_before_ns < core_config.ACME_MIN_RENEW_BEFORE_NS) return error.RenewBeforeOutOfRange;
         if (cfg.renew_before_ns > core_config.ACME_MAX_RENEW_BEFORE_NS) return error.RenewBeforeOutOfRange;
-        if (cfg.challenge_bind_port == 0) return error.InvalidChallengePort;
 
         var runtime = RuntimeConfig{
             .enabled = cfg.enabled,
-            .challenge_bind_port = cfg.challenge_bind_port,
             .renew_before_ns = cfg.renew_before_ns,
             .poll_interval_ms = cfg.poll_interval_ms,
             .fail_backoff_min_ms = cfg.fail_backoff_min_ms,

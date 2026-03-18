@@ -643,9 +643,6 @@ pub const AcmeConfig = struct {
     /// Directory for persisted account/cert/journal state.
     state_dir_path: []const u8 = "",
 
-    /// HTTP port that serves HTTP-01 challenge tokens.
-    challenge_bind_port: u16 = ACME_DEFAULT_HTTP01_PORT,
-
     /// Start renewal when not_after - renew_before_ns is reached.
     renew_before_ns: u64 = ACME_DEFAULT_RENEW_BEFORE_NS,
 
@@ -702,7 +699,6 @@ test "Config has sensible defaults" {
 test "AcmeConfig has sensible defaults" {
     const cfg = AcmeConfig{};
     try std.testing.expect(!cfg.enabled);
-    try std.testing.expectEqual(@as(u16, 80), cfg.challenge_bind_port);
     try std.testing.expectEqual(ACME_DEFAULT_RENEW_BEFORE_NS, cfg.renew_before_ns);
     try std.testing.expectEqual(ACME_DEFAULT_POLL_INTERVAL_MS, cfg.poll_interval_ms);
     try std.testing.expectEqual(@as(usize, 0), cfg.domains.len);
