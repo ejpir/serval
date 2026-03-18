@@ -34,8 +34,6 @@ const NETBIRD_HEALTH_BODY: []const u8 = "ok\n";
 
 const DEFAULT_ACME_DIRECTORY_URL: []const u8 = "https://acme-v02.api.letsencrypt.org/directory";
 const DEFAULT_ACME_STATE_DIR: []const u8 = "/var/lib/netbird-proxy/acme";
-const DEFAULT_ACME_CHALLENGE_BIND_HOST: []const u8 = "0.0.0.0";
-const DEFAULT_ACME_CHALLENGE_PORT: u16 = 80;
 
 const ACME_CERT_PATH_BUF_SIZE_BYTES: usize = 1024;
 const ACME_KEY_PATH_BUF_SIZE_BYTES: usize = 1024;
@@ -61,8 +59,6 @@ const NetbirdExtra = struct {
     @"acme-email": ?[]const u8 = null,
     @"acme-state-dir": ?[]const u8 = null,
     @"acme-domain": ?[]const u8 = null,
-    @"acme-challenge-host": ?[]const u8 = null,
-    @"acme-challenge-port": ?[]const u8 = null,
 };
 
 const NetbirdProxyConfig = struct {
@@ -87,8 +83,6 @@ const NetbirdProxyConfig = struct {
     acme_contact_email: []const u8 = "",
     acme_state_dir_path: []const u8 = DEFAULT_ACME_STATE_DIR,
     acme_domain: []const u8 = "",
-    acme_challenge_bind_host: []const u8 = DEFAULT_ACME_CHALLENGE_BIND_HOST,
-    acme_challenge_bind_port: u16 = DEFAULT_ACME_CHALLENGE_PORT,
     acme_renew_before_ns: u64 = serval.config.ACME_DEFAULT_RENEW_BEFORE_NS,
 };
 
@@ -488,15 +482,6 @@ fn parseConfigLine(
         cfg.acme_domain = value;
         return;
     }
-    if (std.mem.eql(u8, key, "acme_challenge_bind_host")) {
-        cfg.acme_challenge_bind_host = try parseListenHost(value);
-        return;
-    }
-    if (std.mem.eql(u8, key, "acme_challenge_bind_port")) {
-        cfg.acme_challenge_bind_port = try parsePort(value);
-        return;
-    }
-
     return error.UnknownConfigKey;
 }
 
@@ -547,37 +532,6 @@ fn printRouteMatrix() void {
     std.debug.print("  /api/*                            -> management_http\n", .{});
     std.debug.print("  Zitadel paths (/admin/v1,/auth/v1,/management/v1,/system/v1,/assets/v1,/ui,/oidc/v1,/saml/v2,/oauth/v2,/openapi,/debug,/device,/.well-known/openid-configuration,...) -> zitadel_http (h2c/h2)\n", .{});
     std.debug.print("  /*                                -> dashboard_http\n", .{});
-}
-
-const AcmeChallengeThreadCtx = struct {
-    runtime_config: *const serval.AcmeRuntimeConfig,
-    challenge_store: *serval.AcmeHttp01Store,
-    bind_host: []const u8,
-    shutdown: *std.atomic.Value(bool),
-};
-
-fn acmeChallengeServerThread(ctx: *AcmeChallengeThreadCtx) void {
-    assert(@intFromPtr(ctx) != 0);
-    assert(@intFromPtr(ctx.runtime_config) != 0);
-    assert(@intFromPtr(ctx.challenge_store) != 0);
-    assert(@intFromPtr(ctx.shutdown) != 0);
-
-    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
-    defer threaded.deinit();
-
-    var listener = serval.server.AcmeChallengeListener.init(
-        ctx.runtime_config,
-        ctx.challenge_store,
-        ctx.bind_host,
-    ) catch |err| {
-        std.debug.print("error: failed to init ACME challenge listener: {s}\n", .{@errorName(err)});
-        return;
-    };
-
-    listener.run(threaded.io(), ctx.shutdown, null) catch |err| {
-        if (ctx.shutdown.load(.acquire)) return;
-        std.debug.print("error: ACME challenge listener failed: {s}\n", .{@errorName(err)});
-    };
 }
 
 fn AcmeIssueThreadCtx(comptime ServerType: type) type {
@@ -652,7 +606,6 @@ fn acmeIssueThread(comptime ServerType: type, thread_ctx: *AcmeIssueThreadCtx(Se
         .directory_url = thread_ctx.cfg.acme_directory_url,
         .contact_email = thread_ctx.cfg.acme_contact_email,
         .state_dir_path = thread_ctx.cfg.acme_state_dir_path,
-        .challenge_bind_port = thread_ctx.cfg.acme_challenge_bind_port,
         .renew_before_ns = thread_ctx.cfg.acme_renew_before_ns,
         .domains = &.{thread_ctx.cfg.acme_domain},
     };
@@ -747,8 +700,6 @@ pub fn main(process_init: std.process.Init) !void {
     if (args.extra.@"acme-email") |value| cfg.acme_contact_email = value;
     if (args.extra.@"acme-state-dir") |value| cfg.acme_state_dir_path = value;
     if (args.extra.@"acme-domain") |value| cfg.acme_domain = value;
-    if (args.extra.@"acme-challenge-host") |value| cfg.acme_challenge_bind_host = try parseListenHost(value);
-    if (args.extra.@"acme-challenge-port") |value| cfg.acme_challenge_bind_port = try parsePort(value);
 
     if (args.port != 8080 or !saw_listen_port_in_file) {
         cfg.listen_port = args.port;
@@ -861,7 +812,7 @@ pub fn main(process_init: std.process.Init) !void {
     if (cfg.acme_enabled) {
         std.debug.print("ACME directory: {s}\n", .{cfg.acme_directory_url});
         std.debug.print("ACME domain: {s}\n", .{cfg.acme_domain});
-        std.debug.print("ACME challenge bind: {s}:{d}\n", .{ cfg.acme_challenge_bind_host, cfg.acme_challenge_bind_port });
+        std.debug.print("ACME challenge mode: tls-alpn-01 only\n", .{});
         std.debug.print("TLS-ALPN hook provider installed (awaiting challenge cert activation)\n", .{});
     }
     std.debug.print("Upstreams:\n", .{});
@@ -974,16 +925,12 @@ test "parseConfigLine parses acme keys" {
     try parseConfigLine(&cfg, "acme_contact_email=ops@coreworks.be", &saw_listen_port);
     try parseConfigLine(&cfg, "acme_state_dir_path=/var/lib/netbird-proxy/acme", &saw_listen_port);
     try parseConfigLine(&cfg, "acme_domain=netbird.coreworks.be", &saw_listen_port);
-    try parseConfigLine(&cfg, "acme_challenge_bind_host=0.0.0.0", &saw_listen_port);
-    try parseConfigLine(&cfg, "acme_challenge_bind_port=80", &saw_listen_port);
 
     try std.testing.expect(cfg.acme_enabled);
     try std.testing.expectEqualStrings("https://acme-v02.api.letsencrypt.org/directory", cfg.acme_directory_url);
     try std.testing.expectEqualStrings("ops@coreworks.be", cfg.acme_contact_email);
     try std.testing.expectEqualStrings("/var/lib/netbird-proxy/acme", cfg.acme_state_dir_path);
     try std.testing.expectEqualStrings("netbird.coreworks.be", cfg.acme_domain);
-    try std.testing.expectEqualStrings("0.0.0.0", cfg.acme_challenge_bind_host);
-    try std.testing.expectEqual(@as(u16, 80), cfg.acme_challenge_bind_port);
 }
 
 test "ensureBootstrapTlsCredentials generates cert and key when acme enabled" {

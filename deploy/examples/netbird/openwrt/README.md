@@ -47,6 +47,50 @@ Artifact:
 zig-out/bin/netbird_proxy
 ```
 
+## 2.3 One-command deploy + ALPN-only ACME config update
+
+The deploy helper now:
+
+- builds and deploys `netbird_proxy`
+- fetches router `/etc/serval/netbird.conf`
+- updates/inserts ACME keys in-place (preserves existing upstream matrix)
+- pushes updated config back
+- creates `/etc/serval/acme` on router
+- backs up both binary and config before restart
+- restarts service
+
+Usage:
+
+```sh
+deploy/examples/netbird/openwrt/deploy-router.sh \
+  192.168.1.1 \
+  0.16.0-dev.2821+3edaef9e0 \
+  netbird.coreworks.be \
+  ops@coreworks.be
+```
+
+Arguments:
+
+1. router IP (default `192.168.1.1`)
+2. zig version tag (default `0.16.0-dev.2821+3edaef9e0`)
+3. ACME domain (default `netbird.coreworks.be`)
+4. ACME contact email (default `ops@coreworks.be`)
+
+ACME keys written by the script:
+
+```ini
+acme_enabled=true
+acme_directory_url=https://acme-v02.api.letsencrypt.org/directory
+acme_contact_email=ops@coreworks.be
+acme_state_dir_path=/etc/serval/acme
+acme_domain=netbird.coreworks.be
+```
+
+Notes:
+
+- Current deployment path uses TLS-ALPN-01 challenge handling on **443** only.
+- ACME contact email is metadata for CA notices (expiry/security). It is not an interactive confirmation step during issuance.
+
 ## 3) Install to router
 
 ```sh
@@ -108,6 +152,13 @@ curl -k https://192.168.1.1/healthz
 ```
 
 If hostname TLS is used, test with SNI (`--resolve`) rather than raw IP where applicable.
+
+Verify issued certificate chain/validity from a host with internet reachability:
+
+```sh
+openssl s_client -connect netbird.coreworks.be:443 -servername netbird.coreworks.be </dev/null 2>/dev/null | \
+  openssl x509 -noout -subject -issuer -dates
+```
 
 ## 7) Capture one peer-connect debug window
 
