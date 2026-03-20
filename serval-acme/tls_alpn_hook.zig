@@ -22,6 +22,14 @@ pub const Error = error{
 
 var installed_provider: ?*TlsAlpnHookProvider = null;
 
+fn loadInstalledProvider() ?*TlsAlpnHookProvider {
+    return @atomicLoad(?*TlsAlpnHookProvider, &installed_provider, .acquire);
+}
+
+fn storeInstalledProvider(provider: ?*TlsAlpnHookProvider) void {
+    @atomicStore(?*TlsAlpnHookProvider, &installed_provider, provider, .release);
+}
+
 pub const TlsAlpnHookProvider = struct {
     mutex: std.atomic.Mutex = .unlocked,
     installed: bool = false,
@@ -41,11 +49,11 @@ pub const TlsAlpnHookProvider = struct {
         defer self.mutex.unlock();
 
         if (self.installed) return;
-        if (installed_provider != null) return error.HookInUse;
+        if (loadInstalledProvider() != null) return error.HookInUse;
         if (ssl.getServerAlpnHook() != null) return error.HookInUse;
         if (ssl.getServerCertHook() != null) return error.HookInUse;
 
-        installed_provider = self;
+        storeInstalledProvider(self);
         ssl.setServerAlpnHook(serverAlpnHook);
         ssl.setServerCertHook(serverCertHook);
         self.installed = true;
@@ -58,11 +66,11 @@ pub const TlsAlpnHookProvider = struct {
         defer self.mutex.unlock();
 
         if (!self.installed) return error.NotInstalled;
-        if (installed_provider != self) return error.NotInstalled;
+        if (loadInstalledProvider() != self) return error.NotInstalled;
 
         ssl.setServerAlpnHook(null);
         ssl.setServerCertHook(null);
-        installed_provider = null;
+        storeInstalledProvider(null);
         self.installed = false;
         self.challenge_active = false;
         self.challenge_ctx = null;
@@ -122,11 +130,12 @@ fn lockMutex(mutex: *std.atomic.Mutex) void {
         std.atomic.spinLoopHint();
     }
 
+    std.log.err("acme-tls-alpn-hook: mutex lock timeout attempts={d}", .{lock_max_attempts});
     @panic("TlsAlpnHookProvider mutex lock timeout");
 }
 
 fn serverAlpnHook(input: *const ssl.ServerAlpnHookInput) ssl.ServerAlpnHookDecision {
-    const provider = installed_provider orelse return .default_policy;
+    const provider = loadInstalledProvider() orelse return .default_policy;
 
     lockMutex(&provider.mutex);
     defer provider.mutex.unlock();
@@ -139,7 +148,7 @@ fn serverAlpnHook(input: *const ssl.ServerAlpnHookInput) ssl.ServerAlpnHookDecis
 }
 
 fn serverCertHook(input: *const ssl.ServerCertHookInput) ssl.ServerCertHookDecision {
-    const provider = installed_provider orelse return .default_ctx;
+    const provider = loadInstalledProvider() orelse return .default_ctx;
 
     lockMutex(&provider.mutex);
     defer provider.mutex.unlock();
@@ -169,8 +178,8 @@ test "TlsAlpnHookProvider hook decisions honor active challenge domain" {
     @memcpy(provider.domain_buf[0..20], "netbird.coreworks.be");
     provider.challenge_ctx = @ptrFromInt(0x1000);
 
-    installed_provider = &provider;
-    defer installed_provider = null;
+    storeInstalledProvider(&provider);
+    defer storeInstalledProvider(null);
 
     const alpn = serverAlpnHook(&.{
         .sni = "netbird.coreworks.be",

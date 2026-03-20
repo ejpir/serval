@@ -301,11 +301,17 @@ fn authorizeTlsAlpn01(
     defer {
         cwd.deleteFile(std.Options.debug_io, cert_path) catch |err| switch (err) {
             error.FileNotFound => {},
-            else => {},
+            else => std.log.warn("acme-runtime: challenge cert cleanup failed path={s} err={s}", .{
+                cert_path,
+                @errorName(err),
+            }),
         };
         cwd.deleteFile(std.Options.debug_io, key_path) catch |err| switch (err) {
             error.FileNotFound => {},
-            else => {},
+            else => std.log.warn("acme-runtime: challenge key cleanup failed path={s} err={s}", .{
+                key_path,
+                @errorName(err),
+            }),
         };
     }
 
@@ -315,7 +321,7 @@ fn authorizeTlsAlpn01(
     try hook_provider.activateChallenge(host, challenge_ctx);
     defer hook_provider.clearChallenge() catch |err| switch (err) {
         error.NotInstalled => {},
-        else => {},
+        else => std.log.warn("acme-runtime: tls-alpn challenge clear failed err={s}", .{@errorName(err)}),
     };
 
     try notifyChallengeReady(flow_ctx, acme_client, signer, io, work, &challenge.url);

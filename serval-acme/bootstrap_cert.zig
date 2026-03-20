@@ -1,6 +1,6 @@
 //! Bootstrap self-signed TLS certificate generation.
 //!
-//! Generates a short-lived self-signed P-256 certificate with SAN for initial
+//! Generates a bootstrap self-signed P-256 certificate with SAN for initial
 //! server startup before ACME issuance completes.
 
 const std = @import("std");
@@ -24,6 +24,8 @@ const oid_prime256v1 = [_]u8{ 0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x
 const oid_ecdsa_sha256 = [_]u8{ 0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02 };
 const oid_common_name = [_]u8{ 0x06, 0x03, 0x55, 0x04, 0x03 };
 const oid_subject_alt_name = [_]u8{ 0x06, 0x03, 0x55, 0x1D, 0x11 };
+const bootstrap_not_before_generalized_time: []const u8 = "20000101000000Z";
+const bootstrap_not_after_generalized_time: []const u8 = "20991231235959Z";
 
 pub fn generateMaterials(
     io: std.Io,
@@ -147,14 +149,11 @@ fn buildNameFromCommonName(out: []u8, common_name: []const u8) Error![]const u8 
 }
 
 fn buildValidity(out: []u8) Error![]const u8 {
-    const not_before = "20240101000000Z";
-    const not_after = "20260101000000Z";
-
     var nb_buf: [24]u8 = undefined;
-    const nb = try wrapDerTlv(&nb_buf, 0x18, not_before);
+    const nb = try wrapDerTlv(&nb_buf, 0x18, bootstrap_not_before_generalized_time);
 
     var na_buf: [24]u8 = undefined;
-    const na = try wrapDerTlv(&na_buf, 0x18, not_after);
+    const na = try wrapDerTlv(&na_buf, 0x18, bootstrap_not_after_generalized_time);
 
     return wrapSequenceFromParts(out, &.{ nb, na });
 }

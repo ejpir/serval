@@ -11,6 +11,7 @@ const max_domains_per_cert: usize = core_config.ACME_MAX_DOMAINS_PER_CERT;
 const max_directory_url_len: usize = core_config.ACME_MAX_DIRECTORY_URL_BYTES;
 const max_contact_email_len: usize = core_config.ACME_MAX_CONTACT_EMAIL_BYTES;
 const max_state_dir_path_len: usize = core_config.ACME_MAX_STATE_DIR_PATH_BYTES;
+const max_domain_label_len: u8 = 63;
 
 pub const Error = error{
     InvalidDirectoryUrl,
@@ -55,9 +56,7 @@ pub const DomainName = struct {
 
         if (value.len == 0) return error.InvalidDomainName;
         if (value.len > max_domain_name_len) return error.DomainTooLong;
-        if (std.mem.indexOfScalar(u8, value, '/')) |_| return error.InvalidDomainName;
-        if (value[0] == '.') return error.InvalidDomainName;
-        if (value[value.len - 1] == '.') return error.InvalidDomainName;
+        try validateDomainName(value);
 
         @memset(self.bytes[0..], 0);
         @memcpy(self.bytes[0..value.len], value);
@@ -70,6 +69,35 @@ pub const DomainName = struct {
         return self.bytes[0..self.len];
     }
 };
+
+fn validateDomainName(value: []const u8) Error!void {
+    if (value.len == 0) return error.InvalidDomainName;
+
+    var label_len: u8 = 0;
+    var index: usize = 0;
+    while (index < value.len) : (index += 1) {
+        const c = value[index];
+        if (c == '.') {
+            if (label_len == 0) return error.InvalidDomainName;
+            if (value[index - 1] == '-') return error.InvalidDomainName;
+            label_len = 0;
+            continue;
+        }
+
+        const is_digit = c >= '0' and c <= '9';
+        const is_upper = c >= 'A' and c <= 'Z';
+        const is_lower = c >= 'a' and c <= 'z';
+        const is_dash = c == '-';
+
+        if (!is_digit and !is_upper and !is_lower and !is_dash) return error.InvalidDomainName;
+        if (label_len == 0 and is_dash) return error.InvalidDomainName;
+        if (label_len >= max_domain_label_len) return error.InvalidDomainName;
+        label_len += 1;
+    }
+
+    if (label_len == 0) return error.InvalidDomainName;
+    if (value[value.len - 1] == '-') return error.InvalidDomainName;
+}
 
 /// Runtime-validated ACME configuration copied into fixed-capacity buffers.
 ///
@@ -181,6 +209,11 @@ test "DomainName rejects invalid hostnames" {
     var domain = DomainName{};
     try std.testing.expectError(error.InvalidDomainName, domain.set(""));
     try std.testing.expectError(error.InvalidDomainName, domain.set("/bad"));
+    try std.testing.expectError(error.InvalidDomainName, domain.set("foo..bar"));
+    try std.testing.expectError(error.InvalidDomainName, domain.set("foo bar"));
+    try std.testing.expectError(error.InvalidDomainName, domain.set("foo:443"));
+    try std.testing.expectError(error.InvalidDomainName, domain.set("-example.com"));
+    try std.testing.expectError(error.InvalidDomainName, domain.set("example-.com"));
     try std.testing.expectError(error.InvalidDomainName, domain.set("example.com."));
 }
 

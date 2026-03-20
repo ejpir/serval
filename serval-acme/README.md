@@ -55,7 +55,7 @@ Layer 2 (Infrastructure).
   - generates ephemeral self-signed challenge certificate + key (PEM)
   - includes SAN and critical `id-pe-acmeIdentifier` extension
 - ACME bootstrap certificate helper (`bootstrap_cert.zig`):
-  - generates short-lived self-signed startup certificate + key (PEM)
+  - generates self-signed startup certificate + key (PEM)
   - SAN dNSName for the configured host, used before first ACME issuance
 - ACME storage helper (`storage.zig`):
   - tmp+fsync+rename persistence for cert and key
@@ -79,7 +79,7 @@ Layer 2 (Infrastructure).
   - pass `*AcmeTlsAlpnHookProvider` to issuance entrypoints
   - runtime activates per-challenge temporary TLS context only during challenge validation
 - Bootstrap-first startup flow is supported:
-  - generate short-lived bootstrap cert (`bootstrap_cert.zig`)
+  - generate bootstrap cert (`bootstrap_cert.zig`)
   - start HTTPS listener
   - run ACME issuance and hot-activate issued cert/key
 - ACME contact email is account metadata for CA notices (expiry/security); it is not an interactive confirmation step.
