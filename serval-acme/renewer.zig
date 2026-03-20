@@ -55,13 +55,13 @@ pub const Params = struct {
     activate_fn: ActivateFn,
 };
 
-const cert_path_buf_size_bytes: usize = 1024;
-const key_path_buf_size_bytes: usize = 1024;
-const csr_buf_size_bytes: usize = 32 * 1024;
-const key_pem_buf_size_bytes: usize = 32 * 1024;
-const cert_pem_read_buf_size_bytes: usize = 24 * 1024;
-const cert_pem_base64_buf_size_bytes: usize = 24 * 1024;
-const cert_der_buf_size_bytes: usize = 16 * 1024;
+const cert_path_buf_size_bytes = 1024;
+const key_path_buf_size_bytes = 1024;
+const csr_buf_size_bytes = 32 * 1024;
+const key_pem_buf_size_bytes = 32 * 1024;
+const cert_pem_read_buf_size_bytes = 24 * 1024;
+const cert_pem_base64_buf_size_bytes = 24 * 1024;
+const cert_der_buf_size_bytes = 16 * 1024;
 
 pub const ManagedParams = struct {
     allocator: std.mem.Allocator,
@@ -146,7 +146,8 @@ pub const Renewer = struct {
     }
 
     fn should_renew_callback(ctx_raw: *anyopaque, now_ns: u64) scheduler_mod.ShouldRenewResult {
-        _ = now_ns;
+        assert(@intFromPtr(ctx_raw) != 0);
+        assert(now_ns <= std.math.maxInt(u64));
         const self: *Renewer = @ptrCast(@alignCast(ctx_raw));
 
         const renew = should_renew_from_certificate(
@@ -158,7 +159,9 @@ pub const Renewer = struct {
     }
 
     fn issue_callback(ctx_raw: *anyopaque, io: Io) scheduler_mod.IssueResult {
+        assert(@intFromPtr(ctx_raw) != 0);
         const self: *Renewer = @ptrCast(@alignCast(ctx_raw));
+        assert(self.check_interval_ms > 0);
 
         const persisted = runtime.runIssuanceOnce(
             self.runtime_config,
@@ -269,6 +272,7 @@ pub const ManagedRenewer = struct {
 
     pub fn initFromAcmeConfig(params: ManagedFromAcmeConfigParams, io: Io) Error!ManagedRenewer {
         assert(@intFromPtr(params.activate_ctx) != 0);
+        assert(@intFromPtr(params.hook_provider) != 0);
 
         var runtime_config = try types.RuntimeConfig.initFromConfig(params.acme_config);
         return init(.{
@@ -284,6 +288,7 @@ pub const ManagedRenewer = struct {
 
     pub fn deinit(self: *ManagedRenewer) void {
         assert(@intFromPtr(self) != 0);
+        assert(self.client_ctx == null or @intFromPtr(self.client_ctx.?) != 0);
 
         self.acme_client.deinit();
         if (self.client_ctx) |ctx| {
@@ -327,12 +332,15 @@ pub const ManagedRenewer = struct {
     }
 
     fn certCurrentPath(self: *const ManagedRenewer) []const u8 {
+        assert(@intFromPtr(self) != 0);
         assert(self.cert_current_path_len <= cert_path_buf_size_bytes);
         return self.cert_current_path_bytes[0..self.cert_current_path_len];
     }
 };
 
 fn build_current_cert_path(state_dir_path: []const u8, out: []u8) Error![]const u8 {
+    assert(out.len > 0);
+    assert(cert_path_buf_size_bytes > 0);
     if (state_dir_path.len == 0) return error.InvalidCertPath;
     const path = std.fmt.bufPrint(out, "{s}/cert/current/fullchain.pem", .{state_dir_path}) catch {
         return error.CertPathTooLong;
@@ -341,6 +349,8 @@ fn build_current_cert_path(state_dir_path: []const u8, out: []u8) Error![]const 
 }
 
 fn should_renew_from_certificate(cert_path: []const u8, renew_before_ns: u64, parse_buffers: ParseBuffers) bool {
+    assert(cert_path.len > 0);
+    assert(parse_buffers.cert_der_buf.len > 0);
     const not_after_sec = parse_first_pem_certificate_not_after_sec(cert_path, parse_buffers) orelse return true;
 
     const now_ns_i128 = time.realtimeNanos();
@@ -353,6 +363,8 @@ fn should_renew_from_certificate(cert_path: []const u8, renew_before_ns: u64, pa
 }
 
 fn parse_first_pem_certificate_not_after_sec(cert_path: []const u8, parse_buffers: ParseBuffers) ?u64 {
+    assert(cert_path.len > 0);
+    assert(parse_buffers.cert_pem_read_buf.len > 0);
     const pem = Io.Dir.cwd().readFile(std.Options.debug_io, cert_path, parse_buffers.cert_pem_read_buf) catch return null;
 
     const begin_marker = "-----BEGIN CERTIFICATE-----";
@@ -364,17 +376,19 @@ fn parse_first_pem_certificate_not_after_sec(cert_path: []const u8, parse_buffer
     const end_idx = after_begin + end_idx_rel;
     const block = pem[after_begin..end_idx];
 
-    var b64_len: usize = 0;
-    var i: usize = 0;
-    while (i < block.len) : (i += 1) {
-        const c = block[i];
+    if (block.len > std.math.maxInt(u32)) return null;
+    const block_len: u32 = @intCast(block.len);
+    var b64_len: u32 = 0;
+    var i: u32 = 0;
+    while (i < block_len) : (i += 1) {
+        const c = block[@intCast(i)];
         if (c == '\n' or c == '\r' or c == ' ' or c == '\t') continue;
         if (b64_len >= parse_buffers.cert_pem_b64_buf.len) return null;
-        parse_buffers.cert_pem_b64_buf[b64_len] = c;
+        parse_buffers.cert_pem_b64_buf[@intCast(b64_len)] = c;
         b64_len += 1;
     }
 
-    const b64 = parse_buffers.cert_pem_b64_buf[0..b64_len];
+    const b64 = parse_buffers.cert_pem_b64_buf[0..@intCast(b64_len)];
     const der_len = std.base64.standard.Decoder.calcSizeForSlice(b64) catch return null;
     if (der_len > parse_buffers.cert_der_buf.len) return null;
     std.base64.standard.Decoder.decode(parse_buffers.cert_der_buf[0..der_len], b64) catch return null;
@@ -406,6 +420,8 @@ test "ManagedRenewer initFromAcmeConfig validates ACME config" {
     var hook_provider = hook_mod.TlsAlpnHookProvider.init();
     const Callbacks = struct {
         fn activate(_: *anyopaque, _: []const u8, _: []const u8) ActivationResult {
+            assert(@sizeOf(ActivationResult) == 1);
+            assert(cert_path_buf_size_bytes > 0);
             return .success;
         }
     };

@@ -18,6 +18,8 @@ pub const BoundedBackoff = struct {
     max_ms: u32,
 
     pub fn init(min_ms: u32, max_ms: u32) Error!BoundedBackoff {
+        assert(config.ACME_DEFAULT_FAIL_BACKOFF_MIN_MS > 0);
+        assert(config.ACME_DEFAULT_FAIL_BACKOFF_MIN_MS <= config.ACME_DEFAULT_FAIL_BACKOFF_MAX_MS);
         if (min_ms == 0) return error.InvalidRange;
         if (min_ms > max_ms) return error.InvalidRange;
 
@@ -70,6 +72,7 @@ pub const BoundedBackoff = struct {
 
 fn addDeterministicJitter(base_ms: u64, seed: u64) u64 {
     assert(base_ms > 0);
+    assert(seed <= std.math.maxInt(u64));
 
     // Bounded 0..12.5% jitter to avoid synchronization while preserving cap.
     const max_jitter_ms: u64 = @max(1, base_ms >> 3);
@@ -79,6 +82,8 @@ fn addDeterministicJitter(base_ms: u64, seed: u64) u64 {
 }
 
 fn mix64(value: u64) u64 {
+    assert(@sizeOf(u64) == 8);
+    assert(value <= std.math.maxInt(u64));
     var x = value;
     x ^= x >> 33;
     x *%= 0xff51afd7ed558ccd;

@@ -6,11 +6,11 @@ const std = @import("std");
 const assert = std.debug.assert;
 const core_config = @import("serval-core").config;
 
-const max_domain_name_len: usize = core_config.ACME_MAX_DOMAIN_NAME_LEN;
-const max_domains_per_cert: usize = core_config.ACME_MAX_DOMAINS_PER_CERT;
-const max_directory_url_len: usize = core_config.ACME_MAX_DIRECTORY_URL_BYTES;
-const max_contact_email_len: usize = core_config.ACME_MAX_CONTACT_EMAIL_BYTES;
-const max_state_dir_path_len: usize = core_config.ACME_MAX_STATE_DIR_PATH_BYTES;
+const max_domain_name_len = core_config.ACME_MAX_DOMAIN_NAME_LEN;
+const max_domains_per_cert = core_config.ACME_MAX_DOMAINS_PER_CERT;
+const max_directory_url_len = core_config.ACME_MAX_DIRECTORY_URL_BYTES;
+const max_contact_email_len = core_config.ACME_MAX_CONTACT_EMAIL_BYTES;
+const max_state_dir_path_len = core_config.ACME_MAX_STATE_DIR_PATH_BYTES;
 const max_domain_label_len: u8 = 63;
 
 pub const Error = error{
@@ -53,6 +53,7 @@ pub const DomainName = struct {
 
     pub fn set(self: *DomainName, value: []const u8) Error!void {
         assert(@intFromPtr(self) != 0);
+        assert(self.len <= max_domain_name_len);
 
         if (value.len == 0) return error.InvalidDomainName;
         if (value.len > max_domain_name_len) return error.DomainTooLong;
@@ -61,6 +62,7 @@ pub const DomainName = struct {
         @memset(self.bytes[0..], 0);
         @memcpy(self.bytes[0..value.len], value);
         self.len = @intCast(value.len);
+        assert(self.len == @as(u16, @intCast(value.len)));
     }
 
     pub fn slice(self: *const DomainName) []const u8 {
@@ -71,15 +73,19 @@ pub const DomainName = struct {
 };
 
 fn validateDomainName(value: []const u8) Error!void {
+    assert(max_domain_name_len > 0);
+    assert(max_domain_label_len > 0);
     if (value.len == 0) return error.InvalidDomainName;
+    if (value.len > std.math.maxInt(u16)) return error.InvalidDomainName;
+    const value_len: u16 = @intCast(value.len);
 
     var label_len: u8 = 0;
-    var index: usize = 0;
-    while (index < value.len) : (index += 1) {
-        const c = value[index];
+    var index: u16 = 0;
+    while (index < value_len) : (index += 1) {
+        const c = value[@intCast(index)];
         if (c == '.') {
             if (label_len == 0) return error.InvalidDomainName;
-            if (value[index - 1] == '-') return error.InvalidDomainName;
+            if (value[@intCast(index - 1)] == '-') return error.InvalidDomainName;
             label_len = 0;
             continue;
         }
@@ -96,7 +102,7 @@ fn validateDomainName(value: []const u8) Error!void {
     }
 
     if (label_len == 0) return error.InvalidDomainName;
-    if (value[value.len - 1] == '-') return error.InvalidDomainName;
+    if (value[value_len - 1] == '-') return error.InvalidDomainName;
 }
 
 /// Runtime-validated ACME configuration copied into fixed-capacity buffers.
@@ -123,6 +129,8 @@ pub const RuntimeConfig = struct {
     domain_count: u8 = 0,
 
     pub fn initFromConfig(cfg: core_config.AcmeConfig) Error!RuntimeConfig {
+        assert(max_domains_per_cert > 0);
+        assert(max_directory_url_len > 0);
         if (cfg.poll_interval_ms == 0) return error.PollIntervalOutOfRange;
         if (cfg.fail_backoff_min_ms == 0) return error.BackoffRangeInvalid;
         if (cfg.fail_backoff_min_ms > cfg.fail_backoff_max_ms) return error.BackoffRangeInvalid;
@@ -162,7 +170,7 @@ pub const RuntimeConfig = struct {
         @memcpy(runtime.state_dir_path_bytes[0..cfg.state_dir_path.len], cfg.state_dir_path);
         runtime.state_dir_path_len = @intCast(cfg.state_dir_path.len);
 
-        var domain_index: usize = 0;
+        var domain_index: u8 = 0;
         while (domain_index < cfg.domains.len) : (domain_index += 1) {
             try runtime.domains[domain_index].set(cfg.domains[domain_index]);
             runtime.domain_count += 1;
@@ -191,6 +199,7 @@ pub const RuntimeConfig = struct {
 
     pub fn domainAt(self: *const RuntimeConfig, index: u8) ?[]const u8 {
         assert(@intFromPtr(self) != 0);
+        assert(self.domain_count <= max_domains_per_cert);
 
         if (index >= self.domain_count) return null;
         return self.domains[index].slice();
@@ -201,7 +210,7 @@ test "DomainName stores valid hostname" {
     var domain = DomainName{};
     try domain.set("api.example.com");
 
-    try std.testing.expectEqual(@as(usize, 15), domain.slice().len);
+    try std.testing.expectEqual(@as(u16, 15), @as(u16, @intCast(domain.slice().len)));
     try std.testing.expect(std.mem.eql(u8, "api.example.com", domain.slice()));
 }
 

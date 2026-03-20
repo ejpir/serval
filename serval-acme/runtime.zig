@@ -65,14 +65,59 @@ pub fn runIssuanceOnce(
     assert(@intFromPtr(acme_client) != 0);
     assert(@intFromPtr(signer) != 0);
 
+    try validateRunInputs(runtime_config, tls_alpn_hook_provider);
+
+    var flow_ctx = try fetchDirectoryAndNonce(runtime_config, acme_client, io, work);
+    try ensureAccount(&flow_ctx, runtime_config, acme_client, signer, io, work);
+
+    const initial_order = try createOrder(&flow_ctx, runtime_config, acme_client, signer, io, work);
+    try authorizeOrderChallenges(
+        &flow_ctx,
+        runtime_config,
+        acme_client,
+        signer,
+        io,
+        work,
+        initial_order,
+        tls_alpn_hook_provider.?,
+    );
+
+    const csr_result = try finalizeOrder(&flow_ctx, runtime_config, acme_client, signer, io, work);
+    const cert_pem = try pollAndDownloadOrderCertificate(&flow_ctx, runtime_config, acme_client, signer, io, work);
+
+    return persistAndActivate(
+        runtime_config,
+        tls_manager,
+        cert_pem,
+        csr_result.key_pem,
+        work.cert_path_buf,
+        work.key_path_buf,
+    );
+}
+
+fn validateRunInputs(
+    runtime_config: *const acme_types.RuntimeConfig,
+    tls_alpn_hook_provider: ?*tls_alpn_hook_mod.TlsAlpnHookProvider,
+) Error!void {
+    assert(@intFromPtr(runtime_config) != 0);
+    assert(runtime_config.domain_count <= config.ACME_MAX_DOMAINS_PER_CERT);
+
     if (!runtime_config.enabled) return error.InvalidRuntimeConfig;
     if (runtime_config.domain_count == 0) return error.InvalidRuntimeConfig;
     if (tls_alpn_hook_provider == null) return error.MissingTlsAlpnHookProvider;
+}
+
+fn fetchDirectoryAndNonce(
+    runtime_config: *const acme_types.RuntimeConfig,
+    acme_client: *Client,
+    io: Io,
+    work: WorkBuffers,
+) Error!orchestration.FlowContext {
+    assert(@intFromPtr(runtime_config) != 0);
+    assert(@intFromPtr(acme_client) != 0);
 
     const directory = try fetchDirectory(runtime_config, acme_client, io, work.header_buf, work.body_buf);
     var flow_ctx = orchestration.FlowContext.init(&directory);
-
-    // 1) nonce
     _ = try transport.executeOperation(&flow_ctx, acme_client, .{
         .operation = .fetch_nonce,
         .signed_body = &.{},
@@ -80,54 +125,89 @@ pub fn runIssuanceOnce(
         .header_buf = work.header_buf,
         .body_buf = work.body_buf,
     });
+    return flow_ctx;
+}
 
-    // 2) ensure account (new)
+fn ensureAccount(
+    flow_ctx: *orchestration.FlowContext,
+    runtime_config: *const acme_types.RuntimeConfig,
+    acme_client: *Client,
+    signer: *const signer_mod.AccountSigner,
+    io: Io,
+    work: WorkBuffers,
+) Error!void {
+    assert(@intFromPtr(flow_ctx) != 0);
+    assert(@intFromPtr(runtime_config) != 0);
+
     const new_account_payload = try client.serializeNewAccountPayload(work.payload_buf, .{
         .contact_email = runtime_config.contactEmail(),
     });
     const new_account_body = try signer.signWithJwk(
         work.jws_buf,
         &flow_ctx.nonce,
-        &directory.new_account_url,
+        &flow_ctx.directory.new_account_url,
         new_account_payload,
     );
-    _ = try transport.executeOperation(&flow_ctx, acme_client, .{
+    _ = try transport.executeOperation(flow_ctx, acme_client, .{
         .operation = .new_account,
         .signed_body = new_account_body,
         .io = io,
         .header_buf = work.header_buf,
         .body_buf = work.body_buf,
     });
+}
 
-    // 3) create order
+fn createOrder(
+    flow_ctx: *orchestration.FlowContext,
+    runtime_config: *const acme_types.RuntimeConfig,
+    acme_client: *Client,
+    signer: *const signer_mod.AccountSigner,
+    io: Io,
+    work: WorkBuffers,
+) Error!client.OrderResponse {
+    assert(@intFromPtr(flow_ctx) != 0);
+    assert(@intFromPtr(runtime_config) != 0);
+
     const new_order_req = try client.NewOrderRequest.initFromRuntimeConfig(runtime_config);
     const new_order_payload = try client.serializeNewOrderPayload(work.payload_buf, &new_order_req);
     const new_order_body = try signer.signWithKid(
         work.jws_buf,
         &flow_ctx.nonce,
-        &directory.new_order_url,
+        &flow_ctx.directory.new_order_url,
         &flow_ctx.account_url,
         new_order_payload,
     );
-    const new_order_handled = try transport.executeOperation(&flow_ctx, acme_client, .{
+    const new_order_handled = try transport.executeOperation(flow_ctx, acme_client, .{
         .operation = .new_order,
         .signed_body = new_order_body,
         .io = io,
         .header_buf = work.header_buf,
         .body_buf = work.body_buf,
     });
-    const initial_order = switch (new_order_handled.parsed) {
+    return switch (new_order_handled.parsed) {
         .order => |order| order,
-        else => return error.InvalidOrderStatus,
+        else => error.InvalidOrderStatus,
     };
+}
 
-    // 4) authorize each authz URL using TLS-ALPN-01
-    const hook_provider = tls_alpn_hook_provider orelse return error.MissingTlsAlpnHookProvider;
+fn authorizeOrderChallenges(
+    flow_ctx: *orchestration.FlowContext,
+    runtime_config: *const acme_types.RuntimeConfig,
+    acme_client: *Client,
+    signer: *const signer_mod.AccountSigner,
+    io: Io,
+    work: WorkBuffers,
+    initial_order: client.OrderResponse,
+    hook_provider: *tls_alpn_hook_mod.TlsAlpnHookProvider,
+) Error!void {
+    assert(@intFromPtr(flow_ctx) != 0);
+    assert(@intFromPtr(hook_provider) != 0);
+
     var auth_idx: u8 = 0;
     while (auth_idx < initial_order.authorization_count) : (auth_idx += 1) {
         const auth_url = initial_order.authorization_urls[auth_idx];
         try authorizeChallenge(
-            &flow_ctx,
+            flow_ctx,
             runtime_config,
             acme_client,
             signer,
@@ -137,21 +217,39 @@ pub fn runIssuanceOnce(
             hook_provider,
         );
     }
+}
 
-    // 5) finalize with CSR
-    var domains: [config.ACME_MAX_DOMAINS_PER_CERT][]const u8 = undefined;
-    var domain_count: usize = 0;
-    var domain_idx: u8 = 0;
-    while (domain_idx < runtime_config.domain_count) : (domain_idx += 1) {
-        const domain = runtime_config.domainAt(domain_idx) orelse break;
-        domains[domain_count] = domain;
-        domain_count += 1;
+fn collectRuntimeDomains(
+    runtime_config: *const acme_types.RuntimeConfig,
+    out: *[config.ACME_MAX_DOMAINS_PER_CERT][]const u8,
+) []const []const u8 {
+    assert(@intFromPtr(runtime_config) != 0);
+    assert(runtime_config.domain_count <= config.ACME_MAX_DOMAINS_PER_CERT);
+
+    var domain_count: u8 = 0;
+    while (domain_count < runtime_config.domain_count) : (domain_count += 1) {
+        out[domain_count] = runtime_config.domainAt(domain_count) orelse break;
     }
+    return out[0..domain_count];
+}
 
+fn finalizeOrder(
+    flow_ctx: *orchestration.FlowContext,
+    runtime_config: *const acme_types.RuntimeConfig,
+    acme_client: *Client,
+    signer: *const signer_mod.AccountSigner,
+    io: Io,
+    work: WorkBuffers,
+) Error!csr_mod.Result {
+    assert(@intFromPtr(flow_ctx) != 0);
+    assert(@intFromPtr(runtime_config) != 0);
+
+    var domains: [config.ACME_MAX_DOMAINS_PER_CERT][]const u8 = undefined;
+    const domain_slice = collectRuntimeDomains(runtime_config, &domains);
     const csr_result = try csr_mod.generate(
         std.heap.page_allocator,
         runtime_config.stateDirPath(),
-        domains[0..domain_count],
+        domain_slice,
         work.csr_der_buf,
         work.key_pem_buf,
     );
@@ -164,28 +262,32 @@ pub fn runIssuanceOnce(
         &flow_ctx.account_url,
         finalize_payload,
     );
-    _ = try transport.executeOperation(&flow_ctx, acme_client, .{
+    _ = try transport.executeOperation(flow_ctx, acme_client, .{
         .operation = .finalize_order,
         .signed_body = finalize_body,
         .io = io,
         .header_buf = work.header_buf,
         .body_buf = work.body_buf,
     });
+    return csr_result;
+}
 
-    // 6) poll order until cert URL available
-    const final_order = try pollOrderValid(
-        &flow_ctx,
-        runtime_config,
-        acme_client,
-        signer,
-        io,
-        work,
-    );
+fn pollAndDownloadOrderCertificate(
+    flow_ctx: *orchestration.FlowContext,
+    runtime_config: *const acme_types.RuntimeConfig,
+    acme_client: *Client,
+    signer: *const signer_mod.AccountSigner,
+    io: Io,
+    work: WorkBuffers,
+) Error![]const u8 {
+    assert(@intFromPtr(flow_ctx) != 0);
+    assert(@intFromPtr(runtime_config) != 0);
+
+    const final_order = try pollOrderValid(flow_ctx, runtime_config, acme_client, signer, io, work);
     if (!final_order.has_certificate_url) return error.MissingCertificateUrl;
 
-    // 7) download certificate via POST-as-GET (empty payload)
     const cert_pem = try downloadCertificate(
-        &flow_ctx,
+        flow_ctx,
         acme_client,
         signer,
         io,
@@ -193,20 +295,30 @@ pub fn runIssuanceOnce(
         &final_order.certificate_url,
     );
     if (cert_pem.len == 0) return error.CertResponseEmpty;
+    return cert_pem;
+}
 
-    // 8) persist and activate
+fn persistAndActivate(
+    runtime_config: *const acme_types.RuntimeConfig,
+    tls_manager: ?*ReloadableServerCtx,
+    cert_pem: []const u8,
+    key_pem: []const u8,
+    cert_path_buf: []u8,
+    key_path_buf: []u8,
+) Error!storage.PersistedPaths {
+    assert(@intFromPtr(runtime_config) != 0);
+    assert(cert_pem.len > 0);
+
     const persisted = try storage.persistCertificateAndKey(
         runtime_config.stateDirPath(),
         cert_pem,
-        csr_result.key_pem,
-        work.cert_path_buf,
-        work.key_path_buf,
+        key_pem,
+        cert_path_buf,
+        key_path_buf,
     );
-
     if (tls_manager) |manager| {
         _ = try manager.activateFromPemFiles(persisted.cert_path, persisted.key_path);
     }
-
     return persisted;
 }
 
@@ -217,6 +329,8 @@ fn fetchDirectory(
     header_buf: []u8,
     body_buf: []u8,
 ) Error!client.Directory {
+    assert(@intFromPtr(runtime_config) != 0);
+    assert(@intFromPtr(acme_client) != 0);
     var dir_url = client.Url{};
     try dir_url.set(runtime_config.directoryUrl());
     const parsed = try wire.parseAbsoluteUrl(&dir_url);
@@ -248,6 +362,8 @@ fn authorizeChallenge(
     auth_url: *const client.Url,
     hook_provider: *tls_alpn_hook_mod.TlsAlpnHookProvider,
 ) Error!void {
+    assert(@intFromPtr(flow_ctx) != 0);
+    assert(@intFromPtr(hook_provider) != 0);
     const auth = try fetchAuthorization(flow_ctx, acme_client, signer, io, work, auth_url);
     if (auth.status == .valid) return;
 
@@ -280,6 +396,8 @@ fn authorizeTlsAlpn01(
     challenge: *const client.AuthorizationChallenge,
     hook_provider: *tls_alpn_hook_mod.TlsAlpnHookProvider,
 ) Error!void {
+    assert(@intFromPtr(flow_ctx) != 0);
+    assert(@intFromPtr(challenge) != 0);
     var key_auth_buf: [config.ACME_MAX_HTTP01_KEY_AUTHORIZATION_BYTES]u8 = undefined;
     const key_auth = try signer.computeKeyAuthorization(challenge.token(), &key_auth_buf);
 
@@ -336,6 +454,8 @@ fn notifyChallengeReady(
     work: WorkBuffers,
     challenge_url: *const client.Url,
 ) Error!void {
+    assert(@intFromPtr(flow_ctx) != 0);
+    assert(@intFromPtr(challenge_url) != 0);
     const notify_body = try signer.signWithKid(
         work.jws_buf,
         &flow_ctx.nonce,
@@ -363,6 +483,8 @@ fn pollAuthorizationValid(
     work: WorkBuffers,
     auth_url: *const client.Url,
 ) Error!void {
+    assert(@intFromPtr(flow_ctx) != 0);
+    assert(@intFromPtr(auth_url) != 0);
     var attempt: u16 = 0;
     while (attempt < config.ACME_MAX_POLL_ATTEMPTS) : (attempt += 1) {
         const polled = try fetchAuthorization(flow_ctx, acme_client, signer, io, work, auth_url);
@@ -384,6 +506,8 @@ fn fetchAuthorization(
     work: WorkBuffers,
     auth_url: *const client.Url,
 ) Error!client.AuthorizationResponse {
+    assert(@intFromPtr(flow_ctx) != 0);
+    assert(@intFromPtr(auth_url) != 0);
     const body = try signer.signWithKid(
         work.jws_buf,
         &flow_ctx.nonce,
@@ -413,6 +537,8 @@ fn pollOrderValid(
     io: Io,
     work: WorkBuffers,
 ) Error!client.OrderResponse {
+    assert(@intFromPtr(flow_ctx) != 0);
+    assert(@intFromPtr(acme_client) != 0);
     var attempt: u16 = 0;
     while (attempt < config.ACME_MAX_POLL_ATTEMPTS) : (attempt += 1) {
         const fetch_order_body = try signer.signWithKid(
@@ -457,6 +583,8 @@ fn downloadCertificate(
     work: WorkBuffers,
     cert_url: *const client.Url,
 ) Error![]const u8 {
+    assert(@intFromPtr(flow_ctx) != 0);
+    assert(@intFromPtr(cert_url) != 0);
     const body = try signer.signWithKid(
         work.jws_buf,
         &flow_ctx.nonce,

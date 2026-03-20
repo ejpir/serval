@@ -44,6 +44,7 @@ pub const SignedBodies = struct {
 
     pub fn bodyForOperation(self: *const SignedBodies, operation: orchestration.Operation) Error![]const u8 {
         assert(@intFromPtr(self) != 0);
+        assert(self.new_account_body.len <= config.ACME_MAX_JWS_BODY_BYTES);
 
         return switch (operation) {
             .fetch_nonce => &.{},
@@ -56,6 +57,8 @@ pub const SignedBodies = struct {
     }
 
     fn requireSignedBody(value: []const u8) Error![]const u8 {
+        assert(config.ACME_MAX_JWS_BODY_BYTES > 0);
+        assert(value.len <= config.ACME_MAX_JWS_BODY_BYTES);
         if (value.len == 0) return error.MissingSignedBody;
         return value;
     }
@@ -84,6 +87,7 @@ pub const Executor = struct {
         ) transport.ExecuteOperationError!orchestration.HandledResponse,
     ) Executor {
         assert(@intFromPtr(execute_fn) != 0);
+        assert(@sizeOf(Executor) > 0);
         return .{
             .context = context,
             .execute_fn = execute_fn,
@@ -92,6 +96,7 @@ pub const Executor = struct {
 
     pub fn fromClient(client_ptr: *Client) Executor {
         assert(@intFromPtr(client_ptr) != 0);
+        assert(@intFromPtr(executeWithClient) != 0);
         return .{
             .context = client_ptr,
             .execute_fn = executeWithClient,
@@ -104,6 +109,7 @@ pub const Executor = struct {
         params: transport.ExecuteOperationParams,
     ) transport.ExecuteOperationError!orchestration.HandledResponse {
         assert(@intFromPtr(flow_ctx) != 0);
+        assert(@intFromPtr(self.execute_fn) != 0);
         return self.execute_fn(self.context, flow_ctx, params);
     }
 
@@ -113,6 +119,7 @@ pub const Executor = struct {
         params: transport.ExecuteOperationParams,
     ) transport.ExecuteOperationError!orchestration.HandledResponse {
         assert(context != null);
+        assert(@intFromPtr(flow_ctx) != 0);
 
         const client_ptr: *Client = @ptrCast(@alignCast(context.?));
         return transport.executeOperation(flow_ctx, client_ptr, params);
@@ -144,11 +151,13 @@ pub const Manager = struct {
 
     pub fn init(directory: *const client.Directory, upstream_idx: config.UpstreamIndex) Manager {
         assert(@intFromPtr(directory) != 0);
+        assert(config.ACME_DEFAULT_FAIL_BACKOFF_MIN_MS > 0);
+        assert(config.ACME_DEFAULT_FAIL_BACKOFF_MIN_MS <= config.ACME_DEFAULT_FAIL_BACKOFF_MAX_MS);
 
-        const retry_backoff = backoff.BoundedBackoff.init(
-            config.ACME_DEFAULT_FAIL_BACKOFF_MIN_MS,
-            config.ACME_DEFAULT_FAIL_BACKOFF_MAX_MS,
-        ) catch unreachable;
+        const retry_backoff = backoff.BoundedBackoff{
+            .min_ms = config.ACME_DEFAULT_FAIL_BACKOFF_MIN_MS,
+            .max_ms = config.ACME_DEFAULT_FAIL_BACKOFF_MAX_MS,
+        };
 
         return .{
             .state = .idle,
@@ -160,6 +169,7 @@ pub const Manager = struct {
 
     pub fn startRenewal(self: *Manager) void {
         assert(@intFromPtr(self) != 0);
+        assert(self.max_transitions_per_tick > 0);
 
         self.state = .fetch_nonce;
         self.backoff_wait_until_ns = 0;
@@ -304,6 +314,7 @@ pub const Manager = struct {
 
     fn operationForState(self: *const Manager) ?orchestration.Operation {
         assert(@intFromPtr(self) != 0);
+        assert(self.max_transitions_per_tick > 0);
 
         return switch (self.state) {
             .fetch_nonce => .fetch_nonce,
@@ -355,93 +366,46 @@ pub const Manager = struct {
         assert(@intFromPtr(handled) != 0);
 
         switch (operation) {
-            .fetch_nonce => {
-                self.state = .ensure_account;
-            },
-            .new_account, .fetch_account => {
-                const account = switch (handled.parsed) {
-                    .account => |account| account,
-                    else => {
-                        self.state = .fatal;
-                        return;
-                    },
-                };
-
-                switch (account.status) {
-                    .valid => self.state = .create_order,
-                    .deactivated, .revoked => self.state = .fatal,
-                }
-            },
-            .new_order => {
-                const order = switch (handled.parsed) {
-                    .order => |order| order,
-                    else => {
-                        self.state = .fatal;
-                        return;
-                    },
-                };
-
-                switch (order.status) {
-                    .ready => self.state = .finalize_order,
-                    .pending, .processing => self.state = .poll_order_ready,
-                    .valid => {
-                        if (order.has_certificate_url) {
-                            self.state = .download_certificate;
-                        } else {
-                            self.state = .poll_order_ready;
-                        }
-                    },
-                    .invalid => self.state = .backoff_wait,
-                }
-            },
-            .finalize_order => {
-                const order = switch (handled.parsed) {
-                    .order => |order| order,
-                    else => {
-                        self.state = .fatal;
-                        return;
-                    },
-                };
-
-                switch (order.status) {
-                    .valid => {
-                        if (order.has_certificate_url) {
-                            self.state = .download_certificate;
-                        } else {
-                            self.state = .poll_order_ready;
-                        }
-                    },
-                    .invalid => self.state = .backoff_wait,
-                    .pending, .ready, .processing => self.state = .poll_order_ready,
-                }
-            },
-            .fetch_order => {
-                const order = switch (handled.parsed) {
-                    .order => |order| order,
-                    else => {
-                        self.state = .fatal;
-                        return;
-                    },
-                };
-
-                switch (order.status) {
-                    .ready => self.state = .finalize_order,
-                    .pending, .processing => self.state = .poll_order_ready,
-                    .valid => {
-                        if (order.has_certificate_url) {
-                            self.state = .download_certificate;
-                        } else {
-                            self.state = .poll_order_ready;
-                        }
-                    },
-                    .invalid => self.state = .backoff_wait,
-                }
-            },
+            .fetch_nonce => self.state = .ensure_account,
+            .new_account, .fetch_account => self.applyAccountSuccess(handled),
+            .new_order, .finalize_order, .fetch_order => self.applyOrderSuccess(handled),
         }
+    }
+
+    fn applyAccountSuccess(self: *Manager, handled: *const orchestration.HandledResponse) void {
+        assert(@intFromPtr(self) != 0);
+        assert(@intFromPtr(handled) != 0);
+
+        const account = switch (handled.parsed) {
+            .account => |account| account,
+            else => {
+                self.state = .fatal;
+                return;
+            },
+        };
+        self.state = switch (account.status) {
+            .valid => .create_order,
+            .deactivated, .revoked => .fatal,
+        };
+    }
+
+    fn applyOrderSuccess(self: *Manager, handled: *const orchestration.HandledResponse) void {
+        assert(@intFromPtr(self) != 0);
+        assert(@intFromPtr(handled) != 0);
+
+        const order = switch (handled.parsed) {
+            .order => |order| order,
+            else => {
+                self.state = .fatal;
+                return;
+            },
+        };
+        self.state = nextStateFromOrder(&order);
     }
 
     fn handleExecutionError(self: *Manager, err: transport.ExecuteOperationError) void {
         assert(@intFromPtr(self) != 0);
+        assert(self.consecutive_failures <= max_error_count);
 
         const disposition = classifyExecutionError(err);
         self.consecutive_failures = incrementErrorCount(self.consecutive_failures);
@@ -454,6 +418,7 @@ pub const Manager = struct {
 
     fn applyFailureState(self: *Manager, disposition: ExecutionDisposition) void {
         assert(@intFromPtr(self) != 0);
+        assert(self.retry_backoff.min_ms <= self.retry_backoff.max_ms);
 
         switch (disposition) {
             .refresh_nonce => {
@@ -478,13 +443,28 @@ pub const Manager = struct {
     }
 };
 
+fn nextStateFromOrder(order: *const client.OrderResponse) acme_types.CertState {
+    assert(@intFromPtr(order) != 0);
+    assert(order.authorization_count <= config.ACME_MAX_AUTHORIZATION_URLS_PER_ORDER);
+
+    return switch (order.status) {
+        .ready => .finalize_order,
+        .pending, .processing => .poll_order_ready,
+        .valid => if (order.has_certificate_url) .download_certificate else .poll_order_ready,
+        .invalid => .backoff_wait,
+    };
+}
+
 fn incrementErrorCount(value: u16) u16 {
+    assert(value <= max_error_count);
     const next = std.math.add(u16, value, 1) catch max_error_count;
     assert(next >= value);
     return next;
 }
 
 fn isTerminal(state: acme_types.CertState) bool {
+    assert(@sizeOf(acme_types.CertState) == 1);
+    assert(@intFromEnum(state) <= @intFromEnum(acme_types.CertState.fatal));
     return switch (state) {
         .fatal,
         .download_certificate,
@@ -497,6 +477,8 @@ fn isTerminal(state: acme_types.CertState) bool {
 }
 
 fn classifyExecutionError(err: transport.ExecuteOperationError) ExecutionDisposition {
+    assert(@sizeOf(ExecutionDisposition) == 1);
+    assert(@sizeOf(@TypeOf(err)) > 0);
     return switch (err) {
         error.MissingReplayNonceHeader,
         error.NonceUnavailable,
@@ -523,6 +505,8 @@ fn classifyExecutionError(err: transport.ExecuteOperationError) ExecutionDisposi
 }
 
 fn classifyExecutionErrorAssessment(err: transport.ExecuteOperationError) orchestration.ErrorAssessment {
+    assert(@sizeOf(orchestration.ErrorAssessment) > 0);
+    assert(@sizeOf(@TypeOf(err)) > 0);
     return switch (err) {
         error.MissingReplayNonceHeader,
         error.NonceUnavailable,
@@ -557,12 +541,18 @@ fn classifyExecutionErrorAssessment(err: transport.ExecuteOperationError) orches
 }
 
 fn make_url(value: []const u8) client.Url {
+    assert(value.len > 0);
+    assert(value.len <= config.ACME_MAX_DIRECTORY_URL_BYTES);
     var url = client.Url{};
-    url.set(value) catch unreachable;
+    url.set(value) catch |err| {
+        std.debug.panic("manager test helper invalid url err={s}", .{@errorName(err)});
+    };
     return url;
 }
 
 fn make_order(status: client.OrderStatus, has_certificate_url: bool) client.OrderResponse {
+    assert(@sizeOf(client.OrderStatus) == 1);
+    assert(@sizeOf(client.OrderResponse) > 0);
     var order = client.OrderResponse{
         .status = status,
         .finalize_url = make_url("https://acme.example/order/1/finalize"),
@@ -589,6 +579,8 @@ const ScriptExecutor = struct {
     cursor: u8 = 0,
 
     fn asExecutor(self: *ScriptExecutor) Executor {
+        assert(@intFromPtr(self) != 0);
+        assert(self.cursor <= self.steps.len);
         return Executor.init(self, run);
     }
 
@@ -603,7 +595,7 @@ const ScriptExecutor = struct {
         const self: *ScriptExecutor = @ptrCast(@alignCast(context.?));
         assert(self.cursor < self.steps.len);
 
-        const index: usize = self.cursor;
+        const index: u8 = self.cursor;
         const step = self.steps[index];
         self.cursor += 1;
 

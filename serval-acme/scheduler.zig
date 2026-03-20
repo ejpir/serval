@@ -39,6 +39,8 @@ pub const Config = struct {
     max_iterations: u32 = 1_000_000_000,
 
     pub fn init(check_interval_ms: u32) Error!Config {
+        assert(config.ACME_MAX_POLL_ATTEMPTS > 0);
+        assert(check_interval_ms <= std.math.maxInt(u32));
         if (check_interval_ms == 0) return error.InvalidCheckInterval;
         return .{ .check_interval_ms = check_interval_ms };
     }
@@ -153,13 +155,16 @@ const TestCtx = struct {
 };
 
 fn testShouldRenew(ctx_raw: *anyopaque, now_ns: u64) ShouldRenewResult {
-    _ = now_ns;
+    assert(@intFromPtr(ctx_raw) != 0);
+    assert(now_ns <= std.math.maxInt(u64));
     const ctx: *TestCtx = @ptrCast(@alignCast(ctx_raw));
     ctx.should_calls += 1;
     return ctx.should_result;
 }
 
 fn testIssue(ctx_raw: *anyopaque, io: Io) IssueResult {
+    assert(@intFromPtr(ctx_raw) != 0);
+    assert(@sizeOf(Io) > 0);
     _ = io;
     const ctx: *TestCtx = @ptrCast(@alignCast(ctx_raw));
     ctx.issue_calls += 1;

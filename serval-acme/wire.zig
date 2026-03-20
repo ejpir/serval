@@ -13,9 +13,9 @@ const Method = types.Method;
 const client = @import("client.zig");
 const jws = @import("jws.zig");
 
-const max_host_bytes: usize = config.ACME_MAX_DOMAIN_NAME_LEN;
-const max_path_bytes: usize = config.ACME_MAX_DIRECTORY_URL_BYTES;
-const max_body_bytes: usize = config.ACME_MAX_JWS_BODY_BYTES;
+const max_host_bytes = config.ACME_MAX_DOMAIN_NAME_LEN;
+const max_path_bytes = config.ACME_MAX_DIRECTORY_URL_BYTES;
+const max_body_bytes = config.ACME_MAX_JWS_BODY_BYTES;
 
 pub const Error = error{
     InvalidUrl,
@@ -38,6 +38,8 @@ pub const ParsedUrl = struct {
     path_bytes: [max_path_bytes]u8 = [_]u8{0} ** max_path_bytes,
 
     pub fn init() ParsedUrl {
+        assert(max_host_bytes > 0);
+        assert(max_path_bytes > 0);
         var parsed = ParsedUrl{};
         parsed.path_bytes[0] = '/';
         parsed.path_len = 1;
@@ -81,16 +83,19 @@ pub const WireRequest = struct {
 
     pub fn upstream(self: *const WireRequest, idx: config.UpstreamIndex) types.Upstream {
         assert(@intFromPtr(self) != 0);
+        assert(self.target.host_len > 0);
         return self.target.toUpstream(idx);
     }
 
     pub fn path(self: *const WireRequest) []const u8 {
         assert(@intFromPtr(self) != 0);
+        assert(self.target.path_len >= 1);
         return self.target.path();
     }
 
     pub fn hasBody(self: *const WireRequest) bool {
         assert(@intFromPtr(self) != 0);
+        assert(self.body.len <= max_body_bytes);
         return self.body.len > 0;
     }
 };
@@ -99,15 +104,21 @@ pub const ComposeSignedRequestError = Error || jws.Error;
 
 pub fn parseAbsoluteUrl(url: *const client.Url) Error!ParsedUrl {
     assert(@intFromPtr(url) != 0);
-    return parseAbsoluteUrlSlice(url.slice());
+    const parsed = try parseAbsoluteUrlSlice(url.slice());
+    assert(parsed.host_len > 0);
+    return parsed;
 }
 
 pub fn parseAbsoluteUrlSlice(value: []const u8) Error!ParsedUrl {
+    assert(max_host_bytes > 0);
+    assert(max_path_bytes > 0);
     if (value.len == 0) return error.InvalidUrl;
+    if (value.len > std.math.maxInt(u32)) return error.InvalidUrl;
+    const value_len: u32 = @intCast(value.len);
 
     var parsed = ParsedUrl.init();
 
-    var cursor: usize = 0;
+    var cursor: u32 = 0;
     if (std.mem.startsWith(u8, value, "https://")) {
         parsed.tls = true;
         parsed.port = 443;
@@ -120,68 +131,77 @@ pub fn parseAbsoluteUrlSlice(value: []const u8) Error!ParsedUrl {
         return error.InvalidScheme;
     }
 
-    if (cursor >= value.len) return error.InvalidHost;
+    if (cursor >= value_len) return error.InvalidHost;
 
-    var authority_end: usize = cursor;
-    while (authority_end < value.len) : (authority_end += 1) {
-        const c = value[authority_end];
+    var authority_end: u32 = cursor;
+    while (authority_end < value_len) : (authority_end += 1) {
+        const c = value[@intCast(authority_end)];
         if (c == '/' or c == '?' or c == '#') break;
     }
 
-    const authority = value[cursor..authority_end];
+    const authority = value[@intCast(cursor)..@intCast(authority_end)];
     try parseAuthority(&parsed, authority);
 
-    const path_source = if (authority_end < value.len) value[authority_end..] else "";
+    const path_source = if (authority_end < value_len) value[@intCast(authority_end)..] else "";
     try setPathFromRemainder(&parsed, path_source);
 
+    assert(parsed.host_len > 0);
+    assert(parsed.path_len >= 1);
     return parsed;
 }
 
 pub fn buildNewNonceRequest(directory: *const client.Directory) Error!WireRequest {
     assert(@intFromPtr(directory) != 0);
-
-    return .{
+    var request = WireRequest{
         .method = .HEAD,
         .target = try parseAbsoluteUrl(&directory.new_nonce_url),
         .body = &.{},
         .content_type = null,
     };
+    assert(request.body.len == 0);
+    return request;
 }
 
 pub fn buildNewAccountRequest(directory: *const client.Directory, body: []const u8) Error!WireRequest {
     assert(@intFromPtr(directory) != 0);
 
     if (body.len > max_body_bytes) return error.BodyTooLarge;
-    return .{
+    var request = WireRequest{
         .method = .POST,
         .target = try parseAbsoluteUrl(&directory.new_account_url),
         .body = body,
         .content_type = "application/jose+json",
     };
+    assert(request.body.len == body.len);
+    return request;
 }
 
 pub fn buildNewOrderRequest(directory: *const client.Directory, body: []const u8) Error!WireRequest {
     assert(@intFromPtr(directory) != 0);
 
     if (body.len > max_body_bytes) return error.BodyTooLarge;
-    return .{
+    var request = WireRequest{
         .method = .POST,
         .target = try parseAbsoluteUrl(&directory.new_order_url),
         .body = body,
         .content_type = "application/jose+json",
     };
+    assert(request.body.len == body.len);
+    return request;
 }
 
 pub fn buildSignedPostRequest(target_url: *const client.Url, body: []const u8) Error!WireRequest {
     assert(@intFromPtr(target_url) != 0);
 
     if (body.len > max_body_bytes) return error.BodyTooLarge;
-    return .{
+    var request = WireRequest{
         .method = .POST,
         .target = try parseAbsoluteUrl(target_url),
         .body = body,
         .content_type = "application/jose+json",
     };
+    assert(request.body.len == body.len);
+    return request;
 }
 
 pub fn composeNewAccountRequestWithFlattenedJws(
@@ -192,6 +212,7 @@ pub fn composeNewAccountRequestWithFlattenedJws(
     assert(@intFromPtr(directory) != 0);
 
     const body = try jws.serializeFlattenedJws(body_out, params);
+    assert(body.len <= max_body_bytes);
     return try buildNewAccountRequest(directory, body);
 }
 
@@ -203,6 +224,7 @@ pub fn composeNewOrderRequestWithFlattenedJws(
     assert(@intFromPtr(directory) != 0);
 
     const body = try jws.serializeFlattenedJws(body_out, params);
+    assert(body.len <= max_body_bytes);
     return try buildNewOrderRequest(directory, body);
 }
 
@@ -214,11 +236,13 @@ pub fn composeSignedPostRequestWithFlattenedJws(
     assert(@intFromPtr(target_url) != 0);
 
     const body = try jws.serializeFlattenedJws(body_out, params);
+    assert(body.len <= max_body_bytes);
     return try buildSignedPostRequest(target_url, body);
 }
 
 pub fn parseReplayNonceFromHeaders(headers: *const HeaderMap) (Error || client.Error)!client.ReplayNonce {
     assert(@intFromPtr(headers) != 0);
+    assert(config.MAX_HEADERS > 0);
 
     const replay_nonce_value = headers.get("replay-nonce") orelse return error.MissingReplayNonceHeader;
     return client.parseReplayNonceHeader(replay_nonce_value);
@@ -226,6 +250,7 @@ pub fn parseReplayNonceFromHeaders(headers: *const HeaderMap) (Error || client.E
 
 pub fn parseLocationFromHeaders(headers: *const HeaderMap) (Error || client.Error)!client.Url {
     assert(@intFromPtr(headers) != 0);
+    assert(config.MAX_HEADERS > 0);
 
     const location_value = headers.get("location") orelse return error.MissingLocationHeader;
     return client.parseLocationHeader(location_value);
@@ -233,6 +258,7 @@ pub fn parseLocationFromHeaders(headers: *const HeaderMap) (Error || client.Erro
 
 fn parseAuthority(parsed: *ParsedUrl, authority: []const u8) Error!void {
     assert(@intFromPtr(parsed) != 0);
+    assert(parsed.path_len >= 1);
 
     if (authority.len == 0) return error.InvalidHost;
 
@@ -254,16 +280,20 @@ fn parseAuthority(parsed: *ParsedUrl, authority: []const u8) Error!void {
     @memset(parsed.host_bytes[0..], 0);
     @memcpy(parsed.host_bytes[0..host_part.len], host_part);
     parsed.host_len = @intCast(host_part.len);
+    assert(parsed.host_len > 0);
 }
 
 fn parsePort(port_part: []const u8) Error!u16 {
+    assert(std.math.maxInt(u16) == 65535);
+    assert(max_host_bytes > 0);
     if (port_part.len == 0) return error.InvalidPort;
     if (port_part.len > 5) return error.InvalidPort;
+    const port_len: u8 = @intCast(port_part.len);
 
     var port_value: u32 = 0;
-    var index: usize = 0;
-    while (index < port_part.len) : (index += 1) {
-        const c = port_part[index];
+    var index: u8 = 0;
+    while (index < port_len) : (index += 1) {
+        const c = port_part[@intCast(index)];
         if (c < '0' or c > '9') return error.InvalidPort;
 
         port_value = port_value * 10 + (c - '0');
@@ -275,11 +305,14 @@ fn parsePort(port_part: []const u8) Error!u16 {
 }
 
 fn validateHost(host: []const u8) Error!void {
+    assert(max_host_bytes > 0);
     if (host.len == 0) return error.InvalidHost;
+    if (host.len > std.math.maxInt(u16)) return error.InvalidHost;
+    const host_len: u16 = @intCast(host.len);
 
-    var index: usize = 0;
-    while (index < host.len) : (index += 1) {
-        const c = host[index];
+    var index: u16 = 0;
+    while (index < host_len) : (index += 1) {
+        const c = host[@intCast(index)];
         const is_digit = c >= '0' and c <= '9';
         const is_upper = c >= 'A' and c <= 'Z';
         const is_lower = c >= 'a' and c <= 'z';
@@ -292,10 +325,12 @@ fn validateHost(host: []const u8) Error!void {
     }
 
     if (host[0] == '.' or host[host.len - 1] == '.') return error.InvalidHost;
+    assert(host[0] != '.' and host[host.len - 1] != '.');
 }
 
 fn setPathFromRemainder(parsed: *ParsedUrl, remainder: []const u8) Error!void {
     assert(@intFromPtr(parsed) != 0);
+    assert(parsed.host_len <= max_host_bytes);
 
     if (remainder.len == 0) {
         parsed.path_bytes[0] = '/';
@@ -303,9 +338,10 @@ fn setPathFromRemainder(parsed: *ParsedUrl, remainder: []const u8) Error!void {
         return;
     }
 
-    var fragment_index: usize = remainder.len;
+    if (remainder.len > std.math.maxInt(u16)) return error.PathTooLong;
+    var fragment_index: u16 = @intCast(remainder.len);
     if (std.mem.indexOfScalar(u8, remainder, '#')) |idx| {
-        fragment_index = idx;
+        fragment_index = @intCast(idx);
     }
 
     const no_fragment = remainder[0..fragment_index];
@@ -334,13 +370,16 @@ fn setPathFromRemainder(parsed: *ParsedUrl, remainder: []const u8) Error!void {
 
 fn setPath(parsed: *ParsedUrl, path: []const u8) Error!void {
     assert(@intFromPtr(parsed) != 0);
+    assert(max_path_bytes > 0);
 
     if (path.len == 0) return error.PathTooLong;
     if (path.len > max_path_bytes) return error.PathTooLong;
+    assert(path[0] == '/');
 
     @memset(parsed.path_bytes[0..], 0);
     @memcpy(parsed.path_bytes[0..path.len], path);
     parsed.path_len = @intCast(path.len);
+    assert(parsed.path_len == @as(u16, @intCast(path.len)));
 }
 
 test "parseAbsoluteUrlSlice parses https default port and path" {

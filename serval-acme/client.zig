@@ -8,19 +8,20 @@ const assert = std.debug.assert;
 const config = @import("serval-core").config;
 const acme_types = @import("types.zig");
 
-const max_url_bytes: usize = config.ACME_MAX_DIRECTORY_URL_BYTES;
-const max_nonce_bytes: usize = config.ACME_MAX_NONCE_BYTES;
-const max_contact_email_bytes: usize = config.ACME_MAX_CONTACT_EMAIL_BYTES;
-const max_identifiers_per_order: usize = config.ACME_MAX_DOMAINS_PER_CERT;
-const max_authorization_urls_per_order: usize = config.ACME_MAX_AUTHORIZATION_URLS_PER_ORDER;
-const max_directory_response_bytes: usize = config.ACME_MAX_DIRECTORY_RESPONSE_BYTES;
-const max_account_response_bytes: usize = config.ACME_MAX_ACCOUNT_RESPONSE_BYTES;
-const max_order_response_bytes: usize = config.ACME_MAX_ORDER_RESPONSE_BYTES;
-const max_jws_body_bytes: usize = config.ACME_MAX_JWS_BODY_BYTES;
-const max_challenges_per_authorization: usize = 16;
-const max_challenge_token_bytes: usize = config.ACME_MAX_HTTP01_TOKEN_BYTES;
+const max_url_bytes = config.ACME_MAX_DIRECTORY_URL_BYTES;
+const max_nonce_bytes = config.ACME_MAX_NONCE_BYTES;
+const max_contact_email_bytes = config.ACME_MAX_CONTACT_EMAIL_BYTES;
+const max_identifiers_per_order = config.ACME_MAX_DOMAINS_PER_CERT;
+const max_authorization_urls_per_order = config.ACME_MAX_AUTHORIZATION_URLS_PER_ORDER;
+const max_directory_response_bytes = config.ACME_MAX_DIRECTORY_RESPONSE_BYTES;
+const max_account_response_bytes = config.ACME_MAX_ACCOUNT_RESPONSE_BYTES;
+const max_order_response_bytes = config.ACME_MAX_ORDER_RESPONSE_BYTES;
+const max_jws_body_bytes = config.ACME_MAX_JWS_BODY_BYTES;
+const max_challenges_per_authorization = 16;
+const max_challenge_token_bytes = config.ACME_MAX_HTTP01_TOKEN_BYTES;
+const output_cursor_max: u32 = max_jws_body_bytes;
 
-const json_parse_scratch_size_bytes: usize = 8192;
+const json_parse_scratch_size_bytes = 8192;
 
 pub const Error = error{
     EmptyInput,
@@ -56,6 +57,7 @@ pub const Url = struct {
 
     pub fn set(self: *Url, value: []const u8) Error!void {
         assert(@intFromPtr(self) != 0);
+        assert(self.len <= max_url_bytes);
 
         if (value.len == 0) return error.InvalidUrl;
         if (value.len > max_url_bytes) return error.UrlTooLong;
@@ -70,6 +72,7 @@ pub const Url = struct {
         @memset(self.bytes[0..], 0);
         @memcpy(self.bytes[0..value.len], value);
         self.len = @intCast(value.len);
+        assert(self.len == @as(u16, @intCast(value.len)));
     }
 
     pub fn slice(self: *const Url) []const u8 {
@@ -86,6 +89,7 @@ pub const ReplayNonce = struct {
 
     pub fn set(self: *ReplayNonce, value: []const u8) Error!void {
         assert(@intFromPtr(self) != 0);
+        assert(self.len <= max_nonce_bytes);
 
         if (value.len == 0) return error.InvalidNonce;
         if (value.len > max_nonce_bytes) return error.NonceTooLong;
@@ -96,6 +100,7 @@ pub const ReplayNonce = struct {
         @memset(self.bytes[0..], 0);
         @memcpy(self.bytes[0..value.len], value);
         self.len = @intCast(value.len);
+        assert(self.len == @as(u16, @intCast(value.len)));
     }
 
     pub fn slice(self: *const ReplayNonce) []const u8 {
@@ -154,11 +159,13 @@ pub const AuthorizationChallenge = struct {
 
     pub fn setToken(self: *AuthorizationChallenge, token_value: []const u8) Error!void {
         assert(@intFromPtr(self) != 0);
+        assert(self.token_len <= max_challenge_token_bytes);
         if (token_value.len == 0 or token_value.len > max_challenge_token_bytes) return error.InvalidChallengeToken;
+        const token_len: u16 = @intCast(token_value.len);
 
-        var i: usize = 0;
-        while (i < token_value.len) : (i += 1) {
-            const c = token_value[i];
+        var i: u16 = 0;
+        while (i < token_len) : (i += 1) {
+            const c = token_value[@intCast(i)];
             const is_digit = c >= '0' and c <= '9';
             const is_upper = c >= 'A' and c <= 'Z';
             const is_lower = c >= 'a' and c <= 'z';
@@ -171,7 +178,8 @@ pub const AuthorizationChallenge = struct {
 
         @memset(self.token_bytes[0..], 0);
         @memcpy(self.token_bytes[0..token_value.len], token_value);
-        self.token_len = @intCast(token_value.len);
+        self.token_len = token_len;
+        assert(self.token_len == token_len);
     }
 
     pub fn token(self: *const AuthorizationChallenge) []const u8 {
@@ -193,6 +201,7 @@ pub const AuthorizationResponse = struct {
 
     pub fn firstTlsAlpn01Challenge(self: *const AuthorizationResponse) ?*const AuthorizationChallenge {
         assert(@intFromPtr(self) != 0);
+        assert(self.challenge_count <= max_challenges_per_authorization);
 
         var i: u8 = 0;
         while (i < self.challenge_count) : (i += 1) {
@@ -214,14 +223,17 @@ pub const NewOrderRequest = struct {
     identifier_count: u8 = 0,
 
     pub fn init() NewOrderRequest {
-        return .{};
+        assert(max_identifiers_per_order > 0);
+        const request = NewOrderRequest{};
+        assert(request.identifier_count == 0);
+        return request;
     }
 
     pub fn addIdentifier(self: *NewOrderRequest, domain: []const u8) Error!void {
         assert(@intFromPtr(self) != 0);
 
         if (self.identifier_count >= max_identifiers_per_order) return error.TooManyIdentifiers;
-        const slot_index: usize = self.identifier_count;
+        const slot_index: u8 = self.identifier_count;
         self.identifiers[slot_index].set(domain) catch |err| switch (err) {
             error.InvalidDomainName, error.DomainTooLong => return error.InvalidDomainName,
             else => return error.InvalidDomainName,
@@ -233,6 +245,7 @@ pub const NewOrderRequest = struct {
 
     pub fn initFromRuntimeConfig(runtime: *const acme_types.RuntimeConfig) Error!NewOrderRequest {
         assert(@intFromPtr(runtime) != 0);
+        assert(runtime.domain_count <= max_identifiers_per_order);
 
         var request = NewOrderRequest.init();
         if (runtime.domain_count == 0) return error.InvalidIdentifierCount;
@@ -243,6 +256,7 @@ pub const NewOrderRequest = struct {
             try request.addIdentifier(domain);
         }
 
+        assert(request.identifier_count == runtime.domain_count);
         return request;
     }
 };
@@ -263,6 +277,8 @@ pub const NewAccountPayload = struct {
 };
 
 pub fn parseDirectoryResponseJson(json_body: []const u8) Error!Directory {
+    assert(max_directory_response_bytes > 0);
+    assert(json_parse_scratch_size_bytes > 0);
     if (json_body.len == 0) return error.EmptyInput;
     if (json_body.len > max_directory_response_bytes) return error.ResponseTooLarge;
 
@@ -291,22 +307,29 @@ pub fn parseDirectoryResponseJson(json_body: []const u8) Error!Directory {
     try directory.new_nonce_url.set(nonce_raw);
     try directory.new_account_url.set(account_raw);
     try directory.new_order_url.set(order_raw);
+    assert(directory.new_nonce_url.slice().len > 0);
     return directory;
 }
 
 pub fn parseReplayNonceHeader(replay_nonce_value: []const u8) Error!ReplayNonce {
+    assert(max_nonce_bytes > 0);
     var nonce = ReplayNonce{};
     try nonce.set(replay_nonce_value);
+    assert(nonce.slice().len == replay_nonce_value.len);
     return nonce;
 }
 
 pub fn parseLocationHeader(location_header_value: []const u8) Error!Url {
+    assert(max_url_bytes > 0);
     var location = Url{};
     try location.set(location_header_value);
+    assert(location.slice().len == location_header_value.len);
     return location;
 }
 
 pub fn parseAccountResponseJson(json_body: []const u8) Error!AccountResponse {
+    assert(max_account_response_bytes > 0);
+    assert(json_parse_scratch_size_bytes > 0);
     if (json_body.len == 0) return error.EmptyInput;
     if (json_body.len > max_account_response_bytes) return error.ResponseTooLarge;
 
@@ -337,10 +360,13 @@ pub fn parseAccountResponseJson(json_body: []const u8) Error!AccountResponse {
         try response.orders_url.set(orders_url);
     }
 
+    assert(!response.has_orders_url or response.orders_url.slice().len > 0);
     return response;
 }
 
 pub fn parseOrderResponseJson(json_body: []const u8) Error!OrderResponse {
+    assert(max_order_response_bytes > 0);
+    assert(max_authorization_urls_per_order > 0);
     if (json_body.len == 0) return error.EmptyInput;
     if (json_body.len > max_order_response_bytes) return error.ResponseTooLarge;
 
@@ -369,6 +395,7 @@ pub fn parseOrderResponseJson(json_body: []const u8) Error!OrderResponse {
     if (authorization_urls.len > max_authorization_urls_per_order) {
         return error.TooManyAuthorizations;
     }
+    const authorization_count: u8 = @intCast(authorization_urls.len);
 
     var response = OrderResponse{
         .status = try parseOrderStatus(status_raw),
@@ -376,22 +403,25 @@ pub fn parseOrderResponseJson(json_body: []const u8) Error!OrderResponse {
     };
     try response.finalize_url.set(final_url_raw);
 
-    var index: usize = 0;
-    while (index < authorization_urls.len) : (index += 1) {
+    var index: u8 = 0;
+    while (index < authorization_count) : (index += 1) {
         try response.authorization_urls[index].set(authorization_urls[index]);
         response.authorization_count += 1;
     }
-    assert(@as(usize, response.authorization_count) == authorization_urls.len);
+    assert(response.authorization_count == authorization_count);
 
     if (parsed.value.certificate) |certificate_url| {
         response.has_certificate_url = true;
         try response.certificate_url.set(certificate_url);
     }
 
+    assert(response.authorization_count <= max_authorization_urls_per_order);
     return response;
 }
 
 pub fn parseAuthorizationResponseJson(json_body: []const u8) Error!AuthorizationResponse {
+    assert(max_order_response_bytes > 0);
+    assert(max_challenges_per_authorization > 0);
     if (json_body.len == 0) return error.EmptyInput;
     if (json_body.len > max_order_response_bytes) return error.ResponseTooLarge;
 
@@ -421,22 +451,20 @@ pub fn parseAuthorizationResponseJson(json_body: []const u8) Error!Authorization
         .{ .ignore_unknown_fields = true },
     ) catch |err| return mapJsonParseError(err);
     defer parsed.deinit();
-
     const status_raw = parsed.value.status orelse return error.MissingOrderField;
     const identifier = parsed.value.identifier orelse return error.MissingOrderField;
     const identifier_type = identifier.type orelse return error.MissingOrderField;
     const identifier_value = identifier.value orelse return error.MissingOrderField;
     if (!std.mem.eql(u8, identifier_type, "dns")) return error.InvalidDomainName;
-
     const challenges = parsed.value.challenges orelse return error.MissingOrderField;
     if (challenges.len > max_challenges_per_authorization) return error.TooManyChallenges;
-
+    const challenges_len: u8 = @intCast(challenges.len);
     var response = AuthorizationResponse{ .status = try parseAuthorizationStatus(status_raw) };
     response.identifier_dns.set(identifier_value) catch return error.InvalidDomainName;
 
-    var i: usize = 0;
-    while (i < challenges.len) : (i += 1) {
-        const challenge = challenges[i];
+    var i: u8 = 0;
+    while (i < challenges_len) : (i += 1) {
+        const challenge = challenges[@intCast(i)];
         const challenge_type_raw = challenge.type orelse return error.MissingOrderField;
         const challenge_type = parseChallengeTypeOptional(challenge_type_raw) orelse continue;
 
@@ -444,7 +472,7 @@ pub fn parseAuthorizationResponseJson(json_body: []const u8) Error!Authorization
         const challenge_url_raw = challenge.url orelse return error.MissingOrderField;
 
         if (response.challenge_count >= max_challenges_per_authorization) return error.TooManyChallenges;
-        const out_index: usize = response.challenge_count;
+        const out_index: u8 = response.challenge_count;
         response.challenges[out_index] = .{
             .challenge_type = challenge_type,
             .status = try parseChallengeStatus(challenge_status_raw),
@@ -455,33 +483,42 @@ pub fn parseAuthorizationResponseJson(json_body: []const u8) Error!Authorization
         if (challenge.token) |token_raw| {
             try response.challenges[out_index].setToken(token_raw);
         }
-
         response.challenge_count += 1;
     }
 
+    assert(response.challenge_count <= max_challenges_per_authorization);
     return response;
 }
 
 pub fn serializeFinalizePayload(out: []u8, csr_der: []const u8) Error![]const u8 {
+    assert(max_jws_body_bytes > 0);
+    assert(csr_der.len <= std.math.maxInt(u32));
+    assert(max_jws_body_bytes <= std.math.maxInt(u32));
     if (csr_der.len == 0) return error.OutputTooSmall;
 
     const csr_b64_len = std.base64.url_safe_no_pad.Encoder.calcSize(csr_der.len);
     if (csr_b64_len + 10 > out.len) return error.OutputTooSmall;
+    if (csr_b64_len > std.math.maxInt(u32)) return error.OutputTooSmall;
 
-    var cursor: usize = 0;
+    var cursor: u32 = 0;
     cursor = try appendToOutput(out, cursor, "{\"csr\":\"");
-    _ = std.base64.url_safe_no_pad.Encoder.encode(out[cursor .. cursor + csr_b64_len], csr_der);
-    cursor += csr_b64_len;
+    const csr_b64_len_u32: u32 = @intCast(csr_b64_len);
+    const csr_b64_end = cursor + csr_b64_len_u32;
+    _ = std.base64.url_safe_no_pad.Encoder.encode(out[@intCast(cursor)..@intCast(csr_b64_end)], csr_der);
+    cursor = csr_b64_end;
     cursor = try appendToOutput(out, cursor, "\"}");
     if (cursor > max_jws_body_bytes) return error.OutputTooSmall;
+    assert(cursor <= @as(u32, @intCast(out.len)));
 
-    return out[0..cursor];
+    return out[0..@intCast(cursor)];
 }
 
 pub fn serializeNewAccountPayload(
     out: []u8,
     payload: NewAccountPayload,
 ) Error![]const u8 {
+    assert(max_contact_email_bytes > 0);
+    assert(max_jws_body_bytes > 0);
     if (payload.contact_email.len == 0) return error.InvalidContactEmail;
     if (payload.contact_email.len > max_contact_email_bytes) return error.InvalidContactEmail;
     validateJsonString(payload.contact_email) catch return error.InvalidContactEmail;
@@ -496,15 +533,17 @@ pub fn serializeNewAccountPayload(
     ) catch return error.OutputTooSmall;
 
     if (rendered.len > max_jws_body_bytes) return error.OutputTooSmall;
+    assert(rendered.len <= out.len);
     return rendered;
 }
 
 pub fn serializeNewOrderPayload(out: []u8, request: *const NewOrderRequest) Error![]const u8 {
     assert(@intFromPtr(request) != 0);
+    assert(request.identifier_count <= max_identifiers_per_order);
 
     if (request.identifier_count == 0) return error.InvalidIdentifierCount;
 
-    var cursor: usize = 0;
+    var cursor: u32 = 0;
     cursor = try appendToOutput(out, cursor, "{\"identifiers\":[");
 
     var index: u8 = 0;
@@ -524,10 +563,12 @@ pub fn serializeNewOrderPayload(out: []u8, request: *const NewOrderRequest) Erro
 
     cursor = try appendToOutput(out, cursor, "]}");
     if (cursor > max_jws_body_bytes) return error.OutputTooSmall;
-    return out[0..cursor];
+    return out[0..@intCast(cursor)];
 }
 
 fn parseAccountStatus(value: []const u8) Error!AccountStatus {
+    assert(@sizeOf(AccountStatus) == 1);
+    assert(value.len <= max_account_response_bytes);
     if (std.mem.eql(u8, value, "valid")) return .valid;
     if (std.mem.eql(u8, value, "deactivated")) return .deactivated;
     if (std.mem.eql(u8, value, "revoked")) return .revoked;
@@ -535,6 +576,8 @@ fn parseAccountStatus(value: []const u8) Error!AccountStatus {
 }
 
 fn parseOrderStatus(value: []const u8) Error!OrderStatus {
+    assert(@sizeOf(OrderStatus) == 1);
+    assert(value.len <= max_order_response_bytes);
     if (std.mem.eql(u8, value, "pending")) return .pending;
     if (std.mem.eql(u8, value, "ready")) return .ready;
     if (std.mem.eql(u8, value, "processing")) return .processing;
@@ -544,6 +587,8 @@ fn parseOrderStatus(value: []const u8) Error!OrderStatus {
 }
 
 fn parseAuthorizationStatus(value: []const u8) Error!AuthorizationStatus {
+    assert(@sizeOf(AuthorizationStatus) == 1);
+    assert(value.len <= max_order_response_bytes);
     if (std.mem.eql(u8, value, "pending")) return .pending;
     if (std.mem.eql(u8, value, "valid")) return .valid;
     if (std.mem.eql(u8, value, "invalid")) return .invalid;
@@ -554,6 +599,8 @@ fn parseAuthorizationStatus(value: []const u8) Error!AuthorizationStatus {
 }
 
 fn parseChallengeStatus(value: []const u8) Error!ChallengeStatus {
+    assert(@sizeOf(ChallengeStatus) == 1);
+    assert(value.len <= max_order_response_bytes);
     if (std.mem.eql(u8, value, "pending")) return .pending;
     if (std.mem.eql(u8, value, "processing")) return .processing;
     if (std.mem.eql(u8, value, "valid")) return .valid;
@@ -562,11 +609,15 @@ fn parseChallengeStatus(value: []const u8) Error!ChallengeStatus {
 }
 
 fn parseChallengeTypeOptional(value: []const u8) ?ChallengeType {
+    assert(@sizeOf(ChallengeType) == 1);
+    assert(value.len <= max_order_response_bytes);
     if (std.mem.eql(u8, value, "tls-alpn-01")) return .tls_alpn01;
     return null;
 }
 
 fn mapJsonParseError(err: anyerror) Error {
+    assert(@typeInfo(@TypeOf(err)) == .error_set);
+    assert(json_parse_scratch_size_bytes > 0);
     return switch (err) {
         error.OutOfMemory => error.JsonScratchExhausted,
         else => error.JsonParseFailed,
@@ -574,21 +625,28 @@ fn mapJsonParseError(err: anyerror) Error {
 }
 
 fn validateJsonString(value: []const u8) Error!void {
-    var index: usize = 0;
-    while (index < value.len) : (index += 1) {
-        const c = value[index];
+    assert(max_jws_body_bytes > 0);
+    assert(value.len <= max_jws_body_bytes);
+    const value_len: u32 = @intCast(value.len);
+    var index: u32 = 0;
+    while (index < value_len) : (index += 1) {
+        const c = value[@intCast(index)];
         if (c < 0x20) return error.InvalidDomainName;
         if (c == '"') return error.InvalidDomainName;
         if (c == '\\') return error.InvalidDomainName;
     }
 }
 
-fn appendToOutput(out: []u8, cursor: usize, chunk: []const u8) Error!usize {
-    assert(cursor <= out.len);
+fn appendToOutput(out: []u8, cursor: u32, chunk: []const u8) Error!u32 {
+    assert(out.len <= output_cursor_max);
+    const out_len_u32: u32 = @intCast(out.len);
+    assert(cursor <= out_len_u32);
+    assert(chunk.len <= out_len_u32);
 
-    if (cursor + chunk.len > out.len) return error.OutputTooSmall;
-    @memcpy(out[cursor..][0..chunk.len], chunk);
-    return cursor + chunk.len;
+    const chunk_len_u32: u32 = @intCast(chunk.len);
+    if (chunk_len_u32 > out_len_u32 - cursor) return error.OutputTooSmall;
+    @memcpy(out[@intCast(cursor)..][0..chunk.len], chunk);
+    return cursor + chunk_len_u32;
 }
 
 test "parseDirectoryResponseJson reads required endpoints" {
@@ -712,11 +770,11 @@ test "parseAccountResponseJson rejects unknown status" {
 
 test "parseOrderResponseJson rejects too many authorization urls" {
     var body_buf: [4096]u8 = undefined;
-    var cursor: usize = 0;
+    var cursor: u32 = 0;
 
     cursor = try appendToOutput(&body_buf, cursor, "{\"status\":\"pending\",\"authorizations\":[");
 
-    var index: usize = 0;
+    var index: u16 = 0;
     while (index < max_authorization_urls_per_order + 1) : (index += 1) {
         if (index > 0) {
             cursor = try appendToOutput(&body_buf, cursor, ",");
@@ -733,7 +791,7 @@ test "parseOrderResponseJson rejects too many authorization urls" {
         "],\"finalize\":\"https://acme.example/order/finalize\"}",
     );
 
-    try std.testing.expectError(error.TooManyAuthorizations, parseOrderResponseJson(body_buf[0..cursor]));
+    try std.testing.expectError(error.TooManyAuthorizations, parseOrderResponseJson(body_buf[0..@intCast(cursor)]));
 }
 
 test "parseAuthorizationResponseJson parses tls-alpn-01 and ignores unsupported challenge types" {

@@ -71,6 +71,11 @@ Layer 2 (Infrastructure).
   - init-time setup only; no hidden runtime allocations in `run`
   - explicit `deinit` frees owned TLS client context
   - convenience `initFromAcmeConfig(...)` accepts `serval-core.config.AcmeConfig` directly
+- TigerStyle hardening updates:
+  - fixed ACME bootstrap certificate validity window generation (no stale fixed expiry)
+  - explicit cleanup error logging in runtime challenge teardown (no swallowed catch-all errors)
+  - TLS-ALPN hook provider pointer access uses atomic load/store
+  - stricter local domain validation and bounded integer cursors/counters in ACME codecs
 
 ## Integration Notes
 

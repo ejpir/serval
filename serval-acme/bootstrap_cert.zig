@@ -4,6 +4,7 @@
 //! server startup before ACME issuance completes.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const config = @import("serval-core").config;
 
 const Scheme = std.crypto.sign.ecdsa.EcdsaP256Sha256;
@@ -26,6 +27,7 @@ const oid_common_name = [_]u8{ 0x06, 0x03, 0x55, 0x04, 0x03 };
 const oid_subject_alt_name = [_]u8{ 0x06, 0x03, 0x55, 0x1D, 0x11 };
 const bootstrap_not_before_generalized_time: []const u8 = "20000101000000Z";
 const bootstrap_not_after_generalized_time: []const u8 = "20991231235959Z";
+const DerCursor = u16;
 
 pub fn generateMaterials(
     io: std.Io,
@@ -33,6 +35,8 @@ pub fn generateMaterials(
     cert_pem_buf: []u8,
     key_pem_buf: []u8,
 ) Error!Materials {
+    assert(cert_pem_buf.len > 0);
+    assert(key_pem_buf.len > 0);
     if (domain.len == 0 or domain.len > config.ACME_MAX_DOMAIN_NAME_LEN) return error.InvalidDomain;
 
     const key_pair = Scheme.KeyPair.generate(io);
@@ -58,6 +62,8 @@ pub fn generateMaterials(
 }
 
 fn buildTbsCertificate(io: std.Io, out: []u8, domain: []const u8, public_key_sec1: *const [65]u8) Error![]const u8 {
+    assert(out.len > 0);
+    assert(@intFromPtr(public_key_sec1) != 0);
     var serial_bytes: [16]u8 = undefined;
     io.random(&serial_bytes);
     serial_bytes[0] &= 0x7F;
@@ -82,7 +88,7 @@ fn buildTbsCertificate(io: std.Io, out: []u8, domain: []const u8, public_key_sec
     const extensions = try buildExtensions(&ext_buf, domain);
 
     var content_buf: [4096]u8 = undefined;
-    var cursor: usize = 0;
+    var cursor: DerCursor = 0;
     cursor = try appendBytes(&content_buf, cursor, &.{ 0xA0, 0x03, 0x02, 0x01, 0x02 });
     cursor = try appendBytes(&content_buf, cursor, serial_tlv);
     cursor = try appendBytes(&content_buf, cursor, sig_alg);
@@ -92,31 +98,35 @@ fn buildTbsCertificate(io: std.Io, out: []u8, domain: []const u8, public_key_sec
     cursor = try appendBytes(&content_buf, cursor, spki);
     cursor = try appendBytes(&content_buf, cursor, extensions);
 
-    return wrapDerTlv(out, 0x30, content_buf[0..cursor]);
+    return wrapDerTlv(out, 0x30, content_buf[0..@intCast(cursor)]);
 }
 
 fn buildCertificate(out: []u8, tbs_der: []const u8, signature_der: []const u8) Error![]const u8 {
+    assert(out.len > 0);
+    assert(tbs_der.len > 0 and signature_der.len > 0);
     var sig_alg_buf: [32]u8 = undefined;
     const sig_alg = try wrapSequenceFromParts(&sig_alg_buf, &.{&oid_ecdsa_sha256});
 
     var sig_bitstring_content: [256]u8 = undefined;
-    var sig_cursor: usize = 0;
+    var sig_cursor: DerCursor = 0;
     sig_cursor = try appendBytes(&sig_bitstring_content, sig_cursor, &.{0x00});
     sig_cursor = try appendBytes(&sig_bitstring_content, sig_cursor, signature_der);
 
     var sig_bitstring_buf: [280]u8 = undefined;
-    const sig_bitstring = try wrapDerTlv(&sig_bitstring_buf, 0x03, sig_bitstring_content[0..sig_cursor]);
+    const sig_bitstring = try wrapDerTlv(&sig_bitstring_buf, 0x03, sig_bitstring_content[0..@intCast(sig_cursor)]);
 
     var content_buf: [8192]u8 = undefined;
-    var cursor: usize = 0;
+    var cursor: DerCursor = 0;
     cursor = try appendBytes(&content_buf, cursor, tbs_der);
     cursor = try appendBytes(&content_buf, cursor, sig_alg);
     cursor = try appendBytes(&content_buf, cursor, sig_bitstring);
 
-    return wrapDerTlv(out, 0x30, content_buf[0..cursor]);
+    return wrapDerTlv(out, 0x30, content_buf[0..@intCast(cursor)]);
 }
 
 fn buildExtensions(out: []u8, domain: []const u8) Error![]const u8 {
+    assert(out.len > 0);
+    assert(domain.len > 0);
     var dns_tlv_buf: [320]u8 = undefined;
     const dns_tlv = try wrapDerTlv(&dns_tlv_buf, 0x82, domain);
 
@@ -136,6 +146,8 @@ fn buildExtensions(out: []u8, domain: []const u8) Error![]const u8 {
 }
 
 fn buildNameFromCommonName(out: []u8, common_name: []const u8) Error![]const u8 {
+    assert(out.len > 0);
+    assert(common_name.len > 0);
     var cn_value_buf: [320]u8 = undefined;
     const cn_value = try wrapDerTlv(&cn_value_buf, 0x0C, common_name);
 
@@ -149,6 +161,8 @@ fn buildNameFromCommonName(out: []u8, common_name: []const u8) Error![]const u8 
 }
 
 fn buildValidity(out: []u8) Error![]const u8 {
+    assert(out.len > 0);
+    assert(bootstrap_not_after_generalized_time.len > bootstrap_not_before_generalized_time.len - 1);
     var nb_buf: [24]u8 = undefined;
     const nb = try wrapDerTlv(&nb_buf, 0x18, bootstrap_not_before_generalized_time);
 
@@ -159,62 +173,82 @@ fn buildValidity(out: []u8) Error![]const u8 {
 }
 
 fn buildSubjectPublicKeyInfo(out: []u8, public_key_sec1: *const [65]u8) Error![]const u8 {
+    assert(out.len > 0);
+    assert(@intFromPtr(public_key_sec1) != 0);
     var alg_buf: [64]u8 = undefined;
     const alg = try wrapSequenceFromParts(&alg_buf, &.{ &oid_id_ec_public_key, &oid_prime256v1 });
 
     var bit_content_buf: [80]u8 = undefined;
-    var bit_cursor: usize = 0;
+    var bit_cursor: DerCursor = 0;
     bit_cursor = try appendBytes(&bit_content_buf, bit_cursor, &.{0x00});
     bit_cursor = try appendBytes(&bit_content_buf, bit_cursor, public_key_sec1);
 
     var bit_tlv_buf: [96]u8 = undefined;
-    const bit_tlv = try wrapDerTlv(&bit_tlv_buf, 0x03, bit_content_buf[0..bit_cursor]);
+    const bit_tlv = try wrapDerTlv(&bit_tlv_buf, 0x03, bit_content_buf[0..@intCast(bit_cursor)]);
 
     return wrapSequenceFromParts(out, &.{ alg, bit_tlv });
 }
 
 fn buildInteger(out: []u8, bytes: []const u8) Error![]const u8 {
-    var i: usize = 0;
-    while (i + 1 < bytes.len and bytes[i] == 0) : (i += 1) {}
-    const trimmed = bytes[i..];
+    assert(out.len > 0);
+    assert(bytes.len > 0);
+    const bytes_len_u16 = std.math.cast(u16, bytes.len) orelse return error.OutputTooSmall;
+    var i: u16 = 0;
+    while (i + 1 < bytes_len_u16 and bytes[@intCast(i)] == 0) : (i += 1) {}
+    const trimmed = bytes[@intCast(i)..];
 
     var value_buf: [32]u8 = undefined;
-    var cursor: usize = 0;
+    var cursor: DerCursor = 0;
     if (trimmed[0] & 0x80 != 0) {
         cursor = try appendBytes(&value_buf, cursor, &.{0x00});
     }
     cursor = try appendBytes(&value_buf, cursor, trimmed);
-    return wrapDerTlv(out, 0x02, value_buf[0..cursor]);
+    return wrapDerTlv(out, 0x02, value_buf[0..@intCast(cursor)]);
 }
 
 fn wrapSequenceFromParts(out: []u8, parts: []const []const u8) Error![]const u8 {
+    assert(out.len > 0);
+    assert(parts.len > 0);
     var content_buf: [8192]u8 = undefined;
-    var cursor: usize = 0;
+    var cursor: DerCursor = 0;
     for (parts) |part| cursor = try appendBytes(&content_buf, cursor, part);
-    return wrapDerTlv(out, 0x30, content_buf[0..cursor]);
+    return wrapDerTlv(out, 0x30, content_buf[0..@intCast(cursor)]);
 }
 
 fn wrapDerTlv(out: []u8, tag: u8, value: []const u8) Error![]const u8 {
-    var cursor: usize = 0;
+    assert(out.len > 0);
+    assert(tag != 0);
+    var cursor: DerCursor = 0;
     cursor = try appendByte(out, cursor, tag);
-    cursor = try appendDerLength(out, cursor, value.len);
+    const value_len = std.math.cast(u16, value.len) orelse return error.OutputTooSmall;
+    cursor = try appendDerLength(out, cursor, value_len);
     cursor = try appendBytes(out, cursor, value);
-    return out[0..cursor];
+    return out[0..@intCast(cursor)];
 }
 
-fn appendByte(out: []u8, cursor: usize, value: u8) error{OutputTooSmall}!usize {
-    if (cursor >= out.len) return error.OutputTooSmall;
-    out[cursor] = value;
-    return cursor + 1;
+fn appendByte(out: []u8, cursor: DerCursor, value: u8) error{OutputTooSmall}!DerCursor {
+    assert(out.len <= std.math.maxInt(DerCursor));
+    assert(cursor <= @as(DerCursor, @intCast(out.len)));
+    assert(value <= std.math.maxInt(u8));
+    if (cursor >= @as(DerCursor, @intCast(out.len))) return error.OutputTooSmall;
+    out[@intCast(cursor)] = value;
+    return std.math.add(DerCursor, cursor, 1) catch error.OutputTooSmall;
 }
 
-fn appendBytes(out: []u8, cursor: usize, bytes: []const u8) error{OutputTooSmall}!usize {
-    if (cursor + bytes.len > out.len) return error.OutputTooSmall;
-    @memcpy(out[cursor..][0..bytes.len], bytes);
-    return cursor + bytes.len;
+fn appendBytes(out: []u8, cursor: DerCursor, bytes: []const u8) error{OutputTooSmall}!DerCursor {
+    assert(out.len <= std.math.maxInt(DerCursor));
+    assert(cursor <= @as(DerCursor, @intCast(out.len)));
+    assert(bytes.len <= out.len);
+    const bytes_len = std.math.cast(DerCursor, bytes.len) orelse return error.OutputTooSmall;
+    const end = std.math.add(DerCursor, cursor, bytes_len) catch return error.OutputTooSmall;
+    if (end > @as(DerCursor, @intCast(out.len))) return error.OutputTooSmall;
+    @memcpy(out[@intCast(cursor)..][0..@intCast(bytes_len)], bytes);
+    return end;
 }
 
-fn appendDerLength(out: []u8, cursor: usize, len: usize) error{OutputTooSmall}!usize {
+fn appendDerLength(out: []u8, cursor: DerCursor, len: u16) error{OutputTooSmall}!DerCursor {
+    assert(cursor <= @as(DerCursor, @intCast(out.len)));
+    assert(len <= 65_535);
     if (len <= 127) return appendByte(out, cursor, @intCast(len));
     if (len <= 255) {
         var next = try appendByte(out, cursor, 0x81);
@@ -231,8 +265,10 @@ fn appendDerLength(out: []u8, cursor: usize, len: usize) error{OutputTooSmall}!u
 }
 
 fn encodeSec1EcPrivateKeyDer(out: []u8, secret_key: *const [32]u8, public_key_sec1: *const [65]u8) Error![]const u8 {
+    assert(out.len > 0);
+    assert(@intFromPtr(secret_key) != 0 and @intFromPtr(public_key_sec1) != 0);
     var content_buf: [192]u8 = undefined;
-    var cursor: usize = 0;
+    var cursor: DerCursor = 0;
 
     cursor = try appendBytes(&content_buf, cursor, &.{ 0x02, 0x01, 0x01 });
     cursor = try appendBytes(&content_buf, cursor, &.{ 0x04, 32 });
@@ -243,36 +279,43 @@ fn encodeSec1EcPrivateKeyDer(out: []u8, secret_key: *const [32]u8, public_key_se
     cursor = try appendBytes(&content_buf, cursor, params);
 
     var pubkey_content_buf: [80]u8 = undefined;
-    var pk_cursor: usize = 0;
+    var pk_cursor: DerCursor = 0;
     pk_cursor = try appendBytes(&pubkey_content_buf, pk_cursor, &.{0x00});
     pk_cursor = try appendBytes(&pubkey_content_buf, pk_cursor, public_key_sec1);
 
     var pubkey_bit_tlv_buf: [96]u8 = undefined;
-    const pubkey_bit_tlv = try wrapDerTlv(&pubkey_bit_tlv_buf, 0x03, pubkey_content_buf[0..pk_cursor]);
+    const pubkey_bit_tlv = try wrapDerTlv(&pubkey_bit_tlv_buf, 0x03, pubkey_content_buf[0..@intCast(pk_cursor)]);
 
     var pubkey_ctx_buf: [112]u8 = undefined;
     const pubkey_ctx = try wrapDerTlv(&pubkey_ctx_buf, 0xA1, pubkey_bit_tlv);
     cursor = try appendBytes(&content_buf, cursor, pubkey_ctx);
 
-    return wrapDerTlv(out, 0x30, content_buf[0..cursor]);
+    return wrapDerTlv(out, 0x30, content_buf[0..@intCast(cursor)]);
 }
 
 fn encodePem(label: []const u8, der: []const u8, out: []u8) Error![]const u8 {
+    assert(label.len > 0);
+    assert(der.len > 0);
     const b64_len = std.base64.standard.Encoder.calcSize(der.len);
     var b64_buf: [8192]u8 = undefined;
     if (b64_len > b64_buf.len) return error.OutputTooSmall;
+    const b64_len_u16 = std.math.cast(u16, b64_len) orelse return error.OutputTooSmall;
 
     _ = std.base64.standard.Encoder.encode(b64_buf[0..b64_len], der);
 
-    var cursor: usize = 0;
+    var cursor: DerCursor = 0;
     cursor = try appendBytes(out, cursor, "-----BEGIN ");
     cursor = try appendBytes(out, cursor, label);
     cursor = try appendBytes(out, cursor, "-----\n");
 
-    var line_start: usize = 0;
-    while (line_start < b64_len) {
-        const line_len: usize = @min(@as(usize, 64), b64_len - line_start);
-        cursor = try appendBytes(out, cursor, b64_buf[line_start .. line_start + line_len]);
+    var line_start: u16 = 0;
+    while (line_start < b64_len_u16) {
+        const line_len: u16 = @min(@as(u16, 64), b64_len_u16 - line_start);
+        cursor = try appendBytes(
+            out,
+            cursor,
+            b64_buf[@intCast(line_start) .. @intCast(line_start + line_len)],
+        );
         cursor = try appendBytes(out, cursor, "\n");
         line_start += line_len;
     }
@@ -281,7 +324,7 @@ fn encodePem(label: []const u8, der: []const u8, out: []u8) Error![]const u8 {
     cursor = try appendBytes(out, cursor, label);
     cursor = try appendBytes(out, cursor, "-----\n");
 
-    return out[0..cursor];
+    return out[0..@intCast(cursor)];
 }
 
 test "generate bootstrap cert materials" {

@@ -75,6 +75,8 @@ fn writeAtomic(path: []const u8, data: []const u8) Error!void {
 }
 
 fn fsyncParent(path: []const u8) void {
+    assert(path.len > 0);
+    assert(path.len <= 1200);
     const parent_path = std.fs.path.dirname(path) orelse return;
     const io = std.Options.debug_io;
     var dir = Io.Dir.cwd().openDir(io, parent_path, .{}) catch |err| {
@@ -93,7 +95,7 @@ test "persistCertificateAndKey writes files under cert/current" {
     defer tmp.cleanup();
 
     var state_buf: [1200]u8 = undefined;
-    const state_path = std.fmt.bufPrint(&state_buf, "{s}/state", .{tmp.sub_path[0..]}) catch unreachable;
+    const state_path = try std.fmt.bufPrint(&state_buf, "{s}/state", .{tmp.sub_path[0..]});
 
     var cert_path_buf: [1024]u8 = undefined;
     var key_path_buf: [1024]u8 = undefined;

@@ -33,6 +33,7 @@ const oid_ecdsa_sha256 = [_]u8{ 0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 
 const oid_common_name = [_]u8{ 0x06, 0x03, 0x55, 0x04, 0x03 };
 const oid_extension_request = [_]u8{ 0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x0E };
 const oid_subject_alt_name = [_]u8{ 0x06, 0x03, 0x55, 0x1D, 0x11 };
+const DerCursor = u16;
 
 pub fn generate(
     allocator: std.mem.Allocator,
@@ -51,9 +52,10 @@ pub fn generate(
     const io = std.Options.debug_io;
     Io.Dir.cwd().createDirPath(io, state_dir) catch return error.InvalidStateDir;
 
-    var i: usize = 0;
-    while (i < domains.len) : (i += 1) {
-        const domain = domains[i];
+    var i: u8 = 0;
+    const domain_count = std.math.cast(u8, domains.len) orelse return error.InvalidDomainCount;
+    while (i < domain_count) : (i += 1) {
+        const domain = domains[@intCast(i)];
         if (domain.len == 0 or domain.len > config.ACME_MAX_DOMAIN_NAME_LEN) return error.InvalidDomain;
     }
 
@@ -103,7 +105,7 @@ fn buildCertificationRequestInfo(
     const attrs_der = try buildAttributesWithSubjectAltName(&attrs_buf, domains);
 
     var content_buf: [4096]u8 = undefined;
-    var cursor: usize = 0;
+    var cursor: DerCursor = 0;
 
     // version INTEGER 0
     cursor = appendBytes(&content_buf, cursor, &.{ 0x02, 0x01, 0x00 }) catch return error.ConfigTooLarge;
@@ -111,7 +113,7 @@ fn buildCertificationRequestInfo(
     cursor = appendBytes(&content_buf, cursor, spki_der) catch return error.ConfigTooLarge;
     cursor = appendBytes(&content_buf, cursor, attrs_der) catch return error.ConfigTooLarge;
 
-    return wrapDerTlv(out, 0x30, content_buf[0..cursor]) catch return error.ConfigTooLarge;
+    return wrapDerTlv(out, 0x30, content_buf[0..@intCast(cursor)]) catch return error.ConfigTooLarge;
 }
 
 fn buildCertificationRequest(
@@ -126,26 +128,27 @@ fn buildCertificationRequest(
     const sig_alg_der = wrapSequenceFromParts(&sig_alg_buf, &.{&oid_ecdsa_sha256}) catch return error.CsrTooLarge;
 
     var sig_bitstring_content_buf: [256]u8 = undefined;
-    var sig_cursor: usize = 0;
+    var sig_cursor: DerCursor = 0;
     sig_cursor = appendBytes(&sig_bitstring_content_buf, sig_cursor, &.{0x00}) catch return error.CsrTooLarge;
     sig_cursor = appendBytes(&sig_bitstring_content_buf, sig_cursor, signature_der) catch return error.CsrTooLarge;
 
     var sig_bitstring_buf: [280]u8 = undefined;
-    const sig_bitstring = wrapDerTlv(&sig_bitstring_buf, 0x03, sig_bitstring_content_buf[0..sig_cursor]) catch {
+    const sig_bitstring = wrapDerTlv(&sig_bitstring_buf, 0x03, sig_bitstring_content_buf[0..@intCast(sig_cursor)]) catch {
         return error.CsrTooLarge;
     };
 
     var csr_content_buf: [8192]u8 = undefined;
-    var cursor: usize = 0;
+    var cursor: DerCursor = 0;
     cursor = appendBytes(&csr_content_buf, cursor, cri_der) catch return error.CsrTooLarge;
     cursor = appendBytes(&csr_content_buf, cursor, sig_alg_der) catch return error.CsrTooLarge;
     cursor = appendBytes(&csr_content_buf, cursor, sig_bitstring) catch return error.CsrTooLarge;
 
-    return wrapDerTlv(out, 0x30, csr_content_buf[0..cursor]) catch return error.CsrTooLarge;
+    return wrapDerTlv(out, 0x30, csr_content_buf[0..@intCast(cursor)]) catch return error.CsrTooLarge;
 }
 
 fn buildSubjectName(out: []u8, common_name: []const u8) Error![]const u8 {
     assert(out.len > 0);
+    assert(common_name.len > 0);
     if (common_name.len == 0 or common_name.len > config.ACME_MAX_DOMAIN_NAME_LEN) return error.InvalidDomain;
 
     var cn_value_buf: [320]u8 = undefined;
@@ -165,6 +168,7 @@ fn buildSubjectPublicKeyInfo(
     public_key_sec1: *const [Scheme.PublicKey.uncompressed_sec1_encoded_length]u8,
 ) Error![]const u8 {
     assert(out.len > 0);
+    assert(@intFromPtr(public_key_sec1) != 0);
 
     var alg_buf: [64]u8 = undefined;
     const alg_der = wrapSequenceFromParts(&alg_buf, &.{ &oid_id_ec_public_key, &oid_prime256v1 }) catch {
@@ -172,7 +176,7 @@ fn buildSubjectPublicKeyInfo(
     };
 
     var pubkey_content_buf: [80]u8 = undefined;
-    var cursor: usize = 0;
+    var cursor: DerCursor = 0;
     cursor = appendBytes(&pubkey_content_buf, cursor, &.{0x00}) catch return error.ConfigTooLarge;
     cursor = appendBytes(&pubkey_content_buf, cursor, public_key_sec1) catch return error.ConfigTooLarge;
 
@@ -189,11 +193,12 @@ fn buildAttributesWithSubjectAltName(out: []u8, domains: []const []const u8) Err
     assert(domains.len > 0);
 
     var general_names_content: [2048]u8 = undefined;
-    var general_cursor: usize = 0;
+    var general_cursor: DerCursor = 0;
 
-    var i: usize = 0;
-    while (i < domains.len) : (i += 1) {
-        const domain = domains[i];
+    var i: u8 = 0;
+    const domain_count = std.math.cast(u8, domains.len) orelse return error.InvalidDomainCount;
+    while (i < domain_count) : (i += 1) {
+        const domain = domains[@intCast(i)];
         if (domain.len == 0 or domain.len > config.ACME_MAX_DOMAIN_NAME_LEN) return error.InvalidDomain;
 
         // dNSName [2] IA5String -> tag 0x82
@@ -203,7 +208,7 @@ fn buildAttributesWithSubjectAltName(out: []u8, domains: []const []const u8) Err
     }
 
     var general_names_buf: [2304]u8 = undefined;
-    const general_names = wrapDerTlv(&general_names_buf, 0x30, general_names_content[0..general_cursor]) catch {
+    const general_names = wrapDerTlv(&general_names_buf, 0x30, general_names_content[0..@intCast(general_cursor)]) catch {
         return error.ConfigTooLarge;
     };
 
@@ -232,41 +237,55 @@ fn buildAttributesWithSubjectAltName(out: []u8, domains: []const []const u8) Err
 
 fn wrapSequenceFromParts(out: []u8, parts: []const []const u8) error{OutputTooSmall}![]const u8 {
     assert(out.len > 0);
+    assert(parts.len > 0);
 
     var content_buf: [8192]u8 = undefined;
-    var cursor: usize = 0;
+    var cursor: DerCursor = 0;
 
-    var i: usize = 0;
-    while (i < parts.len) : (i += 1) {
-        cursor = appendBytes(&content_buf, cursor, parts[i]) catch return error.OutputTooSmall;
+    var i: u16 = 0;
+    const parts_len = std.math.cast(u16, parts.len) orelse return error.OutputTooSmall;
+    while (i < parts_len) : (i += 1) {
+        cursor = appendBytes(&content_buf, cursor, parts[@intCast(i)]) catch return error.OutputTooSmall;
     }
 
-    return wrapDerTlv(out, 0x30, content_buf[0..cursor]);
+    return wrapDerTlv(out, 0x30, content_buf[0..@intCast(cursor)]);
 }
 
 fn wrapDerTlv(out: []u8, tag: u8, value: []const u8) error{OutputTooSmall}![]const u8 {
     assert(out.len > 0);
+    assert(tag != 0);
 
-    var cursor: usize = 0;
+    var cursor: DerCursor = 0;
     cursor = appendByte(out, cursor, tag) catch return error.OutputTooSmall;
-    cursor = appendDerLength(out, cursor, value.len) catch return error.OutputTooSmall;
+    const value_len = std.math.cast(u16, value.len) orelse return error.OutputTooSmall;
+    cursor = appendDerLength(out, cursor, value_len) catch return error.OutputTooSmall;
     cursor = appendBytes(out, cursor, value) catch return error.OutputTooSmall;
-    return out[0..cursor];
+    return out[0..@intCast(cursor)];
 }
 
-fn appendByte(out: []u8, cursor: usize, value: u8) error{OutputTooSmall}!usize {
-    if (cursor >= out.len) return error.OutputTooSmall;
-    out[cursor] = value;
-    return cursor + 1;
+fn appendByte(out: []u8, cursor: DerCursor, value: u8) error{OutputTooSmall}!DerCursor {
+    assert(out.len <= std.math.maxInt(DerCursor));
+    assert(cursor <= @as(DerCursor, @intCast(out.len)));
+    assert(value <= std.math.maxInt(u8));
+    if (cursor >= @as(DerCursor, @intCast(out.len))) return error.OutputTooSmall;
+    out[@intCast(cursor)] = value;
+    return std.math.add(DerCursor, cursor, 1) catch error.OutputTooSmall;
 }
 
-fn appendBytes(out: []u8, cursor: usize, bytes: []const u8) error{OutputTooSmall}!usize {
-    if (cursor + bytes.len > out.len) return error.OutputTooSmall;
-    @memcpy(out[cursor..][0..bytes.len], bytes);
-    return cursor + bytes.len;
+fn appendBytes(out: []u8, cursor: DerCursor, bytes: []const u8) error{OutputTooSmall}!DerCursor {
+    assert(out.len <= std.math.maxInt(DerCursor));
+    assert(cursor <= @as(DerCursor, @intCast(out.len)));
+    assert(bytes.len <= out.len);
+    const bytes_len = std.math.cast(DerCursor, bytes.len) orelse return error.OutputTooSmall;
+    const end = std.math.add(DerCursor, cursor, bytes_len) catch return error.OutputTooSmall;
+    if (end > @as(DerCursor, @intCast(out.len))) return error.OutputTooSmall;
+    @memcpy(out[@intCast(cursor)..][0..@intCast(bytes_len)], bytes);
+    return end;
 }
 
-fn appendDerLength(out: []u8, cursor: usize, len: usize) error{OutputTooSmall}!usize {
+fn appendDerLength(out: []u8, cursor: DerCursor, len: u16) error{OutputTooSmall}!DerCursor {
+    assert(cursor <= @as(DerCursor, @intCast(out.len)));
+    assert(len <= 65_535);
     if (len <= 127) {
         return appendByte(out, cursor, @intCast(len));
     }
@@ -293,6 +312,7 @@ fn encodeSec1EcPrivateKeyDer(
     public_key_sec1: *const [Scheme.PublicKey.uncompressed_sec1_encoded_length]u8,
 ) error{OutputTooSmall}![]const u8 {
     assert(out.len >= 128);
+    assert(@intFromPtr(secret_key) != 0 and @intFromPtr(public_key_sec1) != 0);
 
     // ECPrivateKey ::= SEQUENCE {
     //   version        INTEGER(1),
@@ -301,7 +321,7 @@ fn encodeSec1EcPrivateKeyDer(
     //   publicKey  [1] BIT STRING OPTIONAL
     // }
     var content_buf: [192]u8 = undefined;
-    var cursor: usize = 0;
+    var cursor: DerCursor = 0;
 
     cursor = appendBytes(&content_buf, cursor, &.{ 0x02, 0x01, 0x01 }) catch return error.OutputTooSmall;
 
@@ -313,12 +333,12 @@ fn encodeSec1EcPrivateKeyDer(
     cursor = appendBytes(&content_buf, cursor, params_tlv) catch return error.OutputTooSmall;
 
     var pubkey_content_buf: [80]u8 = undefined;
-    var pubkey_cursor: usize = 0;
+    var pubkey_cursor: DerCursor = 0;
     pubkey_cursor = appendBytes(&pubkey_content_buf, pubkey_cursor, &.{0x00}) catch return error.OutputTooSmall;
     pubkey_cursor = appendBytes(&pubkey_content_buf, pubkey_cursor, public_key_sec1) catch return error.OutputTooSmall;
 
     var pubkey_bitstring_buf: [96]u8 = undefined;
-    const pubkey_bitstring = wrapDerTlv(&pubkey_bitstring_buf, 0x03, pubkey_content_buf[0..pubkey_cursor]) catch {
+    const pubkey_bitstring = wrapDerTlv(&pubkey_bitstring_buf, 0x03, pubkey_content_buf[0..@intCast(pubkey_cursor)]) catch {
         return error.OutputTooSmall;
     };
 
@@ -326,7 +346,7 @@ fn encodeSec1EcPrivateKeyDer(
     const pubkey_ctx = wrapDerTlv(&pubkey_ctx_buf, 0xA1, pubkey_bitstring) catch return error.OutputTooSmall;
     cursor = appendBytes(&content_buf, cursor, pubkey_ctx) catch return error.OutputTooSmall;
 
-    return wrapDerTlv(out, 0x30, content_buf[0..cursor]);
+    return wrapDerTlv(out, 0x30, content_buf[0..@intCast(cursor)]);
 }
 
 fn encodePem(label: []const u8, der: []const u8, out: []u8) error{OutputTooSmall}![]const u8 {
@@ -339,16 +359,21 @@ fn encodePem(label: []const u8, der: []const u8, out: []u8) error{OutputTooSmall
 
     _ = std.base64.standard.Encoder.encode(b64_buf[0..b64_len], der);
 
-    var cursor: usize = 0;
+    var cursor: DerCursor = 0;
     cursor = appendBytes(out, cursor, "-----BEGIN ") catch return error.OutputTooSmall;
     cursor = appendBytes(out, cursor, label) catch return error.OutputTooSmall;
     cursor = appendBytes(out, cursor, "-----\n") catch return error.OutputTooSmall;
 
-    var line_start: usize = 0;
-    while (line_start < b64_len) {
-        const remaining = b64_len - line_start;
-        const line_len: usize = @min(@as(usize, 64), remaining);
-        cursor = appendBytes(out, cursor, b64_buf[line_start .. line_start + line_len]) catch return error.OutputTooSmall;
+    const b64_len_u16 = std.math.cast(u16, b64_len) orelse return error.OutputTooSmall;
+    var line_start: u16 = 0;
+    while (line_start < b64_len_u16) {
+        const remaining = b64_len_u16 - line_start;
+        const line_len: u16 = @min(@as(u16, 64), remaining);
+        cursor = appendBytes(
+            out,
+            cursor,
+            b64_buf[@intCast(line_start) .. @intCast(line_start + line_len)],
+        ) catch return error.OutputTooSmall;
         cursor = appendBytes(out, cursor, "\n") catch return error.OutputTooSmall;
         line_start += line_len;
     }
@@ -357,7 +382,7 @@ fn encodePem(label: []const u8, der: []const u8, out: []u8) error{OutputTooSmall
     cursor = appendBytes(out, cursor, label) catch return error.OutputTooSmall;
     cursor = appendBytes(out, cursor, "-----\n") catch return error.OutputTooSmall;
 
-    return out[0..cursor];
+    return out[0..@intCast(cursor)];
 }
 
 test "buildSubjectAltName remains deterministic" {

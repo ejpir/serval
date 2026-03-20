@@ -13,8 +13,10 @@ const Method = core.types.Method;
 const client = @import("client.zig");
 const wire = @import("wire.zig");
 
-const max_problem_document_bytes: usize = @intCast(@max(config.ACME_MAX_ACCOUNT_RESPONSE_BYTES, config.ACME_MAX_ORDER_RESPONSE_BYTES));
-const problem_parse_scratch_size_bytes: usize = 2048;
+const max_problem_document_bytes: u32 = @intCast(
+    @max(config.ACME_MAX_ACCOUNT_RESPONSE_BYTES, config.ACME_MAX_ORDER_RESPONSE_BYTES),
+);
+const problem_parse_scratch_size_bytes = 2048;
 
 pub const Error = error{
     NonceUnavailable,
@@ -68,6 +70,7 @@ pub const ResponseAssessment = struct {
 
     pub fn isSuccess(self: *const ResponseAssessment) bool {
         assert(@intFromPtr(self) != 0);
+        assert(self.http_status <= 999);
         return self.outcome == .success;
     }
 };
@@ -130,6 +133,7 @@ pub const FlowContext = struct {
 
     pub fn init(directory: *const client.Directory) FlowContext {
         assert(@intFromPtr(directory) != 0);
+        assert(directory.new_nonce_url.len <= config.ACME_MAX_DIRECTORY_URL_BYTES);
         return .{ .directory = directory.* };
     }
 
@@ -143,6 +147,7 @@ pub const FlowContext = struct {
 
     pub fn requireNonce(self: *const FlowContext) Error!client.ReplayNonce {
         assert(@intFromPtr(self) != 0);
+        assert(!self.has_nonce or self.nonce.len > 0);
 
         if (!self.has_nonce) return error.NonceUnavailable;
         return self.nonce;
@@ -174,6 +179,7 @@ pub const FlowContext = struct {
 
     pub fn selectEndpoint(self: *const FlowContext, endpoint: Endpoint) Error!client.Url {
         assert(@intFromPtr(self) != 0);
+        assert(self.directory.new_nonce_url.len <= config.ACME_MAX_DIRECTORY_URL_BYTES);
 
         return switch (endpoint) {
             .directory_new_nonce => self.directory.new_nonce_url,
@@ -191,6 +197,7 @@ pub const FlowContext = struct {
         signed_body: []const u8,
     ) (Error || wire.Error)!wire.WireRequest {
         assert(@intFromPtr(self) != 0);
+        assert(@sizeOf(Operation) == 1);
 
         if (operation != .fetch_nonce and signed_body.len == 0) {
             return error.SignedBodyRequired;
@@ -290,6 +297,7 @@ pub const FlowContext = struct {
 
 pub fn assessResponse(operation: Operation, response: *const ResponseView) ResponseAssessment {
     assert(@intFromPtr(response) != 0);
+    assert(response.status <= 999);
 
     if (isExpectedSuccessStatus(operation, response.status)) {
         return .{ .outcome = .success, .reason = .none, .http_status = response.status };
@@ -331,6 +339,8 @@ pub fn assessResponse(operation: Operation, response: *const ResponseView) Respo
 }
 
 pub fn classifyProtocolError(err: ProtocolError) ErrorAssessment {
+    assert(@sizeOf(ErrorAssessment) > 0);
+    assert(@sizeOf(@TypeOf(err)) > 0);
     return switch (err) {
         error.MissingReplayNonceHeader => .{
             .class = .protocol,
@@ -384,6 +394,8 @@ pub fn classifyProtocolError(err: ProtocolError) ErrorAssessment {
 }
 
 fn isExpectedSuccessStatus(operation: Operation, status: u16) bool {
+    assert(@sizeOf(Operation) == 1);
+    assert(status <= 999);
     return switch (operation) {
         .fetch_nonce => status == 200 or status == 204,
         .new_account => status == 200 or status == 201,
@@ -396,6 +408,7 @@ fn isExpectedSuccessStatus(operation: Operation, status: u16) bool {
 
 fn assessBadRequest(status: u16, body: []const u8) ResponseAssessment {
     assert(status == 400);
+    assert(body.len <= max_problem_document_bytes);
 
     const problem_type = parseProblemType(body) catch {
         return .{
@@ -423,6 +436,8 @@ fn assessBadRequest(status: u16, body: []const u8) ResponseAssessment {
 }
 
 fn parseProblemType(body: []const u8) error{ ProblemTooLarge, ParseFailed }!?[]const u8 {
+    assert(max_problem_document_bytes > 0);
+    assert(problem_parse_scratch_size_bytes > 0);
     if (body.len == 0) return null;
     if (body.len > max_problem_document_bytes) return error.ProblemTooLarge;
 

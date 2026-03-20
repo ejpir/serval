@@ -9,9 +9,10 @@ const assert = std.debug.assert;
 const config = @import("serval-core").config;
 const client = @import("client.zig");
 
-const max_jws_body_bytes: usize = config.ACME_MAX_JWS_BODY_BYTES;
-const max_signature_bytes: usize = config.ACME_MAX_JWS_SIGNATURE_BYTES;
-const max_jwk_coordinate_b64_bytes: usize = 96;
+const max_jws_body_bytes = config.ACME_MAX_JWS_BODY_BYTES;
+const max_signature_bytes = config.ACME_MAX_JWS_SIGNATURE_BYTES;
+const max_jwk_coordinate_b64_bytes = 96;
+const JwsLen = u16;
 
 pub const Error = error{
     InvalidNonce,
@@ -35,6 +36,7 @@ pub const JwkP256 = struct {
 
     pub fn setCoordinates(self: *JwkP256, x_b64u: []const u8, y_b64u: []const u8) Error!void {
         assert(@intFromPtr(self) != 0);
+        assert(self.x_len <= max_jwk_coordinate_b64_bytes);
 
         try validateCoordinate(x_b64u);
         try validateCoordinate(y_b64u);
@@ -46,6 +48,7 @@ pub const JwkP256 = struct {
 
         self.x_len = @intCast(x_b64u.len);
         self.y_len = @intCast(y_b64u.len);
+        assert(self.x_len == @as(u8, @intCast(x_b64u.len)));
     }
 
     pub fn xSlice(self: *const JwkP256) []const u8 {
@@ -99,7 +102,7 @@ pub fn serializeProtectedHeaderWithJwk(
 
     if (x.len == 0 or y.len == 0) return error.InvalidJwkCoordinate;
 
-    var cursor: usize = 0;
+    var cursor: JwsLen = 0;
     cursor = try appendChunk(out, cursor, "{\"alg\":\"ES256\",\"nonce\":\"");
     cursor = try appendChunk(out, cursor, nonce);
     cursor = try appendChunk(out, cursor, "\",\"url\":\"");
@@ -112,7 +115,7 @@ pub fn serializeProtectedHeaderWithJwk(
 
     if (cursor > max_jws_body_bytes) return error.ProtectedHeaderTooLarge;
     assert(cursor > 0);
-    return out[0..cursor];
+    return out[0..@intCast(cursor)];
 }
 
 pub fn serializeProtectedHeaderWithKid(
@@ -135,7 +138,7 @@ pub fn serializeProtectedHeaderWithKid(
     validateJsonString(url) catch return error.InvalidUrl;
     validateJsonString(kid) catch return error.InvalidKid;
 
-    var cursor: usize = 0;
+    var cursor: JwsLen = 0;
     cursor = try appendChunk(out, cursor, "{\"alg\":\"ES256\",\"nonce\":\"");
     cursor = try appendChunk(out, cursor, nonce);
     cursor = try appendChunk(out, cursor, "\",\"url\":\"");
@@ -146,7 +149,7 @@ pub fn serializeProtectedHeaderWithKid(
 
     if (cursor > max_jws_body_bytes) return error.ProtectedHeaderTooLarge;
     assert(cursor > 0);
-    return out[0..cursor];
+    return out[0..@intCast(cursor)];
 }
 
 pub fn serializeSigningInput(
@@ -154,14 +157,17 @@ pub fn serializeSigningInput(
     protected_header_json: []const u8,
     payload_json: []const u8,
 ) Error![]const u8 {
+    assert(max_jws_body_bytes > 0);
     if (protected_header_json.len == 0) return error.EmptyProtectedHeader;
     if (protected_header_json.len > max_jws_body_bytes) return error.ProtectedHeaderTooLarge;
     if (payload_json.len > max_jws_body_bytes) return error.PayloadTooLarge;
 
-    const protected_b64_len = base64UrlEncodedLenNoPad(protected_header_json.len);
-    const payload_b64_len = base64UrlEncodedLenNoPad(payload_json.len);
+    const protected_input_len = std.math.cast(JwsLen, protected_header_json.len) orelse return error.ProtectedHeaderTooLarge;
+    const payload_input_len = std.math.cast(JwsLen, payload_json.len) orelse return error.PayloadTooLarge;
+    const protected_b64_len = base64UrlEncodedLenNoPad(protected_input_len);
+    const payload_b64_len = base64UrlEncodedLenNoPad(payload_input_len);
 
-    var total_len: usize = 0;
+    var total_len: JwsLen = 0;
     total_len = try checkedAdd(total_len, protected_b64_len);
     total_len = try checkedAdd(total_len, 1);
     total_len = try checkedAdd(total_len, payload_b64_len);
@@ -169,38 +175,44 @@ pub fn serializeSigningInput(
     if (total_len > out.len) return error.OutputTooSmall;
     if (total_len > max_jws_body_bytes) return error.OutputTooSmall;
 
-    var cursor: usize = 0;
+    var cursor: JwsLen = 0;
+    const protected_end = std.math.add(JwsLen, cursor, protected_b64_len) catch return error.OutputTooSmall;
     _ = std.base64.url_safe_no_pad.Encoder.encode(
-        out[cursor .. cursor + protected_b64_len],
+        out[@intCast(cursor) .. @intCast(protected_end)],
         protected_header_json,
     );
-    cursor += protected_b64_len;
+    cursor = protected_end;
 
-    out[cursor] = '.';
+    out[@intCast(cursor)] = '.';
     cursor += 1;
 
+    const payload_end = std.math.add(JwsLen, cursor, payload_b64_len) catch return error.OutputTooSmall;
     _ = std.base64.url_safe_no_pad.Encoder.encode(
-        out[cursor .. cursor + payload_b64_len],
+        out[@intCast(cursor) .. @intCast(payload_end)],
         payload_json,
     );
-    cursor += payload_b64_len;
+    cursor = payload_end;
 
     assert(cursor == total_len);
-    return out[0..cursor];
+    return out[0..@intCast(cursor)];
 }
 
 pub fn serializeFlattenedJws(out: []u8, params: FlattenedJwsParams) Error![]const u8 {
+    assert(max_signature_bytes > 0);
     if (params.protected_header_json.len == 0) return error.EmptyProtectedHeader;
     if (params.protected_header_json.len > max_jws_body_bytes) return error.ProtectedHeaderTooLarge;
     if (params.payload_json.len > max_jws_body_bytes) return error.PayloadTooLarge;
     if (params.signature.len == 0) return error.InvalidSignature;
     if (params.signature.len > max_signature_bytes) return error.SignatureTooLarge;
 
-    const protected_b64_len = base64UrlEncodedLenNoPad(params.protected_header_json.len);
-    const payload_b64_len = base64UrlEncodedLenNoPad(params.payload_json.len);
-    const signature_b64_len = base64UrlEncodedLenNoPad(params.signature.len);
+    const protected_input_len = std.math.cast(JwsLen, params.protected_header_json.len) orelse return error.ProtectedHeaderTooLarge;
+    const payload_input_len = std.math.cast(JwsLen, params.payload_json.len) orelse return error.PayloadTooLarge;
+    const signature_input_len = std.math.cast(JwsLen, params.signature.len) orelse return error.SignatureTooLarge;
+    const protected_b64_len = base64UrlEncodedLenNoPad(protected_input_len);
+    const payload_b64_len = base64UrlEncodedLenNoPad(payload_input_len);
+    const signature_b64_len = base64UrlEncodedLenNoPad(signature_input_len);
 
-    var total_len: usize = 0;
+    var total_len: JwsLen = 0;
     total_len = try checkedAdd(total_len, "{\"protected\":\"".len);
     total_len = try checkedAdd(total_len, protected_b64_len);
     total_len = try checkedAdd(total_len, "\",\"payload\":\"".len);
@@ -212,47 +224,55 @@ pub fn serializeFlattenedJws(out: []u8, params: FlattenedJwsParams) Error![]cons
     if (total_len > out.len) return error.OutputTooSmall;
     if (total_len > max_jws_body_bytes) return error.OutputTooSmall;
 
-    var cursor: usize = 0;
+    var cursor: JwsLen = 0;
     cursor = try appendChunk(out, cursor, "{\"protected\":\"");
 
+    const protected_end = std.math.add(JwsLen, cursor, protected_b64_len) catch return error.OutputTooSmall;
     _ = std.base64.url_safe_no_pad.Encoder.encode(
-        out[cursor .. cursor + protected_b64_len],
+        out[@intCast(cursor) .. @intCast(protected_end)],
         params.protected_header_json,
     );
-    cursor += protected_b64_len;
+    cursor = protected_end;
 
     cursor = try appendChunk(out, cursor, "\",\"payload\":\"");
 
+    const payload_end = std.math.add(JwsLen, cursor, payload_b64_len) catch return error.OutputTooSmall;
     _ = std.base64.url_safe_no_pad.Encoder.encode(
-        out[cursor .. cursor + payload_b64_len],
+        out[@intCast(cursor) .. @intCast(payload_end)],
         params.payload_json,
     );
-    cursor += payload_b64_len;
+    cursor = payload_end;
 
     cursor = try appendChunk(out, cursor, "\",\"signature\":\"");
 
+    const signature_end = std.math.add(JwsLen, cursor, signature_b64_len) catch return error.OutputTooSmall;
     _ = std.base64.url_safe_no_pad.Encoder.encode(
-        out[cursor .. cursor + signature_b64_len],
+        out[@intCast(cursor) .. @intCast(signature_end)],
         params.signature,
     );
-    cursor += signature_b64_len;
+    cursor = signature_end;
 
     cursor = try appendChunk(out, cursor, "\"}");
     assert(cursor == total_len);
 
-    return out[0..cursor];
+    return out[0..@intCast(cursor)];
 }
 
 fn validateCoordinate(value: []const u8) Error!void {
+    assert(max_jwk_coordinate_b64_bytes > 0);
+    assert(max_jwk_coordinate_b64_bytes <= std.math.maxInt(u8));
     if (value.len == 0) return error.InvalidJwkCoordinate;
     if (value.len > max_jwk_coordinate_b64_bytes) return error.JwkCoordinateTooLong;
     try validateBase64UrlText(value, error.InvalidJwkCoordinate);
 }
 
 fn validateBase64UrlText(value: []const u8, invalid_err: Error) Error!void {
-    var index: usize = 0;
-    while (index < value.len) : (index += 1) {
-        const c = value[index];
+    assert(max_jws_body_bytes > 0);
+    assert(value.len <= max_jws_body_bytes);
+    const value_len = std.math.cast(JwsLen, value.len) orelse return invalid_err;
+    var index: JwsLen = 0;
+    while (index < value_len) : (index += 1) {
+        const c = value[@intCast(index)];
         const is_digit = c >= '0' and c <= '9';
         const is_upper = c >= 'A' and c <= 'Z';
         const is_lower = c >= 'a' and c <= 'z';
@@ -266,30 +286,42 @@ fn validateBase64UrlText(value: []const u8, invalid_err: Error) Error!void {
 }
 
 fn validateJsonString(value: []const u8) Error!void {
-    var index: usize = 0;
-    while (index < value.len) : (index += 1) {
-        const c = value[index];
+    assert(max_jws_body_bytes > 0);
+    assert(value.len <= max_jws_body_bytes);
+    const value_len = std.math.cast(JwsLen, value.len) orelse return error.InvalidUrl;
+    var index: JwsLen = 0;
+    while (index < value_len) : (index += 1) {
+        const c = value[@intCast(index)];
         if (c < 0x20) return error.InvalidUrl;
         if (c == '"') return error.InvalidUrl;
         if (c == '\\') return error.InvalidUrl;
     }
 }
 
-fn appendChunk(out: []u8, cursor: usize, chunk: []const u8) Error!usize {
-    assert(cursor <= out.len);
+fn appendChunk(out: []u8, cursor: JwsLen, chunk: []const u8) Error!JwsLen {
+    assert(out.len <= std.math.maxInt(JwsLen));
+    assert(cursor <= @as(JwsLen, @intCast(out.len)));
+    assert(chunk.len <= out.len);
 
-    if (cursor + chunk.len > out.len) return error.OutputTooSmall;
-    @memcpy(out[cursor..][0..chunk.len], chunk);
+    const chunk_len = std.math.cast(JwsLen, chunk.len) orelse return error.OutputTooSmall;
+    const end = std.math.add(JwsLen, cursor, chunk_len) catch return error.OutputTooSmall;
+    if (end > @as(JwsLen, @intCast(out.len))) return error.OutputTooSmall;
+    @memcpy(out[@intCast(cursor)..][0..@intCast(chunk_len)], chunk);
 
-    return cursor + chunk.len;
+    return end;
 }
 
-fn checkedAdd(a: usize, b: usize) Error!usize {
-    return std.math.add(usize, a, b) catch error.OutputTooSmall;
+fn checkedAdd(a: JwsLen, b: JwsLen) Error!JwsLen {
+    assert(a <= std.math.maxInt(JwsLen));
+    assert(b <= std.math.maxInt(JwsLen));
+    return std.math.add(JwsLen, a, b) catch error.OutputTooSmall;
 }
 
-fn base64UrlEncodedLenNoPad(input_len: usize) usize {
-    return std.base64.url_safe_no_pad.Encoder.calcSize(input_len);
+fn base64UrlEncodedLenNoPad(input_len: JwsLen) JwsLen {
+    assert(max_jws_body_bytes > 0);
+    const encoded_len = std.base64.url_safe_no_pad.Encoder.calcSize(input_len);
+    assert(encoded_len >= input_len);
+    return @intCast(encoded_len);
 }
 
 test "JwkP256 setCoordinates stores values" {

@@ -11,8 +11,8 @@ const jws = @import("jws.zig");
 
 const Scheme = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 
-const max_body_bytes: usize = config.ACME_MAX_JWS_BODY_BYTES;
-const max_sig_bytes: usize = Scheme.Signature.encoded_length;
+const max_body_bytes = config.ACME_MAX_JWS_BODY_BYTES;
+const max_sig_bytes = Scheme.Signature.encoded_length;
 
 pub const Error = error{
     InvalidNonce,
@@ -32,11 +32,15 @@ pub const AccountSigner = struct {
     key_pair: Scheme.KeyPair,
 
     pub fn generate(io: std.Io) AccountSigner {
+        assert(max_body_bytes > 0);
+        assert(max_sig_bytes > 0);
         const key_pair = Scheme.KeyPair.generate(io);
         return .{ .key_pair = key_pair };
     }
 
     pub fn generateDeterministic(seed: [Scheme.KeyPair.seed_length]u8) !AccountSigner {
+        assert(Scheme.KeyPair.seed_length > 0);
+        assert(seed.len == Scheme.KeyPair.seed_length);
         const key_pair = try Scheme.KeyPair.generateDeterministic(seed);
         return .{ .key_pair = key_pair };
     }
@@ -48,6 +52,7 @@ pub const AccountSigner = struct {
         out_y: []u8,
     ) Error!jws.JwkP256 {
         assert(@intFromPtr(self) != 0);
+        assert(out_x.len > 0 and out_y.len > 0);
 
         const sec1 = self.key_pair.public_key.toUncompressedSec1();
         if (sec1.len != 65 or sec1[0] != 0x04) return error.MissingJwkCoordinates;
@@ -123,11 +128,14 @@ pub const AccountSigner = struct {
         out: []u8,
     ) Error![]const u8 {
         assert(@intFromPtr(self) != 0);
+        assert(out.len > 0);
         if (token.len == 0) return error.InvalidToken;
+        if (token.len > std.math.maxInt(u16)) return error.InvalidToken;
+        const token_len: u16 = @intCast(token.len);
 
-        var i: usize = 0;
-        while (i < token.len) : (i += 1) {
-            const c = token[i];
+        var i: u16 = 0;
+        while (i < token_len) : (i += 1) {
+            const c = token[@intCast(i)];
             const is_digit = c >= '0' and c <= '9';
             const is_upper = c >= 'A' and c <= 'Z';
             const is_lower = c >= 'a' and c <= 'z';
@@ -193,6 +201,8 @@ pub const AccountSigner = struct {
 };
 
 fn mapJwsError(err: anyerror) Error {
+    assert(@sizeOf(@TypeOf(err)) > 0);
+    assert(@sizeOf(Error) > 0);
     return switch (err) {
         error.InvalidNonce => error.InvalidNonce,
         error.InvalidUrl => error.InvalidUrl,

@@ -23,10 +23,14 @@ pub const Error = error{
 var installed_provider: ?*TlsAlpnHookProvider = null;
 
 fn loadInstalledProvider() ?*TlsAlpnHookProvider {
+    assert(lock_max_attempts > 0);
+    assert(max_domain_len > 0);
     return @atomicLoad(?*TlsAlpnHookProvider, &installed_provider, .acquire);
 }
 
 fn storeInstalledProvider(provider: ?*TlsAlpnHookProvider) void {
+    assert(provider == null or @intFromPtr(provider.?) != 0);
+    assert(lock_max_attempts > 0);
     @atomicStore(?*TlsAlpnHookProvider, &installed_provider, provider, .release);
 }
 
@@ -39,11 +43,14 @@ pub const TlsAlpnHookProvider = struct {
     domain_buf: [max_domain_len]u8 = [_]u8{0} ** max_domain_len,
 
     pub fn init() TlsAlpnHookProvider {
+        assert(max_domain_len > 0);
+        assert(lock_max_attempts > 0);
         return .{};
     }
 
     pub fn install(self: *TlsAlpnHookProvider) Error!void {
         assert(@intFromPtr(self) != 0);
+        assert(self.domain_len <= max_domain_len);
 
         lockMutex(&self.mutex);
         defer self.mutex.unlock();
@@ -61,6 +68,7 @@ pub const TlsAlpnHookProvider = struct {
 
     pub fn uninstall(self: *TlsAlpnHookProvider) Error!void {
         assert(@intFromPtr(self) != 0);
+        assert(self.domain_len <= max_domain_len);
 
         lockMutex(&self.mutex);
         defer self.mutex.unlock();
@@ -101,6 +109,7 @@ pub const TlsAlpnHookProvider = struct {
 
     pub fn clearChallenge(self: *TlsAlpnHookProvider) Error!void {
         assert(@intFromPtr(self) != 0);
+        assert(self.domain_len <= max_domain_len);
 
         lockMutex(&self.mutex);
         defer self.mutex.unlock();
@@ -113,6 +122,8 @@ pub const TlsAlpnHookProvider = struct {
     }
 
     fn matchesSni(self: *const TlsAlpnHookProvider, sni: ?[]const u8) bool {
+        assert(@intFromPtr(self) != 0);
+        assert(self.domain_len <= max_domain_len);
         if (!self.challenge_active) return false;
         const server_name = sni orelse return false;
         const domain = self.domain_buf[0..self.domain_len];
@@ -123,6 +134,7 @@ pub const TlsAlpnHookProvider = struct {
 
 fn lockMutex(mutex: *std.atomic.Mutex) void {
     assert(@intFromPtr(mutex) != 0);
+    assert(lock_max_attempts > 0);
 
     var attempts: u32 = 0;
     while (attempts < lock_max_attempts) : (attempts += 1) {
@@ -135,6 +147,8 @@ fn lockMutex(mutex: *std.atomic.Mutex) void {
 }
 
 fn serverAlpnHook(input: *const ssl.ServerAlpnHookInput) ssl.ServerAlpnHookDecision {
+    assert(@intFromPtr(input) != 0);
+    assert(lock_max_attempts > 0);
     const provider = loadInstalledProvider() orelse return .default_policy;
 
     lockMutex(&provider.mutex);
@@ -148,6 +162,8 @@ fn serverAlpnHook(input: *const ssl.ServerAlpnHookInput) ssl.ServerAlpnHookDecis
 }
 
 fn serverCertHook(input: *const ssl.ServerCertHookInput) ssl.ServerCertHookDecision {
+    assert(@intFromPtr(input) != 0);
+    assert(lock_max_attempts > 0);
     const provider = loadInstalledProvider() orelse return .default_ctx;
 
     lockMutex(&provider.mutex);
