@@ -32,6 +32,8 @@ pub const ConnectionState = struct {
     flow: h2.ConnectionFlowControl,
 
     pub fn init() Error!ConnectionState {
+        assert(config.H2_CONNECTION_WINDOW_SIZE_BYTES > 0);
+        assert(config.H2_CONNECTION_WINDOW_SIZE_BYTES <= config.H2_MAX_WINDOW_SIZE_BYTES);
         const flow = try h2.ConnectionFlowControl.init(config.H2_CONNECTION_WINDOW_SIZE_BYTES);
         return .{ .flow = flow };
     }
@@ -76,7 +78,7 @@ pub const ConnectionState = struct {
         const new_initial_window_size_bytes = self.peer_settings.initial_window_size_bytes;
         if (new_initial_window_size_bytes != old_initial_window_size_bytes) {
             const delta_i64: i64 = @as(i64, new_initial_window_size_bytes) - @as(i64, old_initial_window_size_bytes);
-            self.streams.adjustAllSendWindows(delta_i64);
+            try self.streams.adjustAllSendWindows(delta_i64);
         }
 
         self.peer_settings_received = true;
@@ -109,21 +111,25 @@ pub const ConnectionState = struct {
 
     pub fn endRemoteStream(self: *ConnectionState, stream_id: u32) Error!void {
         assert(@intFromPtr(self) != 0);
+        assert(stream_id > 0);
         try self.streams.endRemote(stream_id);
     }
 
     pub fn endLocalStream(self: *ConnectionState, stream_id: u32) Error!void {
         assert(@intFromPtr(self) != 0);
+        assert(stream_id > 0);
         try self.streams.endLocal(stream_id);
     }
 
     pub fn resetStream(self: *ConnectionState, stream_id: u32) Error!void {
         assert(@intFromPtr(self) != 0);
+        assert(stream_id > 0);
         try self.streams.reset(stream_id);
     }
 
     pub fn consumeRecvWindow(self: *ConnectionState, bytes: u32) Error!void {
         assert(@intFromPtr(self) != 0);
+        assert(bytes <= config.H2_MAX_WINDOW_SIZE_BYTES);
         try self.flow.recv_window.consume(bytes);
     }
 
@@ -135,6 +141,7 @@ pub const ConnectionState = struct {
 
     pub fn incrementRecvWindow(self: *ConnectionState, delta_bytes: u32) Error!void {
         assert(@intFromPtr(self) != 0);
+        assert(delta_bytes <= config.H2_MAX_WINDOW_SIZE_BYTES);
         try self.flow.recv_window.increment(delta_bytes);
     }
 
@@ -146,6 +153,7 @@ pub const ConnectionState = struct {
 
     pub fn consumeSendWindow(self: *ConnectionState, bytes: u32) Error!void {
         assert(@intFromPtr(self) != 0);
+        assert(bytes <= config.H2_MAX_WINDOW_SIZE_BYTES);
         try self.flow.send_window.consume(bytes);
     }
 
@@ -157,6 +165,7 @@ pub const ConnectionState = struct {
 
     pub fn incrementSendWindow(self: *ConnectionState, delta_bytes: u32) Error!void {
         assert(@intFromPtr(self) != 0);
+        assert(delta_bytes <= config.H2_MAX_WINDOW_SIZE_BYTES);
         try self.flow.send_window.increment(delta_bytes);
     }
 
@@ -196,12 +205,17 @@ pub const ConnectionState = struct {
 };
 
 fn defaultLocalSettings() h2.Settings {
-    return .{
+    assert(config.H2_MAX_CONCURRENT_STREAMS > 0);
+    assert(config.H2_INITIAL_WINDOW_SIZE_BYTES <= config.H2_MAX_WINDOW_SIZE_BYTES);
+
+    const defaults: h2.Settings = .{
         .enable_push = false,
         .max_concurrent_streams = config.H2_MAX_CONCURRENT_STREAMS,
         .initial_window_size_bytes = config.H2_INITIAL_WINDOW_SIZE_BYTES,
         .max_frame_size_bytes = config.H2_MAX_FRAME_SIZE_BYTES,
     };
+    assert(defaults.max_frame_size_bytes >= h2.settings.min_max_frame_size_bytes);
+    return defaults;
 }
 
 test "ConnectionState accepts first preface only once" {

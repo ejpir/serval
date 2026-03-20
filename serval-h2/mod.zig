@@ -73,6 +73,7 @@ pub const request = @import("request.zig");
 pub const RequestHead = request.RequestHead;
 pub const InitialRequest = request.InitialRequest;
 pub const InitialRequestError = request.Error;
+pub const request_stable_storage_size_bytes = request.request_stable_storage_size_bytes;
 pub const decodeRequestHeaderBlock = request.decodeRequestHeaderBlock;
 pub const decodeRequestHeaderBlockWithDecoder = request.decodeRequestHeaderBlockWithDecoder;
 pub const parseInitialRequest = request.parseInitialRequest;

@@ -261,6 +261,8 @@ defer h2_pool.deinit();
 - `completeHandshake()` for prior-knowledge preface + SETTINGS synchronization
 - `sendRequestHeaders()` / `sendRequestData()` on multiplexed stream ids
 - `receiveAction()` / `receiveActionHandlingControl()` for inbound frame dispatch
+- `sendRequestData()` now emits bounded DATA chunks using `min(connection_window, stream_window, peer_max_frame_size)` and fails closed with `SendWindowExhausted` when no outbound flow-control credit is available
+- `receiveActionHandlingControl()` drains inbound control actions (`SETTINGS ACK`, `PING ACK`) before returning non-control actions to callers
 
 `H2UpstreamSessionPool` adds bounded session lifecycle management above the driver:
 - `acquireOrConnect()` validates `.http_protocol = .h2c`, opens a fresh upstream session on miss, or returns a healthy cached session on hit

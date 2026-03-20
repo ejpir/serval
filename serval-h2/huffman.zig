@@ -4,6 +4,7 @@
 //! TigerStyle: bounded decode, fixed tables, no allocation.
 
 const std = @import("std");
+const assert = std.debug.assert;
 
 pub const Error = error{
     InvalidHuffman,
@@ -28,6 +29,9 @@ const Trie = struct {
 const trie: Trie = buildTrie();
 
 pub fn decode(input: []const u8, out: []u8) Error![]const u8 {
+    assert(out.len > 0 or input.len == 0);
+    assert(trie.count > 0);
+
     var node_index: u16 = 0;
     var out_len: usize = 0;
     var bits_since_symbol: u8 = 0;
@@ -74,6 +78,9 @@ pub fn decode(input: []const u8, out: []u8) Error![]const u8 {
 }
 
 fn buildTrie() Trie {
+    assert(max_symbol_count == 256);
+    assert(max_code_len_bits == 30);
+
     @setEvalBranchQuota(20_000);
 
     var nodes = [_]Node{.{}} ** max_node_count;

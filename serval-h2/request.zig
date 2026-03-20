@@ -29,7 +29,17 @@ pub const InitialRequest = struct {
     consumed_bytes: u32,
 };
 
-const priority_field_size_bytes: usize = 5;
+const HeaderAssembly = struct {
+    active: bool = false,
+    stream_id: u32 = 0,
+    continuation_frames: u8 = 0,
+    block_len: u32 = 0,
+    block_buf: [config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined,
+};
+
+const priority_field_size_bytes: u32 = 5;
+// Reserve one header-block budget for copied names and one for copied values.
+pub const request_stable_storage_size_bytes: u32 = config.H2_MAX_HEADER_BLOCK_SIZE_BYTES * 2;
 
 pub const Error = error{
     NeedMoreData,
@@ -57,100 +67,40 @@ pub const Error = error{
     TooManyFrames,
     TooManyHeaders,
     DuplicateContentLength,
+    StableStorageTooSmall,
 } || frame.Error || settings.Error || hpack.Error;
 
-pub fn parseInitialRequest(input: []const u8) Error!InitialRequest {
+pub fn parseInitialRequest(input: []const u8, request_storage_out: []u8) Error!InitialRequest {
     assert(input.len > 0);
+    assert(preface.client_connection_preface.len > 0);
+    if (request_storage_out.len < request_stable_storage_size_bytes) return error.StableStorageTooSmall;
 
     if (!preface.looksLikeClientConnectionPrefacePrefix(input)) return error.InvalidPreface;
     if (input.len < preface.client_connection_preface.len) return error.NeedMoreData;
 
     var cursor: usize = preface.client_connection_preface.len;
     var frames_seen: u32 = 0;
-
-    var assembling_header_block = false;
-    var header_stream_id: u32 = 0;
-    var continuation_frames: u8 = 0;
-    var header_block_len: usize = 0;
-    var header_block_buf: [config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+    var header_assembly = HeaderAssembly{};
 
     while (cursor < input.len and frames_seen < config.H2_MAX_INITIAL_PARSE_FRAMES) : (frames_seen += 1) {
         if (cursor + frame.frame_header_size_bytes > input.len) return error.NeedMoreData;
 
         const header = try frame.parseFrameHeader(input[cursor..]);
+        if (frames_seen == 0 and header.frame_type != .settings) return error.InvalidFrame;
         const payload_start = cursor + frame.frame_header_size_bytes;
         const payload_end = payload_start + header.length;
         if (payload_end > input.len) return error.NeedMoreData;
         const payload = input[payload_start..payload_end];
 
-        if (assembling_header_block and header.frame_type != .continuation) {
-            return error.InvalidFrame;
-        }
-
-        switch (header.frame_type) {
-            .settings => {
-                settings.validateFrame(header, payload) catch |err| switch (err) {
-                    error.InvalidStreamId,
-                    error.InvalidPayloadLength,
-                    error.AckMustBeEmpty,
-                    error.TooManySettings,
-                    error.InvalidEnablePush,
-                    error.InvalidInitialWindowSize,
-                    error.InvalidMaxFrameSize,
-                    => return error.InvalidFrame,
-                    else => return err,
-                };
-            },
-            .window_update => {
-                if (header.length != 4) return error.InvalidFrame;
-            },
-            .ping => {
-                if (header.stream_id != 0 or header.length != 8) return error.InvalidFrame;
-            },
-            .priority => {
-                if (header.stream_id == 0) return error.InvalidStreamId;
-                if (header.length != priority_field_size_bytes) return error.InvalidFrame;
-            },
-            .headers => {
-                if (header.stream_id == 0) return error.InvalidStreamId;
-                if ((header.flags & frame.flags_padded) != 0) return error.UnsupportedPadding;
-
-                var header_fragment = payload;
-                if ((header.flags & frame.flags_priority) != 0) {
-                    if (payload.len < priority_field_size_bytes) return error.InvalidFrame;
-                    header_fragment = payload[priority_field_size_bytes..];
-                }
-
-                if ((header.flags & frame.flags_end_headers) != 0) {
-                    if (header_fragment.len > config.H2_MAX_HEADER_BLOCK_SIZE_BYTES) return error.HeadersTooLarge;
-                    return try buildInitialRequest(header_fragment, header.stream_id, @intCast(payload_end));
-                }
-
-                assembling_header_block = true;
-                header_stream_id = header.stream_id;
-                continuation_frames = 0;
-                header_block_len = 0;
-                try appendHeaderFragment(&header_block_buf, &header_block_len, header_fragment);
-            },
-            .continuation => {
-                if (!assembling_header_block) return error.UnsupportedContinuation;
-                if (header.stream_id != header_stream_id) return error.InvalidStreamId;
-                if ((header.flags & ~frame.flags_end_headers) != 0) return error.InvalidFrame;
-
-                if (continuation_frames >= config.H2_MAX_CONTINUATION_FRAMES) return error.TooManyFrames;
-                continuation_frames += 1;
-                try appendHeaderFragment(&header_block_buf, &header_block_len, payload);
-
-                if ((header.flags & frame.flags_end_headers) != 0) {
-                    return try buildInitialRequest(
-                        header_block_buf[0..header_block_len],
-                        header_stream_id,
-                        @intCast(payload_end),
-                    );
-                }
-            },
-            else => {},
-        }
+        const maybe_request = try parseInitialFrame(
+            header,
+            payload,
+            frames_seen,
+            payload_end,
+            &header_assembly,
+            request_storage_out,
+        );
+        if (maybe_request) |initial_request| return initial_request;
 
         cursor = payload_end;
     }
@@ -159,24 +109,156 @@ pub fn parseInitialRequest(input: []const u8) Error!InitialRequest {
     return error.NeedMoreData;
 }
 
+fn parseInitialFrame(
+    header: frame.FrameHeader,
+    payload: []const u8,
+    frames_seen: u32,
+    payload_end: usize,
+    header_assembly: *HeaderAssembly,
+    request_storage_out: []u8,
+) Error!?InitialRequest {
+    assert(@intFromPtr(header_assembly) != 0);
+    assert(payload_end >= payload.len);
+
+    if (header_assembly.active and header.frame_type != .continuation) return error.InvalidFrame;
+
+    switch (header.frame_type) {
+        .settings => try validateInitialSettingsFrame(header, payload, frames_seen),
+        .window_update => if (header.length != 4) return error.InvalidFrame,
+        .ping => if (header.stream_id != 0 or header.length != 8) return error.InvalidFrame,
+        .priority => {
+            if (header.stream_id == 0) return error.InvalidStreamId;
+            if (header.length != priority_field_size_bytes) return error.InvalidFrame;
+        },
+        .headers => {
+            return handleInitialHeadersFrame(
+                header,
+                payload,
+                payload_end,
+                header_assembly,
+                request_storage_out,
+            );
+        },
+        .continuation => {
+            return handleInitialContinuationFrame(
+                header,
+                payload,
+                payload_end,
+                header_assembly,
+                request_storage_out,
+            );
+        },
+        else => {},
+    }
+
+    return null;
+}
+
+fn validateInitialSettingsFrame(header: frame.FrameHeader, payload: []const u8, frames_seen: u32) Error!void {
+    assert(header.frame_type == .settings);
+    assert(header.length == payload.len);
+
+    if (frames_seen == 0 and (header.flags & frame.flags_ack) != 0) return error.InvalidFrame;
+    settings.validateFrame(header, payload) catch |err| switch (err) {
+        error.InvalidStreamId,
+        error.InvalidPayloadLength,
+        error.AckMustBeEmpty,
+        error.TooManySettings,
+        error.InvalidEnablePush,
+        error.InvalidInitialWindowSize,
+        error.InvalidMaxFrameSize,
+        => return error.InvalidFrame,
+        else => return err,
+    };
+}
+
+fn handleInitialHeadersFrame(
+    header: frame.FrameHeader,
+    payload: []const u8,
+    payload_end: usize,
+    header_assembly: *HeaderAssembly,
+    request_storage_out: []u8,
+) Error!?InitialRequest {
+    assert(header.frame_type == .headers);
+    assert(@intFromPtr(header_assembly) != 0);
+
+    if (header.stream_id == 0) return error.InvalidStreamId;
+    if ((header.stream_id & 1) == 0) return error.InvalidStreamId;
+    if ((header.flags & frame.flags_padded) != 0) return error.UnsupportedPadding;
+
+    var header_fragment = payload;
+    if ((header.flags & frame.flags_priority) != 0) {
+        const priority_size: usize = @intCast(priority_field_size_bytes);
+        if (payload.len < priority_size) return error.InvalidFrame;
+        header_fragment = payload[priority_size..];
+    }
+
+    if ((header.flags & frame.flags_end_headers) != 0) {
+        if (header_fragment.len > config.H2_MAX_HEADER_BLOCK_SIZE_BYTES) return error.HeadersTooLarge;
+        return try buildInitialRequest(header_fragment, header.stream_id, @intCast(payload_end), request_storage_out);
+    }
+
+    header_assembly.active = true;
+    header_assembly.stream_id = header.stream_id;
+    header_assembly.continuation_frames = 0;
+    header_assembly.block_len = 0;
+    try appendHeaderFragment(&header_assembly.block_buf, &header_assembly.block_len, header_fragment);
+    return null;
+}
+
+fn handleInitialContinuationFrame(
+    header: frame.FrameHeader,
+    payload: []const u8,
+    payload_end: usize,
+    header_assembly: *HeaderAssembly,
+    request_storage_out: []u8,
+) Error!?InitialRequest {
+    assert(header.frame_type == .continuation);
+    assert(@intFromPtr(header_assembly) != 0);
+
+    if (!header_assembly.active) return error.UnsupportedContinuation;
+    if (header.stream_id != header_assembly.stream_id) return error.InvalidStreamId;
+    if ((header.flags & ~frame.flags_end_headers) != 0) return error.InvalidFrame;
+    if (header_assembly.continuation_frames >= config.H2_MAX_CONTINUATION_FRAMES) return error.TooManyFrames;
+
+    header_assembly.continuation_frames += 1;
+    try appendHeaderFragment(&header_assembly.block_buf, &header_assembly.block_len, payload);
+    if ((header.flags & frame.flags_end_headers) == 0) return null;
+
+    const block_len: usize = @intCast(header_assembly.block_len);
+    return try buildInitialRequest(
+        header_assembly.block_buf[0..block_len],
+        header_assembly.stream_id,
+        @intCast(payload_end),
+        request_storage_out,
+    );
+}
+
 fn appendHeaderFragment(
     buf: *[config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8,
-    len: *usize,
+    len: *u32,
     fragment: []const u8,
 ) Error!void {
     assert(@intFromPtr(len) != 0);
-    assert(len.* <= config.H2_MAX_HEADER_BLOCK_SIZE_BYTES);
+    const current_len: usize = @intCast(len.*);
+    assert(current_len <= config.H2_MAX_HEADER_BLOCK_SIZE_BYTES);
 
-    if (len.* + fragment.len > config.H2_MAX_HEADER_BLOCK_SIZE_BYTES) return error.HeadersTooLarge;
-    @memcpy(buf[len.* .. len.* + fragment.len], fragment);
-    len.* += fragment.len;
+    if (fragment.len > config.H2_MAX_HEADER_BLOCK_SIZE_BYTES - current_len) return error.HeadersTooLarge;
+    @memcpy(buf[current_len .. current_len + fragment.len], fragment);
+    len.* = @intCast(current_len + fragment.len);
 }
 
-fn buildInitialRequest(header_block: []const u8, stream_id: u32, consumed_bytes: u32) Error!InitialRequest {
+fn buildInitialRequest(
+    header_block: []const u8,
+    stream_id: u32,
+    consumed_bytes: u32,
+    request_storage_out: []u8,
+) Error!InitialRequest {
     assert(header_block.len <= config.H2_MAX_HEADER_BLOCK_SIZE_BYTES);
     assert(stream_id > 0);
+    if (request_storage_out.len < request_stable_storage_size_bytes) return error.StableStorageTooSmall;
 
-    const head = try decodeRequestHeaderBlock(header_block, stream_id);
+    const head = try decodeRequestHeaderBlock(header_block, stream_id, request_storage_out);
     return .{
         .request = head.request,
         .stream_id = head.stream_id,
@@ -184,121 +266,234 @@ fn buildInitialRequest(header_block: []const u8, stream_id: u32, consumed_bytes:
     };
 }
 
-pub fn decodeRequestHeaderBlock(header_block: []const u8, stream_id: u32) Error!RequestHead {
-    var decoder = hpack.Decoder.init();
-    return decodeRequestHeaderBlockWithDecoder(&decoder, header_block, stream_id);
-}
-
-pub fn decodeRequestHeaderBlockWithDecoder(
-    decoder: *hpack.Decoder,
+pub fn decodeRequestHeaderBlock(
     header_block: []const u8,
     stream_id: u32,
+    request_storage_out: []u8,
 ) Error!RequestHead {
-    assert(@intFromPtr(decoder) != 0);
     assert(header_block.len <= config.H2_MAX_HEADER_BLOCK_SIZE_BYTES);
     assert(stream_id > 0);
 
-    var fields_buf: [config.MAX_HEADERS]hpack.HeaderField = undefined;
-    const fields = try decoder.decodeHeaderBlock(header_block, &fields_buf);
+    var decoder = hpack.Decoder.init();
+    return decodeRequestHeaderBlockWithDecoder(&decoder, header_block, stream_id, request_storage_out);
+}
 
-    var request = Request{
+const HeaderDecodeState = struct {
+    request: Request = .{
         .method = .GET,
         .path = "",
         .version = .@"HTTP/1.1",
         .headers = HeaderMap.init(),
         .body = null,
-    };
+    },
+    method_found: bool = false,
+    path_found: bool = false,
+    scheme_found: bool = false,
+    authority_found: bool = false,
+    protocol_found: bool = false,
+    regular_headers_seen: bool = false,
+    connect_method: bool = false,
+    authority_value: []const u8 = "",
+    storage_cursor: u32 = 0,
+};
 
-    var method_found = false;
-    var path_found = false;
-    var scheme_found = false;
-    var authority_found = false;
-    var protocol_found = false;
-    var regular_headers_seen = false;
-    var connect_method = false;
-    var authority_value: []const u8 = "";
+pub fn decodeRequestHeaderBlockWithDecoder(
+    decoder: *hpack.Decoder,
+    header_block: []const u8,
+    stream_id: u32,
+    request_storage_out: []u8,
+) Error!RequestHead {
+    assert(@intFromPtr(decoder) != 0);
+    assert(header_block.len <= config.H2_MAX_HEADER_BLOCK_SIZE_BYTES);
+    assert(stream_id > 0);
+    if (request_storage_out.len < request_stable_storage_size_bytes) return error.StableStorageTooSmall;
+
+    var fields_buf: [config.MAX_HEADERS]hpack.HeaderField = undefined;
+    const fields = try decoder.decodeHeaderBlock(header_block, &fields_buf);
+    var state = HeaderDecodeState{};
 
     for (fields) |field| {
         if (!isHeaderNameLowercase(field.name)) return error.InvalidHeaderName;
 
         if (field.name.len > 0 and field.name[0] == ':') {
-            if (regular_headers_seen) return error.PseudoHeaderAfterRegularHeader;
-
-            if (std.mem.eql(u8, field.name, ":method")) {
-                if (method_found) return error.DuplicatePseudoHeader;
-                request.method = parseMethod(field.value) orelse return error.InvalidMethod;
-                method_found = true;
-                connect_method = request.method == .CONNECT;
-            } else if (std.mem.eql(u8, field.name, ":path")) {
-                if (path_found) return error.DuplicatePseudoHeader;
-                request.path = field.value;
-                path_found = true;
-            } else if (std.mem.eql(u8, field.name, ":scheme")) {
-                if (scheme_found) return error.DuplicatePseudoHeader;
-                if (field.value.len == 0) return error.MissingScheme;
-                scheme_found = true;
-
-                request.headers.put("x-forwarded-proto", field.value) catch |err| switch (err) {
-                    error.TooManyHeaders => return error.TooManyHeaders,
-                    error.DuplicateContentLength => return error.DuplicateContentLength,
-                };
-            } else if (std.mem.eql(u8, field.name, ":authority")) {
-                if (authority_found) return error.DuplicatePseudoHeader;
-                try request.headers.put("host", field.value);
-                authority_found = true;
-                authority_value = field.value;
-            } else if (std.mem.eql(u8, field.name, ":protocol")) {
-                if (protocol_found) return error.DuplicatePseudoHeader;
-                if (!connect_method) return error.UnexpectedPseudoHeader;
-                if (field.value.len == 0) return error.UnexpectedPseudoHeader;
-                protocol_found = true;
-                try request.headers.put("x-http2-protocol", field.value);
-            } else {
-                return error.UnexpectedPseudoHeader;
-            }
+            try decodePseudoHeader(&state, field, request_storage_out);
             continue;
         }
 
-        regular_headers_seen = true;
-
-        if (isConnectionSpecificHeader(field.name)) return error.ConnectionSpecificHeader;
-
-        if (std.mem.eql(u8, field.name, "te") and !isTeTrailersOnly(field.value)) {
-            return error.InvalidTe;
-        }
-
-        if (authority_found and std.mem.eql(u8, field.name, "host")) {
-            if (!std.ascii.eqlIgnoreCase(field.value, authority_value)) return error.AuthorityHostMismatch;
-            continue;
-        }
-
-        request.headers.put(field.name, field.value) catch |err| switch (err) {
-            error.TooManyHeaders => return error.TooManyHeaders,
-            error.DuplicateContentLength => return error.DuplicateContentLength,
-        };
+        try decodeRegularHeader(&state, field, request_storage_out);
     }
 
-    if (!method_found) return error.MissingMethod;
-    if (!authority_found and request.headers.getHost() == null) return error.MissingAuthority;
+    try validateDecodedRequestState(&state);
+    return .{ .request = state.request, .stream_id = stream_id };
+}
 
-    if (connect_method) {
-        if (protocol_found) {
-            if (!path_found or request.path.len == 0) return error.MissingPath;
-            if (!scheme_found) return error.MissingScheme;
-        } else {
-            if (path_found) return error.ConnectPathNotAllowed;
-            if (scheme_found) return error.ConnectSchemeNotAllowed;
-        }
-    } else {
-        if (protocol_found) return error.UnexpectedPseudoHeader;
-        if (!path_found or request.path.len == 0) return error.MissingPath;
-        if (!scheme_found) return error.MissingScheme;
+fn decodePseudoHeader(
+    state: *HeaderDecodeState,
+    field: hpack.HeaderField,
+    request_storage_out: []u8,
+) Error!void {
+    assert(@intFromPtr(state) != 0);
+    assert(field.name.len > 0 and field.name[0] == ':');
+
+    if (state.regular_headers_seen) return error.PseudoHeaderAfterRegularHeader;
+
+    if (std.mem.eql(u8, field.name, ":method")) {
+        if (state.method_found) return error.DuplicatePseudoHeader;
+        state.request.method = parseMethod(field.value) orelse return error.InvalidMethod;
+        state.method_found = true;
+        state.connect_method = state.request.method == .CONNECT;
+        return;
     }
 
-    return .{ .request = request, .stream_id = stream_id };
+    if (std.mem.eql(u8, field.name, ":path")) {
+        if (state.path_found) return error.DuplicatePseudoHeader;
+        state.request.path = try copyIntoStableStorage(
+            request_storage_out,
+            &state.storage_cursor,
+            field.value,
+        );
+        state.path_found = true;
+        return;
+    }
+
+    if (std.mem.eql(u8, field.name, ":scheme")) {
+        if (state.scheme_found) return error.DuplicatePseudoHeader;
+        if (field.value.len == 0) return error.MissingScheme;
+
+        const proto_value = try copyIntoStableStorage(
+            request_storage_out,
+            &state.storage_cursor,
+            field.value,
+        );
+        try putRequestHeader(&state.request, "x-forwarded-proto", proto_value);
+        state.scheme_found = true;
+        return;
+    }
+
+    if (std.mem.eql(u8, field.name, ":authority")) {
+        if (state.authority_found) return error.DuplicatePseudoHeader;
+        const authority = try copyIntoStableStorage(
+            request_storage_out,
+            &state.storage_cursor,
+            field.value,
+        );
+        try putRequestHeader(&state.request, "host", authority);
+        state.authority_found = true;
+        state.authority_value = authority;
+        return;
+    }
+
+    if (std.mem.eql(u8, field.name, ":protocol")) return decodeProtocolPseudoHeader(state, field, request_storage_out);
+
+    return error.UnexpectedPseudoHeader;
+}
+
+fn decodeProtocolPseudoHeader(
+    state: *HeaderDecodeState,
+    field: hpack.HeaderField,
+    request_storage_out: []u8,
+) Error!void {
+    assert(@intFromPtr(state) != 0);
+    assert(std.mem.eql(u8, field.name, ":protocol"));
+
+    if (state.protocol_found) return error.DuplicatePseudoHeader;
+    if (!state.connect_method) return error.UnexpectedPseudoHeader;
+    if (field.value.len == 0) return error.UnexpectedPseudoHeader;
+
+    const protocol_value = try copyIntoStableStorage(
+        request_storage_out,
+        &state.storage_cursor,
+        field.value,
+    );
+    try putRequestHeader(&state.request, "x-http2-protocol", protocol_value);
+    state.protocol_found = true;
+}
+
+fn decodeRegularHeader(
+    state: *HeaderDecodeState,
+    field: hpack.HeaderField,
+    request_storage_out: []u8,
+) Error!void {
+    assert(@intFromPtr(state) != 0);
+    assert(field.name.len == 0 or field.name[0] != ':');
+
+    state.regular_headers_seen = true;
+
+    if (isConnectionSpecificHeader(field.name)) return error.ConnectionSpecificHeader;
+    if (std.mem.eql(u8, field.name, "te") and !isTeTrailersOnly(field.value)) return error.InvalidTe;
+
+    if (state.authority_found and std.mem.eql(u8, field.name, "host")) {
+        if (!std.ascii.eqlIgnoreCase(field.value, state.authority_value)) return error.AuthorityHostMismatch;
+        return;
+    }
+
+    const stable_name = try copyIntoStableStorage(
+        request_storage_out,
+        &state.storage_cursor,
+        field.name,
+    );
+    const stable_value = try copyIntoStableStorage(
+        request_storage_out,
+        &state.storage_cursor,
+        field.value,
+    );
+    try putRequestHeader(&state.request, stable_name, stable_value);
+}
+
+fn putRequestHeader(request: *Request, name: []const u8, value: []const u8) Error!void {
+    assert(@intFromPtr(request) != 0);
+    assert(name.len > 0);
+
+    request.headers.put(name, value) catch |err| switch (err) {
+        error.TooManyHeaders => return error.TooManyHeaders,
+        error.DuplicateContentLength => return error.DuplicateContentLength,
+    };
+}
+
+fn validateDecodedRequestState(state: *const HeaderDecodeState) Error!void {
+    assert(@intFromPtr(state) != 0);
+    assert(state.storage_cursor <= request_stable_storage_size_bytes);
+
+    if (!state.method_found) return error.MissingMethod;
+    if (!state.authority_found and state.request.headers.getHost() == null) return error.MissingAuthority;
+
+    if (state.connect_method) {
+        if (state.protocol_found) {
+            if (!state.path_found or state.request.path.len == 0) return error.MissingPath;
+            if (!state.scheme_found) return error.MissingScheme;
+            return;
+        }
+
+        if (state.path_found) return error.ConnectPathNotAllowed;
+        if (state.scheme_found) return error.ConnectSchemeNotAllowed;
+        return;
+    }
+
+    if (state.protocol_found) return error.UnexpectedPseudoHeader;
+    if (!state.path_found or state.request.path.len == 0) return error.MissingPath;
+    if (!state.scheme_found) return error.MissingScheme;
+}
+
+fn copyIntoStableStorage(storage: []u8, cursor: *u32, data: []const u8) Error![]const u8 {
+    assert(@intFromPtr(cursor) != 0);
+    assert(storage.len <= std.math.maxInt(u32));
+    const cursor_usize: usize = @intCast(cursor.*);
+    assert(cursor_usize <= storage.len);
+
+    if (data.len == 0) return "";
+    if (storage.len - cursor_usize < data.len) return error.StableStorageTooSmall;
+
+    const start = cursor_usize;
+    @memcpy(storage[start .. start + data.len], data);
+    const next_cursor = start + data.len;
+    cursor.* = @intCast(next_cursor);
+    return storage[start .. start + data.len];
 }
 
 fn parseMethod(token: []const u8) ?Method {
+    assert(token.len <= config.H2_MAX_HEADER_BLOCK_SIZE_BYTES);
+    assert(config.H2_MAX_HEADER_BLOCK_SIZE_BYTES > 0);
+
     const map = std.StaticStringMap(Method).initComptime(.{
         .{ "GET", .GET },
         .{ "HEAD", .HEAD },
@@ -314,6 +509,8 @@ fn parseMethod(token: []const u8) ?Method {
 }
 
 fn isHeaderNameLowercase(name: []const u8) bool {
+    assert(name.len <= config.H2_MAX_HEADER_BLOCK_SIZE_BYTES);
+
     if (name.len == 0) return false;
 
     var index: usize = 0;
@@ -321,10 +518,14 @@ fn isHeaderNameLowercase(name: []const u8) bool {
         const c = name[index];
         if (c >= 'A' and c <= 'Z') return false;
     }
+    assert(index == name.len);
     return true;
 }
 
 fn isConnectionSpecificHeader(name: []const u8) bool {
+    assert(name.len <= config.H2_MAX_HEADER_BLOCK_SIZE_BYTES);
+    assert(config.H2_MAX_HEADER_BLOCK_SIZE_BYTES > 0);
+
     if (std.mem.eql(u8, name, "connection")) return true;
     if (std.mem.eql(u8, name, "proxy-connection")) return true;
     if (std.mem.eql(u8, name, "keep-alive")) return true;
@@ -334,6 +535,9 @@ fn isConnectionSpecificHeader(name: []const u8) bool {
 }
 
 fn isTeTrailersOnly(value: []const u8) bool {
+    assert(value.len <= config.H2_MAX_HEADER_BLOCK_SIZE_BYTES);
+    assert(config.H2_MAX_HEADER_BLOCK_SIZE_BYTES > 0);
+
     const trimmed = std.mem.trim(u8, value, " \t");
     if (trimmed.len == 0) return false;
 
@@ -361,6 +565,9 @@ const TestHeaderPair = struct {
 };
 
 fn encodeHeaderPairs(pairs: []const TestHeaderPair, out: []u8) ![]const u8 {
+    assert(pairs.len <= config.MAX_HEADERS);
+    assert(out.len > 0);
+
     var len: usize = 0;
     for (pairs) |pair| {
         const encoded = try hpack.encodeLiteralHeaderWithoutIndexing(out[len..], pair.name, pair.value);
@@ -372,6 +579,7 @@ fn encodeHeaderPairs(pairs: []const TestHeaderPair, out: []u8) ![]const u8 {
 test "parseInitialRequest parses preface and first HEADERS request" {
     var block_buf: [256]u8 = undefined;
     var block_len: usize = 0;
+    var request_storage_buf: [request_stable_storage_size_bytes]u8 = undefined;
 
     const pairs = [_]struct { name: []const u8, value: []const u8 }{
         .{ .name = ":method", .value = "POST" },
@@ -412,16 +620,95 @@ test "parseInitialRequest parses preface and first HEADERS request" {
     @memcpy(input_buf[pos..][0..block_len], block_buf[0..block_len]);
     pos += block_len;
 
-    const parsed = try parseInitialRequest(input_buf[0..pos]);
+    const parsed = try parseInitialRequest(input_buf[0..pos], &request_storage_buf);
     try std.testing.expectEqual(Method.POST, parsed.request.method);
     try std.testing.expectEqualStrings("/grpc.health.v1.Health/Check", parsed.request.path);
     try std.testing.expectEqualStrings("application/grpc", parsed.request.headers.get("content-type").?);
     try std.testing.expectEqual(@as(u32, 1), parsed.stream_id);
 }
 
+test "parseInitialRequest rejects non-settings first frame after preface" {
+    var request_storage_buf: [request_stable_storage_size_bytes]u8 = undefined;
+    var input_buf: [preface.client_connection_preface.len + frame.frame_header_size_bytes + 8]u8 = undefined;
+    var pos: usize = 0;
+
+    @memcpy(input_buf[pos..][0..preface.client_connection_preface.len], preface.client_connection_preface);
+    pos += preface.client_connection_preface.len;
+
+    const ping_header = try frame.buildFrameHeader(input_buf[pos..][0..frame.frame_header_size_bytes], .{
+        .length = 8,
+        .frame_type = .ping,
+        .flags = 0,
+        .stream_id = 0,
+    });
+    pos += ping_header.len;
+    @memset(input_buf[pos..][0..8], 0);
+    pos += 8;
+
+    try std.testing.expectError(error.InvalidFrame, parseInitialRequest(input_buf[0..pos], &request_storage_buf));
+}
+
+test "parseInitialRequest rejects ACK as first settings frame" {
+    var request_storage_buf: [request_stable_storage_size_bytes]u8 = undefined;
+    var input_buf: [preface.client_connection_preface.len + frame.frame_header_size_bytes]u8 = undefined;
+    var pos: usize = 0;
+
+    @memcpy(input_buf[pos..][0..preface.client_connection_preface.len], preface.client_connection_preface);
+    pos += preface.client_connection_preface.len;
+
+    const settings_ack = try frame.buildFrameHeader(input_buf[pos..][0..frame.frame_header_size_bytes], .{
+        .length = 0,
+        .frame_type = .settings,
+        .flags = frame.flags_ack,
+        .stream_id = 0,
+    });
+    pos += settings_ack.len;
+
+    try std.testing.expectError(error.InvalidFrame, parseInitialRequest(input_buf[0..pos], &request_storage_buf));
+}
+
+test "parseInitialRequest rejects even-numbered client request stream id" {
+    var request_storage_buf: [request_stable_storage_size_bytes]u8 = undefined;
+    var block_buf: [256]u8 = undefined;
+    const block = try encodeHeaderPairs(&.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/grpc.test.Echo/EvenStreamId" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":authority", .value = "127.0.0.1:8080" },
+        .{ .name = "content-type", .value = "application/grpc" },
+        .{ .name = "te", .value = "trailers" },
+    }, &block_buf);
+
+    var input_buf: [1024]u8 = undefined;
+    var pos: usize = 0;
+    @memcpy(input_buf[pos..][0..preface.client_connection_preface.len], preface.client_connection_preface);
+    pos += preface.client_connection_preface.len;
+
+    const settings_header = try frame.buildFrameHeader(input_buf[pos..][0..frame.frame_header_size_bytes], .{
+        .length = 0,
+        .frame_type = .settings,
+        .flags = 0,
+        .stream_id = 0,
+    });
+    pos += settings_header.len;
+
+    const headers_header = try frame.buildFrameHeader(input_buf[pos..][0..frame.frame_header_size_bytes], .{
+        .length = @intCast(block.len),
+        .frame_type = .headers,
+        .flags = frame.flags_end_headers,
+        .stream_id = 2,
+    });
+    pos += headers_header.len;
+    @memcpy(input_buf[pos..][0..block.len], block);
+    pos += block.len;
+
+    try std.testing.expectError(error.InvalidStreamId, parseInitialRequest(input_buf[0..pos], &request_storage_buf));
+}
+
 test "parseInitialRequest reassembles HEADERS and CONTINUATION" {
     var block_buf: [512]u8 = undefined;
     var block_len: usize = 0;
+    var request_storage_buf: [request_stable_storage_size_bytes]u8 = undefined;
 
     const pairs = [_]struct { name: []const u8, value: []const u8 }{
         .{ .name = ":method", .value = "POST" },
@@ -476,7 +763,7 @@ test "parseInitialRequest reassembles HEADERS and CONTINUATION" {
     @memcpy(input_buf[pos..][0..continuation_payload_len], block_buf[split..block_len]);
     pos += continuation_payload_len;
 
-    const parsed = try parseInitialRequest(input_buf[0..pos]);
+    const parsed = try parseInitialRequest(input_buf[0..pos], &request_storage_buf);
     try std.testing.expectEqual(Method.POST, parsed.request.method);
     try std.testing.expectEqualStrings("/grpc.test.Echo/Continuation", parsed.request.path);
     try std.testing.expectEqual(@as(u32, 1), parsed.stream_id);
@@ -486,6 +773,7 @@ test "parseInitialRequest reassembles HEADERS and CONTINUATION" {
 test "parseInitialRequest accepts PRIORITY frame before request HEADERS" {
     var block_buf: [256]u8 = undefined;
     var block_len: usize = 0;
+    var request_storage_buf: [request_stable_storage_size_bytes]u8 = undefined;
 
     const pairs = [_]struct { name: []const u8, value: []const u8 }{
         .{ .name = ":method", .value = "POST" },
@@ -536,7 +824,7 @@ test "parseInitialRequest accepts PRIORITY frame before request HEADERS" {
     @memcpy(input_buf[pos..][0..block_len], block_buf[0..block_len]);
     pos += block_len;
 
-    const parsed = try parseInitialRequest(input_buf[0..pos]);
+    const parsed = try parseInitialRequest(input_buf[0..pos], &request_storage_buf);
     try std.testing.expectEqualStrings("/grpc.test.Echo/PriorityFrame", parsed.request.path);
     try std.testing.expectEqual(@as(u32, 1), parsed.stream_id);
 }
@@ -544,6 +832,7 @@ test "parseInitialRequest accepts PRIORITY frame before request HEADERS" {
 test "parseInitialRequest accepts HEADERS with PRIORITY flag" {
     var block_buf: [256]u8 = undefined;
     var block_len: usize = 0;
+    var request_storage_buf: [request_stable_storage_size_bytes]u8 = undefined;
 
     const pairs = [_]struct { name: []const u8, value: []const u8 }{
         .{ .name = ":method", .value = "POST" },
@@ -586,7 +875,7 @@ test "parseInitialRequest accepts HEADERS with PRIORITY flag" {
     @memcpy(input_buf[pos..][0..block_len], block_buf[0..block_len]);
     pos += block_len;
 
-    const parsed = try parseInitialRequest(input_buf[0..pos]);
+    const parsed = try parseInitialRequest(input_buf[0..pos], &request_storage_buf);
     try std.testing.expectEqualStrings("/grpc.test.Echo/HeadersPriority", parsed.request.path);
     try std.testing.expectEqual(@as(u32, 1), parsed.stream_id);
 }
@@ -594,6 +883,7 @@ test "parseInitialRequest accepts HEADERS with PRIORITY flag" {
 test "parseInitialRequest rejects interleaved non-continuation while assembling headers" {
     var block_buf: [512]u8 = undefined;
     var block_len: usize = 0;
+    var request_storage_buf: [request_stable_storage_size_bytes]u8 = undefined;
 
     const pairs = [_]struct { name: []const u8, value: []const u8 }{
         .{ .name = ":method", .value = "POST" },
@@ -646,12 +936,13 @@ test "parseInitialRequest rejects interleaved non-continuation while assembling 
     input_buf[pos] = 'x';
     pos += 1;
 
-    try std.testing.expectError(error.InvalidFrame, parseInitialRequest(input_buf[0..pos]));
+    try std.testing.expectError(error.InvalidFrame, parseInitialRequest(input_buf[0..pos], &request_storage_buf));
 }
 
 test "parseInitialRequest rejects continuation stream mismatch" {
     var block_buf: [512]u8 = undefined;
     var block_len: usize = 0;
+    var request_storage_buf: [request_stable_storage_size_bytes]u8 = undefined;
 
     const pairs = [_]struct { name: []const u8, value: []const u8 }{
         .{ .name = ":method", .value = "POST" },
@@ -704,12 +995,13 @@ test "parseInitialRequest rejects continuation stream mismatch" {
     @memcpy(input_buf[pos..][0..continuation_payload_len], block_buf[split..block_len]);
     pos += continuation_payload_len;
 
-    try std.testing.expectError(error.InvalidStreamId, parseInitialRequest(input_buf[0..pos]));
+    try std.testing.expectError(error.InvalidStreamId, parseInitialRequest(input_buf[0..pos], &request_storage_buf));
 }
 
 test "parseInitialRequest rejects unexpected CONTINUATION before HEADERS" {
     var input_buf: [512]u8 = undefined;
     var pos: usize = 0;
+    var request_storage_buf: [request_stable_storage_size_bytes]u8 = undefined;
 
     @memcpy(input_buf[pos..][0..preface.client_connection_preface.len], preface.client_connection_preface);
     pos += preface.client_connection_preface.len;
@@ -732,12 +1024,13 @@ test "parseInitialRequest rejects unexpected CONTINUATION before HEADERS" {
     input_buf[pos] = 'x';
     pos += 1;
 
-    try std.testing.expectError(error.UnsupportedContinuation, parseInitialRequest(input_buf[0..pos]));
+    try std.testing.expectError(error.UnsupportedContinuation, parseInitialRequest(input_buf[0..pos], &request_storage_buf));
 }
 
 test "parseInitialRequest rejects CONTINUATION with invalid flags" {
     var input_buf: [512]u8 = undefined;
     var pos: usize = 0;
+    var request_storage_buf: [request_stable_storage_size_bytes]u8 = undefined;
 
     @memcpy(input_buf[pos..][0..preface.client_connection_preface.len], preface.client_connection_preface);
     pos += preface.client_connection_preface.len;
@@ -770,12 +1063,13 @@ test "parseInitialRequest rejects CONTINUATION with invalid flags" {
     input_buf[pos] = 0x00;
     pos += 1;
 
-    try std.testing.expectError(error.InvalidFrame, parseInitialRequest(input_buf[0..pos]));
+    try std.testing.expectError(error.InvalidFrame, parseInitialRequest(input_buf[0..pos], &request_storage_buf));
 }
 
 test "parseInitialRequest enforces continuation frame bound" {
     var input_buf: [4096]u8 = undefined;
     var pos: usize = 0;
+    var request_storage_buf: [request_stable_storage_size_bytes]u8 = undefined;
 
     @memcpy(input_buf[pos..][0..preface.client_connection_preface.len], preface.client_connection_preface);
     pos += preface.client_connection_preface.len;
@@ -811,11 +1105,12 @@ test "parseInitialRequest enforces continuation frame bound" {
         pos += 1;
     }
 
-    try std.testing.expectError(error.TooManyFrames, parseInitialRequest(input_buf[0..pos]));
+    try std.testing.expectError(error.TooManyFrames, parseInitialRequest(input_buf[0..pos], &request_storage_buf));
 }
 
 test "decodeRequestHeaderBlock rejects pseudo header after regular header" {
     var block_buf: [256]u8 = undefined;
+    var request_storage_buf: [request_stable_storage_size_bytes]u8 = undefined;
     const block = try encodeHeaderPairs(&.{
         .{ .name = ":method", .value = "POST" },
         .{ .name = "te", .value = "trailers" },
@@ -824,22 +1119,24 @@ test "decodeRequestHeaderBlock rejects pseudo header after regular header" {
         .{ .name = ":authority", .value = "127.0.0.1:8080" },
     }, &block_buf);
 
-    try std.testing.expectError(error.PseudoHeaderAfterRegularHeader, decodeRequestHeaderBlock(block, 1));
+    try std.testing.expectError(error.PseudoHeaderAfterRegularHeader, decodeRequestHeaderBlock(block, 1, &request_storage_buf));
 }
 
 test "decodeRequestHeaderBlock rejects missing scheme" {
     var block_buf: [256]u8 = undefined;
+    var request_storage_buf: [request_stable_storage_size_bytes]u8 = undefined;
     const block = try encodeHeaderPairs(&.{
         .{ .name = ":method", .value = "POST" },
         .{ .name = ":path", .value = "/grpc.test.Echo/Unary" },
         .{ .name = ":authority", .value = "127.0.0.1:8080" },
     }, &block_buf);
 
-    try std.testing.expectError(error.MissingScheme, decodeRequestHeaderBlock(block, 1));
+    try std.testing.expectError(error.MissingScheme, decodeRequestHeaderBlock(block, 1, &request_storage_buf));
 }
 
 test "decodeRequestHeaderBlock rejects empty path" {
     var block_buf: [256]u8 = undefined;
+    var request_storage_buf: [request_stable_storage_size_bytes]u8 = undefined;
     const block = try encodeHeaderPairs(&.{
         .{ .name = ":method", .value = "POST" },
         .{ .name = ":path", .value = "" },
@@ -847,11 +1144,12 @@ test "decodeRequestHeaderBlock rejects empty path" {
         .{ .name = ":authority", .value = "127.0.0.1:8080" },
     }, &block_buf);
 
-    try std.testing.expectError(error.MissingPath, decodeRequestHeaderBlock(block, 1));
+    try std.testing.expectError(error.MissingPath, decodeRequestHeaderBlock(block, 1, &request_storage_buf));
 }
 
 test "decodeRequestHeaderBlock rejects connection specific headers" {
     var block_buf: [256]u8 = undefined;
+    var request_storage_buf: [request_stable_storage_size_bytes]u8 = undefined;
     const block = try encodeHeaderPairs(&.{
         .{ .name = ":method", .value = "POST" },
         .{ .name = ":path", .value = "/grpc.test.Echo/Unary" },
@@ -860,11 +1158,12 @@ test "decodeRequestHeaderBlock rejects connection specific headers" {
         .{ .name = "connection", .value = "keep-alive" },
     }, &block_buf);
 
-    try std.testing.expectError(error.ConnectionSpecificHeader, decodeRequestHeaderBlock(block, 1));
+    try std.testing.expectError(error.ConnectionSpecificHeader, decodeRequestHeaderBlock(block, 1, &request_storage_buf));
 }
 
 test "decodeRequestHeaderBlock rejects invalid te token" {
     var block_buf: [256]u8 = undefined;
+    var request_storage_buf: [request_stable_storage_size_bytes]u8 = undefined;
     const block = try encodeHeaderPairs(&.{
         .{ .name = ":method", .value = "POST" },
         .{ .name = ":path", .value = "/grpc.test.Echo/Unary" },
@@ -873,11 +1172,12 @@ test "decodeRequestHeaderBlock rejects invalid te token" {
         .{ .name = "te", .value = "gzip" },
     }, &block_buf);
 
-    try std.testing.expectError(error.InvalidTe, decodeRequestHeaderBlock(block, 1));
+    try std.testing.expectError(error.InvalidTe, decodeRequestHeaderBlock(block, 1, &request_storage_buf));
 }
 
 test "decodeRequestHeaderBlock rejects CONNECT with :path" {
     var block_buf: [256]u8 = undefined;
+    var request_storage_buf: [request_stable_storage_size_bytes]u8 = undefined;
     const block = try encodeHeaderPairs(&.{
         .{ .name = ":method", .value = "CONNECT" },
         .{ .name = ":path", .value = "/" },
@@ -885,11 +1185,12 @@ test "decodeRequestHeaderBlock rejects CONNECT with :path" {
         .{ .name = ":authority", .value = "127.0.0.1:8080" },
     }, &block_buf);
 
-    try std.testing.expectError(error.ConnectPathNotAllowed, decodeRequestHeaderBlock(block, 1));
+    try std.testing.expectError(error.ConnectPathNotAllowed, decodeRequestHeaderBlock(block, 1, &request_storage_buf));
 }
 
 test "decodeRequestHeaderBlock accepts extended CONNECT websocket" {
     var block_buf: [256]u8 = undefined;
+    var request_storage_buf: [request_stable_storage_size_bytes]u8 = undefined;
     const block = try encodeHeaderPairs(&.{
         .{ .name = ":method", .value = "CONNECT" },
         .{ .name = ":protocol", .value = "websocket" },
@@ -900,7 +1201,7 @@ test "decodeRequestHeaderBlock accepts extended CONNECT websocket" {
         .{ .name = "sec-websocket-version", .value = "13" },
     }, &block_buf);
 
-    const parsed = try decodeRequestHeaderBlock(block, 1);
+    const parsed = try decodeRequestHeaderBlock(block, 1, &request_storage_buf);
     try std.testing.expectEqual(Method.CONNECT, parsed.request.method);
     try std.testing.expectEqualStrings("/ws-proxy/signal", parsed.request.path);
     try std.testing.expectEqualStrings("https", parsed.request.headers.get("x-forwarded-proto").?);
@@ -909,6 +1210,7 @@ test "decodeRequestHeaderBlock accepts extended CONNECT websocket" {
 
 test "decodeRequestHeaderBlock rejects :protocol on non-CONNECT" {
     var block_buf: [256]u8 = undefined;
+    var request_storage_buf: [request_stable_storage_size_bytes]u8 = undefined;
     const block = try encodeHeaderPairs(&.{
         .{ .name = ":method", .value = "GET" },
         .{ .name = ":protocol", .value = "websocket" },
@@ -917,5 +1219,108 @@ test "decodeRequestHeaderBlock rejects :protocol on non-CONNECT" {
         .{ .name = ":authority", .value = "example.com" },
     }, &block_buf);
 
-    try std.testing.expectError(error.UnexpectedPseudoHeader, decodeRequestHeaderBlock(block, 1));
+    try std.testing.expectError(error.UnexpectedPseudoHeader, decodeRequestHeaderBlock(block, 1, &request_storage_buf));
+}
+
+test "decodeRequestHeaderBlock stores decoded slices in caller storage" {
+    var block_buf: [256]u8 = undefined;
+    var request_storage_buf: [request_stable_storage_size_bytes]u8 = undefined;
+    const block = try encodeHeaderPairs(&.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/stable/path" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.com" },
+        .{ .name = "content-type", .value = "application/grpc" },
+    }, &block_buf);
+
+    const parsed = try decodeRequestHeaderBlock(block, 1, &request_storage_buf);
+
+    const storage_start = @intFromPtr(&request_storage_buf[0]);
+    const storage_end = storage_start + request_storage_buf.len;
+    const path_ptr = @intFromPtr(parsed.request.path.ptr);
+    const content_type_ptr = @intFromPtr(parsed.request.headers.get("content-type").?.ptr);
+
+    try std.testing.expect(path_ptr >= storage_start and path_ptr < storage_end);
+    try std.testing.expect(content_type_ptr >= storage_start and content_type_ptr < storage_end);
+}
+
+test "decodeRequestHeaderBlock rejects undersized stable storage" {
+    var block_buf: [256]u8 = undefined;
+    const block = try encodeHeaderPairs(&.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/small-storage" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":authority", .value = "example.com" },
+        .{ .name = "content-type", .value = "application/grpc" },
+    }, &block_buf);
+
+    var tiny_storage: [8]u8 = undefined;
+    try std.testing.expectError(error.StableStorageTooSmall, decodeRequestHeaderBlock(block, 1, &tiny_storage));
+}
+
+test "parseInitialRequest fuzz corpus maintains parser invariants" {
+    var prng = std.Random.DefaultPrng.init(0x1234_abcd);
+    const random = prng.random();
+
+    var input: [256]u8 = undefined;
+    var request_storage_buf: [request_stable_storage_size_bytes]u8 = undefined;
+
+    var iteration: u32 = 0;
+    while (iteration < 512) : (iteration += 1) {
+        const len: usize = random.intRangeAtMost(usize, 1, input.len);
+        random.bytes(input[0..len]);
+
+        const parsed = parseInitialRequest(input[0..len], &request_storage_buf) catch |err| {
+            switch (err) {
+                error.NeedMoreData,
+                error.InvalidPreface,
+                error.InvalidFrame,
+                error.InvalidFrameType,
+                error.InvalidStreamId,
+                error.HeadersTooLarge,
+                error.UnsupportedContinuation,
+                error.UnsupportedPadding,
+                error.UnsupportedPriority,
+                error.MissingMethod,
+                error.MissingPath,
+                error.MissingScheme,
+                error.MissingAuthority,
+                error.InvalidMethod,
+                error.InvalidTe,
+                error.InvalidHeaderName,
+                error.UnexpectedPseudoHeader,
+                error.PseudoHeaderAfterRegularHeader,
+                error.DuplicatePseudoHeader,
+                error.ConnectionSpecificHeader,
+                error.ConnectPathNotAllowed,
+                error.ConnectSchemeNotAllowed,
+                error.AuthorityHostMismatch,
+                error.TooManyFrames,
+                error.TooManyHeaders,
+                error.DuplicateContentLength,
+                error.StableStorageTooSmall,
+                error.FrameTooLarge,
+                error.BufferTooSmall,
+                error.InvalidPayloadLength,
+                error.ReservedBitSet,
+                error.AckMustBeEmpty,
+                error.TooManySettings,
+                error.InvalidEnablePush,
+                error.InvalidInitialWindowSize,
+                error.InvalidMaxFrameSize,
+                error.IntegerOverflow,
+                error.InvalidStringLength,
+                error.InvalidIndex,
+                error.UnsupportedDynamicTableIndex,
+                error.DynamicTableSizeTooLarge,
+                error.InvalidDynamicTableSizeUpdate,
+                error.InvalidHuffman,
+                => continue,
+            }
+        };
+
+        try std.testing.expect(parsed.consumed_bytes <= len);
+        try std.testing.expect(parsed.stream_id > 0);
+        try std.testing.expect(parsed.request.path.len > 0);
+    }
 }

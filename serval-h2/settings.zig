@@ -32,6 +32,8 @@ pub const Setting = struct {
     value: u32,
 
     pub fn knownId(self: Setting) ?SettingId {
+        assert(@intFromEnum(SettingId.header_table_size) == 0x1);
+        assert(@intFromEnum(SettingId.enable_connect_protocol) == 0x8);
         return decodeSettingId(self.id);
     }
 };
@@ -80,6 +82,7 @@ pub fn parseFrame(
     out_settings: []Setting,
 ) Error![]const Setting {
     assert(header.frame_type == .settings);
+    assert(header.length == payload.len);
 
     try validateFrame(header, payload);
     if (payload.len == 0) return out_settings[0..0];
@@ -88,6 +91,7 @@ pub fn parseFrame(
 
 pub fn parsePayload(payload: []const u8, out_settings: []Setting) Error![]const Setting {
     assert(out_settings.len >= config.H2_MAX_SETTINGS_PER_FRAME or out_settings.len > 0);
+    assert(payload.len <= config.H2_MAX_FRAME_SIZE_BYTES);
 
     if (!isPayloadLengthValid(payload.len)) return error.InvalidPayloadLength;
 
@@ -111,6 +115,7 @@ pub fn parsePayload(payload: []const u8, out_settings: []Setting) Error![]const 
 
 pub fn buildPayload(out: []u8, settings: []const Setting) Error![]const u8 {
     assert(settings.len <= config.H2_MAX_SETTINGS_PER_FRAME);
+    assert(setting_size_bytes == 6);
 
     const needed = settings.len * setting_size_bytes;
     if (needed > out.len) return error.BufferTooSmall;
@@ -137,6 +142,7 @@ pub fn applySettings(target: *Settings, settings: []const Setting) Error!void {
 
 fn applySetting(target: *Settings, setting: Setting) Error!void {
     assert(@intFromPtr(target) != 0);
+    assert(setting_size_bytes == 6);
 
     try validateSetting(setting);
 
@@ -152,6 +158,9 @@ fn applySetting(target: *Settings, setting: Setting) Error!void {
 }
 
 fn validateSetting(setting: Setting) Error!void {
+    assert(setting_size_bytes == 6);
+    assert(std.math.maxInt(u32) == 0xffff_ffff);
+
     switch (decodeSettingId(setting.id) orelse return) {
         .enable_push => {
             if (setting.value > 1) return error.InvalidEnablePush;
@@ -172,6 +181,8 @@ fn validateSetting(setting: Setting) Error!void {
 }
 
 fn decodeSettingId(raw_id: u16) ?SettingId {
+    assert(@intFromEnum(SettingId.header_table_size) == 0x1);
+    assert(@intFromEnum(SettingId.enable_connect_protocol) == 0x8);
     return switch (raw_id) {
         0x1 => .header_table_size,
         0x2 => .enable_push,
@@ -185,6 +196,8 @@ fn decodeSettingId(raw_id: u16) ?SettingId {
 }
 
 fn isPayloadLengthValid(payload_len: usize) bool {
+    assert(payload_len <= config.H2_MAX_FRAME_SIZE_BYTES);
+    assert(setting_size_bytes == 6);
     return payload_len % setting_size_bytes == 0;
 }
 
@@ -262,4 +275,68 @@ test "applySettings updates target state" {
     try std.testing.expectEqual(@as(u32, 32), settings.max_concurrent_streams);
     try std.testing.expectEqual(@as(u32, 70_000), settings.initial_window_size_bytes);
     try std.testing.expect(settings.enable_connect_protocol);
+}
+
+test "settings payload roundtrip property over deterministic corpus" {
+    var prng = std.Random.DefaultPrng.init(0x51e7_5100);
+    const random = prng.random();
+
+    var settings_in: [config.H2_MAX_SETTINGS_PER_FRAME]Setting = undefined;
+    var settings_out: [config.H2_MAX_SETTINGS_PER_FRAME]Setting = undefined;
+    var payload_buf: [config.H2_MAX_SETTINGS_PER_FRAME * setting_size_bytes]u8 = undefined;
+
+    const valid_ids = [_]u16{ 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x8 };
+
+    var iteration: u32 = 0;
+    while (iteration < 256) : (iteration += 1) {
+        const count = random.intRangeAtMost(u8, 0, 8);
+
+        var index: u8 = 0;
+        while (index < count) : (index += 1) {
+            const id = valid_ids[random.intRangeAtMost(u8, 0, valid_ids.len - 1)];
+            const value: u32 = switch (id) {
+                0x2, 0x8 => random.intRangeAtMost(u1, 0, 1),
+                0x4 => random.intRangeAtMost(u32, 0, config.H2_MAX_WINDOW_SIZE_BYTES),
+                0x5 => random.intRangeAtMost(u32, min_max_frame_size_bytes, max_max_frame_size_bytes),
+                else => random.int(u32),
+            };
+            settings_in[index] = .{ .id = id, .value = value };
+        }
+
+        const encoded = try buildPayload(&payload_buf, settings_in[0..count]);
+        const decoded = try parsePayload(encoded, &settings_out);
+
+        try std.testing.expectEqual(@as(usize, count), decoded.len);
+
+        var compare_index: u8 = 0;
+        while (compare_index < count) : (compare_index += 1) {
+            try std.testing.expectEqualDeep(settings_in[compare_index], decoded[compare_index]);
+        }
+    }
+}
+
+test "settings parsePayload fuzz corpus maintains validation boundaries" {
+    var prng = std.Random.DefaultPrng.init(0x9999_1024);
+    const random = prng.random();
+
+    var payload: [96]u8 = undefined;
+    var out: [config.H2_MAX_SETTINGS_PER_FRAME]Setting = undefined;
+
+    var iteration: u32 = 0;
+    while (iteration < 512) : (iteration += 1) {
+        const len = random.intRangeAtMost(u8, 0, @as(u8, @intCast(payload.len)));
+        random.bytes(payload[0..len]);
+
+        const parsed = parsePayload(payload[0..len], &out) catch |err| switch (err) {
+            error.InvalidPayloadLength,
+            error.TooManySettings,
+            error.InvalidEnablePush,
+            error.InvalidInitialWindowSize,
+            error.InvalidMaxFrameSize,
+            => continue,
+            else => return err,
+        };
+
+        try std.testing.expect(parsed.len <= config.H2_MAX_SETTINGS_PER_FRAME);
+    }
 }

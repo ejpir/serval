@@ -2,10 +2,19 @@
 .zig-cache/
 zig-out/
 zig-cache/
+zig-pkg/
 *.so
+*.a
+sframe_test
 
-# Editor files
+# Editor / tool files
 *.swp
 *~
 .vscode/
 .idea/
+.claude/
+.entire/
+.tmp_stdlib/
+
+# Debug / captures
+netbird-debug-captures/

@@ -39,7 +39,7 @@ Current users:
 | `validateClientRequest(request, body_framing)` | Strict client upgrade validation |
 | `computeAcceptKey(client_key, out)` | Compute `Sec-WebSocket-Accept` |
 | `validateServerResponse(status, raw_headers, expected_accept_key)` | Validate upstream `101` response |
-| `headerHasToken(raw_headers, name, token)` | Header token lookup helper |
+| `headerHasToken(value, token)` | Comma-token lookup helper for a header value |
 | `getHeaderValue(raw_headers, name)` | Raw header lookup helper |
 | `PeerRole` | Client/server frame parsing role |
 | `Opcode` | WebSocket opcode enum |
@@ -91,6 +91,7 @@ This separation is intentional:
 ### Frame helpers
 
 `frame.zig` provides bounded frame-header parsing and encoding only.
+`parseFrameHeader` expects header-only input bytes (2-14 bytes), not payload bytes.
 It does not own:
 
 - fragmentation reassembly

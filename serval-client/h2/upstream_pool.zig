@@ -94,6 +94,7 @@ pub const UpstreamSession = struct {
 
     pub fn receiveAction(self: *UpstreamSession) Error!runtime_mod.ReceiveAction {
         assert(@intFromPtr(self) != 0);
+        assert(self.connection.socket.get_fd() >= 0);
 
         const action = try self.h2.receiveAction();
         self.last_used_ns = time.monotonicNanos();
@@ -102,6 +103,7 @@ pub const UpstreamSession = struct {
 
     pub fn receiveActionTimeout(self: *UpstreamSession, io: Io, timeout: Io.Timeout) Error!runtime_mod.ReceiveAction {
         assert(@intFromPtr(self) != 0);
+        assert(self.connection.socket.get_fd() >= 0);
 
         const action = try self.h2.receiveActionTimeout(io, timeout);
         self.last_used_ns = time.monotonicNanos();
@@ -110,6 +112,7 @@ pub const UpstreamSession = struct {
 
     pub fn receiveActionHandlingControl(self: *UpstreamSession) Error!runtime_mod.ReceiveAction {
         assert(@intFromPtr(self) != 0);
+        assert(self.connection.socket.get_fd() >= 0);
 
         const action = try self.h2.receiveActionHandlingControl();
         self.last_used_ns = time.monotonicNanos();
@@ -118,6 +121,7 @@ pub const UpstreamSession = struct {
 
     pub fn receiveActionHandlingControlTimeout(self: *UpstreamSession, io: Io, timeout: Io.Timeout) Error!runtime_mod.ReceiveAction {
         assert(@intFromPtr(self) != 0);
+        assert(self.connection.socket.get_fd() >= 0);
 
         const action = try self.h2.receiveActionHandlingControlTimeout(io, timeout);
         self.last_used_ns = time.monotonicNanos();
@@ -126,6 +130,8 @@ pub const UpstreamSession = struct {
 
     pub fn close(self: *UpstreamSession) void {
         assert(@intFromPtr(self) != 0);
+        const fd = self.connection.socket.get_fd();
+        assert(fd >= 0 or fd == -1);
         self.connection.close();
     }
 };
@@ -143,11 +149,15 @@ pub const UpstreamSessionPool = struct {
     slots: [slot_count]Slot = [_]Slot{.{}} ** slot_count,
 
     pub fn init() UpstreamSessionPool {
-        return .{};
+        assert(slot_count > 0);
+        const pool: UpstreamSessionPool = .{};
+        assert(pool.slots.len == slot_count);
+        return pool;
     }
 
     pub fn deinit(self: *UpstreamSessionPool) void {
         assert(@intFromPtr(self) != 0);
+        assert(self.slots.len == slot_count);
         self.closeAll();
     }
 
@@ -167,45 +177,8 @@ pub const UpstreamSessionPool = struct {
         assert(slot_index < slot_count);
         var slot = &self.slots[slot_index];
 
-        if (slotHasAnySession(slot) and !slotMatchesUpstream(slot, upstream)) {
-            closeSlot(slot);
-        }
-
-        cleanupUnusableSessions(slot);
-        try rotateActiveSessionForRollover(slot);
-
-        if (slot.active_session) |*existing| {
-            if (sessionAcceptsNewStreams(existing)) {
-                existing.last_used_ns = time.monotonicNanos();
-                return .{
-                    .session = existing,
-                    .connect = .{
-                        .reused = true,
-                        .dns_duration_ns = 0,
-                        .tcp_connect_duration_ns = 0,
-                        .tls_handshake_duration_ns = 0,
-                        .local_port = 0,
-                    },
-                };
-            }
-        }
-
-        if (slot.draining_session) |*draining| {
-            if (!sessionHasActiveStreams(draining) or sessionNeedsReconnect(draining)) {
-                closeSession(&slot.draining_session);
-            }
-        }
-
-        if (slot.active_session == null and slot.draining_session != null and !sessionHasActiveStreams(&slot.draining_session.?)) {
-            closeSession(&slot.draining_session);
-        }
-
-        if (slot.active_session != null and slot.draining_session != null and
-            sessionHasActiveStreams(&slot.active_session.?) and
-            sessionHasActiveStreams(&slot.draining_session.?))
-        {
-            return error.UpstreamSessionPoolExhausted;
-        }
+        if (try tryAcquireReusableSession(slot, upstream)) |reused| return reused;
+        try ensureSlotCanOpenFreshConnection(slot);
 
         const connected = try client.connect(upstream, io);
 
@@ -213,17 +186,7 @@ pub const UpstreamSessionPool = struct {
         slot.upstream_tls = upstream.tls;
         slot.upstream_protocol = upstream.http_protocol;
 
-        if (slot.active_session != null) {
-            if (slot.draining_session) |*draining| {
-                if (!sessionHasActiveStreams(draining) or sessionNeedsReconnect(draining)) {
-                    closeSession(&slot.draining_session);
-                } else {
-                    return error.UpstreamSessionPoolExhausted;
-                }
-            }
-            slot.draining_session = slot.active_session;
-            slot.active_session = null;
-        }
+        try prepareSlotForFreshActiveSession(slot);
 
         const generation = nextGeneration(slot);
         slot.active_session = .{
@@ -319,6 +282,7 @@ pub const UpstreamSessionPool = struct {
 
     pub fn closeAll(self: *UpstreamSessionPool) void {
         assert(@intFromPtr(self) != 0);
+        assert(self.slots.len == slot_count);
 
         var index: usize = 0;
         while (index < self.slots.len) : (index += 1) {
@@ -329,10 +293,74 @@ pub const UpstreamSessionPool = struct {
 
 fn validateUpstream(upstream: Upstream) Error!void {
     assert(upstream.port > 0);
+    assert(upstream.idx < slot_count);
 
     const supports_h2c_plain = upstream.http_protocol == .h2c and !upstream.tls;
     const supports_h2_tls = upstream.http_protocol == .h2 and upstream.tls;
     if (!supports_h2c_plain and !supports_h2_tls) return error.UnsupportedProtocol;
+}
+
+fn tryAcquireReusableSession(slot: *Slot, upstream: Upstream) Error!?AcquireResult {
+    assert(@intFromPtr(slot) != 0);
+    assert(upstream.port > 0);
+
+    if (slotHasAnySession(slot) and !slotMatchesUpstream(slot, upstream)) {
+        closeSlot(slot);
+    }
+    cleanupUnusableSessions(slot);
+    try rotateActiveSessionForRollover(slot);
+
+    if (slot.active_session) |*existing| {
+        if (!sessionAcceptsNewStreams(existing)) return null;
+        existing.last_used_ns = time.monotonicNanos();
+        return .{
+            .session = existing,
+            .connect = .{
+                .reused = true,
+                .dns_duration_ns = 0,
+                .tcp_connect_duration_ns = 0,
+                .tls_handshake_duration_ns = 0,
+                .local_port = 0,
+            },
+        };
+    }
+    return null;
+}
+
+fn ensureSlotCanOpenFreshConnection(slot: *Slot) Error!void {
+    assert(@intFromPtr(slot) != 0);
+    assert(slot.next_generation > 0);
+
+    if (slot.draining_session) |*draining| {
+        if (!sessionHasActiveStreams(draining) or sessionNeedsReconnect(draining)) {
+            closeSession(&slot.draining_session);
+        }
+    }
+    if (slot.active_session == null and slot.draining_session != null and !sessionHasActiveStreams(&slot.draining_session.?)) {
+        closeSession(&slot.draining_session);
+    }
+    if (slot.active_session != null and slot.draining_session != null and
+        sessionHasActiveStreams(&slot.active_session.?) and
+        sessionHasActiveStreams(&slot.draining_session.?))
+    {
+        return error.UpstreamSessionPoolExhausted;
+    }
+}
+
+fn prepareSlotForFreshActiveSession(slot: *Slot) Error!void {
+    assert(@intFromPtr(slot) != 0);
+    assert(slot.next_generation > 0);
+
+    if (slot.active_session == null) return;
+    if (slot.draining_session) |*draining| {
+        if (!sessionHasActiveStreams(draining) or sessionNeedsReconnect(draining)) {
+            closeSession(&slot.draining_session);
+        } else {
+            return error.UpstreamSessionPoolExhausted;
+        }
+    }
+    slot.draining_session = slot.active_session;
+    slot.active_session = null;
 }
 
 fn slotMatchesUpstream(slot: *const Slot, upstream: Upstream) bool {
@@ -347,11 +375,13 @@ fn slotMatchesUpstream(slot: *const Slot, upstream: Upstream) bool {
 
 fn slotHasAnySession(slot: *const Slot) bool {
     assert(@intFromPtr(slot) != 0);
+    assert(slot.next_generation > 0);
     return slot.active_session != null or slot.draining_session != null;
 }
 
 fn cleanupUnusableSessions(slot: *Slot) void {
     assert(@intFromPtr(slot) != 0);
+    assert(slot.next_generation > 0);
 
     if (slot.active_session) |*active| {
         if (sessionNeedsReconnect(active)) {
@@ -368,6 +398,7 @@ fn cleanupUnusableSessions(slot: *Slot) void {
 
 fn rotateActiveSessionForRollover(slot: *Slot) Error!void {
     assert(@intFromPtr(slot) != 0);
+    assert(slot.next_generation > 0);
 
     if (slot.active_session) |*active| {
         if (sessionAcceptsNewStreams(active)) return;
@@ -392,11 +423,13 @@ fn rotateActiveSessionForRollover(slot: *Slot) Error!void {
 
 fn sessionHasActiveStreams(session: *const UpstreamSession) bool {
     assert(@intFromPtr(session) != 0);
+    assert(session.generation > 0);
     return session.h2.runtime.state.streams.active_count > 0;
 }
 
 fn sessionAcceptsNewStreams(session: *const UpstreamSession) bool {
     assert(@intFromPtr(session) != 0);
+    assert(session.generation > 0);
 
     if (sessionNeedsReconnect(session)) return false;
 
@@ -407,6 +440,7 @@ fn sessionAcceptsNewStreams(session: *const UpstreamSession) bool {
 
 fn nextGeneration(slot: *Slot) u32 {
     assert(@intFromPtr(slot) != 0);
+    assert(slot.next_generation > 0);
 
     const generation = slot.next_generation;
     if (slot.next_generation < std.math.maxInt(u32)) {
@@ -418,6 +452,7 @@ fn nextGeneration(slot: *Slot) u32 {
 
 fn sessionNeedsReconnect(session: *const UpstreamSession) bool {
     assert(@intFromPtr(session) != 0);
+    assert(session.generation > 0);
 
     if (!session.h2.runtime.state.preface_sent) return true;
 
@@ -437,6 +472,7 @@ fn sessionNeedsReconnect(session: *const UpstreamSession) bool {
 
 fn sessionSocketHasTerminalPollState(session: *const UpstreamSession) bool {
     assert(@intFromPtr(session) != 0);
+    assert(session.connection.socket.get_fd() >= -1);
 
     const fd = session.connection.socket.get_fd();
     if (fd < 0) return true;
@@ -460,6 +496,7 @@ fn sessionSocketHasTerminalPollState(session: *const UpstreamSession) bool {
 
 fn closeSession(session: *?UpstreamSession) void {
     assert(@intFromPtr(session) != 0);
+    assert(session.* == null or session.*.?.generation > 0);
 
     if (session.*) |*inner| {
         inner.close();
@@ -469,6 +506,7 @@ fn closeSession(session: *?UpstreamSession) void {
 
 fn closeSlot(slot: *Slot) void {
     assert(@intFromPtr(slot) != 0);
+    assert(slot.next_generation > 0);
 
     closeSession(&slot.active_session);
     closeSession(&slot.draining_session);
@@ -476,9 +514,14 @@ fn closeSlot(slot: *Slot) void {
 }
 
 fn testSocketPair(domain: u32, sock_type: u32, protocol: u32) ![2]posix.socket_t {
-    var fds: [2]posix.socket_t = undefined;
+    assert(domain <= std.math.maxInt(c_int));
+    assert(sock_type <= std.math.maxInt(c_int));
 
-    while (true) {
+    var fds: [2]posix.socket_t = undefined;
+    var attempts: u32 = 0;
+    const max_attempts: u32 = 1024;
+
+    while (attempts < max_attempts) : (attempts += 1) {
         const rc = std.c.socketpair(@intCast(domain), @intCast(sock_type), @intCast(protocol), &fds);
         switch (std.c.errno(rc)) {
             .SUCCESS => return fds,
@@ -486,6 +529,7 @@ fn testSocketPair(domain: u32, sock_type: u32, protocol: u32) ![2]posix.socket_t
             else => return error.SocketFailed,
         }
     }
+    return error.SocketFailed;
 }
 
 test "validateUpstream accepts h2c plaintext and h2 tls combinations" {

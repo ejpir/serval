@@ -2163,9 +2163,13 @@ pub fn Server(
 
             const parse_start_ns = realtimeNanos();
             var parsed: serval_h2.InitialRequest = undefined;
+            var initial_request_storage_buf: [serval_h2.request_stable_storage_size_bytes]u8 = undefined;
             var local_settings_already_sent = false;
             while (true) {
-                parsed = serval_h2.parseInitialRequest(recv_buf[0..buffer_len.*]) catch |err| switch (err) {
+                parsed = serval_h2.parseInitialRequest(
+                    recv_buf[0..buffer_len.*],
+                    &initial_request_storage_buf,
+                ) catch |err| switch (err) {
                     error.NeedMoreData => {
                         if (!local_settings_already_sent and
                             buffer_len.* >= serval_h2.client_connection_preface.len and

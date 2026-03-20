@@ -41,9 +41,11 @@ pub const Stream = struct {
     state: State = .idle,
     recv_window: flow.Window = .{ .available_bytes = config.H2_INITIAL_WINDOW_SIZE_BYTES },
     send_window: flow.Window = .{ .available_bytes = config.H2_INITIAL_WINDOW_SIZE_BYTES },
+    send_window_debt_bytes: u32 = 0,
 
     pub fn init(id: u32) Stream {
         assert(isValidStreamId(id));
+        assert(config.H2_INITIAL_WINDOW_SIZE_BYTES <= config.H2_MAX_WINDOW_SIZE_BYTES);
         return .{ .id = id };
     }
 
@@ -51,36 +53,42 @@ pub const Stream = struct {
         assert(self.id > 0);
         if (self.state != .idle) return error.InvalidTransition;
         self.state = if (end_stream) .half_closed_local else .open;
+        assert(self.state == .half_closed_local or self.state == .open);
     }
 
     pub fn openRemote(self: *Stream, end_stream: bool) Error!void {
         assert(self.id > 0);
         if (self.state != .idle) return error.InvalidTransition;
         self.state = if (end_stream) .half_closed_remote else .open;
+        assert(self.state == .half_closed_remote or self.state == .open);
     }
 
     pub fn reserveLocal(self: *Stream) Error!void {
         assert(self.id > 0);
         if (self.state != .idle) return error.InvalidTransition;
         self.state = .reserved_local;
+        assert(self.state == .reserved_local);
     }
 
     pub fn reserveRemote(self: *Stream) Error!void {
         assert(self.id > 0);
         if (self.state != .idle) return error.InvalidTransition;
         self.state = .reserved_remote;
+        assert(self.state == .reserved_remote);
     }
 
     pub fn activateReservedLocal(self: *Stream, end_stream: bool) Error!void {
         assert(self.id > 0);
         if (self.state != .reserved_local) return error.InvalidTransition;
         self.state = if (end_stream) .closed else .half_closed_remote;
+        assert(self.state == .closed or self.state == .half_closed_remote);
     }
 
     pub fn activateReservedRemote(self: *Stream, end_stream: bool) Error!void {
         assert(self.id > 0);
         if (self.state != .reserved_remote) return error.InvalidTransition;
         self.state = if (end_stream) .closed else .half_closed_local;
+        assert(self.state == .closed or self.state == .half_closed_local);
     }
 
     pub fn endLocal(self: *Stream) Error!void {
@@ -90,6 +98,7 @@ pub const Stream = struct {
             .half_closed_remote => .closed,
             else => return error.InvalidTransition,
         };
+        assert(self.state == .half_closed_local or self.state == .closed);
     }
 
     pub fn endRemote(self: *Stream) Error!void {
@@ -99,18 +108,24 @@ pub const Stream = struct {
             .half_closed_local => .closed,
             else => return error.InvalidTransition,
         };
+        assert(self.state == .half_closed_remote or self.state == .closed);
     }
 
     pub fn reset(self: *Stream) void {
         assert(self.id > 0);
         self.state = .closed;
+        assert(self.state == .closed);
     }
 
     pub fn isClosed(self: *const Stream) bool {
+        assert(@intFromPtr(self) != 0);
+        assert(self.id > 0);
         return self.state == .closed;
     }
 
     pub fn localCanSend(self: *const Stream) bool {
+        assert(@intFromPtr(self) != 0);
+        assert(self.id > 0);
         return switch (self.state) {
             .open, .half_closed_remote => true,
             else => false,
@@ -118,6 +133,8 @@ pub const Stream = struct {
     }
 
     pub fn remoteCanSend(self: *const Stream) bool {
+        assert(@intFromPtr(self) != 0);
+        assert(self.id > 0);
         return switch (self.state) {
             .open, .half_closed_local => true,
             else => false,
@@ -130,6 +147,7 @@ pub const Stream = struct {
 
         try self.recv_window.set(recv_initial_bytes);
         try self.send_window.set(send_initial_bytes);
+        self.send_window_debt_bytes = 0;
     }
 
     pub fn consumeRecvWindow(self: *Stream, bytes: u32) Error!void {
@@ -141,19 +159,67 @@ pub const Stream = struct {
     pub fn consumeSendWindow(self: *Stream, bytes: u32) Error!void {
         assert(self.id > 0);
         assert(bytes <= config.H2_MAX_WINDOW_SIZE_BYTES);
+        assert(self.send_window_debt_bytes <= config.H2_MAX_WINDOW_SIZE_BYTES);
+
+        if (self.send_window_debt_bytes != 0) return error.WindowUnderflow;
         try self.send_window.consume(bytes);
     }
 
     pub fn incrementSendWindow(self: *Stream, delta_bytes: u32) Error!void {
         assert(self.id > 0);
         assert(delta_bytes <= config.H2_MAX_WINDOW_SIZE_BYTES);
-        try self.send_window.increment(delta_bytes);
+        try self.applySendWindowDelta(@intCast(delta_bytes));
     }
 
     pub fn incrementRecvWindow(self: *Stream, delta_bytes: u32) Error!void {
         assert(self.id > 0);
         assert(delta_bytes <= config.H2_MAX_WINDOW_SIZE_BYTES);
         try self.recv_window.increment(delta_bytes);
+    }
+
+    fn applySendWindowDelta(self: *Stream, delta_bytes: i64) Error!void {
+        assert(self.id > 0);
+        assert(self.send_window.available_bytes <= config.H2_MAX_WINDOW_SIZE_BYTES);
+        assert(self.send_window_debt_bytes <= config.H2_MAX_WINDOW_SIZE_BYTES);
+
+        if (delta_bytes >= 0) {
+            const credit_bytes: u32 = @intCast(delta_bytes);
+            if (credit_bytes == 0) return;
+
+            if (self.send_window_debt_bytes > 0) {
+                if (credit_bytes <= self.send_window_debt_bytes) {
+                    self.send_window_debt_bytes -= credit_bytes;
+                    return;
+                }
+
+                const remaining_credit_bytes = credit_bytes - self.send_window_debt_bytes;
+                self.send_window_debt_bytes = 0;
+                try self.send_window.increment(remaining_credit_bytes);
+                return;
+            }
+
+            try self.send_window.increment(credit_bytes);
+            return;
+        }
+
+        var debt_delta_bytes: u64 = @intCast(-delta_bytes);
+        if (debt_delta_bytes == 0) return;
+        if (debt_delta_bytes > config.H2_MAX_WINDOW_SIZE_BYTES) return error.WindowOverflow;
+
+        const available_bytes: u64 = self.send_window.available_bytes;
+        if (debt_delta_bytes >= available_bytes) {
+            self.send_window.available_bytes = 0;
+            debt_delta_bytes -= available_bytes;
+        } else {
+            self.send_window.available_bytes = @intCast(available_bytes - debt_delta_bytes);
+            return;
+        }
+
+        if (debt_delta_bytes == 0) return;
+
+        const next_debt_bytes: u64 = @as(u64, self.send_window_debt_bytes) + debt_delta_bytes;
+        if (next_debt_bytes > config.H2_MAX_WINDOW_SIZE_BYTES) return error.WindowOverflow;
+        self.send_window_debt_bytes = @intCast(next_debt_bytes);
     }
 };
 
@@ -170,10 +236,14 @@ pub const StreamTable = struct {
     last_remote_stream_id: u32 = 0,
 
     pub fn init(role: Role) StreamTable {
+        assert(table_capacity > 0);
+        assert(config.H2_MAX_CONCURRENT_STREAMS > 0);
         return .{ .role = role };
     }
 
     pub fn openLocal(self: *StreamTable, stream_id: u32, end_stream: bool) Error!*Stream {
+        assert(@intFromPtr(self) != 0);
+        assert(self.active_count <= config.H2_MAX_CONCURRENT_STREAMS);
         try validateNewStreamId(self.role, stream_id, .local, self.last_local_stream_id);
         if (self.findIndex(stream_id) != null) return error.StreamAlreadyExists;
 
@@ -187,6 +257,8 @@ pub const StreamTable = struct {
     }
 
     pub fn openRemote(self: *StreamTable, stream_id: u32, end_stream: bool) Error!*Stream {
+        assert(@intFromPtr(self) != 0);
+        assert(self.active_count <= config.H2_MAX_CONCURRENT_STREAMS);
         try validateNewStreamId(self.role, stream_id, .remote, self.last_remote_stream_id);
         if (self.findIndex(stream_id) != null) return error.StreamAlreadyExists;
 
@@ -200,73 +272,78 @@ pub const StreamTable = struct {
     }
 
     pub fn get(self: *StreamTable, stream_id: u32) ?*Stream {
+        assert(@intFromPtr(self) != 0);
+        assert(stream_id != 0);
         const index = self.findIndex(stream_id) orelse return null;
         return &self.slots[index].stream;
     }
 
     pub fn endLocal(self: *StreamTable, stream_id: u32) Error!void {
+        assert(@intFromPtr(self) != 0);
+        assert(stream_id != 0);
         const index = self.findIndex(stream_id) orelse return error.StreamNotFound;
         try self.slots[index].stream.endLocal();
         self.releaseIfClosed(index);
     }
 
     pub fn endRemote(self: *StreamTable, stream_id: u32) Error!void {
+        assert(@intFromPtr(self) != 0);
+        assert(stream_id != 0);
         const index = self.findIndex(stream_id) orelse return error.StreamNotFound;
         try self.slots[index].stream.endRemote();
         self.releaseIfClosed(index);
     }
 
     pub fn reset(self: *StreamTable, stream_id: u32) Error!void {
+        assert(@intFromPtr(self) != 0);
+        assert(stream_id != 0);
         const index = self.findIndex(stream_id) orelse return error.StreamNotFound;
         self.slots[index].stream.reset();
         self.releaseIfClosed(index);
     }
 
     pub fn consumeRecvWindow(self: *StreamTable, stream_id: u32, bytes: u32) Error!void {
+        assert(@intFromPtr(self) != 0);
+        assert(stream_id != 0);
         const index = self.findIndex(stream_id) orelse return error.StreamNotFound;
         try self.slots[index].stream.consumeRecvWindow(bytes);
     }
 
     pub fn consumeSendWindow(self: *StreamTable, stream_id: u32, bytes: u32) Error!void {
+        assert(@intFromPtr(self) != 0);
+        assert(stream_id != 0);
         const index = self.findIndex(stream_id) orelse return error.StreamNotFound;
         try self.slots[index].stream.consumeSendWindow(bytes);
     }
 
     pub fn incrementSendWindow(self: *StreamTable, stream_id: u32, delta_bytes: u32) Error!void {
+        assert(@intFromPtr(self) != 0);
+        assert(stream_id != 0);
         const index = self.findIndex(stream_id) orelse return error.StreamNotFound;
         try self.slots[index].stream.incrementSendWindow(delta_bytes);
     }
 
     pub fn incrementRecvWindow(self: *StreamTable, stream_id: u32, delta_bytes: u32) Error!void {
+        assert(@intFromPtr(self) != 0);
+        assert(stream_id != 0);
         const index = self.findIndex(stream_id) orelse return error.StreamNotFound;
         try self.slots[index].stream.incrementRecvWindow(delta_bytes);
     }
 
-    pub fn adjustAllSendWindows(self: *StreamTable, delta_bytes: i64) void {
+    pub fn adjustAllSendWindows(self: *StreamTable, delta_bytes: i64) Error!void {
+        assert(@intFromPtr(self) != 0);
+        assert(self.active_count <= config.H2_MAX_CONCURRENT_STREAMS);
+
         for (self.slots[0..]) |*slot| {
             if (!slot.used) continue;
-
-            if (delta_bytes >= 0) {
-                const delta_u32: u32 = @intCast(delta_bytes);
-                const current: u64 = slot.stream.send_window.available_bytes;
-                const next: u64 = current + delta_u32;
-                slot.stream.send_window.available_bytes = if (next > config.H2_MAX_WINDOW_SIZE_BYTES)
-                    config.H2_MAX_WINDOW_SIZE_BYTES
-                else
-                    @intCast(next);
-            } else {
-                const dec_u64: u64 = @intCast(-delta_bytes);
-                const current: u64 = slot.stream.send_window.available_bytes;
-                if (dec_u64 >= current) {
-                    slot.stream.send_window.available_bytes = 0;
-                } else {
-                    slot.stream.send_window.available_bytes = @intCast(current - dec_u64);
-                }
-            }
+            try slot.stream.applySendWindowDelta(delta_bytes);
         }
     }
 
     fn findIndex(self: *const StreamTable, stream_id: u32) ?usize {
+        assert(@intFromPtr(self) != 0);
+        assert(stream_id != 0);
+
         for (self.slots, 0..) |slot, index| {
             if (!slot.used) continue;
             if (slot.stream.id == stream_id) return index;
@@ -275,6 +352,9 @@ pub const StreamTable = struct {
     }
 
     fn allocSlot(self: *const StreamTable) ?usize {
+        assert(@intFromPtr(self) != 0);
+        assert(self.active_count <= config.H2_MAX_CONCURRENT_STREAMS);
+
         if (self.active_count >= config.H2_MAX_CONCURRENT_STREAMS) return null;
 
         for (self.slots, 0..) |slot, index| {
@@ -300,6 +380,9 @@ const Initiator = enum {
 };
 
 fn validateNewStreamId(role: Role, stream_id: u32, initiator: Initiator, last_stream_id: u32) Error!void {
+    assert(last_stream_id <= 0x7fff_ffff);
+    assert(stream_id <= 0x7fff_ffff or stream_id == 0);
+
     if (!isValidStreamId(stream_id)) return error.InvalidStreamId;
     if (stream_id <= last_stream_id) return error.StreamIdRegression;
     if (streamIdIsOdd(stream_id) != expectedOddParity(role, initiator)) {
@@ -308,15 +391,21 @@ fn validateNewStreamId(role: Role, stream_id: u32, initiator: Initiator, last_st
 }
 
 fn isValidStreamId(stream_id: u32) bool {
+    assert((stream_id & 0x8000_0000) == 0 or stream_id == 0);
+    assert((stream_id & 0x7fff_ffff) == stream_id or stream_id == 0);
     if (stream_id == 0) return false;
     return (stream_id & 0x8000_0000) == 0;
 }
 
 fn streamIdIsOdd(stream_id: u32) bool {
+    assert(stream_id > 0);
+    assert((stream_id & 0x8000_0000) == 0);
     return (stream_id & 1) == 1;
 }
 
 fn expectedOddParity(role: Role, initiator: Initiator) bool {
+    assert(role == .client or role == .server);
+    assert(initiator == .local or initiator == .remote);
     return switch (role) {
         .client => initiator == .local,
         .server => initiator == .remote,
@@ -366,6 +455,39 @@ test "stream window helpers enforce bounded accounting" {
 
     try std.testing.expectEqual(@as(u32, 28), stream.recv_window.available_bytes);
     try std.testing.expectEqual(@as(u32, 72), stream.send_window.available_bytes);
+    try std.testing.expectEqual(@as(u32, 0), stream.send_window_debt_bytes);
+}
+
+test "stream table tracks send-window debt across settings deltas" {
+    var table = StreamTable.init(.client);
+    _ = try table.openLocal(1, false);
+
+    const decrease_bytes: i64 = @as(i64, config.H2_INITIAL_WINDOW_SIZE_BYTES) + 10;
+    try table.adjustAllSendWindows(-decrease_bytes);
+
+    const stream = table.get(1).?;
+    try std.testing.expectEqual(@as(u32, 0), stream.send_window.available_bytes);
+    try std.testing.expectEqual(@as(u32, 10), stream.send_window_debt_bytes);
+    try std.testing.expectError(error.WindowUnderflow, table.consumeSendWindow(1, 1));
+
+    try table.adjustAllSendWindows(5);
+    try std.testing.expectEqual(@as(u32, 0), stream.send_window.available_bytes);
+    try std.testing.expectEqual(@as(u32, 5), stream.send_window_debt_bytes);
+
+    try table.adjustAllSendWindows(8);
+    try std.testing.expectEqual(@as(u32, 3), stream.send_window.available_bytes);
+    try std.testing.expectEqual(@as(u32, 0), stream.send_window_debt_bytes);
+}
+
+test "stream table rejects overflow on positive settings delta" {
+    var table = StreamTable.init(.client);
+    const stream = try table.openLocal(1, false);
+
+    const growth = config.H2_MAX_WINDOW_SIZE_BYTES - config.H2_INITIAL_WINDOW_SIZE_BYTES;
+    try stream.incrementSendWindow(growth);
+    try std.testing.expectEqual(config.H2_MAX_WINDOW_SIZE_BYTES, stream.send_window.available_bytes);
+
+    try std.testing.expectError(error.WindowOverflow, table.adjustAllSendWindows(1));
 }
 
 test "stream table enforces monotonic ids" {
@@ -396,4 +518,72 @@ test "stream table rejects capacity overflow" {
     }
 
     try std.testing.expectError(error.StreamTableFull, table.openLocal(stream_id, false));
+}
+
+test "stream randomized operation corpus preserves invariants" {
+    var prng = std.Random.DefaultPrng.init(0x57ee_0001);
+    const random = prng.random();
+
+    var table = StreamTable.init(.client);
+    var next_stream_id: u32 = 1;
+
+    var iteration: u32 = 0;
+    while (iteration < 1024) : (iteration += 1) {
+        const action = random.intRangeAtMost(u8, 0, 4);
+        switch (action) {
+            0 => {
+                if (next_stream_id <= 0x7fff_ffff) {
+                    _ = table.openLocal(next_stream_id, false) catch |err| switch (err) {
+                        error.StreamTableFull => {},
+                        else => return err,
+                    };
+                    next_stream_id +|= 2;
+                }
+            },
+            1 => {
+                const stream_id = random.intRangeAtMost(u32, 1, 127) | 1;
+                _ = table.endLocal(stream_id) catch |err| switch (err) {
+                    error.StreamNotFound,
+                    error.InvalidTransition,
+                    => {},
+                    else => return err,
+                };
+            },
+            2 => {
+                const stream_id = random.intRangeAtMost(u32, 1, 127) | 1;
+                _ = table.endRemote(stream_id) catch |err| switch (err) {
+                    error.StreamNotFound,
+                    error.InvalidTransition,
+                    => {},
+                    else => return err,
+                };
+            },
+            3 => {
+                const stream_id = random.intRangeAtMost(u32, 1, 127) | 1;
+                _ = table.reset(stream_id) catch |err| switch (err) {
+                    error.StreamNotFound => {},
+                    else => return err,
+                };
+            },
+            else => {
+                const delta = random.intRangeAtMost(i16, -200, 200);
+                _ = table.adjustAllSendWindows(delta) catch |err| switch (err) {
+                    error.WindowOverflow => {},
+                    else => return err,
+                };
+            },
+        }
+
+        try std.testing.expect(table.active_count <= config.H2_MAX_CONCURRENT_STREAMS);
+        var active_count_computed: u16 = 0;
+        for (table.slots) |slot| {
+            if (!slot.used) continue;
+            active_count_computed += 1;
+            try std.testing.expect(slot.stream.id > 0);
+            try std.testing.expect(slot.stream.send_window.available_bytes <= config.H2_MAX_WINDOW_SIZE_BYTES);
+            try std.testing.expect(slot.stream.recv_window.available_bytes <= config.H2_MAX_WINDOW_SIZE_BYTES);
+            try std.testing.expect(slot.stream.send_window_debt_bytes <= config.H2_MAX_WINDOW_SIZE_BYTES);
+        }
+        try std.testing.expectEqual(active_count_computed, table.active_count);
+    }
 }

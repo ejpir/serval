@@ -37,6 +37,8 @@ pub const Header = struct {
     header_len_bytes: u8,
 
     pub fn isControl(self: Header) bool {
+        assert(self.header_len_bytes >= 2);
+        assert(self.header_len_bytes <= max_header_size_bytes);
         return isControlOpcode(self.opcode);
     }
 };
@@ -59,6 +61,8 @@ pub const FrameError = error{
     HeaderTooLarge,
 };
 
+/// Parse a single WebSocket frame header from `input`.
+/// `input` must contain header bytes only (max 14 bytes), not payload bytes.
 pub fn parseHeader(input: []const u8, role: PeerRole) FrameError!Header {
     assert(input.len > 0);
 
@@ -101,47 +105,52 @@ pub fn parseHeader(input: []const u8, role: PeerRole) FrameError!Header {
 
 pub fn buildHeader(out: []u8, frame: OutboundHeader) ?[]const u8 {
     assert(out.len > 0);
+    assert(out.len <= std.math.maxInt(u32));
 
     if (frame.payload_len > std.math.maxInt(u63)) return null;
 
-    var pos: usize = 0;
+    var pos_bytes: u32 = 0;
     if (out.len < 2) return null;
 
-    out[pos] = buildFirstByte(frame.fin, frame.opcode);
-    pos += 1;
+    out[@intCast(pos_bytes)] = buildFirstByte(frame.fin, frame.opcode);
+    pos_bytes += 1;
 
     const masked = frame.mask_key != null;
     const mask_bit: u8 = if (masked) 0x80 else 0x00;
 
     if (frame.payload_len <= 125) {
-        out[pos] = mask_bit | @as(u8, @intCast(frame.payload_len));
-        pos += 1;
+        out[@intCast(pos_bytes)] = mask_bit | @as(u8, @intCast(frame.payload_len));
+        pos_bytes += 1;
     } else if (frame.payload_len <= std.math.maxInt(u16)) {
-        if (out.len < pos + 3) return null;
-        out[pos] = mask_bit | 126;
-        pos += 1;
-        writeBigEndianU16(out[pos..][0..2], @intCast(frame.payload_len));
-        pos += 2;
+        const needed_bytes: u32 = pos_bytes + 3;
+        if (out.len < @as(usize, @intCast(needed_bytes))) return null;
+        out[@intCast(pos_bytes)] = mask_bit | 126;
+        pos_bytes += 1;
+        writeBigEndianU16(out[@intCast(pos_bytes)..][0..2], @intCast(frame.payload_len));
+        pos_bytes += 2;
     } else {
-        if (out.len < pos + 9) return null;
-        out[pos] = mask_bit | 127;
-        pos += 1;
-        writeBigEndianU64(out[pos..][0..8], frame.payload_len);
-        pos += 8;
+        const needed_bytes: u32 = pos_bytes + 9;
+        if (out.len < @as(usize, @intCast(needed_bytes))) return null;
+        out[@intCast(pos_bytes)] = mask_bit | 127;
+        pos_bytes += 1;
+        writeBigEndianU64(out[@intCast(pos_bytes)..][0..8], frame.payload_len);
+        pos_bytes += 8;
     }
 
     if (frame.mask_key) |mask_key| {
-        if (out.len < pos + 4) return null;
-        @memcpy(out[pos..][0..4], &mask_key);
-        pos += 4;
+        const needed_bytes: u32 = pos_bytes + 4;
+        if (out.len < @as(usize, @intCast(needed_bytes))) return null;
+        @memcpy(out[@intCast(pos_bytes)..][0..4], &mask_key);
+        pos_bytes += 4;
     }
 
-    assert(pos <= out.len);
-    return out[0..pos];
+    assert(@as(usize, @intCast(pos_bytes)) <= out.len);
+    return out[0..@intCast(pos_bytes)];
 }
 
 pub fn applyMask(payload: []u8, mask_key: [4]u8) void {
     assert(payload.len <= std.math.maxInt(u32));
+    assert(mask_key.len == 4);
 
     var idx: u32 = 0;
     const payload_len: u32 = @intCast(payload.len);
@@ -152,25 +161,37 @@ pub fn applyMask(payload: []u8, mask_key: [4]u8) void {
 }
 
 pub fn isControlOpcode(opcode: Opcode) bool {
-    return switch (opcode) {
+    const opcode_bits: u8 = @intFromEnum(opcode);
+    assert(opcode_bits <= 0xF);
+
+    const is_control = switch (opcode) {
         .close, .ping, .pong => true,
         .continuation, .text, .binary => false,
     };
+    assert(is_control == ((opcode_bits & 0x8) != 0));
+    return is_control;
 }
 
 fn parseOpcode(raw_opcode: u4) FrameError!Opcode {
-    return switch (raw_opcode) {
+    assert(raw_opcode <= 0xF);
+
+    const opcode: Opcode = switch (raw_opcode) {
         0x0 => .continuation,
         0x1 => .text,
         0x2 => .binary,
         0x8 => .close,
         0x9 => .ping,
         0xA => .pong,
-        else => error.UnsupportedOpcode,
+        else => return error.UnsupportedOpcode,
     };
+    assert(@intFromEnum(opcode) == raw_opcode);
+    return opcode;
 }
 
 fn parsePayloadLen(input: []const u8, second: u8) FrameError!u64 {
+    assert(input.len >= 2);
+    assert(input.len <= max_header_size_bytes);
+
     const len_code: u8 = second & 0x7F;
     return switch (len_code) {
         0...125 => len_code,
@@ -188,10 +209,15 @@ fn parsePayloadLen(input: []const u8, second: u8) FrameError!u64 {
 }
 
 fn parseMaskKey(input: []const u8, second: u8) FrameError!?[4]u8 {
+    assert(input.len >= 2);
+    assert(input.len <= max_header_size_bytes);
+
     const masked = (second & 0x80) != 0;
     if (!masked) return null;
 
     const header_len = try parseHeaderLen(input, second);
+    assert(header_len >= 6);
+    assert(header_len <= max_header_size_bytes);
     const mask_offset = header_len - 4;
     if (input.len < header_len) return error.IncompleteHeader;
 
@@ -204,6 +230,9 @@ fn parseMaskKey(input: []const u8, second: u8) FrameError!?[4]u8 {
 }
 
 fn parseHeaderLen(input: []const u8, second: u8) FrameError!u8 {
+    assert(input.len >= 2);
+    assert(input.len <= max_header_size_bytes);
+
     const len_code: u8 = second & 0x7F;
     const masked = (second & 0x80) != 0;
 
@@ -214,14 +243,20 @@ fn parseHeaderLen(input: []const u8, second: u8) FrameError!u8 {
         else => unreachable,
     };
     const total_len: u8 = base_len + if (masked) @as(u8, 4) else @as(u8, 0);
+    assert(total_len >= 2);
+    assert(total_len <= max_header_size_bytes);
     if (input.len < total_len) return error.IncompleteHeader;
     return total_len;
 }
 
 fn buildFirstByte(fin: bool, opcode: Opcode) u8 {
+    assert(@intFromEnum(opcode) <= 0xF);
+
     const fin_bit: u8 = if (fin) 0x80 else 0x00;
     const opcode_bits: u8 = @intFromEnum(opcode);
-    return fin_bit | opcode_bits;
+    const first_byte = fin_bit | opcode_bits;
+    assert((first_byte & 0x0F) == opcode_bits);
+    return first_byte;
 }
 
 fn readBigEndianU16(bytes: []const u8) u16 {
@@ -231,6 +266,7 @@ fn readBigEndianU16(bytes: []const u8) u16 {
     for (bytes) |byte| {
         value = (value << 8) | byte;
     }
+    assert(@as(u8, @intCast(value >> 8)) == bytes[0]);
     return value;
 }
 
@@ -241,6 +277,7 @@ fn readBigEndianU64(bytes: []const u8) u64 {
     for (bytes) |byte| {
         value = (value << 8) | byte;
     }
+    assert(@as(u8, @intCast((value >> 56) & 0xFF)) == bytes[0]);
     return value;
 }
 
@@ -249,6 +286,7 @@ fn writeBigEndianU16(out: []u8, value: u16) void {
 
     out[0] = @intCast((value >> 8) & 0xFF);
     out[1] = @intCast(value & 0xFF);
+    assert(readBigEndianU16(out) == value);
 }
 
 fn writeBigEndianU64(out: []u8, value: u64) void {
@@ -262,6 +300,7 @@ fn writeBigEndianU64(out: []u8, value: u64) void {
         if (shift == 0) break;
         shift -= 8;
     }
+    assert(readBigEndianU64(out) == value);
 }
 
 test "parseHeader accepts masked client text frame" {
@@ -301,6 +340,29 @@ test "parseHeader rejects unmasked client frame" {
 test "parseHeader rejects masked server frame" {
     const raw = [_]u8{ 0x81, 0x81, 0x01, 0x02, 0x03, 0x04 };
     try std.testing.expectError(error.MaskedServerFrame, parseHeader(&raw, .server));
+}
+
+test "parseHeader rejects incomplete header bytes" {
+    const raw = [_]u8{0x81};
+    try std.testing.expectError(error.IncompleteHeader, parseHeader(&raw, .client));
+}
+
+test "parseHeader rejects unsupported opcode" {
+    const raw = [_]u8{ 0x83, 0x80, 0x01, 0x02, 0x03, 0x04 };
+    try std.testing.expectError(error.UnsupportedOpcode, parseHeader(&raw, .client));
+}
+
+test "parseHeader rejects invalid 64-bit payload length with high bit set" {
+    const raw = [_]u8{ 0x82, 0x7F, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    try std.testing.expectError(error.InvalidPayloadLength, parseHeader(&raw, .server));
+}
+
+test "parseHeader rejects input larger than maximum header size" {
+    const raw = [_]u8{
+        0x82, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        0x00, 0x00, 0x11, 0x22, 0x33, 0x44, 0x99,
+    };
+    try std.testing.expectError(error.HeaderTooLarge, parseHeader(&raw, .client));
 }
 
 test "parseHeader rejects reserved bits without negotiated extension" {
@@ -352,4 +414,54 @@ test "buildHeader encodes masked client binary frame header" {
     try std.testing.expectEqual(@as(u8, 0x7E), encoded[3]);
     try std.testing.expectEqual(@as(u8, 0x01), encoded[4]);
     try std.testing.expectEqual(@as(u8, 0x04), encoded[7]);
+}
+
+test "buildHeader and parseHeader round trip across bounded random inputs" {
+    var prng = std.Random.DefaultPrng.init(0x1dea_f00d);
+    const random = prng.random();
+
+    var out: [max_header_size_bytes]u8 = undefined;
+    var iterations: u32 = 0;
+    const max_iterations: u32 = 256;
+
+    while (iterations < max_iterations) : (iterations += 1) {
+        const fin = random.uintLessThan(u8, 2) == 1;
+        const opcode = if (random.uintLessThan(u8, 2) == 0) Opcode.text else Opcode.binary;
+        const payload_bucket = random.uintLessThan(u8, 3);
+        const payload_len: u64 = switch (payload_bucket) {
+            0 => random.uintLessThan(u8, 126),
+            1 => @as(u64, 126) + random.uintLessThan(u16, 1024),
+            2 => @as(u64, 65_536) + random.uintLessThan(u32, 1_000_000),
+            else => unreachable,
+        };
+
+        const encoded_server = buildHeader(&out, .{
+            .fin = fin,
+            .opcode = opcode,
+            .payload_len = payload_len,
+        }).?;
+        const parsed_server = try parseHeader(encoded_server, .server);
+        try std.testing.expectEqual(fin, parsed_server.fin);
+        try std.testing.expectEqual(opcode, parsed_server.opcode);
+        try std.testing.expectEqual(payload_len, parsed_server.payload_len);
+        try std.testing.expectEqual(@as(?[4]u8, null), parsed_server.mask_key);
+
+        const mask_key = [4]u8{
+            random.int(u8),
+            random.int(u8),
+            random.int(u8),
+            random.int(u8),
+        };
+        const encoded_client = buildHeader(&out, .{
+            .fin = fin,
+            .opcode = opcode,
+            .payload_len = payload_len,
+            .mask_key = mask_key,
+        }).?;
+        const parsed_client = try parseHeader(encoded_client, .client);
+        try std.testing.expectEqual(fin, parsed_client.fin);
+        try std.testing.expectEqual(opcode, parsed_client.opcode);
+        try std.testing.expectEqual(payload_len, parsed_client.payload_len);
+        try std.testing.expectEqual(@as(?[4]u8, mask_key), parsed_client.mask_key);
+    }
 }

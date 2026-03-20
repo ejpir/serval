@@ -72,6 +72,9 @@ if ! ssh "root@$ROUTER_IP" "cat '$REMOTE_CONF_FILE'" > "$ROUTER_CONF_LOCAL" 2>/d
     log_error "Cannot read router config: $REMOTE_CONF_FILE"
 fi
 
+# Remove stale HTTP-01 challenge keys (dropped in favour of TLS-ALPN-01)
+sed -i '/^acme_challenge_bind_host=/d; /^acme_challenge_bind_port=/d' "$ROUTER_CONF_LOCAL"
+
 upsert_config_key "$ROUTER_CONF_LOCAL" "acme_enabled" "true"
 upsert_config_key "$ROUTER_CONF_LOCAL" "acme_directory_url" "$ACME_DIRECTORY_URL"
 upsert_config_key "$ROUTER_CONF_LOCAL" "acme_contact_email" "$ACME_EMAIL"

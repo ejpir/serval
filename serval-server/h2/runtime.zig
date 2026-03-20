@@ -83,11 +83,14 @@ const priority_field_size_bytes: usize = 5;
 pub const Runtime = struct {
     state: connection.ConnectionState,
     header_decoder: h2.HpackDecoder = h2.HpackDecoder.init(),
+    request_header_storage_buf: [h2.request_stable_storage_size_bytes]u8 = undefined,
     pending_request_headers: PendingRequestHeaders = .{},
     request_body_trackers: [request_body_tracker_capacity]RequestBodyTracker = [_]RequestBodyTracker{.{}} ** request_body_tracker_capacity,
     last_peer_reset_stream_id: u32 = 0,
 
     pub fn init() Error!Runtime {
+        assert(request_body_tracker_capacity > 0);
+        assert(h2.request_stable_storage_size_bytes > 0);
         return .{
             .state = try connection.ConnectionState.init(),
             .header_decoder = h2.HpackDecoder.init(),
@@ -96,6 +99,7 @@ pub const Runtime = struct {
 
     pub fn receiveClientPreface(self: *Runtime) Error!void {
         assert(@intFromPtr(self) != 0);
+        assert(!self.state.preface_received);
         try self.state.markPrefaceReceived();
     }
 
@@ -125,6 +129,7 @@ pub const Runtime = struct {
 
     pub fn writePingAckFrame(out: []u8, opaque_data: [h2.control.ping_payload_size_bytes]u8) Error![]const u8 {
         assert(out.len >= h2.frame_header_size_bytes + h2.control.ping_payload_size_bytes);
+        assert(h2.control.ping_payload_size_bytes == 8);
         return try h2.buildPingFrame(out, h2.flags_ack, opaque_data);
     }
 
@@ -198,13 +203,14 @@ fn handleSettings(self: *Runtime, header: h2.FrameHeader, payload: []const u8) E
     return .send_settings_ack;
 }
 
-fn handleHeaders(self: *Runtime, header: h2.FrameHeader, payload: []const u8) Error!ReceiveAction {
-    assert(@intFromPtr(self) != 0);
+const ParsedHeadersPayload = struct {
+    header_block: []const u8,
+    end_stream: bool,
+};
+
+fn parseHeadersPayload(header: h2.FrameHeader, payload: []const u8) Error!ParsedHeadersPayload {
     assert(header.frame_type == .headers);
     assert(header.length == payload.len);
-
-    if (header.stream_id == 0) return error.InvalidStreamId;
-    if (!self.state.canAcceptRemoteStream(header.stream_id)) return error.ConnectionClosing;
 
     var header_payload = payload;
     if ((header.flags & h2.flags_padded) != 0) {
@@ -214,46 +220,66 @@ fn handleHeaders(self: *Runtime, header: h2.FrameHeader, payload: []const u8) Er
     var header_block = header_payload;
     if ((header.flags & h2.flags_priority) != 0) {
         if (header_payload.len < priority_field_size_bytes) return error.InvalidFrame;
-
         const dependency_stream_id = parsePriorityDependency(header_payload[0..priority_field_size_bytes]);
         if (dependency_stream_id == header.stream_id) return error.StreamProtocolError;
         header_block = header_payload[priority_field_size_bytes..];
     }
 
-    const end_stream = (header.flags & h2.flags_end_stream) != 0;
+    return .{
+        .header_block = header_block,
+        .end_stream = (header.flags & h2.flags_end_stream) != 0,
+    };
+}
 
-    if (self.state.getStream(header.stream_id)) |stream| {
-        if (!stream.remoteCanSend()) return error.StreamClosedError;
-        if ((header.flags & h2.flags_end_headers) == 0) return error.StreamProtocolError;
-        if (!end_stream) return error.StreamProtocolError;
+fn handleExistingStreamTrailerHeaders(
+    self: *Runtime,
+    header: h2.FrameHeader,
+    header_block: []const u8,
+    end_stream: bool,
+) Error!?ReceiveAction {
+    assert(@intFromPtr(self) != 0);
+    assert(header.stream_id > 0);
 
-        try validateTrailerHeaderBlock(self, header_block);
-        try finalizeRequestBodyOnEndStream(self, header.stream_id);
-        try self.state.endRemoteStream(header.stream_id);
+    const stream = self.state.getStream(header.stream_id) orelse return null;
+    if (!stream.remoteCanSend()) return error.StreamClosedError;
+    if ((header.flags & h2.flags_end_headers) == 0) return error.StreamProtocolError;
+    if (!end_stream) return error.StreamProtocolError;
 
-        return .{ .request_data = .{
-            .stream_id = header.stream_id,
-            .end_stream = true,
-            .payload = &[_]u8{},
-        } };
-    }
+    try validateTrailerHeaderBlock(self, header_block);
+    try finalizeRequestBodyOnEndStream(self, header.stream_id);
+    try self.state.endRemoteStream(header.stream_id);
+    return .{ .request_data = .{
+        .stream_id = header.stream_id,
+        .end_stream = true,
+        .payload = &[_]u8{},
+    } };
+}
+
+fn validateNewInboundHeadersStream(self: *const Runtime, stream_id: u32) Error!void {
+    assert(@intFromPtr(self) != 0);
+    assert(stream_id > 0);
 
     const last_remote_stream_id = self.state.streams.last_remote_stream_id;
-    if (header.stream_id <= last_remote_stream_id) {
-        if (header.stream_id == self.last_peer_reset_stream_id) return error.StreamClosedError;
-        if (header.stream_id == last_remote_stream_id) return error.ConnectionStreamClosedError;
-        return error.ConnectionProtocolError;
-    }
+    if (stream_id > last_remote_stream_id) return;
+    if (stream_id == self.last_peer_reset_stream_id) return error.StreamClosedError;
+    if (stream_id == last_remote_stream_id) return error.ConnectionStreamClosedError;
+    return error.ConnectionProtocolError;
+}
 
-    if ((header.flags & h2.flags_end_headers) == 0) {
-        try startHeaderBlockContinuation(self, header.stream_id, end_stream, header_block);
-        return .none;
-    }
+fn decodeRequestHeadForStream(
+    self: *Runtime,
+    stream_id: u32,
+    header_block: []const u8,
+) Error!h2.RequestHead {
+    assert(@intFromPtr(self) != 0);
+    assert(stream_id > 0);
+    assert(header_block.len <= config.H2_MAX_HEADER_BLOCK_SIZE_BYTES);
 
-    const request_head = h2.decodeRequestHeaderBlockWithDecoder(
+    return h2.decodeRequestHeaderBlockWithDecoder(
         &self.header_decoder,
         header_block,
-        header.stream_id,
+        stream_id,
+        &self.request_header_storage_buf,
     ) catch |err| switch (err) {
         error.MissingMethod,
         error.MissingPath,
@@ -274,8 +300,13 @@ fn handleHeaders(self: *Runtime, header: h2.FrameHeader, payload: []const u8) Er
         => return error.StreamProtocolError,
         else => return err,
     };
+}
 
-    _ = self.state.openRemoteStream(header.stream_id, end_stream) catch |err| switch (err) {
+fn openRemoteRequestStream(self: *Runtime, stream_id: u32, end_stream: bool) Error!void {
+    assert(@intFromPtr(self) != 0);
+    assert(stream_id > 0);
+
+    _ = self.state.openRemoteStream(stream_id, end_stream) catch |err| switch (err) {
         error.StreamTableFull => return error.StreamRefused,
         error.StreamAlreadyExists => return error.StreamClosedError,
         error.WrongStreamParity,
@@ -284,12 +315,34 @@ fn handleHeaders(self: *Runtime, header: h2.FrameHeader, payload: []const u8) Er
         => return error.ConnectionProtocolError,
         else => return err,
     };
+}
 
-    try startRequestBodyTracking(self, header.stream_id, &request_head.request, end_stream);
+fn handleHeaders(self: *Runtime, header: h2.FrameHeader, payload: []const u8) Error!ReceiveAction {
+    assert(@intFromPtr(self) != 0);
+    assert(header.frame_type == .headers);
+    assert(header.length == payload.len);
+
+    if (header.stream_id == 0) return error.InvalidStreamId;
+    if (!self.state.canAcceptRemoteStream(header.stream_id)) return error.ConnectionClosing;
+
+    const parsed = try parseHeadersPayload(header, payload);
+    if (try handleExistingStreamTrailerHeaders(self, header, parsed.header_block, parsed.end_stream)) |action| {
+        return action;
+    }
+    try validateNewInboundHeadersStream(self, header.stream_id);
+
+    if ((header.flags & h2.flags_end_headers) == 0) {
+        try startHeaderBlockContinuation(self, header.stream_id, parsed.end_stream, parsed.header_block);
+        return .none;
+    }
+
+    const request_head = try decodeRequestHeadForStream(self, header.stream_id, parsed.header_block);
+    try openRemoteRequestStream(self, header.stream_id, parsed.end_stream);
+    try startRequestBodyTracking(self, header.stream_id, &request_head.request, parsed.end_stream);
 
     return .{ .request_headers = .{
         .stream_id = request_head.stream_id,
-        .end_stream = end_stream,
+        .end_stream = parsed.end_stream,
         .request = request_head.request,
     } };
 }
@@ -355,67 +408,17 @@ fn finishPendingRequestHeaders(self: *Runtime) Error!ReceiveAction {
     const block_len: usize = @intCast(self.pending_request_headers.block_len);
     const stream_id = self.pending_request_headers.stream_id;
     const end_stream = self.pending_request_headers.end_stream;
+    errdefer resetPendingRequestHeaders(self);
 
-    if (self.state.getStream(stream_id) != null) {
-        resetPendingRequestHeaders(self);
-        return error.StreamClosedError;
-    }
+    if (self.state.getStream(stream_id) != null) return error.StreamClosedError;
+    try validateNewInboundHeadersStream(self, stream_id);
 
-    const last_remote_stream_id = self.state.streams.last_remote_stream_id;
-    if (stream_id <= last_remote_stream_id) {
-        resetPendingRequestHeaders(self);
-        if (stream_id == self.last_peer_reset_stream_id) return error.StreamClosedError;
-        if (stream_id == last_remote_stream_id) return error.ConnectionStreamClosedError;
-        return error.ConnectionProtocolError;
-    }
-
-    const request_head = h2.decodeRequestHeaderBlockWithDecoder(
-        &self.header_decoder,
-        self.pending_request_headers.block_buf[0..block_len],
+    const request_head = try decodeRequestHeadForStream(
+        self,
         stream_id,
-    ) catch |err| switch (err) {
-        error.MissingMethod,
-        error.MissingPath,
-        error.MissingScheme,
-        error.MissingAuthority,
-        error.InvalidMethod,
-        error.InvalidTe,
-        error.InvalidHeaderName,
-        error.UnexpectedPseudoHeader,
-        error.PseudoHeaderAfterRegularHeader,
-        error.DuplicatePseudoHeader,
-        error.ConnectionSpecificHeader,
-        error.ConnectPathNotAllowed,
-        error.ConnectSchemeNotAllowed,
-        error.AuthorityHostMismatch,
-        error.TooManyHeaders,
-        error.DuplicateContentLength,
-        => {
-            resetPendingRequestHeaders(self);
-            return error.StreamProtocolError;
-        },
-        else => return err,
-    };
-
-    _ = self.state.openRemoteStream(stream_id, end_stream) catch |err| switch (err) {
-        error.StreamTableFull => {
-            resetPendingRequestHeaders(self);
-            return error.StreamRefused;
-        },
-        error.StreamAlreadyExists => {
-            resetPendingRequestHeaders(self);
-            return error.StreamClosedError;
-        },
-        error.StreamIdRegression,
-        error.WrongStreamParity,
-        error.InvalidTransition,
-        => {
-            resetPendingRequestHeaders(self);
-            return error.ConnectionProtocolError;
-        },
-        else => return err,
-    };
-
+        self.pending_request_headers.block_buf[0..block_len],
+    );
+    try openRemoteRequestStream(self, stream_id, end_stream);
     resetPendingRequestHeaders(self);
     try startRequestBodyTracking(self, stream_id, &request_head.request, end_stream);
 
@@ -428,6 +431,7 @@ fn finishPendingRequestHeaders(self: *Runtime) Error!ReceiveAction {
 
 fn resetPendingRequestHeaders(self: *Runtime) void {
     assert(@intFromPtr(self) != 0);
+    assert(self.pending_request_headers.block_len <= config.H2_MAX_HEADER_BLOCK_SIZE_BYTES);
 
     self.pending_request_headers.active = false;
     self.pending_request_headers.stream_id = 0;
@@ -437,6 +441,8 @@ fn resetPendingRequestHeaders(self: *Runtime) void {
 }
 
 fn trimPaddedPayload(payload: []const u8) Error![]const u8 {
+    assert(payload.len <= config.H2_MAX_FRAME_SIZE_BYTES);
+    assert(config.H2_MAX_FRAME_SIZE_BYTES > 0);
     if (payload.len == 0) return error.InvalidFrame;
 
     const pad_len: usize = payload[0];
@@ -447,6 +453,7 @@ fn trimPaddedPayload(payload: []const u8) Error![]const u8 {
 
 fn parsePriorityDependency(priority_payload: []const u8) u32 {
     assert(priority_payload.len == priority_field_size_bytes);
+    assert(priority_field_size_bytes == 5);
 
     const raw_dependency = std.mem.readInt(u32, priority_payload[0..4], .big);
     return raw_dependency & 0x7fff_ffff;
@@ -503,6 +510,7 @@ fn finalizeRequestBodyOnEndStream(self: *Runtime, stream_id: u32) Error!void {
 
 fn parseExpectedContentLength(request: *const types.Request) Error!?u64 {
     assert(@intFromPtr(request) != 0);
+    assert(request.path.len > 0);
 
     const raw = request.headers.get("content-length") orelse return null;
     const parsed = std.fmt.parseInt(u64, raw, 10) catch return error.StreamProtocolError;
@@ -511,6 +519,7 @@ fn parseExpectedContentLength(request: *const types.Request) Error!?u64 {
 
 fn validateTrailerHeaderBlock(self: *Runtime, header_block: []const u8) Error!void {
     assert(@intFromPtr(self) != 0);
+    assert(header_block.len <= config.H2_MAX_HEADER_BLOCK_SIZE_BYTES);
 
     var fields_buf: [config.MAX_HEADERS]h2.HeaderField = undefined;
     const fields = try h2.decodeHeaderBlockWithDecoder(&self.header_decoder, header_block, &fields_buf);
@@ -599,6 +608,7 @@ fn handleData(self: *Runtime, header: h2.FrameHeader, payload: []const u8) Error
 
 fn handlePing(header: h2.FrameHeader, payload: []const u8) Error!ReceiveAction {
     assert(header.frame_type == .ping);
+    assert(header.length == payload.len);
     const opaque_data = try h2.parsePingFrame(header, payload);
     if ((header.flags & h2.flags_ack) != 0) return .none;
     return .{ .send_ping_ack = opaque_data };
@@ -678,6 +688,8 @@ fn handleGoAway(self: *Runtime, header: h2.FrameHeader, payload: []const u8) Err
 }
 
 fn buildLocalSettingsPayload(local_settings: h2.Settings, out: []u8) Error![]const u8 {
+    assert(local_settings.max_frame_size_bytes >= h2.settings.min_max_frame_size_bytes);
+    assert(local_settings.max_frame_size_bytes <= config.H2_MAX_FRAME_SIZE_BYTES);
     const settings = [_]h2.Setting{
         .{ .id = @intFromEnum(h2.SettingId.enable_push), .value = if (local_settings.enable_push) 1 else 0 },
         .{ .id = @intFromEnum(h2.SettingId.max_concurrent_streams), .value = local_settings.max_concurrent_streams },
@@ -690,6 +702,7 @@ fn buildLocalSettingsPayload(local_settings: h2.Settings, out: []u8) Error![]con
 
 fn buildHeaderBlock(path: []const u8, out: []u8) ![]const u8 {
     assert(path.len > 0);
+    assert(out.len > 0);
     var len: usize = 0;
     const fields = [_]struct { name: []const u8, value: []const u8 }{
         .{ .name = ":method", .value = "POST" },
@@ -704,11 +717,13 @@ fn buildHeaderBlock(path: []const u8, out: []u8) ![]const u8 {
         const encoded = try h2.encodeLiteralHeaderWithoutIndexing(out[len..], field.name, field.value);
         len += encoded.len;
     }
+    assert(len <= out.len);
     return out[0..len];
 }
 
 fn appendFrame(out: []u8, frame_type: h2.FrameType, flags: u8, stream_id: u32, payload: []const u8) ![]const u8 {
-    assert(out.len > 0);
+    assert(out.len >= h2.frame_header_size_bytes);
+    assert(payload.len <= std.math.maxInt(u24));
     const header = try h2.buildFrameHeader(out[0..h2.frame_header_size_bytes], .{
         .length = @intCast(payload.len),
         .frame_type = frame_type,

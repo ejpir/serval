@@ -46,6 +46,7 @@ pub const Error = error{
 
 pub fn parseFrameHeader(raw: []const u8) Error!FrameHeader {
     assert(raw.len > 0);
+    assert(frame_header_size_bytes == 9);
 
     if (raw.len < frame_header_size_bytes) return error.NeedMoreData;
 
@@ -126,4 +127,48 @@ test "parseFrameHeader ignores reserved stream-id bit" {
     const raw = [_]u8{ 0x00, 0x00, 0x00, 0x06, 0x00, 0x80, 0x00, 0x00, 0x00 };
     const header = try parseFrameHeader(&raw);
     try std.testing.expectEqual(@as(u32, 0), header.stream_id);
+}
+
+test "frame header roundtrip property over deterministic corpus" {
+    var prng = std.Random.DefaultPrng.init(0xf12e_42aa);
+    const random = prng.random();
+
+    var buf: [frame_header_size_bytes]u8 = undefined;
+    var iteration: u32 = 0;
+    while (iteration < 512) : (iteration += 1) {
+        const frame_type_raw = random.intRangeAtMost(u8, 0, 10);
+        const frame_type: FrameType = if (frame_type_raw <= 9)
+            @enumFromInt(frame_type_raw)
+        else
+            .extension;
+
+        const header = FrameHeader{
+            .length = random.intRangeAtMost(u32, 0, config.H2_MAX_FRAME_SIZE_BYTES),
+            .frame_type = frame_type,
+            .flags = random.int(u8),
+            .stream_id = random.intRangeAtMost(u32, 0, 0x7fff_ffff),
+        };
+        const encoded = try buildFrameHeader(&buf, header);
+        const decoded = try parseFrameHeader(encoded);
+
+        try std.testing.expectEqual(header.length, decoded.length);
+        try std.testing.expectEqual(header.flags, decoded.flags);
+        try std.testing.expectEqual(header.stream_id, decoded.stream_id);
+        try std.testing.expectEqual(header.frame_type, decoded.frame_type);
+    }
+}
+
+test "parseFrameHeader fuzz corpus maintains invariants" {
+    var prng = std.Random.DefaultPrng.init(0xface_b00c);
+    const random = prng.random();
+
+    var raw: [frame_header_size_bytes]u8 = undefined;
+    var iteration: u32 = 0;
+    while (iteration < 1024) : (iteration += 1) {
+        random.bytes(&raw);
+        _ = parseFrameHeader(&raw) catch |err| switch (err) {
+            error.FrameTooLarge => continue,
+            else => return err,
+        };
+    }
 }

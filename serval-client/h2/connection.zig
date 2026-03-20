@@ -50,10 +50,14 @@ pub const ClientConnection = struct {
     frame_count: u32 = 0,
 
     pub fn init(socket: *Socket) Error!ClientConnection {
+        assert(@intFromPtr(socket) != 0);
+        assert(socket.get_fd() >= 0);
         return initMaybeIo(socket, null);
     }
 
     pub fn initWithIo(socket: *Socket, io: Io) Error!ClientConnection {
+        assert(@intFromPtr(socket) != 0);
+        assert(socket.get_fd() >= 0);
         return initMaybeIo(socket, io);
     }
 
@@ -70,9 +74,11 @@ pub const ClientConnection = struct {
 
     pub fn sendClientPrefaceAndSettings(self: *ClientConnection) Error!void {
         assert(@intFromPtr(self) != 0);
+        assert(self.socket.get_fd() >= 0);
 
         var out: [preface_settings_buffer_size_bytes]u8 = undefined;
         const frame = try self.runtime.writeClientPrefaceAndSettings(&out);
+        assert(frame.len <= out.len);
         try self.writeAll(frame);
     }
 
@@ -90,14 +96,17 @@ pub const ClientConnection = struct {
         opaque_data: [h2.control.ping_payload_size_bytes]u8,
     ) Error!void {
         assert(@intFromPtr(self) != 0);
+        assert(h2.control.ping_payload_size_bytes == 8);
 
         var out: [h2.frame_header_size_bytes + h2.control.ping_payload_size_bytes]u8 = undefined;
         const frame = try runtime_mod.Runtime.writePingAckFrame(&out, opaque_data);
+        assert(frame.len == out.len);
         try self.writeAll(frame);
     }
 
     pub fn completeHandshake(self: *ClientConnection) Error!void {
         assert(@intFromPtr(self) != 0);
+        assert(config.H2_MAX_INITIAL_PARSE_FRAMES > 0);
 
         try self.sendClientPrefaceAndSettings();
 
@@ -148,66 +157,126 @@ pub const ClientConnection = struct {
 
         if (payload.len == 0) {
             if (!end_stream) return;
-
-            var frame_out: [data_frame_buffer_size_bytes]u8 = undefined;
-            const frame = try self.runtime.writeRequestDataFrame(&frame_out, stream_id, &[_]u8{}, true);
-            try self.writeAll(frame);
+            try self.sendEmptyRequestDataFrame(stream_id);
             return;
         }
+
+        try self.sendRequestDataChunks(stream_id, payload, end_stream);
+    }
+
+    fn sendEmptyRequestDataFrame(self: *ClientConnection, stream_id: u32) Error!void {
+        assert(@intFromPtr(self) != 0);
+        assert(stream_id > 0);
+
+        var frame_out: [data_frame_buffer_size_bytes]u8 = undefined;
+        const frame = try self.runtime.writeRequestDataFrame(&frame_out, stream_id, &[_]u8{}, true);
+        assert(frame.len == h2.frame_header_size_bytes);
+        try self.writeAll(frame);
+    }
+
+    fn sendRequestDataChunks(
+        self: *ClientConnection,
+        stream_id: u32,
+        payload: []const u8,
+        end_stream: bool,
+    ) Error!void {
+        assert(@intFromPtr(self) != 0);
+        assert(payload.len > 0);
+        assert(payload.len <= std.math.maxInt(u32));
 
         const payload_len: u32 = @intCast(payload.len);
         var sent: u32 = 0;
         var frames: u32 = 0;
 
         while (sent < payload_len and frames < config.H2_CLIENT_MAX_FRAME_COUNT) : (frames += 1) {
-            const stream = self.runtime.state.getStream(stream_id) orelse {
-                log.warn(
-                    "client h2 connection: missing stream in sendRequestData stream={d} sent={d}/{d} frames={d} active={d} last_local={d} last_remote={d} goaway={any} last_stream_id={d}",
-                    .{
-                        stream_id,
-                        sent,
-                        payload_len,
-                        frames,
-                        self.runtime.state.streams.active_count,
-                        self.runtime.state.streams.last_local_stream_id,
-                        self.runtime.state.streams.last_remote_stream_id,
-                        self.runtime.state.goaway_received,
-                        self.runtime.state.peer_goaway_last_stream_id,
-                    },
-                );
-                return error.StreamNotFound;
-            };
+            const stream = self.runtime.state.getStream(stream_id) orelse return logAndReturnMissingStream(self, stream_id, sent, payload_len, frames);
             if (self.runtime.state.goaway_received and stream_id > self.runtime.state.peer_goaway_last_stream_id) {
                 return error.ConnectionClosing;
             }
-
-            const connection_window = self.runtime.state.flow.send_window.available_bytes;
-            const stream_window = stream.send_window.available_bytes;
-            const window_budget = @min(connection_window, stream_window);
-            if (window_budget == 0) return error.SendWindowExhausted;
-
-            const remaining = payload_len - sent;
-            const max_frame = self.runtime.state.peer_settings.max_frame_size_bytes;
-            const chunk_len = @min(remaining, @min(window_budget, max_frame));
-            assert(chunk_len > 0);
-
-            const offset: usize = @intCast(sent);
-            const limit: usize = @intCast(sent + chunk_len);
-            const chunk = payload[offset..limit];
-            const is_last_chunk = sent + chunk_len == payload_len;
-
-            var frame_out: [data_frame_buffer_size_bytes]u8 = undefined;
-            const frame = try self.runtime.writeRequestDataFrame(
-                &frame_out,
-                stream_id,
-                chunk,
-                end_stream and is_last_chunk,
-            );
-            try self.writeAll(frame);
+            const chunk_len = computeDataChunkLen(self, stream, sent, payload_len);
+            if (chunk_len == 0) return error.SendWindowExhausted;
+            try self.sendDataChunk(stream_id, payload, sent, chunk_len, payload_len, end_stream);
             sent += chunk_len;
         }
 
         if (sent < payload_len) return error.FrameLimitExceeded;
+        assert(sent == payload_len);
+    }
+
+    fn sendDataChunk(
+        self: *ClientConnection,
+        stream_id: u32,
+        payload: []const u8,
+        sent: u32,
+        chunk_len: u32,
+        payload_len: u32,
+        end_stream: bool,
+    ) Error!void {
+        assert(@intFromPtr(self) != 0);
+        assert(chunk_len > 0);
+        assert(sent + chunk_len <= payload_len);
+
+        const offset: usize = @intCast(sent);
+        const limit: usize = @intCast(sent + chunk_len);
+        const chunk = payload[offset..limit];
+        const is_last_chunk = sent + chunk_len == payload_len;
+
+        var frame_out: [data_frame_buffer_size_bytes]u8 = undefined;
+        const frame = try self.runtime.writeRequestDataFrame(
+            &frame_out,
+            stream_id,
+            chunk,
+            end_stream and is_last_chunk,
+        );
+        assert(frame.len >= h2.frame_header_size_bytes);
+        try self.writeAll(frame);
+    }
+
+    fn computeDataChunkLen(
+        self: *const ClientConnection,
+        stream: *const h2.H2Stream,
+        sent: u32,
+        payload_len: u32,
+    ) u32 {
+        assert(@intFromPtr(self) != 0);
+        assert(@intFromPtr(stream) != 0);
+        assert(sent <= payload_len);
+
+        const connection_window = self.runtime.state.flow.send_window.available_bytes;
+        const stream_window = stream.send_window.available_bytes;
+        const window_budget = @min(connection_window, stream_window);
+        const remaining = payload_len - sent;
+        const max_frame = self.runtime.state.peer_settings.max_frame_size_bytes;
+        const chunk_len = @min(remaining, @min(window_budget, max_frame));
+        assert(chunk_len <= remaining);
+        return chunk_len;
+    }
+
+    fn logAndReturnMissingStream(
+        self: *const ClientConnection,
+        stream_id: u32,
+        sent: u32,
+        payload_len: u32,
+        frames: u32,
+    ) Error {
+        assert(@intFromPtr(self) != 0);
+        assert(stream_id > 0);
+
+        log.warn(
+            "client h2 connection: missing stream in sendRequestData stream={d} sent={d}/{d} frames={d} active={d} last_local={d} last_remote={d} goaway={any} last_stream_id={d}",
+            .{
+                stream_id,
+                sent,
+                payload_len,
+                frames,
+                self.runtime.state.streams.active_count,
+                self.runtime.state.streams.last_local_stream_id,
+                self.runtime.state.streams.last_remote_stream_id,
+                self.runtime.state.goaway_received,
+                self.runtime.state.peer_goaway_last_stream_id,
+            },
+        );
+        return error.StreamNotFound;
     }
 
     pub fn sendStreamReset(self: *ClientConnection, stream_id: u32, error_code_raw: u32) Error!void {
@@ -223,15 +292,20 @@ pub const ClientConnection = struct {
     }
 
     pub fn receiveAction(self: *ClientConnection) Error!runtime_mod.ReceiveAction {
+        assert(@intFromPtr(self) != 0);
+        assert(self.pending_discard_len <= self.recv_len);
         return self.receiveActionTimeout(null, .none);
     }
 
     pub fn receiveActionIo(self: *ClientConnection, io: Io) Error!runtime_mod.ReceiveAction {
+        assert(@intFromPtr(self) != 0);
+        assert(self.socket.get_fd() >= 0);
         return self.receiveActionTimeout(io, .none);
     }
 
     pub fn receiveActionTimeout(self: *ClientConnection, maybe_io: ?Io, timeout: Io.Timeout) Error!runtime_mod.ReceiveAction {
         assert(@intFromPtr(self) != 0);
+        assert(self.pending_discard_len <= self.recv_len);
 
         self.finalizePendingFrame();
         if (self.frame_count >= config.H2_CLIENT_MAX_FRAME_COUNT) return error.FrameLimitExceeded;
@@ -249,10 +323,14 @@ pub const ClientConnection = struct {
     }
 
     pub fn receiveActionHandlingControl(self: *ClientConnection) Error!runtime_mod.ReceiveAction {
+        assert(@intFromPtr(self) != 0);
+        assert(config.H2_CLIENT_MAX_FRAME_COUNT > 0);
         return self.receiveActionHandlingControlTimeout(null, .none);
     }
 
     pub fn receiveActionHandlingControlIo(self: *ClientConnection, io: Io) Error!runtime_mod.ReceiveAction {
+        assert(@intFromPtr(self) != 0);
+        assert(self.socket.get_fd() >= 0);
         return self.receiveActionHandlingControlTimeout(io, .none);
     }
 
@@ -262,6 +340,7 @@ pub const ClientConnection = struct {
         timeout: Io.Timeout,
     ) Error!runtime_mod.ReceiveAction {
         assert(@intFromPtr(self) != 0);
+        assert(config.H2_CLIENT_MAX_FRAME_COUNT > 0);
 
         var frames: u32 = 0;
         while (frames < config.H2_CLIENT_MAX_FRAME_COUNT) : (frames += 1) {
@@ -275,6 +354,7 @@ pub const ClientConnection = struct {
 
     fn handleControlAction(self: *ClientConnection, action: runtime_mod.ReceiveAction) Error!bool {
         assert(@intFromPtr(self) != 0);
+        assert(self.socket.get_fd() >= 0);
 
         switch (action) {
             .send_settings_ack => {
@@ -297,6 +377,7 @@ pub const ClientConnection = struct {
 
     fn ensureFrame(self: *ClientConnection, maybe_io: ?Io, timeout: Io.Timeout) Error!bool {
         assert(@intFromPtr(self) != 0);
+        assert(self.recv_len <= self.recv_buf.len);
 
         if (self.recv_len == 0) {
             const n = try self.readIntoBuffer(maybe_io, timeout);
@@ -337,6 +418,7 @@ pub const ClientConnection = struct {
 
     fn finalizePendingFrame(self: *ClientConnection) void {
         assert(@intFromPtr(self) != 0);
+        assert(self.pending_discard_len <= self.recv_len);
 
         if (self.pending_discard_len == 0) return;
         self.discardPrefix(self.pending_discard_len);
@@ -358,6 +440,7 @@ pub const ClientConnection = struct {
 
     fn writeAll(self: *ClientConnection, data: []const u8) Error!void {
         assert(@intFromPtr(self) != 0);
+        assert(self.socket.get_fd() >= 0);
 
         switch (self.socket.*) {
             .plain => |plain| {
@@ -425,6 +508,7 @@ fn readSome(socket: *Socket, maybe_io: ?Io, timeout: Io.Timeout, out: []u8) Erro
 
 fn waitUntilReadable(fd: i32, io: Io, timeout: Io.Timeout) Error!void {
     assert(fd >= 0);
+    assert(rawStreamForFd(fd).socket.handle == fd);
 
     var messages: [1]Io.net.IncomingMessage = .{Io.net.IncomingMessage.init};
     var peek_buf: [1]u8 = undefined;
@@ -444,50 +528,64 @@ fn waitUntilReadable(fd: i32, io: Io, timeout: Io.Timeout) Error!void {
 
 fn rawStreamForFd(fd: i32) Io.net.Stream {
     assert(fd >= 0);
-    return .{
+    const stream: Io.net.Stream = .{
         .socket = .{
             .handle = fd,
             .address = .{ .ip4 = .unspecified(0) },
         },
     };
+    assert(stream.socket.handle == fd);
+    return stream;
 }
 
 fn mapReadError(err: SocketError) Error {
-    return switch (err) {
+    const mapped: Error = switch (err) {
         error.ConnectionClosed,
         error.ConnectionReset,
         => error.ConnectionClosed,
         else => error.ReadFailed,
     };
+    assert(mapped != error.WriteFailed);
+    assert(mapped == error.ConnectionClosed or mapped == error.ReadFailed);
+    return mapped;
 }
 
 fn mapWriteError(err: SocketError) Error {
-    return switch (err) {
+    const mapped: Error = switch (err) {
         error.ConnectionClosed,
         error.ConnectionReset,
         error.BrokenPipe,
         => error.ConnectionClosed,
         else => error.WriteFailed,
     };
+    assert(mapped != error.ReadFailed);
+    assert(mapped == error.ConnectionClosed or mapped == error.WriteFailed);
+    return mapped;
 }
 
 fn mapIoReadError(err: anyerror) Error {
-    return switch (err) {
+    const mapped: Error = switch (err) {
         error.ConnectionResetByPeer,
         error.SocketUnconnected,
         => error.ConnectionClosed,
         else => error.ReadFailed,
     };
+    assert(mapped != error.WriteFailed);
+    assert(mapped == error.ConnectionClosed or mapped == error.ReadFailed);
+    return mapped;
 }
 
 fn mapIoWriteError(err: anyerror) Error {
-    return switch (err) {
+    const mapped: Error = switch (err) {
         error.ConnectionResetByPeer,
         error.BrokenPipe,
         error.SocketUnconnected,
         => error.ConnectionClosed,
         else => error.WriteFailed,
     };
+    assert(mapped != error.ReadFailed);
+    assert(mapped == error.ConnectionClosed or mapped == error.WriteFailed);
+    return mapped;
 }
 
 fn appendFrame(
@@ -498,6 +596,7 @@ fn appendFrame(
     payload: []const u8,
 ) ![]const u8 {
     assert(out.len >= h2.frame_header_size_bytes);
+    assert(payload.len <= std.math.maxInt(u24));
 
     const header = try h2.buildFrameHeader(out[0..h2.frame_header_size_bytes], .{
         .length = @intCast(payload.len),
@@ -510,16 +609,21 @@ fn appendFrame(
 }
 
 fn buildHeaderBlock(headers: []const types.Header, out: []u8) ![]const u8 {
+    assert(out.len > 0);
+    assert(headers.len <= config.MAX_HEADERS);
+
     var cursor: usize = 0;
     for (headers) |header| {
         const encoded = try h2.encodeLiteralHeaderWithoutIndexing(out[cursor..], header.name, header.value);
         cursor += encoded.len;
     }
+    assert(cursor <= out.len);
     return out[0..cursor];
 }
 
 fn buildResponseHeaderBlock(status: u16, headers: []const types.Header, out: []u8) ![]const u8 {
     assert(status >= 100 and status <= 599);
+    assert(out.len > 0);
 
     var cursor: usize = 0;
     var status_buf: [3]u8 = undefined;
@@ -530,6 +634,7 @@ fn buildResponseHeaderBlock(status: u16, headers: []const types.Header, out: []u
         const encoded = try h2.encodeLiteralHeaderWithoutIndexing(out[cursor..], header.name, header.value);
         cursor += encoded.len;
     }
+    assert(cursor <= out.len);
     return out[0..cursor];
 }
 
@@ -538,7 +643,7 @@ fn readExact(fd: i32, out: []u8) !void {
 
     var offset: usize = 0;
     var reads: usize = 0;
-    const max_reads: usize = out.len + 32;
+    const max_reads: usize = std.math.add(usize, out.len, 32) catch return error.ReadFailed;
 
     while (offset < out.len and reads < max_reads) : (reads += 1) {
         const n = posix.read(fd, out[offset..]) catch return error.ReadFailed;
@@ -547,6 +652,7 @@ fn readExact(fd: i32, out: []u8) !void {
     }
 
     if (offset < out.len) return error.ReadFailed;
+    assert(offset == out.len);
 }
 
 fn writeAllFd(fd: i32, data: []const u8) !void {
@@ -554,13 +660,19 @@ fn writeAllFd(fd: i32, data: []const u8) !void {
     if (data.len == 0) return;
 
     var socket = Socket.Plain.init_client(fd);
+    assert(socket.get_fd() == fd);
     socket.write_all(data) catch return error.WriteFailed;
 }
 
 fn testSocketPair(domain: u32, sock_type: u32, protocol: u32) ![2]posix.socket_t {
-    var fds: [2]posix.socket_t = undefined;
+    assert(domain <= std.math.maxInt(c_int));
+    assert(sock_type <= std.math.maxInt(c_int));
 
-    while (true) {
+    var fds: [2]posix.socket_t = undefined;
+    var attempts: u32 = 0;
+    const max_attempts: u32 = 1024;
+
+    while (attempts < max_attempts) : (attempts += 1) {
         const rc = std.c.socketpair(@intCast(domain), @intCast(sock_type), @intCast(protocol), &fds);
         switch (std.c.errno(rc)) {
             .SUCCESS => return fds,
@@ -568,13 +680,20 @@ fn testSocketPair(domain: u32, sock_type: u32, protocol: u32) ![2]posix.socket_t
             else => return error.SocketFailed,
         }
     }
+    return error.SocketFailed;
 }
 
 fn buildPeerSettingsFrame(out: []u8) ![]const u8 {
-    return appendFrame(out, .settings, 0, 0, &[_]u8{});
+    assert(out.len >= h2.frame_header_size_bytes);
+    const frame = try appendFrame(out, .settings, 0, 0, &[_]u8{});
+    assert(frame.len == h2.frame_header_size_bytes);
+    return frame;
 }
 
 fn makeGrpcRequest(path: []const u8) !Request {
+    assert(path.len > 0);
+    assert(path[0] == '/');
+
     var request = Request{
         .method = .POST,
         .path = path,
@@ -585,13 +704,14 @@ fn makeGrpcRequest(path: []const u8) !Request {
     try request.headers.put("host", "127.0.0.1:19000");
     try request.headers.put("content-type", "application/grpc");
     try request.headers.put("te", "trailers");
+    assert(request.headers.get("te") != null);
     return request;
 }
 
 test "ClientConnection sends client preface and initial settings" {
     const fds = try testSocketPair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer posix.close(fds[0]);
-    defer posix.close(fds[1]);
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
 
     var socket = Socket.Plain.init_client(fds[0]);
     var conn = try ClientConnection.init(&socket);
@@ -608,8 +728,8 @@ test "ClientConnection sends client preface and initial settings" {
 
 test "ClientConnection completeHandshake sends settings ACK" {
     const fds = try testSocketPair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer posix.close(fds[0]);
-    defer posix.close(fds[1]);
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
 
     var peer_settings_buf: [h2.frame_header_size_bytes]u8 = undefined;
     const peer_settings = try buildPeerSettingsFrame(&peer_settings_buf);
@@ -637,8 +757,8 @@ test "ClientConnection completeHandshake sends settings ACK" {
 
 test "ClientConnection request send and response receive round-trip" {
     const fds = try testSocketPair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer posix.close(fds[0]);
-    defer posix.close(fds[1]);
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
 
     var peer_settings_buf: [h2.frame_header_size_bytes]u8 = undefined;
     const peer_settings = try buildPeerSettingsFrame(&peer_settings_buf);

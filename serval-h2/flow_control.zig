@@ -19,6 +19,8 @@ pub const Window = struct {
     available_bytes: u32,
 
     pub fn init(initial_bytes: u32) Error!Window {
+        assert(config.H2_MAX_WINDOW_SIZE_BYTES > 0);
+        assert(config.H2_INITIAL_WINDOW_SIZE_BYTES <= config.H2_MAX_WINDOW_SIZE_BYTES);
         if (initial_bytes > config.H2_MAX_WINDOW_SIZE_BYTES) {
             return error.InvalidInitialWindowSize;
         }
@@ -45,6 +47,7 @@ pub const Window = struct {
 
     pub fn set(self: *Window, new_bytes: u32) Error!void {
         assert(@intFromPtr(self) != 0);
+        assert(self.available_bytes <= config.H2_MAX_WINDOW_SIZE_BYTES);
         if (new_bytes > config.H2_MAX_WINDOW_SIZE_BYTES) {
             return error.InvalidInitialWindowSize;
         }
@@ -57,6 +60,8 @@ pub const ConnectionFlowControl = struct {
     send_window: Window,
 
     pub fn init(initial_bytes: u32) Error!ConnectionFlowControl {
+        assert(initial_bytes <= config.H2_MAX_WINDOW_SIZE_BYTES);
+        assert(config.H2_CONNECTION_WINDOW_SIZE_BYTES <= config.H2_MAX_WINDOW_SIZE_BYTES);
         const recv_window = try Window.init(initial_bytes);
         const send_window = try Window.init(initial_bytes);
         return .{

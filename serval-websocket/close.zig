@@ -36,6 +36,14 @@ pub const CloseError = error{
 };
 
 pub fn validateCloseCode(code: u16) CloseError!void {
+    const is_reserved = switch (code) {
+        1004, 1005, 1006, 1015 => true,
+        else => false,
+    };
+    const is_private = code >= 3000 and code <= 4999;
+    assert(!(is_reserved and is_private));
+    assert(!(code < 1000 and is_private));
+
     if (code < 1000) return error.InvalidCloseCode;
 
     switch (code) {
@@ -49,6 +57,8 @@ pub fn validateCloseCode(code: u16) CloseError!void {
 }
 
 pub fn parseClosePayload(payload: []const u8) CloseError!CloseInfo {
+    assert(payload.len <= std.math.maxInt(u32));
+
     if (payload.len == 0) {
         return .{ .code = null, .reason = "" };
     }
@@ -60,6 +70,7 @@ pub fn parseClosePayload(payload: []const u8) CloseError!CloseInfo {
     const code = readBigEndianU16(payload[0..2]);
     try validateCloseCode(code);
 
+    assert(payload.len >= 2);
     const reason = payload[2..];
     if (!std.unicode.utf8ValidateSlice(reason)) {
         return error.InvalidCloseReason;
@@ -70,28 +81,33 @@ pub fn parseClosePayload(payload: []const u8) CloseError!CloseInfo {
 
 pub fn buildClosePayload(out: []u8, code: u16, reason: []const u8) CloseError![]const u8 {
     assert(out.len > 0);
+    assert(out.len <= std.math.maxInt(u32));
+    assert(reason.len <= std.math.maxInt(u32));
 
     try validateCloseCode(code);
     if (!std.unicode.utf8ValidateSlice(reason)) return error.InvalidCloseReason;
 
-    const total_len: usize = 2 + reason.len;
-    if (total_len > config.WEBSOCKET_MAX_CONTROL_PAYLOAD_SIZE_BYTES) {
+    const reason_len_bytes: u32 = @intCast(reason.len);
+    const total_len_bytes: u32 = 2 + reason_len_bytes;
+    if (total_len_bytes > config.WEBSOCKET_MAX_CONTROL_PAYLOAD_SIZE_BYTES) {
         return error.PayloadTooLarge;
     }
-    if (out.len < total_len) return error.BufferTooSmall;
+    if (out.len < @as(usize, @intCast(total_len_bytes))) return error.BufferTooSmall;
 
     writeBigEndianU16(out[0..2], code);
     if (reason.len > 0) {
         @memcpy(out[2..][0..reason.len], reason);
     }
 
-    return out[0..total_len];
+    return out[0..@intCast(total_len_bytes)];
 }
 
 fn readBigEndianU16(bytes: []const u8) u16 {
     assert(bytes.len == 2);
 
-    return (@as(u16, bytes[0]) << 8) | bytes[1];
+    const value = (@as(u16, bytes[0]) << 8) | bytes[1];
+    assert(@as(u8, @intCast((value >> 8) & 0xFF)) == bytes[0]);
+    return value;
 }
 
 fn writeBigEndianU16(out: []u8, value: u16) void {
@@ -99,6 +115,7 @@ fn writeBigEndianU16(out: []u8, value: u16) void {
 
     out[0] = @intCast((value >> 8) & 0xFF);
     out[1] = @intCast(value & 0xFF);
+    assert(readBigEndianU16(out) == value);
 }
 
 test "validateCloseCode accepts normal and private-use codes" {
@@ -141,6 +158,15 @@ test "parseClosePayload rejects invalid UTF-8 reason" {
     try std.testing.expectError(error.InvalidCloseReason, parseClosePayload(&payload));
 }
 
+test "parseClosePayload rejects payload larger than control frame maximum" {
+    var payload: [config.WEBSOCKET_MAX_CONTROL_PAYLOAD_SIZE_BYTES + 1]u8 = undefined;
+    payload[0] = 0x03;
+    payload[1] = 0xE8;
+    @memset(payload[2..], 'a');
+
+    try std.testing.expectError(error.PayloadTooLarge, parseClosePayload(&payload));
+}
+
 test "buildClosePayload encodes code and reason" {
     var out: [config.WEBSOCKET_MAX_CONTROL_PAYLOAD_SIZE_BYTES]u8 = undefined;
     const encoded = try buildClosePayload(&out, normal_closure, "bye");
@@ -149,4 +175,23 @@ test "buildClosePayload encodes code and reason" {
     try std.testing.expectEqual(@as(u8, 0x03), encoded[0]);
     try std.testing.expectEqual(@as(u8, 0xE8), encoded[1]);
     try std.testing.expectEqual(@as(u8, 'b'), encoded[2]);
+}
+
+test "buildClosePayload rejects too-small output buffer" {
+    var out: [4]u8 = undefined;
+    try std.testing.expectError(
+        error.BufferTooSmall,
+        buildClosePayload(&out, normal_closure, "hello"),
+    );
+}
+
+test "buildClosePayload rejects payload larger than control frame maximum" {
+    var out: [config.WEBSOCKET_MAX_CONTROL_PAYLOAD_SIZE_BYTES]u8 = undefined;
+    var reason: [124]u8 = undefined;
+    @memset(&reason, 'a');
+
+    try std.testing.expectError(
+        error.PayloadTooLarge,
+        buildClosePayload(&out, normal_closure, &reason),
+    );
 }

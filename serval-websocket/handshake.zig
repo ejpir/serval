@@ -44,6 +44,7 @@ pub const HandshakeError = error{
 /// still fail closed in the server path.
 pub fn looksLikeWebSocketUpgradeRequest(request: *const Request) bool {
     assert(@intFromPtr(request) != 0);
+    assert(request.path.len <= std.math.maxInt(u32));
 
     if (request.method != .GET) return false;
 
@@ -69,6 +70,7 @@ pub fn validateClientRequest(
     body_framing: BodyFraming,
 ) HandshakeError!void {
     assert(@intFromPtr(request) != 0);
+    assert(request.path.len <= std.math.maxInt(u32));
 
     if (request.method != .GET) return error.InvalidMethod;
     if (body_framing != .none) return error.UnexpectedMessageBody;
@@ -154,10 +156,12 @@ pub fn validateServerResponse(
 /// Returns true if a comma-separated header value contains the given token.
 pub fn headerHasToken(value: []const u8, token: []const u8) bool {
     assert(token.len > 0);
+    assert(value.len <= std.math.maxInt(u32));
 
     var parts = std.mem.splitScalar(u8, value, ',');
     var iterations: u32 = 0;
     const max_iterations: u32 = 64;
+    assert(max_iterations > 0);
 
     while (parts.next()) |part| : (iterations += 1) {
         if (iterations >= max_iterations) break;
@@ -202,6 +206,8 @@ fn validateClientKey(client_key: []const u8) HandshakeError!void {
     assert(client_key.len > 0);
 
     const trimmed = std.mem.trim(u8, client_key, " \t");
+    if (trimmed.len > websocket_accept_input_size_bytes) return error.InvalidWebSocketKey;
+    assert(trimmed.len <= websocket_accept_input_size_bytes);
     if (trimmed.len == 0) return error.InvalidWebSocketKey;
 
     const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(trimmed) catch {

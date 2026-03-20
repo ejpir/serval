@@ -44,11 +44,13 @@ const ConnectionIo = union(enum) {
 
     fn initPlain(fd: i32) ConnectionIo {
         assert(fd >= 0);
+        assert(fd <= std.math.maxInt(i32));
         return .{ .plain_fd = fd };
     }
 
     fn initTls(tls_stream: *TLSStream) ConnectionIo {
         assert(@intFromPtr(tls_stream) != 0);
+        assert(tls_stream.fd >= 0);
         return .{ .tls_stream = tls_stream };
     }
 };
@@ -283,6 +285,7 @@ const StreamTrackerTable = struct {
 
     fn popIfClosed(self: *StreamTrackerTable) ?StreamTracker {
         assert(@intFromPtr(self) != 0);
+        assert(self.count <= config.H2_MAX_CONCURRENT_STREAMS);
 
         for (self.slots[0..], 0..) |*slot, index| {
             if (!slot.used) continue;
@@ -311,6 +314,7 @@ const StreamTrackerTable = struct {
 
     fn popAny(self: *StreamTrackerTable) ?StreamTracker {
         assert(@intFromPtr(self) != 0);
+        assert(self.count <= config.H2_MAX_CONCURRENT_STREAMS);
 
         for (self.slots[0..], 0..) |*slot, index| {
             if (!slot.used) continue;
@@ -529,6 +533,9 @@ fn responsePeerMaxFrameSizeBytes(runtime: *const runtime_mod.Runtime) usize {
 }
 
 pub fn verifyHandler(comptime Handler: type) void {
+    assert(@typeInfo(Handler) == .@"struct");
+    assert(@typeName(Handler).len > 0);
+
     if (!@hasDecl(Handler, "handleH2Headers")) {
         @compileError(@typeName(Handler) ++ " must declare handleH2Headers(self, stream_id, request, end_stream, writer)");
     }
@@ -548,6 +555,9 @@ fn verifyOptionalHook(
     comptime expected_params: []const type,
     comptime expected_return: type,
 ) void {
+    assert(hook_name.len > 0);
+    assert(expected_params.len <= 8);
+
     if (!@hasDecl(Handler, hook_name)) return;
 
     const HookFn = @TypeOf(@field(Handler, hook_name));
@@ -572,11 +582,380 @@ fn verifyOptionalHook(
     }
 }
 
+const InboundFrame = struct {
+    header: h2.FrameHeader,
+    frame_len: usize,
+    payload: []const u8,
+};
+
+fn closeTrackedStreamsForFatalError(
+    comptime Handler: type,
+    handler: *Handler,
+    connection_id: u64,
+    stream_trackers: *StreamTrackerTable,
+    err: anyerror,
+) void {
+    assert(@intFromPtr(handler) != 0);
+    assert(@intFromPtr(stream_trackers) != 0);
+
+    closeAllTrackedStreams(
+        Handler,
+        handler,
+        connection_id,
+        stream_trackers,
+        .connection_close,
+        @intFromEnum(mapGoAwayError(err)),
+    );
+}
+
+fn readInboundFrame(
+    io_conn: *ConnectionIo,
+    maybe_plain_reader: ?*Io.net.Stream.Reader,
+    io: Io,
+    connection_id: u64,
+    frame_count: u32,
+    recv_buf: *[read_buffer_size_bytes]u8,
+    buffer_len: *usize,
+) Error!?InboundFrame {
+    assert(@intFromPtr(io_conn) != 0);
+    assert(buffer_len.* <= recv_buf.len);
+
+    log.debug("server: conn={d} h2 waiting for frame frame_count={d} buffered_bytes={d}", .{
+        connection_id,
+        frame_count,
+        buffer_len.*,
+    });
+    const have_frame = try ensureFrame(io_conn, maybe_plain_reader, io, recv_buf, buffer_len);
+    if (!have_frame) return null;
+
+    const header = try h2.parseFrameHeader(recv_buf[0..h2.frame_header_size_bytes]);
+    const frame_len: usize = h2.frame_header_size_bytes + header.length;
+    try fillBuffer(io_conn, maybe_plain_reader, io, recv_buf, buffer_len, frame_len);
+    log.debug("server: conn={d} h2 parsed frame count={d} type={s} stream={d} flags=0x{x} payload_bytes={d} buffered_bytes={d}", .{
+        connection_id,
+        frame_count,
+        @tagName(header.frame_type),
+        header.stream_id,
+        header.flags,
+        header.length,
+        buffer_len.*,
+    });
+
+    return .{
+        .header = header,
+        .frame_len = frame_len,
+        .payload = recv_buf[h2.frame_header_size_bytes..frame_len],
+    };
+}
+
+fn processInboundFrame(
+    comptime Handler: type,
+    handler: *Handler,
+    io_conn: *ConnectionIo,
+    io: Io,
+    connection_id: u64,
+    runtime: *runtime_mod.Runtime,
+    response_states: *ResponseStateTable,
+    stream_trackers: *StreamTrackerTable,
+    recv_buf: *[read_buffer_size_bytes]u8,
+    buffer_len: *usize,
+    frame: InboundFrame,
+) Error!bool {
+    assert(@intFromPtr(handler) != 0);
+    assert(frame.frame_len <= recv_buf.len);
+
+    const action = runtime.receiveFrame(frame.header, frame.payload) catch |err| {
+        if (try tryHandleRecoverableStreamError(
+            Handler,
+            handler,
+            io_conn,
+            io,
+            connection_id,
+            runtime,
+            response_states,
+            stream_trackers,
+            frame.header,
+            err,
+        )) {
+            discardPrefix(recv_buf, buffer_len, frame.frame_len);
+            return false;
+        }
+
+        logRuntimeFrameError(connection_id, frame.header, err);
+        return err;
+    };
+    log.debug("server: conn={d} h2 runtime action={s} frame_type={s} stream={d}", .{
+        connection_id,
+        @tagName(action),
+        @tagName(frame.header.frame_type),
+        frame.header.stream_id,
+    });
+    try handleAction(Handler, handler, io_conn, io, connection_id, runtime, response_states, stream_trackers, action);
+    try flushPendingResponseData(runtime, io_conn, io, response_states, stream_trackers);
+    closeCompletedStreams(Handler, handler, connection_id, stream_trackers);
+    discardPrefix(recv_buf, buffer_len, frame.frame_len);
+    return action == .connection_close;
+}
+
+fn writeFrameLimitGoAway(
+    io_conn: *ConnectionIo,
+    io: Io,
+    runtime: *runtime_mod.Runtime,
+) Error!void {
+    assert(@intFromPtr(io_conn) != 0);
+    assert(@intFromPtr(runtime) != 0);
+
+    var goaway_buf: [frame_buffer_size_bytes]u8 = undefined;
+    const goaway = try runtime.writeGoAwayFrame(&goaway_buf, .{
+        .last_stream_id = runtime.state.local_goaway_last_stream_id,
+        .error_code_raw = @intFromEnum(h2.ErrorCode.enhance_your_calm),
+        .debug_data = "frame_limit",
+    });
+    writeAll(io_conn, io, goaway) catch |write_err| switch (write_err) {
+        error.ConnectionClosed => {},
+        else => {},
+    };
+}
+
+fn runConnectionFrameLoop(
+    comptime Handler: type,
+    handler: *Handler,
+    io_conn: *ConnectionIo,
+    maybe_plain_reader: ?*Io.net.Stream.Reader,
+    io: Io,
+    connection_id: u64,
+    runtime: *runtime_mod.Runtime,
+    response_states: *ResponseStateTable,
+    stream_trackers: *StreamTrackerTable,
+    connection_mutex: *Io.Mutex,
+    recv_buf: *[read_buffer_size_bytes]u8,
+    buffer_len: *usize,
+) Error!void {
+    assert(@intFromPtr(handler) != 0);
+    assert(@intFromPtr(connection_mutex) != 0);
+
+    var frame_count: u32 = 0;
+    while (frame_count < config.H2_SERVER_MAX_FRAME_COUNT) : (frame_count += 1) {
+        const frame = readInboundFrame(io_conn, maybe_plain_reader, io, connection_id, frame_count, recv_buf, buffer_len) catch |err| {
+            try sendRuntimeErrorGoAway(runtime, io_conn, io, runtime.state.local_goaway_last_stream_id, err);
+            closeTrackedStreamsForFatalError(Handler, handler, connection_id, stream_trackers, err);
+            return err;
+        };
+        if (frame == null) {
+            log.debug("server: conn={d} h2 peer closed before next frame", .{connection_id});
+            closeAllTrackedStreams(Handler, handler, connection_id, stream_trackers, .connection_close, 0);
+            return;
+        }
+
+        connection_mutex.lockUncancelable(io);
+        defer connection_mutex.unlock(io);
+
+        const should_close = processInboundFrame(Handler, handler, io_conn, io, connection_id, runtime, response_states, stream_trackers, recv_buf, buffer_len, frame.?) catch |err| {
+            try sendRuntimeErrorGoAway(runtime, io_conn, io, frame.?.header.stream_id, err);
+            closeTrackedStreamsForFatalError(Handler, handler, connection_id, stream_trackers, err);
+            return err;
+        };
+        if (should_close) return;
+    }
+
+    try writeFrameLimitGoAway(io_conn, io, runtime);
+    closeAllTrackedStreams(
+        Handler,
+        handler,
+        connection_id,
+        stream_trackers,
+        .connection_close,
+        @intFromEnum(h2.ErrorCode.enhance_your_calm),
+    );
+    return error.FrameLimitExceeded;
+}
+
+fn initMaybePlainReader(
+    io_conn: *ConnectionIo,
+    io: Io,
+    plain_read_buf: *[config.STREAM_READ_BUFFER_SIZE_BYTES]u8,
+    plain_reader: *Io.net.Stream.Reader,
+) ?*Io.net.Stream.Reader {
+    assert(@intFromPtr(io_conn) != 0);
+    assert(@intFromPtr(plain_reader) != 0);
+
+    switch (io_conn.*) {
+        .plain_fd => |fd| {
+            plain_reader.* = rawStreamForFd(fd).reader(io, plain_read_buf);
+            return plain_reader;
+        },
+        .tls_stream => return null,
+    }
+}
+
+fn sendInitialServerSettings(
+    io_conn: *ConnectionIo,
+    io: Io,
+    connection_id: u64,
+    runtime: *runtime_mod.Runtime,
+    local_settings_already_sent: bool,
+) Error!void {
+    assert(@intFromPtr(io_conn) != 0);
+    assert(@intFromPtr(runtime) != 0);
+
+    if (local_settings_already_sent) return runtime.state.markLocalSettingsSent();
+
+    log.debug("server: conn={d} h2 building initial settings frame", .{connection_id});
+    var settings_buf: [runtime_mod.initial_settings_frame_buffer_size_bytes]u8 = undefined;
+    const initial_settings = try runtime.writeInitialSettingsFrame(&settings_buf);
+    log.debug("server: conn={d} h2 writing initial settings bytes={d} fd={d}", .{
+        connection_id,
+        initial_settings.len,
+        connectionIoFd(io_conn),
+    });
+    writeAll(io_conn, io, initial_settings) catch |err| {
+        log.warn("server: conn={d} h2 initial settings write failed: {s}", .{ connection_id, @errorName(err) });
+        return err;
+    };
+    log.debug("server: conn={d} h2 sent initial settings bytes={d}", .{ connection_id, initial_settings.len });
+}
+
+fn consumeClientPrefaceFromBuffer(
+    io_conn: *ConnectionIo,
+    maybe_plain_reader: ?*Io.net.Stream.Reader,
+    io: Io,
+    runtime: *runtime_mod.Runtime,
+    recv_buf: *[read_buffer_size_bytes]u8,
+    buffer_len: *usize,
+    connection_id: u64,
+) Error!void {
+    assert(@intFromPtr(io_conn) != 0);
+    assert(@intFromPtr(runtime) != 0);
+    assert(buffer_len.* <= recv_buf.len);
+
+    try fillBuffer(io_conn, maybe_plain_reader, io, recv_buf, buffer_len, h2.client_connection_preface.len);
+    if (!h2.looksLikeClientConnectionPreface(recv_buf[0..buffer_len.*])) return error.InvalidPreface;
+    try runtime.receiveClientPreface();
+    discardPrefix(recv_buf, buffer_len, h2.client_connection_preface.len);
+    log.debug("server: conn={d} h2 consumed client preface buffered_bytes={d}", .{ connection_id, buffer_len.* });
+}
+
+fn initReceiveBuffer(recv_buf: *[read_buffer_size_bytes]u8, buffer_len: *usize, initial_bytes: []const u8) void {
+    assert(initial_bytes.len <= recv_buf.len);
+    assert(@intFromPtr(buffer_len) != 0);
+
+    buffer_len.* = 0;
+    if (initial_bytes.len == 0) return;
+    @memcpy(recv_buf[0..initial_bytes.len], initial_bytes);
+    buffer_len.* = initial_bytes.len;
+}
+
+fn startBackgroundTasksIfPresent(
+    comptime Handler: type,
+    handler: *Handler,
+    background_writer: *ResponseWriter,
+    connection_mutex: *Io.Mutex,
+    connection_id: u64,
+) void {
+    assert(@intFromPtr(handler) != 0);
+    assert(@intFromPtr(background_writer) != 0);
+
+    if (comptime @hasDecl(Handler, "startH2BackgroundTasks")) {
+        log.debug("server: conn={d} h2 starting background tasks", .{connection_id});
+        handler.startH2BackgroundTasks(background_writer, connection_mutex);
+        log.debug("server: conn={d} h2 started background tasks", .{connection_id});
+    }
+}
+
+fn stopBackgroundTasksIfPresent(comptime Handler: type, handler: *Handler) void {
+    assert(@intFromPtr(handler) != 0);
+    assert(@sizeOf(Handler) >= 0);
+
+    if (comptime @hasDecl(Handler, "stopH2BackgroundTasks")) handler.stopH2BackgroundTasks();
+}
+
+fn bootstrapUpgradedConnection(
+    comptime Handler: type,
+    handler: *Handler,
+    io_conn: *ConnectionIo,
+    io: Io,
+    connection_id: u64,
+    runtime: *runtime_mod.Runtime,
+    response_states: *ResponseStateTable,
+    stream_trackers: *StreamTrackerTable,
+    settings_payload: []const u8,
+) Error!void {
+    assert(@intFromPtr(handler) != 0);
+    assert(settings_payload.len <= config.H2_MAX_FRAME_SIZE_BYTES);
+
+    var settings_buf: [runtime_mod.initial_settings_frame_buffer_size_bytes]u8 = undefined;
+    const initial_settings = try runtime.writeInitialSettingsFrame(&settings_buf);
+    try writeAll(io_conn, io, initial_settings);
+    try runtime.receiveClientPreface();
+    try applyUpgradePeerSettings(
+        Handler,
+        handler,
+        io_conn,
+        io,
+        connection_id,
+        runtime,
+        response_states,
+        stream_trackers,
+        settings_payload,
+    );
+}
+
+fn processUpgradeSyntheticRequestAndBody(
+    comptime Handler: type,
+    handler: *Handler,
+    io_conn: *ConnectionIo,
+    plain_reader: *Io.net.Stream.Reader,
+    io: Io,
+    connection_id: u64,
+    runtime: *runtime_mod.Runtime,
+    response_states: *ResponseStateTable,
+    stream_trackers: *StreamTrackerTable,
+    request: *const Request,
+    settings_payload: []const u8,
+    initial_body: []const u8,
+    remaining_body_bytes: u64,
+) Error!void {
+    assert(@intFromPtr(handler) != 0);
+    assert(@intFromPtr(request) != 0);
+
+    const total_body_bytes: u64 = @as(u64, @intCast(initial_body.len)) + remaining_body_bytes;
+    try applyUpgradeSyntheticHeaders(
+        Handler,
+        handler,
+        io_conn,
+        io,
+        connection_id,
+        runtime,
+        response_states,
+        stream_trackers,
+        request,
+        settings_payload,
+        total_body_bytes,
+    );
+    try processUpgradeBody(
+        Handler,
+        handler,
+        io_conn,
+        plain_reader,
+        io,
+        connection_id,
+        runtime,
+        response_states,
+        stream_trackers,
+        initial_body,
+        remaining_body_bytes,
+    );
+}
+
 pub fn servePlainConnection(comptime Handler: type, handler: *Handler, fd: i32, io: Io, connection_id: u64) Error!void {
+    assert(@intFromPtr(handler) != 0);
+    assert(fd >= 0);
     return servePlainConnectionWithInitialBytes(Handler, handler, fd, io, connection_id, &[_]u8{});
 }
 
 pub fn serveTlsConnection(comptime Handler: type, handler: *Handler, tls_stream: *TLSStream, io: Io, connection_id: u64) Error!void {
+    assert(@intFromPtr(handler) != 0);
+    assert(@intFromPtr(tls_stream) != 0);
     return serveTlsConnectionWithInitialBytes(Handler, handler, tls_stream, io, connection_id, &[_]u8{});
 }
 
@@ -594,6 +973,9 @@ pub fn servePlainConnectionWithInitialBytes(
     connection_id: u64,
     initial_bytes: []const u8,
 ) Error!void {
+    assert(@intFromPtr(handler) != 0);
+    assert(fd >= 0);
+
     return servePlainConnectionWithInitialBytesOptions(
         Handler,
         handler,
@@ -613,6 +995,9 @@ pub fn serveTlsConnectionWithInitialBytes(
     connection_id: u64,
     initial_bytes: []const u8,
 ) Error!void {
+    assert(@intFromPtr(handler) != 0);
+    assert(@intFromPtr(tls_stream) != 0);
+
     return serveTlsConnectionWithInitialBytesOptions(
         Handler,
         handler,
@@ -634,6 +1019,7 @@ pub fn servePlainConnectionWithInitialBytesOptions(
     options: PlainConnectionOptions,
 ) Error!void {
     assert(fd >= 0);
+    assert(@intFromPtr(handler) != 0);
     var io_conn = ConnectionIo.initPlain(fd);
     return serveConnectionWithInitialBytesOptions(
         Handler,
@@ -656,6 +1042,7 @@ pub fn serveTlsConnectionWithInitialBytesOptions(
     options: PlainConnectionOptions,
 ) Error!void {
     assert(@intFromPtr(tls_stream) != 0);
+    assert(@intFromPtr(handler) != 0);
     var io_conn = ConnectionIo.initTls(tls_stream);
     return serveConnectionWithInitialBytesOptions(
         Handler,
@@ -689,54 +1076,27 @@ fn serveConnectionWithInitialBytesOptions(
     var connection_mutex: Io.Mutex = .init;
     var plain_read_buf: [config.STREAM_READ_BUFFER_SIZE_BYTES]u8 = undefined;
     var plain_reader: Io.net.Stream.Reader = undefined;
-    var maybe_plain_reader: ?*Io.net.Stream.Reader = null;
-    switch (io_conn.*) {
-        .plain_fd => |fd| {
-            plain_reader = rawStreamForFd(fd).reader(io, &plain_read_buf);
-            maybe_plain_reader = &plain_reader;
-        },
-        .tls_stream => {},
-    }
+    const maybe_plain_reader = initMaybePlainReader(io_conn, io, &plain_read_buf, &plain_reader);
 
     log.debug("server: conn={d} h2 server driver start initial_bytes={d} settings_already_sent={}", .{
         connection_id,
         initial_bytes.len,
         options.local_settings_already_sent,
     });
-
-    if (options.local_settings_already_sent) {
-        try runtime.state.markLocalSettingsSent();
-    } else {
-        log.debug("server: conn={d} h2 building initial settings frame", .{connection_id});
-        var settings_buf: [runtime_mod.initial_settings_frame_buffer_size_bytes]u8 = undefined;
-        const initial_settings = try runtime.writeInitialSettingsFrame(&settings_buf);
-        log.debug("server: conn={d} h2 writing initial settings bytes={d} fd={d}", .{
-            connection_id,
-            initial_settings.len,
-            connectionIoFd(io_conn),
-        });
-        writeAll(io_conn, io, initial_settings) catch |err| {
-            log.warn("server: conn={d} h2 initial settings write failed: {s}", .{
-                connection_id,
-                @errorName(err),
-            });
-            return err;
-        };
-        log.debug("server: conn={d} h2 sent initial settings bytes={d}", .{ connection_id, initial_settings.len });
-    }
+    try sendInitialServerSettings(io_conn, io, connection_id, &runtime, options.local_settings_already_sent);
 
     var recv_buf: [read_buffer_size_bytes]u8 = undefined;
-    var buffer_len: usize = 0;
-    if (initial_bytes.len > 0) {
-        @memcpy(recv_buf[0..initial_bytes.len], initial_bytes);
-        buffer_len = initial_bytes.len;
-    }
-
-    try fillBuffer(io_conn, maybe_plain_reader, io, &recv_buf, &buffer_len, h2.client_connection_preface.len);
-    if (!h2.looksLikeClientConnectionPreface(recv_buf[0..buffer_len])) return error.InvalidPreface;
-    try runtime.receiveClientPreface();
-    discardPrefix(&recv_buf, &buffer_len, h2.client_connection_preface.len);
-    log.debug("server: conn={d} h2 consumed client preface buffered_bytes={d}", .{ connection_id, buffer_len });
+    var buffer_len: usize = undefined;
+    initReceiveBuffer(&recv_buf, &buffer_len, initial_bytes);
+    try consumeClientPrefaceFromBuffer(
+        io_conn,
+        maybe_plain_reader,
+        io,
+        &runtime,
+        &recv_buf,
+        &buffer_len,
+        connection_id,
+    );
 
     var background_writer = ResponseWriter{
         .io_conn = io_conn,
@@ -747,153 +1107,103 @@ fn serveConnectionWithInitialBytesOptions(
         .states = &response_states,
         .stream_trackers = &stream_trackers,
     };
-    if (comptime @hasDecl(Handler, "startH2BackgroundTasks")) {
-        log.debug("server: conn={d} h2 starting background tasks", .{connection_id});
-        handler.startH2BackgroundTasks(&background_writer, &connection_mutex);
-        log.debug("server: conn={d} h2 started background tasks", .{connection_id});
-    }
-    defer if (comptime @hasDecl(Handler, "stopH2BackgroundTasks")) {
-        handler.stopH2BackgroundTasks();
-    };
+    startBackgroundTasksIfPresent(Handler, handler, &background_writer, &connection_mutex, connection_id);
+    defer stopBackgroundTasksIfPresent(Handler, handler);
 
-    var frame_count: u32 = 0;
-    while (frame_count < config.H2_SERVER_MAX_FRAME_COUNT) {
-        log.debug("server: conn={d} h2 waiting for frame frame_count={d} buffered_bytes={d}", .{
-            connection_id,
-            frame_count,
-            buffer_len,
-        });
-        const have_frame = ensureFrame(io_conn, maybe_plain_reader, io, &recv_buf, &buffer_len) catch |err| {
-            try sendRuntimeErrorGoAway(&runtime, io_conn, io, runtime.state.local_goaway_last_stream_id, err);
-            closeAllTrackedStreams(
-                Handler,
-                handler,
-                connection_id,
-                &stream_trackers,
-                .connection_close,
-                @intFromEnum(mapGoAwayError(err)),
-            );
-            return err;
-        };
-        if (!have_frame) {
-            log.debug("server: conn={d} h2 peer closed before next frame", .{connection_id});
-            closeAllTrackedStreams(Handler, handler, connection_id, &stream_trackers, .connection_close, 0);
-            return;
-        }
-        frame_count += 1;
-
-        connection_mutex.lockUncancelable(io);
-        defer connection_mutex.unlock(io);
-
-        const header = h2.parseFrameHeader(recv_buf[0..h2.frame_header_size_bytes]) catch |err| {
-            try sendRuntimeErrorGoAway(&runtime, io_conn, io, runtime.state.local_goaway_last_stream_id, err);
-            closeAllTrackedStreams(
-                Handler,
-                handler,
-                connection_id,
-                &stream_trackers,
-                .connection_close,
-                @intFromEnum(mapGoAwayError(err)),
-            );
-            return err;
-        };
-        const frame_len: usize = h2.frame_header_size_bytes + header.length;
-        try fillBuffer(io_conn, maybe_plain_reader, io, &recv_buf, &buffer_len, frame_len);
-        log.debug("server: conn={d} h2 parsed frame count={d} type={s} stream={d} flags=0x{x} payload_bytes={d} buffered_bytes={d}", .{
-            connection_id,
-            frame_count,
-            @tagName(header.frame_type),
-            header.stream_id,
-            header.flags,
-            header.length,
-            buffer_len,
-        });
-
-        const payload = recv_buf[h2.frame_header_size_bytes..frame_len];
-        const action = runtime.receiveFrame(header, payload) catch |err| {
-            if (try tryHandleRecoverableStreamError(
-                Handler,
-                handler,
-                io_conn,
-                io,
-                connection_id,
-                &runtime,
-                &response_states,
-                &stream_trackers,
-                header,
-                err,
-            )) {
-                discardPrefix(&recv_buf, &buffer_len, frame_len);
-                continue;
-            }
-
-            logRuntimeFrameError(connection_id, header, err);
-            try sendRuntimeErrorGoAway(&runtime, io_conn, io, header.stream_id, err);
-            closeAllTrackedStreams(
-                Handler,
-                handler,
-                connection_id,
-                &stream_trackers,
-                .connection_close,
-                @intFromEnum(mapGoAwayError(err)),
-            );
-            return err;
-        };
-        log.debug("server: conn={d} h2 runtime action={s} frame_type={s} stream={d}", .{
-            connection_id,
-            @tagName(action),
-            @tagName(header.frame_type),
-            header.stream_id,
-        });
-        handleAction(Handler, handler, io_conn, io, connection_id, &runtime, &response_states, &stream_trackers, action) catch |err| {
-            closeAllTrackedStreams(
-                Handler,
-                handler,
-                connection_id,
-                &stream_trackers,
-                .connection_close,
-                @intFromEnum(mapGoAwayError(err)),
-            );
-            return err;
-        };
-
-        flushPendingResponseData(&runtime, io_conn, io, &response_states, &stream_trackers) catch |err| {
-            closeAllTrackedStreams(
-                Handler,
-                handler,
-                connection_id,
-                &stream_trackers,
-                .connection_close,
-                @intFromEnum(mapGoAwayError(err)),
-            );
-            return err;
-        };
-        closeCompletedStreams(Handler, handler, connection_id, &stream_trackers);
-
-        discardPrefix(&recv_buf, &buffer_len, frame_len);
-
-        if (action == .connection_close) return;
-    }
-
-    var goaway_buf: [frame_buffer_size_bytes]u8 = undefined;
-    const goaway = try runtime.writeGoAwayFrame(&goaway_buf, .{
-        .last_stream_id = runtime.state.local_goaway_last_stream_id,
-        .error_code_raw = @intFromEnum(h2.ErrorCode.enhance_your_calm),
-        .debug_data = "frame_limit",
-    });
-    writeAll(io_conn, io, goaway) catch |write_err| switch (write_err) {
-        error.ConnectionClosed => {},
-        else => {},
-    };
-    closeAllTrackedStreams(
+    try runConnectionFrameLoop(
         Handler,
         handler,
+        io_conn,
+        maybe_plain_reader,
+        io,
         connection_id,
+        &runtime,
+        &response_states,
         &stream_trackers,
-        .connection_close,
-        @intFromEnum(h2.ErrorCode.enhance_your_calm),
+        &connection_mutex,
+        &recv_buf,
+        &buffer_len,
     );
-    return error.FrameLimitExceeded;
+}
+
+fn applyUpgradePeerSettings(
+    comptime Handler: type,
+    handler: *Handler,
+    io_conn: *ConnectionIo,
+    io: Io,
+    connection_id: u64,
+    runtime: *runtime_mod.Runtime,
+    response_states: *ResponseStateTable,
+    stream_trackers: *StreamTrackerTable,
+    settings_payload: []const u8,
+) Error!void {
+    assert(@intFromPtr(handler) != 0);
+    assert(settings_payload.len <= config.H2_MAX_FRAME_SIZE_BYTES);
+
+    const peer_settings_header = h2.FrameHeader{
+        .length = @intCast(settings_payload.len),
+        .frame_type = .settings,
+        .flags = 0,
+        .stream_id = 0,
+    };
+    const peer_settings_action = runtime.receiveFrame(peer_settings_header, settings_payload) catch |err| {
+        try sendRuntimeErrorGoAway(runtime, io_conn, io, 0, err);
+        closeTrackedStreamsForFatalError(Handler, handler, connection_id, stream_trackers, err);
+        return err;
+    };
+    handleAction(Handler, handler, io_conn, io, connection_id, runtime, response_states, stream_trackers, peer_settings_action) catch |err| {
+        closeTrackedStreamsForFatalError(Handler, handler, connection_id, stream_trackers, err);
+        return err;
+    };
+    try flushPendingResponseData(runtime, io_conn, io, response_states, stream_trackers);
+    closeCompletedStreams(Handler, handler, connection_id, stream_trackers);
+}
+
+fn applyUpgradeSyntheticHeaders(
+    comptime Handler: type,
+    handler: *Handler,
+    io_conn: *ConnectionIo,
+    io: Io,
+    connection_id: u64,
+    runtime: *runtime_mod.Runtime,
+    response_states: *ResponseStateTable,
+    stream_trackers: *StreamTrackerTable,
+    request: *const Request,
+    settings_payload: []const u8,
+    total_body_bytes: u64,
+) Error!void {
+    assert(@intFromPtr(handler) != 0);
+    assert(@intFromPtr(request) != 0);
+
+    var preamble_buf: [upgrade_preamble_size_bytes]u8 = undefined;
+    const preamble = try h2.buildPriorKnowledgePreambleFromUpgrade(
+        &preamble_buf,
+        request,
+        null,
+        settings_payload,
+        total_body_bytes == 0,
+    );
+
+    var cursor: usize = h2.client_connection_preface.len;
+    const preamble_settings_header = try h2.parseFrameHeader(preamble[cursor..]);
+    if (preamble_settings_header.frame_type != .settings) return error.InvalidFrame;
+    cursor += h2.frame_header_size_bytes + preamble_settings_header.length;
+    if (cursor + h2.frame_header_size_bytes > preamble.len) return error.InvalidFrame;
+
+    const headers_header = try h2.parseFrameHeader(preamble[cursor..]);
+    if (headers_header.frame_type != .headers) return error.InvalidFrame;
+    const headers_payload_start = cursor + h2.frame_header_size_bytes;
+    const headers_payload_end = headers_payload_start + headers_header.length;
+    if (headers_payload_end > preamble.len) return error.InvalidFrame;
+
+    const headers_action = runtime.receiveFrame(headers_header, preamble[headers_payload_start..headers_payload_end]) catch |err| {
+        try sendRuntimeErrorGoAway(runtime, io_conn, io, headers_header.stream_id, err);
+        closeTrackedStreamsForFatalError(Handler, handler, connection_id, stream_trackers, err);
+        return err;
+    };
+    try handleAction(Handler, handler, io_conn, io, connection_id, runtime, response_states, stream_trackers, headers_action);
+    try flushPendingResponseData(runtime, io_conn, io, response_states, stream_trackers);
+    closeCompletedStreams(Handler, handler, connection_id, stream_trackers);
 }
 
 pub fn serveUpgradedConnection(
@@ -924,43 +1234,7 @@ pub fn serveUpgradedConnection(
     var response_states = ResponseStateTable{};
     var stream_trackers = StreamTrackerTable{};
     var connection_mutex: Io.Mutex = .init;
-    var settings_buf: [runtime_mod.initial_settings_frame_buffer_size_bytes]u8 = undefined;
-    const initial_settings = try runtime.writeInitialSettingsFrame(&settings_buf);
-    try writeAll(&io_conn, io, initial_settings);
-
-    try runtime.receiveClientPreface();
-
-    const peer_settings_header = h2.FrameHeader{
-        .length = @intCast(settings_payload.len),
-        .frame_type = .settings,
-        .flags = 0,
-        .stream_id = 0,
-    };
-    const peer_settings_action = runtime.receiveFrame(peer_settings_header, settings_payload) catch |err| {
-        try sendRuntimeErrorGoAway(&runtime, &io_conn, io, 0, err);
-        closeAllTrackedStreams(
-            Handler,
-            handler,
-            connection_id,
-            &stream_trackers,
-            .connection_close,
-            @intFromEnum(mapGoAwayError(err)),
-        );
-        return err;
-    };
-    handleAction(Handler, handler, &io_conn, io, connection_id, &runtime, &response_states, &stream_trackers, peer_settings_action) catch |err| {
-        closeAllTrackedStreams(
-            Handler,
-            handler,
-            connection_id,
-            &stream_trackers,
-            .connection_close,
-            @intFromEnum(mapGoAwayError(err)),
-        );
-        return err;
-    };
-    try flushPendingResponseData(&runtime, &io_conn, io, &response_states, &stream_trackers);
-    closeCompletedStreams(Handler, handler, connection_id, &stream_trackers);
+    try bootstrapUpgradedConnection(Handler, handler, &io_conn, io, connection_id, &runtime, &response_states, &stream_trackers, settings_payload);
 
     var background_writer = ResponseWriter{
         .io_conn = &io_conn,
@@ -971,63 +1245,10 @@ pub fn serveUpgradedConnection(
         .states = &response_states,
         .stream_trackers = &stream_trackers,
     };
-    if (comptime @hasDecl(Handler, "startH2BackgroundTasks")) {
-        handler.startH2BackgroundTasks(&background_writer, &connection_mutex);
-    }
-    defer if (comptime @hasDecl(Handler, "stopH2BackgroundTasks")) {
-        handler.stopH2BackgroundTasks();
-    };
+    startBackgroundTasksIfPresent(Handler, handler, &background_writer, &connection_mutex, connection_id);
+    defer stopBackgroundTasksIfPresent(Handler, handler);
 
-    const total_body_bytes: u64 = @as(u64, @intCast(initial_body.len)) + remaining_body_bytes;
-    var preamble_buf: [upgrade_preamble_size_bytes]u8 = undefined;
-    const preamble = try h2.buildPriorKnowledgePreambleFromUpgrade(
-        &preamble_buf,
-        request,
-        null,
-        settings_payload,
-        total_body_bytes == 0,
-    );
-
-    var cursor: usize = h2.client_connection_preface.len;
-    const preamble_settings_header = try h2.parseFrameHeader(preamble[cursor..]);
-    if (preamble_settings_header.frame_type != .settings) return error.InvalidFrame;
-    cursor += h2.frame_header_size_bytes + preamble_settings_header.length;
-
-    if (cursor + h2.frame_header_size_bytes > preamble.len) return error.InvalidFrame;
-    const headers_header = try h2.parseFrameHeader(preamble[cursor..]);
-    if (headers_header.frame_type != .headers) return error.InvalidFrame;
-
-    const headers_payload_start = cursor + h2.frame_header_size_bytes;
-    const headers_payload_end = headers_payload_start + headers_header.length;
-    if (headers_payload_end > preamble.len) return error.InvalidFrame;
-
-    const headers_action = runtime.receiveFrame(headers_header, preamble[headers_payload_start..headers_payload_end]) catch |err| {
-        try sendRuntimeErrorGoAway(&runtime, &io_conn, io, headers_header.stream_id, err);
-        closeAllTrackedStreams(
-            Handler,
-            handler,
-            connection_id,
-            &stream_trackers,
-            .connection_close,
-            @intFromEnum(mapGoAwayError(err)),
-        );
-        return err;
-    };
-    handleAction(Handler, handler, &io_conn, io, connection_id, &runtime, &response_states, &stream_trackers, headers_action) catch |err| {
-        closeAllTrackedStreams(
-            Handler,
-            handler,
-            connection_id,
-            &stream_trackers,
-            .connection_close,
-            @intFromEnum(mapGoAwayError(err)),
-        );
-        return err;
-    };
-    try flushPendingResponseData(&runtime, &io_conn, io, &response_states, &stream_trackers);
-    closeCompletedStreams(Handler, handler, connection_id, &stream_trackers);
-
-    processUpgradeBody(
+    try runUpgradedBodyAndFrameLoop(
         Handler,
         handler,
         &io_conn,
@@ -1037,149 +1258,77 @@ pub fn serveUpgradedConnection(
         &runtime,
         &response_states,
         &stream_trackers,
+        request,
+        settings_payload,
+        initial_body,
+        remaining_body_bytes,
+        &connection_mutex,
+        initial_client_h2_bytes,
+    );
+}
+
+fn runUpgradedBodyAndFrameLoop(
+    comptime Handler: type,
+    handler: *Handler,
+    io_conn: *ConnectionIo,
+    plain_reader: *Io.net.Stream.Reader,
+    io: Io,
+    connection_id: u64,
+    runtime: *runtime_mod.Runtime,
+    response_states: *ResponseStateTable,
+    stream_trackers: *StreamTrackerTable,
+    request: *const Request,
+    settings_payload: []const u8,
+    initial_body: []const u8,
+    remaining_body_bytes: u64,
+    connection_mutex: *Io.Mutex,
+    initial_client_h2_bytes: []const u8,
+) Error!void {
+    assert(@intFromPtr(handler) != 0);
+    assert(@intFromPtr(request) != 0);
+    assert(initial_client_h2_bytes.len <= read_buffer_size_bytes);
+
+    processUpgradeSyntheticRequestAndBody(
+        Handler,
+        handler,
+        io_conn,
+        plain_reader,
+        io,
+        connection_id,
+        runtime,
+        response_states,
+        stream_trackers,
+        request,
+        settings_payload,
         initial_body,
         remaining_body_bytes,
     ) catch |err| {
-        closeAllTrackedStreams(
-            Handler,
-            handler,
-            connection_id,
-            &stream_trackers,
-            .connection_close,
-            @intFromEnum(mapGoAwayError(err)),
-        );
+        closeTrackedStreamsForFatalError(Handler, handler, connection_id, stream_trackers, err);
         return err;
     };
 
     var recv_buf: [read_buffer_size_bytes]u8 = undefined;
-    var buffer_len: usize = 0;
-    if (initial_client_h2_bytes.len > 0) {
-        @memcpy(recv_buf[0..initial_client_h2_bytes.len], initial_client_h2_bytes);
-        buffer_len = initial_client_h2_bytes.len;
-    }
-
-    consumeOptionalUpgradeClientPreface(&io_conn, &plain_reader, io, &recv_buf, &buffer_len) catch |err| {
-        try sendRuntimeErrorGoAway(&runtime, &io_conn, io, 0, err);
-        closeAllTrackedStreams(Handler, handler, connection_id, &stream_trackers, .connection_close, @intFromEnum(mapGoAwayError(err)));
+    var buffer_len: usize = undefined;
+    initReceiveBuffer(&recv_buf, &buffer_len, initial_client_h2_bytes);
+    consumeOptionalUpgradeClientPreface(io_conn, plain_reader, io, &recv_buf, &buffer_len) catch |err| {
+        try sendRuntimeErrorGoAway(runtime, io_conn, io, 0, err);
+        closeTrackedStreamsForFatalError(Handler, handler, connection_id, stream_trackers, err);
         return err;
     };
-
-    var frame_count: u32 = 0;
-    while (frame_count < config.H2_SERVER_MAX_FRAME_COUNT) : (frame_count += 1) {
-        const have_frame = ensureFrame(&io_conn, &plain_reader, io, &recv_buf, &buffer_len) catch |err| {
-            try sendRuntimeErrorGoAway(&runtime, &io_conn, io, runtime.state.local_goaway_last_stream_id, err);
-            closeAllTrackedStreams(
-                Handler,
-                handler,
-                connection_id,
-                &stream_trackers,
-                .connection_close,
-                @intFromEnum(mapGoAwayError(err)),
-            );
-            return err;
-        };
-        if (!have_frame) {
-            closeAllTrackedStreams(Handler, handler, connection_id, &stream_trackers, .connection_close, 0);
-            return;
-        }
-
-        connection_mutex.lockUncancelable(io);
-        defer connection_mutex.unlock(io);
-
-        const header = h2.parseFrameHeader(recv_buf[0..h2.frame_header_size_bytes]) catch |err| {
-            try sendRuntimeErrorGoAway(&runtime, &io_conn, io, runtime.state.local_goaway_last_stream_id, err);
-            closeAllTrackedStreams(
-                Handler,
-                handler,
-                connection_id,
-                &stream_trackers,
-                .connection_close,
-                @intFromEnum(mapGoAwayError(err)),
-            );
-            return err;
-        };
-        const frame_len: usize = h2.frame_header_size_bytes + header.length;
-        try fillBuffer(&io_conn, &plain_reader, io, &recv_buf, &buffer_len, frame_len);
-
-        const payload = recv_buf[h2.frame_header_size_bytes..frame_len];
-        const action = runtime.receiveFrame(header, payload) catch |err| {
-            if (try tryHandleRecoverableStreamError(
-                Handler,
-                handler,
-                &io_conn,
-                io,
-                connection_id,
-                &runtime,
-                &response_states,
-                &stream_trackers,
-                header,
-                err,
-            )) {
-                discardPrefix(&recv_buf, &buffer_len, frame_len);
-                continue;
-            }
-
-            logRuntimeFrameError(connection_id, header, err);
-            try sendRuntimeErrorGoAway(&runtime, &io_conn, io, header.stream_id, err);
-            closeAllTrackedStreams(
-                Handler,
-                handler,
-                connection_id,
-                &stream_trackers,
-                .connection_close,
-                @intFromEnum(mapGoAwayError(err)),
-            );
-            return err;
-        };
-        handleAction(Handler, handler, &io_conn, io, connection_id, &runtime, &response_states, &stream_trackers, action) catch |err| {
-            closeAllTrackedStreams(
-                Handler,
-                handler,
-                connection_id,
-                &stream_trackers,
-                .connection_close,
-                @intFromEnum(mapGoAwayError(err)),
-            );
-            return err;
-        };
-
-        flushPendingResponseData(&runtime, &io_conn, io, &response_states, &stream_trackers) catch |err| {
-            closeAllTrackedStreams(
-                Handler,
-                handler,
-                connection_id,
-                &stream_trackers,
-                .connection_close,
-                @intFromEnum(mapGoAwayError(err)),
-            );
-            return err;
-        };
-        closeCompletedStreams(Handler, handler, connection_id, &stream_trackers);
-
-        discardPrefix(&recv_buf, &buffer_len, frame_len);
-
-        if (action == .connection_close) return;
-    }
-
-    var goaway_buf: [frame_buffer_size_bytes]u8 = undefined;
-    const goaway = try runtime.writeGoAwayFrame(&goaway_buf, .{
-        .last_stream_id = runtime.state.local_goaway_last_stream_id,
-        .error_code_raw = @intFromEnum(h2.ErrorCode.enhance_your_calm),
-        .debug_data = "frame_limit",
-    });
-    writeAll(&io_conn, io, goaway) catch |write_err| switch (write_err) {
-        error.ConnectionClosed => {},
-        else => {},
-    };
-    closeAllTrackedStreams(
+    try runConnectionFrameLoop(
         Handler,
         handler,
+        io_conn,
+        plain_reader,
+        io,
         connection_id,
-        &stream_trackers,
-        .connection_close,
-        @intFromEnum(h2.ErrorCode.enhance_your_calm),
+        runtime,
+        response_states,
+        stream_trackers,
+        connection_mutex,
+        &recv_buf,
+        &buffer_len,
     );
-    return error.FrameLimitExceeded;
 }
 
 fn handleAction(
@@ -1195,152 +1344,259 @@ fn handleAction(
 ) Error!void {
     assert(@intFromPtr(handler) != 0);
     assert(@intFromPtr(io_conn) != 0);
+    assert(@intFromPtr(runtime) != 0);
     assert(@intFromPtr(stream_trackers) != 0);
 
     switch (action) {
         .none => {},
-        .send_settings_ack => {
-            log.debug("server: conn={d} h2 sending settings ack", .{connection_id});
-            var ack_buf: [h2.frame_header_size_bytes]u8 = undefined;
-            const ack = try runtime.writePendingSettingsAck(&ack_buf);
-            try writeAll(io_conn, io, ack);
-        },
-        .send_ping_ack => |opaque_data| {
-            log.debug("server: conn={d} h2 sending ping ack", .{connection_id});
-            var ack_buf: [h2.frame_header_size_bytes + h2.control.ping_payload_size_bytes]u8 = undefined;
-            const ack = try runtime_mod.Runtime.writePingAckFrame(&ack_buf, opaque_data);
-            try writeAll(io_conn, io, ack);
-        },
-        .request_headers => |headers| {
-            log.debug("server: conn={d} h2 dispatch request headers stream={d} end_stream={} method={s} path={s}", .{
-                connection_id,
-                headers.stream_id,
-                headers.end_stream,
-                @tagName(headers.request.method),
-                headers.request.path,
-            });
-            const opened = try stream_trackers.markRequestHeaders(headers.stream_id, headers.end_stream);
-            if (opened) {
-                if (comptime @hasDecl(Handler, "handleH2StreamOpen")) {
-                    handler.handleH2StreamOpen(headers.stream_id, &headers.request);
-                }
-            }
+        .send_settings_ack => try handleSendSettingsAckAction(io_conn, io, connection_id, runtime),
+        .send_ping_ack => |opaque_data| try handleSendPingAckAction(io_conn, io, connection_id, opaque_data),
+        .request_headers => |headers| try handleRequestHeadersAction(
+            Handler,
+            handler,
+            io_conn,
+            io,
+            connection_id,
+            runtime,
+            response_states,
+            stream_trackers,
+            headers,
+        ),
+        .request_data => |data| try handleRequestDataAction(
+            Handler,
+            handler,
+            io_conn,
+            io,
+            connection_id,
+            runtime,
+            response_states,
+            stream_trackers,
+            data,
+        ),
+        .stream_reset => |reset| handleStreamResetAction(
+            Handler,
+            handler,
+            connection_id,
+            response_states,
+            stream_trackers,
+            reset,
+        ),
+        .connection_close => |goaway| handleConnectionCloseAction(
+            Handler,
+            handler,
+            connection_id,
+            stream_trackers,
+            goaway,
+        ),
+    }
+}
 
-            var writer = ResponseWriter{
-                .io_conn = io_conn,
-                .io = io,
-                .connection_id = connection_id,
-                .stream_id = headers.stream_id,
-                .runtime = runtime,
-                .states = response_states,
-                .stream_trackers = stream_trackers,
-            };
-            handler.handleH2Headers(headers.stream_id, &headers.request, headers.end_stream, &writer) catch |err| {
-                const reset_error_code_raw = mapHandlerErrorToResetCodeRaw(err);
-                log.debug(
-                    "server: conn={d} h2 request headers handler failed stream={d} err={s} reset=0x{x}",
-                    .{
-                        connection_id,
-                        headers.stream_id,
-                        @errorName(err),
-                        reset_error_code_raw,
-                    },
-                );
-                response_states.remove(headers.stream_id);
-                closeStreamWithReason(
-                    Handler,
-                    handler,
-                    connection_id,
-                    stream_trackers,
-                    headers.stream_id,
-                    .local_reset,
-                    reset_error_code_raw,
-                );
-                try sendErrorReset(io_conn, io, runtime, headers.stream_id, reset_error_code_raw);
-            };
-            closeCompletedStreams(Handler, handler, connection_id, stream_trackers);
-        },
-        .request_data => |data| {
-            log.debug("server: conn={d} h2 dispatch request data stream={d} payload_bytes={d} end_stream={}", .{
-                connection_id,
-                data.stream_id,
-                data.payload.len,
-                data.end_stream,
-            });
-            try stream_trackers.markRequestData(data.stream_id, data.payload.len, data.end_stream);
-            try replenishReceiveWindows(io_conn, io, runtime, data.stream_id, data.payload.len);
+fn handleSendSettingsAckAction(
+    io_conn: *ConnectionIo,
+    io: Io,
+    connection_id: u64,
+    runtime: *runtime_mod.Runtime,
+) Error!void {
+    assert(@intFromPtr(io_conn) != 0);
+    assert(@intFromPtr(runtime) != 0);
 
-            var writer = ResponseWriter{
-                .io_conn = io_conn,
-                .io = io,
-                .connection_id = connection_id,
-                .stream_id = data.stream_id,
-                .runtime = runtime,
-                .states = response_states,
-                .stream_trackers = stream_trackers,
-            };
-            handler.handleH2Data(data.stream_id, data.payload, data.end_stream, &writer) catch |err| {
-                const reset_error_code_raw = mapHandlerErrorToResetCodeRaw(err);
-                log.debug(
-                    "server: conn={d} h2 request data handler failed stream={d} err={s} reset=0x{x}",
-                    .{
-                        connection_id,
-                        data.stream_id,
-                        @errorName(err),
-                        reset_error_code_raw,
-                    },
-                );
-                response_states.remove(data.stream_id);
-                closeStreamWithReason(
-                    Handler,
-                    handler,
-                    connection_id,
-                    stream_trackers,
-                    data.stream_id,
-                    .local_reset,
-                    reset_error_code_raw,
-                );
-                try sendErrorReset(io_conn, io, runtime, data.stream_id, reset_error_code_raw);
-            };
-            closeCompletedStreams(Handler, handler, connection_id, stream_trackers);
-        },
-        .stream_reset => |reset| {
-            log.debug("server: conn={d} h2 received stream reset stream={d} error_code=0x{x}", .{
-                connection_id,
-                reset.stream_id,
-                reset.error_code_raw,
-            });
-            response_states.remove(reset.stream_id);
-            if (comptime @hasDecl(Handler, "handleH2StreamReset")) {
-                handler.handleH2StreamReset(reset.stream_id, reset.error_code_raw);
-            }
-            closeStreamWithReason(
-                Handler,
-                handler,
-                connection_id,
-                stream_trackers,
-                reset.stream_id,
-                .peer_reset,
-                reset.error_code_raw,
-            );
-        },
-        .connection_close => |goaway| {
-            log.debug("server: conn={d} h2 received goaway last_stream={d} error_code=0x{x}", .{
-                connection_id,
-                goaway.last_stream_id,
-                goaway.error_code_raw,
-            });
-            closeTrackedStreamsForGoAway(
-                Handler,
-                handler,
-                connection_id,
-                stream_trackers,
-                goaway,
-            );
-            if (comptime @hasDecl(Handler, "handleH2ConnectionClose")) {
-                handler.handleH2ConnectionClose(goaway);
-            }
-        },
+    log.debug("server: conn={d} h2 sending settings ack", .{connection_id});
+    var ack_buf: [h2.frame_header_size_bytes]u8 = undefined;
+    const ack = try runtime.writePendingSettingsAck(&ack_buf);
+    try writeAll(io_conn, io, ack);
+}
+
+fn handleSendPingAckAction(
+    io_conn: *ConnectionIo,
+    io: Io,
+    connection_id: u64,
+    opaque_data: [h2.control.ping_payload_size_bytes]u8,
+) Error!void {
+    assert(@intFromPtr(io_conn) != 0);
+    assert(h2.control.ping_payload_size_bytes == 8);
+
+    log.debug("server: conn={d} h2 sending ping ack", .{connection_id});
+    var ack_buf: [h2.frame_header_size_bytes + h2.control.ping_payload_size_bytes]u8 = undefined;
+    const ack = try runtime_mod.Runtime.writePingAckFrame(&ack_buf, opaque_data);
+    try writeAll(io_conn, io, ack);
+}
+
+fn makeResponseWriter(
+    io_conn: *ConnectionIo,
+    io: Io,
+    connection_id: u64,
+    stream_id: u32,
+    runtime: *runtime_mod.Runtime,
+    response_states: *ResponseStateTable,
+    stream_trackers: *StreamTrackerTable,
+) ResponseWriter {
+    assert(@intFromPtr(io_conn) != 0);
+    assert(@intFromPtr(runtime) != 0);
+    assert(stream_id > 0);
+
+    return .{
+        .io_conn = io_conn,
+        .io = io,
+        .connection_id = connection_id,
+        .stream_id = stream_id,
+        .runtime = runtime,
+        .states = response_states,
+        .stream_trackers = stream_trackers,
+    };
+}
+
+fn handleRequestHeadersAction(
+    comptime Handler: type,
+    handler: *Handler,
+    io_conn: *ConnectionIo,
+    io: Io,
+    connection_id: u64,
+    runtime: *runtime_mod.Runtime,
+    response_states: *ResponseStateTable,
+    stream_trackers: *StreamTrackerTable,
+    headers: runtime_mod.RequestHeadersAction,
+) Error!void {
+    assert(@intFromPtr(handler) != 0);
+    assert(headers.stream_id > 0);
+
+    log.debug("server: conn={d} h2 dispatch request headers stream={d} end_stream={} method={s} path={s}", .{
+        connection_id,
+        headers.stream_id,
+        headers.end_stream,
+        @tagName(headers.request.method),
+        headers.request.path,
+    });
+    const opened = try stream_trackers.markRequestHeaders(headers.stream_id, headers.end_stream);
+    if (opened and comptime @hasDecl(Handler, "handleH2StreamOpen")) {
+        handler.handleH2StreamOpen(headers.stream_id, &headers.request);
+    }
+
+    var writer = makeResponseWriter(io_conn, io, connection_id, headers.stream_id, runtime, response_states, stream_trackers);
+    handler.handleH2Headers(headers.stream_id, &headers.request, headers.end_stream, &writer) catch |err| {
+        try handleHandlerFailure(Handler, handler, io_conn, io, connection_id, runtime, response_states, stream_trackers, headers.stream_id, "headers", err);
+    };
+    closeCompletedStreams(Handler, handler, connection_id, stream_trackers);
+}
+
+fn handleRequestDataAction(
+    comptime Handler: type,
+    handler: *Handler,
+    io_conn: *ConnectionIo,
+    io: Io,
+    connection_id: u64,
+    runtime: *runtime_mod.Runtime,
+    response_states: *ResponseStateTable,
+    stream_trackers: *StreamTrackerTable,
+    data: runtime_mod.RequestDataAction,
+) Error!void {
+    assert(@intFromPtr(handler) != 0);
+    assert(data.stream_id > 0);
+
+    log.debug("server: conn={d} h2 dispatch request data stream={d} payload_bytes={d} end_stream={}", .{
+        connection_id,
+        data.stream_id,
+        data.payload.len,
+        data.end_stream,
+    });
+    try stream_trackers.markRequestData(data.stream_id, data.payload.len, data.end_stream);
+    try replenishReceiveWindows(io_conn, io, runtime, data.stream_id, data.payload.len);
+
+    var writer = makeResponseWriter(io_conn, io, connection_id, data.stream_id, runtime, response_states, stream_trackers);
+    handler.handleH2Data(data.stream_id, data.payload, data.end_stream, &writer) catch |err| {
+        try handleHandlerFailure(Handler, handler, io_conn, io, connection_id, runtime, response_states, stream_trackers, data.stream_id, "data", err);
+    };
+    closeCompletedStreams(Handler, handler, connection_id, stream_trackers);
+}
+
+fn handleHandlerFailure(
+    comptime Handler: type,
+    handler: *Handler,
+    io_conn: *ConnectionIo,
+    io: Io,
+    connection_id: u64,
+    runtime: *runtime_mod.Runtime,
+    response_states: *ResponseStateTable,
+    stream_trackers: *StreamTrackerTable,
+    stream_id: u32,
+    phase: []const u8,
+    err: anyerror,
+) Error!void {
+    assert(@intFromPtr(handler) != 0);
+    assert(stream_id > 0);
+
+    const reset_error_code_raw = mapHandlerErrorToResetCodeRaw(err);
+    log.debug(
+        "server: conn={d} h2 request {s} handler failed stream={d} err={s} reset=0x{x}",
+        .{ connection_id, phase, stream_id, @errorName(err), reset_error_code_raw },
+    );
+    response_states.remove(stream_id);
+    closeStreamWithReason(
+        Handler,
+        handler,
+        connection_id,
+        stream_trackers,
+        stream_id,
+        .local_reset,
+        reset_error_code_raw,
+    );
+    try sendErrorReset(io_conn, io, runtime, stream_id, reset_error_code_raw);
+}
+
+fn handleStreamResetAction(
+    comptime Handler: type,
+    handler: *Handler,
+    connection_id: u64,
+    response_states: *ResponseStateTable,
+    stream_trackers: *StreamTrackerTable,
+    reset: runtime_mod.StreamResetAction,
+) void {
+    assert(@intFromPtr(handler) != 0);
+    assert(reset.stream_id > 0);
+
+    log.debug("server: conn={d} h2 received stream reset stream={d} error_code=0x{x}", .{
+        connection_id,
+        reset.stream_id,
+        reset.error_code_raw,
+    });
+    response_states.remove(reset.stream_id);
+    if (comptime @hasDecl(Handler, "handleH2StreamReset")) {
+        handler.handleH2StreamReset(reset.stream_id, reset.error_code_raw);
+    }
+    closeStreamWithReason(
+        Handler,
+        handler,
+        connection_id,
+        stream_trackers,
+        reset.stream_id,
+        .peer_reset,
+        reset.error_code_raw,
+    );
+}
+
+fn handleConnectionCloseAction(
+    comptime Handler: type,
+    handler: *Handler,
+    connection_id: u64,
+    stream_trackers: *StreamTrackerTable,
+    goaway: h2.GoAway,
+) void {
+    assert(@intFromPtr(handler) != 0);
+    assert(goaway.last_stream_id <= 0x7fff_ffff);
+
+    log.debug("server: conn={d} h2 received goaway last_stream={d} error_code=0x{x}", .{
+        connection_id,
+        goaway.last_stream_id,
+        goaway.error_code_raw,
+    });
+    closeTrackedStreamsForGoAway(
+        Handler,
+        handler,
+        connection_id,
+        stream_trackers,
+        goaway,
+    );
+    if (comptime @hasDecl(Handler, "handleH2ConnectionClose")) {
+        handler.handleH2ConnectionClose(goaway);
     }
 }
 
@@ -1694,6 +1950,9 @@ fn sendErrorReset(io_conn: *ConnectionIo, io: Io, runtime: *runtime_mod.Runtime,
 }
 
 fn mapHandlerErrorToResetCodeRaw(err: anyerror) u32 {
+    assert(@intFromEnum(h2.ErrorCode.cancel) != 0);
+    assert(@intFromEnum(h2.ErrorCode.internal_error) != 0);
+
     return switch (err) {
         error.UpstreamConnectionClosing,
         error.ConnectionClosing,
@@ -1770,6 +2029,7 @@ fn sendRuntimeErrorGoAway(runtime: *runtime_mod.Runtime, io_conn: *ConnectionIo,
 
 fn logRuntimeFrameError(connection_id: u64, header: h2.FrameHeader, err: anyerror) void {
     assert(header.stream_id <= 0x7fff_ffff);
+    assert(header.length <= config.H2_MAX_FRAME_SIZE_BYTES);
 
     log.warn(
         "h2: conn={d} frame_err frame_type={s} stream_id={d} flags=0x{x} length={d} err={s} goaway={s}",
@@ -1786,6 +2046,9 @@ fn logRuntimeFrameError(connection_id: u64, header: h2.FrameHeader, err: anyerro
 }
 
 fn mapGoAwayError(err: anyerror) h2.ErrorCode {
+    assert(@intFromEnum(h2.ErrorCode.internal_error) != 0);
+    assert(@intFromEnum(h2.ErrorCode.protocol_error) != 0);
+
     return switch (err) {
         error.FrameTooLarge => .frame_size_error,
         error.WindowOverflow,
@@ -1904,6 +2167,7 @@ fn readIntoBuffer(
 
 fn discardPrefix(recv_buf: *[read_buffer_size_bytes]u8, buffer_len: *usize, prefix_len: usize) void {
     assert(prefix_len <= buffer_len.*);
+    assert(buffer_len.* <= recv_buf.len);
 
     if (prefix_len == buffer_len.*) {
         buffer_len.* = 0;
@@ -1964,6 +2228,7 @@ fn readSome(
 
 fn waitUntilReadable(fd: i32, io: Io) anyerror!void {
     assert(fd >= 0);
+    assert(read_max_retry_count > 0);
 
     var messages: [1]Io.net.IncomingMessage = .{Io.net.IncomingMessage.init};
     var peek_buf: [1]u8 = undefined;
@@ -1979,6 +2244,7 @@ fn waitUntilReadable(fd: i32, io: Io) anyerror!void {
 
 fn writeSome(io_conn: *ConnectionIo, io: Io, out: []const u8) Error!usize {
     assert(@intFromPtr(io_conn) != 0);
+    assert(out.len > 0);
 
     return switch (io_conn.*) {
         .plain_fd => |fd| blk: {
@@ -2027,6 +2293,7 @@ fn writeSome(io_conn: *ConnectionIo, io: Io, out: []const u8) Error!usize {
 
 fn rawStreamForFd(fd: i32) Io.net.Stream {
     assert(fd >= 0);
+    assert(fd <= std.math.maxInt(i32));
     return .{
         .socket = .{
             .handle = fd,
@@ -2037,6 +2304,7 @@ fn rawStreamForFd(fd: i32) Io.net.Stream {
 
 fn connectionIoTransportName(io_conn: *const ConnectionIo) []const u8 {
     assert(@intFromPtr(io_conn) != 0);
+    assert(@sizeOf(ConnectionIo) > 0);
 
     return switch (io_conn.*) {
         .plain_fd => "plain",
@@ -2046,6 +2314,7 @@ fn connectionIoTransportName(io_conn: *const ConnectionIo) []const u8 {
 
 fn connectionIoFd(io_conn: *const ConnectionIo) i32 {
     assert(@intFromPtr(io_conn) != 0);
+    assert(@sizeOf(ConnectionIo) > 0);
 
     return switch (io_conn.*) {
         .plain_fd => |fd| fd,
@@ -2055,6 +2324,7 @@ fn connectionIoFd(io_conn: *const ConnectionIo) i32 {
 
 fn writeAll(io_conn: *ConnectionIo, io: Io, data: []const u8) Error!void {
     assert(@intFromPtr(io_conn) != 0);
+    assert(write_max_retry_count > 0);
 
     if (data.len == 0) return;
 

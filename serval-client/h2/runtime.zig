@@ -101,6 +101,8 @@ pub const Runtime = struct {
     pending_response_headers: PendingResponseHeaders = .{},
 
     pub fn init() Error!Runtime {
+        assert(config.H2_CONNECTION_WINDOW_SIZE_BYTES > 0);
+        assert(config.H2_MAX_HEADER_BLOCK_SIZE_BYTES > 0);
         return .{
             .state = try session.SessionState.init(),
             .header_decoder = h2.HpackDecoder.init(),
@@ -137,6 +139,7 @@ pub const Runtime = struct {
 
     pub fn writePingAckFrame(out: []u8, opaque_data: [h2.control.ping_payload_size_bytes]u8) Error![]const u8 {
         assert(out.len >= h2.frame_header_size_bytes + h2.control.ping_payload_size_bytes);
+        assert(h2.control.ping_payload_size_bytes == 8);
         return try h2.buildPingFrame(out, h2.flags_ack, opaque_data);
     }
 
@@ -288,6 +291,7 @@ const ResponseStateTable = struct {
     count: u16 = 0,
 
     fn get(self: *ResponseStateTable, stream_id: u32) ?*ResponseState {
+        assert(@intFromPtr(self) != 0);
         assert(stream_id > 0);
 
         for (self.slots, 0..) |slot, index| {
@@ -298,6 +302,7 @@ const ResponseStateTable = struct {
     }
 
     fn getOrInsert(self: *ResponseStateTable, stream_id: u32) Error!*ResponseState {
+        assert(@intFromPtr(self) != 0);
         assert(stream_id > 0);
 
         if (self.get(stream_id)) |existing| return existing;
@@ -323,6 +328,8 @@ const ResponseStateTable = struct {
     }
 
     fn allocSlot(self: *const ResponseStateTable) ?usize {
+        assert(@intFromPtr(self) != 0);
+        assert(self.count <= config.H2_MAX_CONCURRENT_STREAMS);
         if (self.count >= config.H2_MAX_CONCURRENT_STREAMS) return null;
 
         for (self.slots, 0..) |slot, index| {
@@ -334,6 +341,7 @@ const ResponseStateTable = struct {
 
 fn ensureConnectionReady(self: *const Runtime, frame_type: h2.FrameType) Error!void {
     assert(@intFromPtr(self) != 0);
+    assert(@intFromEnum(frame_type) <= @intFromEnum(h2.FrameType.extension));
 
     if (!self.state.preface_sent) return error.PrefaceNotSent;
     if (!self.state.peer_settings_received and frame_type != .settings) {
@@ -508,6 +516,7 @@ fn finishPendingResponseHeaders(self: *Runtime) Error!ReceiveAction {
 
 fn resetPendingResponseHeaders(self: *Runtime) void {
     assert(@intFromPtr(self) != 0);
+    assert(self.pending_response_headers.block_len <= config.H2_MAX_HEADER_BLOCK_SIZE_BYTES);
 
     self.pending_response_headers.active = false;
     self.pending_response_headers.stream_id = 0;
@@ -558,6 +567,7 @@ fn handleData(self: *Runtime, header: h2.FrameHeader, payload: []const u8) Error
 
 fn handlePing(header: h2.FrameHeader, payload: []const u8) Error!ReceiveAction {
     assert(header.frame_type == .ping);
+    assert(header.length == payload.len);
 
     const opaque_data = try h2.parsePingFrame(header, payload);
     if ((header.flags & h2.flags_ack) != 0) return .none;
@@ -647,6 +657,9 @@ fn handleGoAway(self: *Runtime, header: h2.FrameHeader, payload: []const u8) Err
 }
 
 fn buildLocalSettingsPayload(local_settings: h2.Settings, out: []u8) Error![]const u8 {
+    assert(local_settings.max_frame_size_bytes >= h2.settings.min_max_frame_size_bytes);
+    assert(local_settings.max_frame_size_bytes <= config.H2_MAX_FRAME_SIZE_BYTES);
+
     const settings = [_]h2.Setting{
         .{ .id = @intFromEnum(h2.SettingId.enable_push), .value = if (local_settings.enable_push) 1 else 0 },
         .{ .id = @intFromEnum(h2.SettingId.max_concurrent_streams), .value = local_settings.max_concurrent_streams },
@@ -684,6 +697,9 @@ fn buildRequestHeaderBlock(
 }
 
 fn skipRequestHeaderForH2(name: []const u8, value: []const u8) bool {
+    assert(name.len <= config.MAX_HEADER_SIZE_BYTES);
+    assert(value.len <= config.MAX_HEADER_SIZE_BYTES);
+
     if (name.len > 0 and name[0] == ':') return true;
 
     if (std.ascii.eqlIgnoreCase(name, "host")) return true;
@@ -698,10 +714,18 @@ fn skipRequestHeaderForH2(name: []const u8, value: []const u8) bool {
 }
 
 fn trimAsciiWhitespace(value: []const u8) []const u8 {
-    return std.mem.trim(u8, value, " \t");
+    const trimmed = std.mem.trim(u8, value, " \t");
+    assert(trimmed.len <= value.len);
+    const trimmed_ptr: usize = @intFromPtr(trimmed.ptr);
+    const value_ptr: usize = @intFromPtr(value.ptr);
+    assert(trimmed_ptr >= value_ptr and trimmed_ptr <= value_ptr + value.len);
+    return trimmed;
 }
 
 fn requestScheme(request: *const Request) []const u8 {
+    assert(@intFromPtr(request) != 0);
+    assert(request.path.len > 0);
+
     if (request.headers.get("x-forwarded-proto")) |proto| {
         const trimmed = trimAsciiWhitespace(proto);
         if (std.ascii.eqlIgnoreCase(trimmed, "https")) return "https";
@@ -710,7 +734,8 @@ fn requestScheme(request: *const Request) []const u8 {
 }
 
 fn methodToken(method: Method) []const u8 {
-    return switch (method) {
+    assert(@intFromEnum(method) <= @intFromEnum(Method.PATCH));
+    const token = switch (method) {
         .GET => "GET",
         .HEAD => "HEAD",
         .POST => "POST",
@@ -721,10 +746,13 @@ fn methodToken(method: Method) []const u8 {
         .TRACE => "TRACE",
         .PATCH => "PATCH",
     };
+    assert(token.len > 0);
+    return token;
 }
 
 fn decodeResponseHeaderBlock(decoder: *h2.HpackDecoder, header_block: []const u8) Error!Response {
     assert(@intFromPtr(decoder) != 0);
+    assert(header_block.len <= config.H2_MAX_HEADER_BLOCK_SIZE_BYTES);
 
     var fields_buf: [config.MAX_HEADERS]h2.HeaderField = undefined;
     const fields = try h2.decodeHeaderBlockWithDecoder(decoder, header_block, &fields_buf);
@@ -764,6 +792,7 @@ fn decodeResponseHeaderBlock(decoder: *h2.HpackDecoder, header_block: []const u8
 
 fn decodeTrailerHeaderBlock(decoder: *h2.HpackDecoder, header_block: []const u8) Error!HeaderMap {
     assert(@intFromPtr(decoder) != 0);
+    assert(header_block.len <= config.H2_MAX_HEADER_BLOCK_SIZE_BYTES);
 
     var fields_buf: [config.MAX_HEADERS]h2.HeaderField = undefined;
     const fields = try h2.decodeHeaderBlockWithDecoder(decoder, header_block, &fields_buf);
@@ -782,6 +811,8 @@ fn decodeTrailerHeaderBlock(decoder: *h2.HpackDecoder, header_block: []const u8)
 }
 
 fn parseStatusCode(token: []const u8) Error!u16 {
+    assert(token.len > 0);
+    assert(token.len <= 3);
     if (token.len != 3) return error.InvalidStatus;
 
     const status = std.fmt.parseUnsigned(u16, token, 10) catch {
@@ -849,6 +880,7 @@ fn appendHeaderBlockFrames(
 
 fn appendFrame(out: []u8, frame_type: h2.FrameType, flags: u8, stream_id: u32, payload: []const u8) Error![]const u8 {
     assert(out.len >= h2.frame_header_size_bytes);
+    assert(payload.len <= std.math.maxInt(u24));
 
     const header = try h2.buildFrameHeader(out[0..h2.frame_header_size_bytes], .{
         .length = @intCast(payload.len),
@@ -863,6 +895,7 @@ fn appendFrame(out: []u8, frame_type: h2.FrameType, flags: u8, stream_id: u32, p
 
 fn buildResponseHeaderBlock(status: u16, headers: []const Header, out: []u8) ![]const u8 {
     assert(status >= 100);
+    assert(status <= 599);
 
     var cursor: usize = 0;
     var status_buf: [3]u8 = undefined;
@@ -873,18 +906,26 @@ fn buildResponseHeaderBlock(status: u16, headers: []const Header, out: []u8) ![]
         cursor += (try h2.encodeLiteralHeaderWithoutIndexing(out[cursor..], header.name, header.value)).len;
     }
 
+    assert(cursor <= out.len);
     return out[0..cursor];
 }
 
 fn buildHeaderBlock(headers: []const Header, out: []u8) ![]const u8 {
+    assert(headers.len <= config.MAX_HEADERS);
+    assert(out.len > 0);
+
     var cursor: usize = 0;
     for (headers) |header| {
         cursor += (try h2.encodeLiteralHeaderWithoutIndexing(out[cursor..], header.name, header.value)).len;
     }
+    assert(cursor <= out.len);
     return out[0..cursor];
 }
 
 fn makeGrpcRequest(path: []const u8) !Request {
+    assert(path.len > 0);
+    assert(path[0] == '/');
+
     var request = Request{
         .method = .POST,
         .path = path,
@@ -895,10 +936,14 @@ fn makeGrpcRequest(path: []const u8) !Request {
     try request.headers.put("host", "127.0.0.1:19000");
     try request.headers.put("content-type", "application/grpc");
     try request.headers.put("te", "trailers");
+    assert(request.headers.get("te") != null);
     return request;
 }
 
 fn initRuntimeReadyForStreams() !Runtime {
+    assert(config.H2_MAX_SETTINGS_PER_FRAME > 0);
+    assert(h2.client_connection_preface.len > 0);
+
     var runtime = try Runtime.init();
 
     var preface_buf: [h2.client_connection_preface.len + h2.frame_header_size_bytes + (4 * h2.setting_size_bytes)]u8 = undefined;
@@ -1455,7 +1500,6 @@ test "Runtime handles upstream RST_STREAM and clears stream state" {
 test "Runtime ignores duplicate upstream RST_STREAM for retired known stream" {
     var runtime = try Runtime.init();
     var request = try makeGrpcRequest("/svc.Method/Foo");
-    defer request.headers.deinit();
 
     var preface_buf: [256]u8 = undefined;
     _ = try runtime.writeClientPrefaceAndSettings(&preface_buf);

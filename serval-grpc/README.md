@@ -59,6 +59,7 @@ Current users:
 - request path must be non-empty
 - `content-type` must be a gRPC content-type
 - `te` must be exactly `trailers`
+- missing/invalid metadata returns explicit typed errors (`Missing*` / `Invalid*`)
 
 This is intentionally minimal and transport-safe. It does not try to interpret
 protobuf payloads or application-level RPC semantics.
@@ -81,6 +82,7 @@ to be gRPC but does not produce valid gRPC terminal metadata.
 - bytes 1-4: big-endian payload length
 
 Length is bounded by `serval-core.config.GRPC_MAX_MESSAGE_SIZE_BYTES`.
+Short frames (`len < 5`) fail with `NeedMoreData` instead of asserting.
 
 ## Example
 

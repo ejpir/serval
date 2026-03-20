@@ -33,6 +33,8 @@ pub const SessionState = struct {
     flow: h2.ConnectionFlowControl,
 
     pub fn init() Error!SessionState {
+        assert(config.H2_CONNECTION_WINDOW_SIZE_BYTES > 0);
+        assert(config.H2_CONNECTION_WINDOW_SIZE_BYTES <= config.H2_MAX_WINDOW_SIZE_BYTES);
         const flow = try h2.ConnectionFlowControl.init(config.H2_CONNECTION_WINDOW_SIZE_BYTES);
         return .{ .flow = flow };
     }
@@ -108,21 +110,25 @@ pub const SessionState = struct {
 
     pub fn endLocalStream(self: *SessionState, stream_id: u32) Error!void {
         assert(@intFromPtr(self) != 0);
+        assert(stream_id > 0);
         try self.streams.endLocal(stream_id);
     }
 
     pub fn endRemoteStream(self: *SessionState, stream_id: u32) Error!void {
         assert(@intFromPtr(self) != 0);
+        assert(stream_id > 0);
         try self.streams.endRemote(stream_id);
     }
 
     pub fn resetStream(self: *SessionState, stream_id: u32) Error!void {
         assert(@intFromPtr(self) != 0);
+        assert(stream_id > 0);
         try self.streams.reset(stream_id);
     }
 
     pub fn consumeSendWindow(self: *SessionState, bytes: u32) Error!void {
         assert(@intFromPtr(self) != 0);
+        assert(bytes <= config.H2_MAX_WINDOW_SIZE_BYTES);
         try self.flow.send_window.consume(bytes);
     }
 
@@ -135,6 +141,7 @@ pub const SessionState = struct {
 
     pub fn consumeRecvWindow(self: *SessionState, bytes: u32) Error!void {
         assert(@intFromPtr(self) != 0);
+        assert(bytes <= config.H2_MAX_WINDOW_SIZE_BYTES);
         try self.flow.recv_window.consume(bytes);
     }
 
@@ -146,6 +153,7 @@ pub const SessionState = struct {
 
     pub fn incrementSendWindow(self: *SessionState, delta_bytes: u32) Error!void {
         assert(@intFromPtr(self) != 0);
+        assert(delta_bytes <= config.H2_MAX_WINDOW_SIZE_BYTES);
         try self.flow.send_window.increment(delta_bytes);
     }
 
@@ -157,6 +165,7 @@ pub const SessionState = struct {
 
     pub fn incrementRecvWindow(self: *SessionState, delta_bytes: u32) Error!void {
         assert(@intFromPtr(self) != 0);
+        assert(delta_bytes <= config.H2_MAX_WINDOW_SIZE_BYTES);
         try self.flow.recv_window.increment(delta_bytes);
     }
 
@@ -198,16 +207,22 @@ pub const SessionState = struct {
 };
 
 fn defaultLocalSettings() h2.Settings {
-    return .{
+    assert(config.H2_MAX_CONCURRENT_STREAMS > 0);
+    assert(config.H2_INITIAL_WINDOW_SIZE_BYTES <= config.H2_MAX_WINDOW_SIZE_BYTES);
+
+    const defaults: h2.Settings = .{
         .enable_push = false,
         .max_concurrent_streams = config.H2_MAX_CONCURRENT_STREAMS,
         .initial_window_size_bytes = config.H2_INITIAL_WINDOW_SIZE_BYTES,
         .max_frame_size_bytes = config.H2_MAX_FRAME_SIZE_BYTES,
     };
+    assert(defaults.max_frame_size_bytes >= h2.settings.min_max_frame_size_bytes);
+    return defaults;
 }
 
 fn peerConcurrentStreamLimitReached(self: *const SessionState) bool {
     assert(@intFromPtr(self) != 0);
+    assert(self.streams.active_count <= config.H2_MAX_CONCURRENT_STREAMS);
     const peer_limit = self.peer_settings.max_concurrent_streams;
     if (peer_limit == std.math.maxInt(u32)) return false;
     return @as(u32, self.streams.active_count) >= peer_limit;

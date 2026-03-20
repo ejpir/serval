@@ -91,9 +91,10 @@ Current responsibilities:
 | `RequestHead` | Decoded HTTP/2 request head |
 | `InitialRequest` | Initial request + bootstrap parse result |
 | `InitialRequestError` | Request/initial parse errors |
-| `decodeRequestHeaderBlock(...)` | Decode request header block |
-| `decodeRequestHeaderBlockWithDecoder(...)` | Decode request block with caller-owned decoder |
-| `parseInitialRequest(...)` | Parse initial request from prior-knowledge bytes |
+| `request_stable_storage_size_bytes` | Minimum caller-provided stable storage for decoded request strings |
+| `decodeRequestHeaderBlock(header_block, stream_id, storage_out)` | Decode request header block into caller-owned stable storage |
+| `decodeRequestHeaderBlockWithDecoder(decoder, header_block, stream_id, storage_out)` | Decode request block with caller-owned decoder and stable storage |
+| `parseInitialRequest(input, storage_out)` | Parse initial request from prior-knowledge bytes into stable storage |
 | `H2cUpgradeError` | h2c upgrade validation/build errors |
 | `looksLikeUpgradeRequest(request)` | Detect HTTP/1.1 `Upgrade: h2c` |
 | `validateUpgradeRequest(request)` | Strict upgrade request validation |
@@ -186,6 +187,12 @@ Those live in:
   `serval-server`, `serval-client`, or `serval-proxy`.
 - Keep unsupported features fail-closed rather than partially permissive.
 - Keep all structures bounded and fixed-capacity.
+- For request decoding APIs, provide `storage_out` with at least
+  `request_stable_storage_size_bytes` so returned header/path slices remain
+  valid after decode returns.
+- Property/fuzz-style coverage now includes deterministic corpora for
+  `frame.zig`, `settings.zig`, `request.zig`, and `stream.zig` in addition to
+  existing HPACK-focused fuzz/property tests.
 
 ## Current Status
 

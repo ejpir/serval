@@ -10,6 +10,7 @@ pub const client_connection_preface_size_bytes: u32 = client_connection_preface.
 
 pub fn looksLikeClientConnectionPrefacePrefix(data: []const u8) bool {
     assert(data.len <= client_connection_preface.len or data.len > 0);
+    assert(client_connection_preface_size_bytes == client_connection_preface.len);
 
     if (data.len == 0) return false;
     if (data.len > client_connection_preface.len) {
@@ -19,6 +20,8 @@ pub fn looksLikeClientConnectionPrefacePrefix(data: []const u8) bool {
 }
 
 pub fn looksLikeClientConnectionPreface(data: []const u8) bool {
+    assert(client_connection_preface_size_bytes == client_connection_preface.len);
+    assert(client_connection_preface.len > 0);
     if (data.len < client_connection_preface.len) return false;
     return std.mem.eql(u8, data[0..client_connection_preface.len], client_connection_preface);
 }

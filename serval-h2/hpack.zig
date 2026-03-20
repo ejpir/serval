@@ -67,11 +67,14 @@ pub const Decoder = struct {
     huffman_scratch_buf: [huffman_scratch_capacity_bytes]u8 = undefined,
 
     pub fn init() Decoder {
+        assert(dynamic_entry_capacity > 0);
+        assert(dynamic_storage_capacity_bytes > 0);
         return .{};
     }
 
     pub fn setMaxDynamicTableSize(self: *Decoder, max_size_bytes: u32) Error!void {
         assert(@intFromPtr(self) != 0);
+        assert(self.dynamic_entry_count <= dynamic_entry_capacity);
 
         if (max_size_bytes > dynamic_storage_capacity_bytes) return error.DynamicTableSizeTooLarge;
         self.max_dynamic_table_size_bytes = max_size_bytes;
@@ -136,6 +139,8 @@ pub const Decoder = struct {
 };
 
 pub fn decodeHeaderBlock(input: []const u8, out_fields: []HeaderField) Error![]const HeaderField {
+    assert(dynamic_entry_capacity > 0);
+    assert(huffman_scratch_capacity_bytes >= dynamic_storage_capacity_bytes);
     var decoder = Decoder.init();
     return decoder.decodeHeaderBlock(input, out_fields);
 }
@@ -146,6 +151,7 @@ pub fn decodeHeaderBlockWithDecoder(
     out_fields: []HeaderField,
 ) Error![]const HeaderField {
     assert(@intFromPtr(decoder) != 0);
+    assert(dynamic_entry_capacity > 0);
     return decoder.decodeHeaderBlock(input, out_fields);
 }
 
@@ -155,6 +161,7 @@ pub fn encodeLiteralHeaderWithoutIndexing(
     value: []const u8,
 ) Error![]const u8 {
     assert(name.len > 0);
+    assert(dynamic_entry_overhead_size_bytes == 32);
 
     var cursor: usize = 0;
     if (cursor >= out.len) return error.BufferTooSmall;
@@ -172,6 +179,7 @@ pub fn encodeLiteralHeaderWithIncrementalIndexing(
     value: []const u8,
 ) Error![]const u8 {
     assert(name.len > 0);
+    assert(dynamic_entry_overhead_size_bytes == 32);
 
     var cursor: usize = 0;
     if (cursor >= out.len) return error.BufferTooSmall;
@@ -184,6 +192,8 @@ pub fn encodeLiteralHeaderWithIncrementalIndexing(
 }
 
 pub fn encodeIndexedHeaderField(out: []u8, index: u32) Error![]const u8 {
+    assert(static_table.len > 0);
+    assert(dynamic_entry_capacity > 0);
     if (index == 0) return error.InvalidIndex;
     const cursor = try encodeInteger(out, 0, 7, 0x80, index);
     return out[0..cursor];
@@ -191,6 +201,7 @@ pub fn encodeIndexedHeaderField(out: []u8, index: u32) Error![]const u8 {
 
 fn decodeHeaderName(self: *Decoder, input: []const u8, cursor: *usize, prefix_bits: u8) Error![]const u8 {
     assert(@intFromPtr(self) != 0);
+    assert(prefix_bits > 0 and prefix_bits < 8);
 
     const name_index = try decodeInteger(input, cursor, prefix_bits);
     if (name_index == 0) {
@@ -203,6 +214,7 @@ fn decodeHeaderName(self: *Decoder, input: []const u8, cursor: *usize, prefix_bi
 
 fn resolveIndexedHeader(self: *const Decoder, index: u32) Error!HeaderField {
     assert(@intFromPtr(self) != 0);
+    assert(self.dynamic_entry_count <= dynamic_entry_capacity);
 
     if (index == 0) return error.InvalidIndex;
     if (index <= static_table.len) {
@@ -230,6 +242,7 @@ fn resolveIndexedHeader(self: *const Decoder, index: u32) Error!HeaderField {
 
 fn applyDynamicTableSizeUpdate(self: *Decoder, dynamic_table_size_bytes: u32) Error!void {
     assert(@intFromPtr(self) != 0);
+    assert(self.current_dynamic_table_size_bytes <= dynamic_storage_capacity_bytes);
 
     if (dynamic_table_size_bytes > self.max_dynamic_table_size_bytes) {
         return error.DynamicTableSizeTooLarge;
@@ -243,6 +256,7 @@ fn applyDynamicTableSizeUpdate(self: *Decoder, dynamic_table_size_bytes: u32) Er
 
 fn insertDynamicEntry(self: *Decoder, name: []const u8, value: []const u8) Error!void {
     assert(@intFromPtr(self) != 0);
+    assert(self.dynamic_entry_count <= dynamic_entry_capacity);
 
     const entry_size_bytes = try dynamicEntrySize(name.len, value.len);
     if (entry_size_bytes > self.dynamic_table_size_limit_bytes) {
@@ -288,6 +302,7 @@ fn insertDynamicEntry(self: *Decoder, name: []const u8, value: []const u8) Error
 
 fn ensureDynamicStorageSpace(self: *Decoder, required_storage_bytes: usize) Error!void {
     assert(@intFromPtr(self) != 0);
+    assert(self.dynamic_storage_len <= dynamic_storage_capacity_bytes);
 
     const current_len: usize = self.dynamic_storage_len;
     if (current_len + required_storage_bytes <= dynamic_storage_capacity_bytes) return;
@@ -302,6 +317,7 @@ fn ensureDynamicStorageSpace(self: *Decoder, required_storage_bytes: usize) Erro
 
 fn compactDynamicStorage(self: *Decoder) void {
     assert(@intFromPtr(self) != 0);
+    assert(self.dynamic_entry_count <= dynamic_entry_capacity);
 
     var compacted_buf: [dynamic_storage_capacity_bytes]u8 = undefined;
     var write_offset: usize = 0;
@@ -333,6 +349,7 @@ fn compactDynamicStorage(self: *Decoder) void {
 
 fn evictOldestDynamicEntry(self: *Decoder) void {
     assert(@intFromPtr(self) != 0);
+    assert(self.dynamic_entry_count <= dynamic_entry_capacity);
 
     if (self.dynamic_entry_count == 0) {
         self.current_dynamic_table_size_bytes = 0;
@@ -358,6 +375,7 @@ fn evictOldestDynamicEntry(self: *Decoder) void {
 
 fn clearDynamicTable(self: *Decoder) void {
     assert(@intFromPtr(self) != 0);
+    assert(self.dynamic_entry_count <= dynamic_entry_capacity);
 
     self.current_dynamic_table_size_bytes = 0;
     self.dynamic_entry_count = 0;
@@ -365,8 +383,11 @@ fn clearDynamicTable(self: *Decoder) void {
 }
 
 fn dynamicEntrySize(name_len: usize, value_len: usize) Error!u32 {
-    const name_u32: u32 = @intCast(name_len);
-    const value_u32: u32 = @intCast(value_len);
+    assert(dynamic_entry_overhead_size_bytes == 32);
+    assert(dynamic_storage_capacity_bytes <= huffman_scratch_capacity_bytes);
+
+    const name_u32 = std.math.cast(u32, name_len) orelse return error.IntegerOverflow;
+    const value_u32 = std.math.cast(u32, value_len) orelse return error.IntegerOverflow;
 
     const payload = std.math.add(u32, name_u32, value_u32) catch return error.IntegerOverflow;
     return std.math.add(u32, payload, dynamic_entry_overhead_size_bytes) catch return error.IntegerOverflow;
@@ -399,6 +420,7 @@ fn decodeInteger(input: []const u8, cursor: *usize, prefix_bits: u8) Error!u32 {
 
 fn decodeString(self: *Decoder, input: []const u8, cursor: *usize) Error![]const u8 {
     assert(@intFromPtr(self) != 0);
+    assert(self.huffman_scratch_len <= huffman_scratch_capacity_bytes);
 
     if (cursor.* >= input.len) return error.NeedMoreData;
 
@@ -453,6 +475,8 @@ fn encodeInteger(out: []u8, cursor_start: usize, prefix_bits: u8, first_prefix: 
 }
 
 fn encodeString(out: []u8, cursor_start: usize, data: []const u8) Error!usize {
+    assert(cursor_start <= out.len);
+    assert(dynamic_entry_overhead_size_bytes == 32);
     var cursor = try encodeInteger(out, cursor_start, 7, 0x00, @intCast(data.len));
     if (cursor + data.len > out.len) return error.BufferTooSmall;
     @memcpy(out[cursor..][0..data.len], data);

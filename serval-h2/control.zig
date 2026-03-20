@@ -15,6 +15,10 @@ pub const rst_stream_payload_size_bytes: u32 = 4;
 pub const window_update_payload_size_bytes: u32 = 4;
 pub const goaway_min_payload_size_bytes: u32 = 8;
 
+comptime {
+    assert(ping_payload_size_bytes == 8);
+}
+
 pub const ErrorCode = enum(u32) {
     no_error = 0x0,
     protocol_error = 0x1,
@@ -38,6 +42,8 @@ pub const GoAway = struct {
     debug_data: []const u8,
 
     pub fn errorCode(self: GoAway) ?ErrorCode {
+        assert(self.last_stream_id <= 0x7fff_ffff);
+        assert(self.debug_data.len <= config.H2_MAX_FRAME_SIZE_BYTES);
         return std.meta.intToEnum(ErrorCode, self.error_code_raw) catch null;
     }
 };
@@ -67,6 +73,7 @@ pub fn parsePingFrame(header: frame.FrameHeader, payload: []const u8) Error![pin
 
 pub fn buildPingFrame(out: []u8, flags: u8, opaque_data: [ping_payload_size_bytes]u8) Error![]const u8 {
     assert(out.len > 0);
+    assert(flags & ~frame.flags_ack == 0);
     return buildFrame(out, .ping, flags, 0, &opaque_data);
 }
 
@@ -77,8 +84,6 @@ pub fn parseWindowUpdateFrame(header: frame.FrameHeader, payload: []const u8) Er
     if (payload.len != window_update_payload_size_bytes) return error.InvalidPayloadLength;
 
     const raw_increment = std.mem.readInt(u32, payload[0..window_update_payload_size_bytes], .big);
-    if ((raw_increment & 0x8000_0000) != 0) return error.ReservedBitSet;
-
     const increment = raw_increment & 0x7fff_ffff;
     if (increment == 0 or increment > config.H2_MAX_WINDOW_SIZE_BYTES) {
         return error.InvalidIncrement;
@@ -126,10 +131,10 @@ pub fn parseGoAwayFrame(header: frame.FrameHeader, payload: []const u8) Error!Go
     if (payload.len < goaway_min_payload_size_bytes) return error.InvalidPayloadLength;
 
     const raw_last_stream_id = std.mem.readInt(u32, payload[0..4], .big);
-    if ((raw_last_stream_id & 0x8000_0000) != 0) return error.ReservedBitSet;
+    const last_stream_id = raw_last_stream_id & 0x7fff_ffff;
 
     return .{
-        .last_stream_id = raw_last_stream_id,
+        .last_stream_id = last_stream_id,
         .error_code_raw = std.mem.readInt(u32, payload[4..8], .big),
         .debug_data = payload[8..],
     };
@@ -213,6 +218,19 @@ test "parseWindowUpdateFrame rejects zero increment" {
     try std.testing.expectError(error.InvalidIncrement, parseWindowUpdateFrame(header, &payload));
 }
 
+test "parseWindowUpdateFrame ignores reserved increment bit" {
+    const header = frame.FrameHeader{
+        .length = window_update_payload_size_bytes,
+        .frame_type = .window_update,
+        .flags = 0,
+        .stream_id = 0,
+    };
+    const payload = [_]u8{ 0x80, 0x00, 0x00, 0x01 };
+
+    const increment = try parseWindowUpdateFrame(header, &payload);
+    try std.testing.expectEqual(@as(u32, 1), increment);
+}
+
 test "goaway frame round-trips last stream and error code" {
     var buf: [frame.frame_header_size_bytes + goaway_min_payload_size_bytes + 3]u8 = undefined;
     const encoded = try buildGoAwayFrame(&buf, 7, @intFromEnum(ErrorCode.protocol_error), "dbg");
@@ -222,4 +240,20 @@ test "goaway frame round-trips last stream and error code" {
     try std.testing.expectEqual(@as(u32, 7), goaway.last_stream_id);
     try std.testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.protocol_error)), goaway.error_code_raw);
     try std.testing.expectEqualStrings("dbg", goaway.debug_data);
+}
+
+test "parseGoAwayFrame ignores reserved last-stream-id bit" {
+    const header = frame.FrameHeader{
+        .length = goaway_min_payload_size_bytes,
+        .frame_type = .goaway,
+        .flags = 0,
+        .stream_id = 0,
+    };
+    const payload = [_]u8{
+        0x80, 0x00, 0x00, 0x07,
+        0x00, 0x00, 0x00, 0x00,
+    };
+
+    const goaway = try parseGoAwayFrame(header, &payload);
+    try std.testing.expectEqual(@as(u32, 7), goaway.last_stream_id);
 }

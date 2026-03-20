@@ -45,6 +45,7 @@ pub const Error = error{
 
 pub fn looksLikeUpgradeRequest(request: *const Request) bool {
     assert(@intFromPtr(request) != 0);
+    assert(request.headers.count <= config.MAX_HEADERS);
 
     if (request.headers.get("HTTP2-Settings") != null) return true;
 
@@ -92,6 +93,7 @@ pub fn validateUpgradeRequest(
 
 pub fn buildUpgradeResponse(out: []u8) Error![]const u8 {
     assert(out.len > 0);
+    assert(upgrade_response.len > 0);
 
     if (out.len < upgrade_response.len) return error.BufferTooSmall;
     @memcpy(out[0..upgrade_response.len], upgrade_response);
@@ -145,6 +147,7 @@ fn findUniqueHeaderValue(headers: *const types.HeaderMap, name: []const u8) Erro
 
 fn decodeSettingsValue(value: []const u8, out: []u8) Error![]const u8 {
     assert(out.len >= config.H2_MAX_FRAME_SIZE_BYTES);
+    assert(settings.setting_size_bytes == 6);
 
     const decoded_len = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(value) catch {
         return error.InvalidHttp2Settings;
@@ -187,6 +190,9 @@ fn encodeHeaderBlock(
 }
 
 fn shouldForwardHeader(name: []const u8, connection: ?[]const u8) bool {
+    assert(name.len > 0);
+    assert(name.len <= config.H2_MAX_HEADER_BLOCK_SIZE_BYTES);
+
     if (eqlIgnoreCase(name, "connection")) return false;
     if (eqlIgnoreCase(name, "upgrade")) return false;
     if (eqlIgnoreCase(name, "http2-settings")) return false;
@@ -202,6 +208,9 @@ fn shouldForwardHeader(name: []const u8, connection: ?[]const u8) bool {
 }
 
 fn appendHeaderLowercaseName(out: []u8, cursor: usize, name: []const u8, value: []const u8) Error!usize {
+    assert(cursor <= out.len);
+    assert(name.len <= config.H2_MAX_HEADER_BLOCK_SIZE_BYTES);
+
     var lower_name_buf: [256]u8 = undefined;
     if (name.len > lower_name_buf.len) return error.HeadersTooLarge;
 
@@ -214,6 +223,9 @@ fn appendHeaderLowercaseName(out: []u8, cursor: usize, name: []const u8, value: 
 }
 
 fn appendHeader(out: []u8, cursor: usize, name: []const u8, value: []const u8) Error!usize {
+    assert(cursor <= out.len);
+    assert(name.len > 0);
+
     const encoded = hpack.encodeLiteralHeaderWithoutIndexing(out[cursor..], name, value) catch |err| switch (err) {
         error.BufferTooSmall => return error.HeadersTooLarge,
         else => return err,
@@ -222,6 +234,9 @@ fn appendHeader(out: []u8, cursor: usize, name: []const u8, value: []const u8) E
 }
 
 fn appendBytes(out: []u8, cursor: usize, data: []const u8) Error!usize {
+    assert(cursor <= out.len);
+    assert(data.len <= config.H2_MAX_FRAME_SIZE_BYTES or data.len == preface.client_connection_preface.len);
+
     if (cursor > out.len) return error.BufferTooSmall;
     if (out.len - cursor < data.len) return error.BufferTooSmall;
     @memcpy(out[cursor..][0..data.len], data);
@@ -236,6 +251,9 @@ fn appendFrame(
     stream_id: u32,
     payload: []const u8,
 ) Error!usize {
+    assert(stream_id <= 0x7fff_ffff);
+    assert(payload.len <= config.H2_MAX_FRAME_SIZE_BYTES);
+
     if (cursor > out.len) return error.BufferTooSmall;
 
     const header = try frame.buildFrameHeader(out[cursor..], .{
@@ -249,6 +267,8 @@ fn appendFrame(
 }
 
 fn methodToBytes(method: Method) []const u8 {
+    assert(std.meta.fields(Method).len > 0);
+    assert(std.meta.fields(Method).len <= 16);
     return switch (method) {
         .GET => "GET",
         .HEAD => "HEAD",
@@ -264,6 +284,7 @@ fn methodToBytes(method: Method) []const u8 {
 
 fn headerHasToken(value: []const u8, token: []const u8) bool {
     assert(token.len > 0);
+    assert(token.len <= config.H2_MAX_HEADER_BLOCK_SIZE_BYTES);
 
     var parts = std.mem.splitScalar(u8, value, ',');
     var count: u32 = 0;
@@ -345,7 +366,8 @@ test "buildPriorKnowledgePreambleFromUpgrade translates request into h2 preamble
 
     var out: [preface.client_connection_preface.len + 2 * frame.frame_header_size_bytes + config.H2_MAX_HEADER_BLOCK_SIZE_BYTES + config.H2_MAX_FRAME_SIZE_BYTES]u8 = undefined;
     const preamble = try buildPriorKnowledgePreambleFromUpgrade(&out, &request, "/rewritten", &settings_raw, false);
-    const parsed = try @import("request.zig").parseInitialRequest(preamble);
+    var request_storage_buf: [@import("request.zig").request_stable_storage_size_bytes]u8 = undefined;
+    const parsed = try @import("request.zig").parseInitialRequest(preamble, &request_storage_buf);
 
     try std.testing.expectEqual(Version.@"HTTP/1.1", parsed.request.version);
     try std.testing.expectEqual(Method.POST, parsed.request.method);

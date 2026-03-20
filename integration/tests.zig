@@ -3275,11 +3275,12 @@ fn grpcH2BackendMain(config: GrpcH2BackendConfig) !void {
     var request_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
     var total: usize = 0;
     var parsed: serval_h2.InitialRequest = undefined;
+    var request_storage_buf: [serval_h2.request_stable_storage_size_bytes]u8 = undefined;
 
     while (true) {
         const n = try conn_io.read(request_buf[total..]);
         total += n;
-        parsed = serval_h2.parseInitialRequest(request_buf[0..total]) catch |err| switch (err) {
+        parsed = serval_h2.parseInitialRequest(request_buf[0..total], &request_storage_buf) catch |err| switch (err) {
             error.NeedMoreData => continue,
             else => return err,
         };
@@ -3497,12 +3498,13 @@ fn grpcH2ResetBackendMain(config: GrpcH2ResetBackendConfig) !void {
     var request_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
     var total: usize = 0;
     var parsed: serval_h2.InitialRequest = undefined;
+    var request_storage_buf: [serval_h2.request_stable_storage_size_bytes]u8 = undefined;
 
     while (true) {
         const n = try posix.recv(conn, request_buf[total..], 0);
         if (n == 0) return error.ConnectionClosed;
         total += n;
-        parsed = serval_h2.parseInitialRequest(request_buf[0..total]) catch |err| switch (err) {
+        parsed = serval_h2.parseInitialRequest(request_buf[0..total], &request_storage_buf) catch |err| switch (err) {
             error.NeedMoreData => continue,
             else => return err,
         };
@@ -3545,12 +3547,13 @@ fn grpcH2GoAwayBackendMain(config: GrpcH2GoAwayBackendConfig) !void {
     var request_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
     var total: usize = 0;
     var parsed: serval_h2.InitialRequest = undefined;
+    var request_storage_buf: [serval_h2.request_stable_storage_size_bytes]u8 = undefined;
 
     while (true) {
         const n = try posix.recv(conn, request_buf[total..], 0);
         if (n == 0) return error.ConnectionClosed;
         total += n;
-        parsed = serval_h2.parseInitialRequest(request_buf[0..total]) catch |err| switch (err) {
+        parsed = serval_h2.parseInitialRequest(request_buf[0..total], &request_storage_buf) catch |err| switch (err) {
             error.NeedMoreData => continue,
             else => return err,
         };
@@ -3735,12 +3738,13 @@ fn grpcH2MultiBackendMain(config: GrpcH2MultiBackendConfig) !void {
     var request_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
     var total: usize = 0;
     var parsed: serval_h2.InitialRequest = undefined;
+    var request_storage_buf: [serval_h2.request_stable_storage_size_bytes]u8 = undefined;
 
     while (true) {
         const n = try posix.recv(conn, request_buf[total..], 0);
         if (n == 0) return error.ConnectionClosed;
         total += n;
-        parsed = serval_h2.parseInitialRequest(request_buf[0..total]) catch |err| switch (err) {
+        parsed = serval_h2.parseInitialRequest(request_buf[0..total], &request_storage_buf) catch |err| switch (err) {
             error.NeedMoreData => continue,
             else => return err,
         };

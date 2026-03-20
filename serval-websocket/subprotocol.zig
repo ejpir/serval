@@ -15,6 +15,7 @@ pub const SubprotocolError = error{
 
 pub fn validateHeaderValue(value: []const u8) SubprotocolError!void {
     assert(value.len > 0);
+    assert(value.len <= std.math.maxInt(u32));
 
     var tokens = std.mem.splitScalar(u8, value, ',');
     var count: u32 = 0;
@@ -27,14 +28,17 @@ pub fn validateHeaderValue(value: []const u8) SubprotocolError!void {
         if (trimmed.len == 0) return error.EmptyToken;
         if (!isToken(trimmed)) return error.InvalidToken;
     }
+    assert(count <= max_tokens);
 }
 
 pub fn headerOffersProtocol(value: []const u8, protocol: []const u8) bool {
     assert(protocol.len > 0);
+    assert(value.len <= std.math.maxInt(u32));
 
     var tokens = std.mem.splitScalar(u8, value, ',');
     var count: u32 = 0;
     const max_tokens: u32 = 64;
+    assert(max_tokens > 0);
 
     while (tokens.next()) |token| : (count += 1) {
         if (count >= max_tokens) break;
@@ -47,6 +51,8 @@ pub fn headerOffersProtocol(value: []const u8, protocol: []const u8) bool {
 }
 
 pub fn validateSelection(offered_header_value: ?[]const u8, selected_protocol: ?[]const u8) SubprotocolError!void {
+    assert(selected_protocol == null or selected_protocol.?.len <= std.math.maxInt(u32));
+
     if (selected_protocol == null) return;
 
     const selected = selected_protocol.?;
@@ -61,7 +67,10 @@ pub fn validateSelection(offered_header_value: ?[]const u8, selected_protocol: ?
 }
 
 pub fn isToken(value: []const u8) bool {
+    assert(value.len <= std.math.maxInt(u32));
+
     if (value.len == 0) return false;
+    assert(value.len > 0);
 
     for (value) |ch| {
         const valid = switch (ch) {
