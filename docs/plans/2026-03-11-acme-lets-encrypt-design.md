@@ -299,35 +299,96 @@ Structured logs include:
 - ACME 429 rate-limit responses
 - ACME badNonce loop beyond bounded retry
 
-## PR Sequence
+## Implementation Status (2026-03-17)
 
-### PR1 — Config + module skeleton + challenge store
-- add `AcmeConfig`
-- add bounded `http01_store`
-- add dedicated challenge listener wiring
+Completed in repository:
 
-### PR2 — Reloadable TLS context
-- add `ReloadableServerCtx`
-- integrate with server accept/handshake path
-- add generation/refcount tests
+- ✅ PR1 subset: module skeleton + bounded challenge store (`http01_store.zig`)
+- ✅ PR3: ACME client/JWS/wire/orchestration primitives
+- ✅ PR4 scaffolding: manager tick runner + operation execution + deterministic response/error assessment
 
-### PR3 — ACME client primitives
-- directory/nonce/account/order protocol structs
-- bounded JSON parser/serializer paths
+Not completed yet:
 
-### PR4 — HTTP-01 order flow
-- publish/poll/cleanup challenge lifecycle
-- deterministic error mapping and backoff
+- ⛔ `AcmeConfig` addition in `serval-core/config.zig` (plan item from PR1)
+- ⛔ dedicated HTTP-01 listener wiring into `serval-server` orchestration path
+- ⛔ reloadable TLS context implementation (`ReloadableServerCtx`) and handshake integration
+- ⛔ CSR/finalize/certificate download/persistence/activation full flow
+- ⛔ crash journal recovery + full ACME metrics set
 
-### PR5 — finalize/download/persist/activate
-- CSR + finalize
-- cert download
-- atomic persistence + hot swap activation
+## Remaining PR Sequence (finish plan)
 
-### PR6 — recovery + observability hardening
-- journal-based resume
-- metrics/logs
-- repeated integration/soak runs
+### PR-A — Core config + runtime wiring
+
+Scope:
+
+- add `AcmeConfig` in `serval-core/config.zig` (bounded fields and validation)
+- thread optional `config.acme` through server bootstrap path
+- define explicit startup behavior when ACME disabled vs enabled
+
+Definition of done:
+
+- `Config` includes `acme: ?AcmeConfig`
+- invalid ACME config fails fast at startup with explicit error
+- module README/docs updated
+
+### PR-B — Dedicated HTTP-01 challenge listener
+
+Scope:
+
+- add `serval-acme/http01_handler.zig`
+- wire a dedicated `serval-server.MinimalServer` listener on `challenge_bind_port`
+- route only `GET /.well-known/acme-challenge/{token}`
+- strict host/method/path checks against managed domain list
+
+Definition of done:
+
+- challenge lookups are bounded and deterministic
+- no coupling to product routing handlers
+- integration test validates challenge visibility from ACME CA simulator
+
+### PR-C — Reloadable TLS context (zero-downtime)
+
+Scope:
+
+- add `ReloadableServerCtx` in `serval-tls`
+- implement atomic generation swap with bounded retire queue
+- integrate handshake path to acquire/release context generation refs
+
+Definition of done:
+
+- new handshakes observe new cert after swap
+- existing handshakes/active connections remain valid
+- bounded retired ctx queue behavior tested (including full queue failure path)
+
+### PR-D — End-to-end ACME order finalize + cert activation
+
+Scope:
+
+- implement CSR generation and finalize call path
+- poll order readiness with bounded attempts
+- download fullchain + key material (bounded buffers)
+- persist atomically (`tmp` + `fsync` + `rename` + dir `fsync`)
+- activate cert via reloadable TLS context swap
+
+Definition of done:
+
+- fresh issuance with Pebble passes end-to-end
+- renewal before expiry activates without restart
+- failure never removes currently active cert
+
+### PR-E — Recovery, backoff, observability hardening
+
+Scope:
+
+- add persistent journal and deterministic startup recovery
+- add bounded exponential backoff module (`backoff.zig`)
+- expose planned metrics/counters/gauges and structured transition logs
+
+Definition of done:
+
+- restart during mid-order resumes/rolls back deterministically
+- disk/network/429/badNonce fault injection tests pass
+- soak test shows stable bounded behavior without retry masking
 
 ## Verification Commands (per PR)
 

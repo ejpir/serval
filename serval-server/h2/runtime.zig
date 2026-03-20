@@ -1285,9 +1285,7 @@ test "Runtime randomized frame sequence preserves bounded invariants" {
         const header = h2.parseFrameHeader(frame) catch continue;
         if (runtime.receiveFrame(header, frame[h2.frame_header_size_bytes .. h2.frame_header_size_bytes + header.length])) |action| {
             _ = action;
-        } else |err| {
-            _ = err;
-        }
+        } else |_| {}
 
         try std.testing.expect(runtime.state.streams.active_count <= config.H2_MAX_CONCURRENT_STREAMS);
         try std.testing.expect(runtime.state.flow.recv_window.available_bytes <= config.H2_MAX_WINDOW_SIZE_BYTES);

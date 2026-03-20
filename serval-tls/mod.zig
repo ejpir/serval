@@ -11,6 +11,12 @@
 
 // BoringSSL bindings
 pub const ssl = @import("ssl.zig");
+pub const ServerAlpnHook = ssl.ServerAlpnHook;
+pub const ServerAlpnHookInput = ssl.ServerAlpnHookInput;
+pub const ServerAlpnHookDecision = ssl.ServerAlpnHookDecision;
+pub const ServerCertHook = ssl.ServerCertHook;
+pub const ServerCertHookInput = ssl.ServerCertHookInput;
+pub const ServerCertHookDecision = ssl.ServerCertHookDecision;
 
 // TLS stream abstraction
 const stream = @import("stream.zig");

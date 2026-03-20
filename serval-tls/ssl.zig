@@ -70,6 +70,18 @@ pub extern fn SSL_CTX_use_PrivateKey_file(ctx: *SSL_CTX, file: [*:0]const u8, ty
 pub extern fn SSL_CTX_load_verify_locations(ctx: *SSL_CTX, ca_file: ?[*:0]const u8, ca_path: ?[*:0]const u8) c_int;
 pub extern fn SSL_CTX_set_verify(ctx: *SSL_CTX, mode: c_int, callback: ?*anyopaque) void;
 
+pub const ServerNameCallback = *const fn (
+    ssl: *SSL,
+    alert: *c_int,
+    arg: ?*anyopaque,
+) callconv(.c) c_int;
+
+pub extern fn SSL_CTX_ctrl(ctx: *SSL_CTX, cmd: c_int, larg: c_long, parg: ?*anyopaque) c_long;
+pub extern fn SSL_CTX_callback_ctrl(ctx: *SSL_CTX, cmd: c_int, cb: ?*const anyopaque) c_long;
+
+pub const SSL_CTRL_SET_TLSEXT_SERVERNAME_CB: c_int = 53;
+pub const SSL_CTRL_SET_TLSEXT_SERVERNAME_ARG: c_int = 54;
+
 // SSL functions
 pub extern fn SSL_new(ctx: *SSL_CTX) ?*SSL;
 pub extern fn SSL_free(ssl: *SSL) void;
@@ -204,6 +216,8 @@ pub extern fn SSL_CTX_set_alpn_select_cb(ctx: *SSL_CTX, cb: AlpnSelectCallback, 
 // ALPN - returns pointer to selected protocol and length
 // Note: data is set to NULL if no ALPN was negotiated
 pub extern fn SSL_get0_alpn_selected(ssl: *const SSL, data: *?[*]const u8, len: *c_uint) void;
+pub extern fn SSL_get_servername(ssl: *const SSL, type_: c_int) ?[*:0]const u8;
+pub extern fn SSL_set_SSL_CTX(ssl: *SSL, ctx: *SSL_CTX) ?*SSL_CTX;
 
 // Certificate inspection
 // Note: OpenSSL 3.x renamed SSL_get_peer_certificate to SSL_get1_peer_certificate
@@ -250,6 +264,7 @@ pub fn createServerCtx() !*SSL_CTX {
     // TODO: Use OpenSSL-compatible SSL_CTX_set_options with SSL_OP_NO_TLSv1 etc
     // _ = SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
     configureServerAlpn(ctx);
+    configureServerCertHook(ctx);
     return ctx;
 }
 
@@ -306,12 +321,48 @@ pub const SSL_TLSEXT_ERR_NOACK: c_int = 3;
 
 const alpn_protocol_h2: []const u8 = "h2";
 const alpn_protocol_http11: []const u8 = "http/1.1";
+const alpn_protocol_acme_tls_1: []const u8 = "acme-tls/1";
 
 pub const AlpnMixedOfferPolicy = config.AlpnMixedOfferPolicy;
+
+pub const ServerAlpnHookDecision = enum {
+    default_policy,
+    force_acme_tls_1,
+    reject,
+};
+
+pub const ServerAlpnHookInput = struct {
+    sni: ?[]const u8,
+    client_offers_http11: bool,
+    client_offers_h2: bool,
+    client_offers_acme_tls_1: bool,
+};
+
+pub const ServerAlpnHook = *const fn (input: *const ServerAlpnHookInput) ServerAlpnHookDecision;
+
+pub const ServerCertHookDecision = union(enum) {
+    default_ctx,
+    reject,
+    override_ctx: *SSL_CTX,
+};
+
+pub const ServerCertHookInput = struct {
+    sni: ?[]const u8,
+};
+
+pub const ServerCertHook = *const fn (input: *const ServerCertHookInput) ServerCertHookDecision;
 
 /// Global mixed-offer ALPN policy used by all server contexts in this process.
 /// TigerStyle: explicit mutable policy for deployment-controlled rollouts.
 var server_alpn_mixed_offer_policy: AlpnMixedOfferPolicy = .prefer_http11;
+
+/// Optional process-wide ALPN override hook.
+/// Used by specialized flows (e.g. ACME TLS-ALPN-01) without polluting core modules.
+var server_alpn_hook: ?ServerAlpnHook = null;
+
+/// Optional process-wide cert selection hook keyed by SNI.
+/// Allows dynamic context override without changing server modules.
+var server_cert_hook: ?ServerCertHook = null;
 
 pub fn setServerAlpnMixedOfferPolicy(policy: AlpnMixedOfferPolicy) void {
     server_alpn_mixed_offer_policy = policy;
@@ -319,6 +370,22 @@ pub fn setServerAlpnMixedOfferPolicy(policy: AlpnMixedOfferPolicy) void {
 
 pub fn getServerAlpnMixedOfferPolicy() AlpnMixedOfferPolicy {
     return server_alpn_mixed_offer_policy;
+}
+
+pub fn setServerAlpnHook(hook: ?ServerAlpnHook) void {
+    server_alpn_hook = hook;
+}
+
+pub fn getServerAlpnHook() ?ServerAlpnHook {
+    return server_alpn_hook;
+}
+
+pub fn setServerCertHook(hook: ?ServerCertHook) void {
+    server_cert_hook = hook;
+}
+
+pub fn getServerCertHook() ?ServerCertHook {
+    return server_cert_hook;
 }
 
 fn resolveServerAlpnMixedOfferPolicy(arg: ?*anyopaque) AlpnMixedOfferPolicy {
@@ -329,6 +396,46 @@ fn resolveServerAlpnMixedOfferPolicy(arg: ?*anyopaque) AlpnMixedOfferPolicy {
     return server_alpn_mixed_offer_policy;
 }
 
+fn resolveServerName(ssl_conn: *SSL) ?[]const u8 {
+    // Unit tests call callbacks with sentinel non-SSL pointers.
+    // Guard low/null-like addresses before handing to OpenSSL.
+    if (@intFromPtr(ssl_conn) < 4096) return null;
+
+    const sni_z = SSL_get_servername(ssl_conn, TLSEXT_NAMETYPE_host_name) orelse return null;
+    const sni = std.mem.sliceTo(sni_z, 0);
+    if (sni.len == 0) return null;
+    return sni;
+}
+
+fn applyServerAlpnHook(
+    ssl_conn: *SSL,
+    out: *?[*]const u8,
+    outlen: *u8,
+    supports_http11: bool,
+    supports_h2: bool,
+    supports_acme_tls_1: bool,
+) ?c_int {
+    const hook = server_alpn_hook orelse return null;
+
+    const input = ServerAlpnHookInput{
+        .sni = resolveServerName(ssl_conn),
+        .client_offers_http11 = supports_http11,
+        .client_offers_h2 = supports_h2,
+        .client_offers_acme_tls_1 = supports_acme_tls_1,
+    };
+
+    return switch (hook(&input)) {
+        .default_policy => null,
+        .reject => SSL_TLSEXT_ERR_ALERT_FATAL,
+        .force_acme_tls_1 => blk: {
+            if (!supports_acme_tls_1) break :blk SSL_TLSEXT_ERR_ALERT_FATAL;
+            out.* = @ptrCast(alpn_protocol_acme_tls_1.ptr);
+            outlen.* = @intCast(alpn_protocol_acme_tls_1.len);
+            break :blk SSL_TLSEXT_ERR_OK;
+        },
+    };
+}
+
 fn serverAlpnSelectCb(
     ssl_conn: *SSL,
     out: *?[*]const u8,
@@ -337,13 +444,12 @@ fn serverAlpnSelectCb(
     inlen: c_uint,
     arg: ?*anyopaque,
 ) callconv(.c) c_int {
-    _ = ssl_conn;
-
     const alpn_policy = resolveServerAlpnMixedOfferPolicy(arg);
     const client_len: usize = @intCast(inlen);
     var pos: usize = 0;
     var supports_http11 = false;
     var supports_h2 = false;
+    var supports_acme_tls_1 = false;
 
     while (pos < client_len) {
         const proto_len: usize = in[pos];
@@ -357,9 +463,15 @@ fn serverAlpnSelectCb(
             supports_http11 = true;
         } else if (std.mem.eql(u8, proto, alpn_protocol_h2)) {
             supports_h2 = true;
+        } else if (std.mem.eql(u8, proto, alpn_protocol_acme_tls_1)) {
+            supports_acme_tls_1 = true;
         }
 
         pos += proto_len;
+    }
+
+    if (applyServerAlpnHook(ssl_conn, out, outlen, supports_http11, supports_h2, supports_acme_tls_1)) |hook_rc| {
+        return hook_rc;
     }
 
     switch (alpn_policy) {
@@ -404,9 +516,35 @@ fn serverAlpnSelectCb(
     return SSL_TLSEXT_ERR_NOACK;
 }
 
+fn serverNameSelectCb(
+    ssl_conn: *SSL,
+    alert: *c_int,
+    arg: ?*anyopaque,
+) callconv(.c) c_int {
+    _ = alert;
+    _ = arg;
+
+    const hook = server_cert_hook orelse return SSL_TLSEXT_ERR_NOACK;
+    const decision = hook(&.{ .sni = resolveServerName(ssl_conn) });
+
+    return switch (decision) {
+        .default_ctx => SSL_TLSEXT_ERR_NOACK,
+        .reject => SSL_TLSEXT_ERR_ALERT_FATAL,
+        .override_ctx => |ctx| blk: {
+            if (SSL_set_SSL_CTX(ssl_conn, ctx) == null) break :blk SSL_TLSEXT_ERR_ALERT_FATAL;
+            break :blk SSL_TLSEXT_ERR_OK;
+        },
+    };
+}
+
 pub fn configureServerAlpn(ctx: *SSL_CTX) void {
     const policy_ptr: *AlpnMixedOfferPolicy = &server_alpn_mixed_offer_policy;
     SSL_CTX_set_alpn_select_cb(ctx, serverAlpnSelectCb, @ptrCast(policy_ptr));
+}
+
+pub fn configureServerCertHook(ctx: *SSL_CTX) void {
+    _ = SSL_CTX_callback_ctrl(ctx, SSL_CTRL_SET_TLSEXT_SERVERNAME_CB, @ptrCast(&serverNameSelectCb));
+    _ = SSL_CTX_ctrl(ctx, SSL_CTRL_SET_TLSEXT_SERVERNAME_ARG, 0, null);
 }
 
 pub fn setClientAlpnProtocol(ssl_conn: *SSL, protocol: []const u8) !void {
@@ -594,6 +732,16 @@ test "ALPN http11_only selects http/1.1 when client offers both" {
     try std.testing.expectEqualStrings(alpn_protocol_http11, selected_ptr.?[0..selected_len]);
 }
 
+fn testHookForceAcme(input: *const ServerAlpnHookInput) ServerAlpnHookDecision {
+    _ = input;
+    return .force_acme_tls_1;
+}
+
+fn testHookReject(input: *const ServerAlpnHookInput) ServerAlpnHookDecision {
+    _ = input;
+    return .reject;
+}
+
 test "ALPN http11_only rejects h2-only client with fatal alert" {
     var policy: AlpnMixedOfferPolicy = .http11_only;
     var selected_ptr: ?[*]const u8 = null;
@@ -601,6 +749,80 @@ test "ALPN http11_only rejects h2-only client with fatal alert" {
 
     // Wire format: h2 only
     const wire = [_]u8{2} ++ "h2";
+
+    const rc = serverAlpnSelectCb(
+        @ptrFromInt(1),
+        &selected_ptr,
+        &selected_len,
+        wire[0..].ptr,
+        @intCast(wire.len),
+        @ptrCast(&policy),
+    );
+
+    try std.testing.expectEqual(SSL_TLSEXT_ERR_ALERT_FATAL, rc);
+}
+
+test "ALPN hook can force acme-tls/1 when offered" {
+    const original_hook = getServerAlpnHook();
+    defer setServerAlpnHook(original_hook);
+
+    setServerAlpnHook(testHookForceAcme);
+
+    var policy: AlpnMixedOfferPolicy = .prefer_http11;
+    var selected_ptr: ?[*]const u8 = null;
+    var selected_len: u8 = 0;
+
+    const wire = [_]u8{8} ++ "http/1.1" ++ [_]u8{10} ++ "acme-tls/1" ++ [_]u8{2} ++ "h2";
+
+    const rc = serverAlpnSelectCb(
+        @ptrFromInt(1),
+        &selected_ptr,
+        &selected_len,
+        wire[0..].ptr,
+        @intCast(wire.len),
+        @ptrCast(&policy),
+    );
+
+    try std.testing.expectEqual(SSL_TLSEXT_ERR_OK, rc);
+    try std.testing.expect(selected_ptr != null);
+    try std.testing.expectEqualStrings(alpn_protocol_acme_tls_1, selected_ptr.?[0..selected_len]);
+}
+
+test "ALPN hook force acme-tls/1 fails if client did not offer protocol" {
+    const original_hook = getServerAlpnHook();
+    defer setServerAlpnHook(original_hook);
+
+    setServerAlpnHook(testHookForceAcme);
+
+    var policy: AlpnMixedOfferPolicy = .prefer_http11;
+    var selected_ptr: ?[*]const u8 = null;
+    var selected_len: u8 = 0;
+
+    const wire = [_]u8{8} ++ "http/1.1" ++ [_]u8{2} ++ "h2";
+
+    const rc = serverAlpnSelectCb(
+        @ptrFromInt(1),
+        &selected_ptr,
+        &selected_len,
+        wire[0..].ptr,
+        @intCast(wire.len),
+        @ptrCast(&policy),
+    );
+
+    try std.testing.expectEqual(SSL_TLSEXT_ERR_ALERT_FATAL, rc);
+}
+
+test "ALPN hook can reject handshake" {
+    const original_hook = getServerAlpnHook();
+    defer setServerAlpnHook(original_hook);
+
+    setServerAlpnHook(testHookReject);
+
+    var policy: AlpnMixedOfferPolicy = .prefer_http11;
+    var selected_ptr: ?[*]const u8 = null;
+    var selected_len: u8 = 0;
+
+    const wire = [_]u8{8} ++ "http/1.1";
 
     const rc = serverAlpnSelectCb(
         @ptrFromInt(1),
