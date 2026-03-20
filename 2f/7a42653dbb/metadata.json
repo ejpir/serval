@@ -3,7 +3,7 @@
   "checkpoint_id": "2f7a42653dbb",
   "strategy": "manual-commit",
   "branch": "main",
-  "checkpoints_count": 2,
+  "checkpoints_count": 3,
   "files_touched": [
     "experiments/tls-poc/boringssl",
     "serval-grpc/serval-k8s-gateway/README.md",
@@ -19,13 +19,20 @@
       "context": "/2f/7a42653dbb/0/context.md",
       "content_hash": "/2f/7a42653dbb/0/content_hash.txt",
       "prompt": "/2f/7a42653dbb/0/prompt.txt"
+    },
+    {
+      "metadata": "/2f/7a42653dbb/1/metadata.json",
+      "transcript": "/2f/7a42653dbb/1/full.jsonl",
+      "context": "/2f/7a42653dbb/1/context.md",
+      "content_hash": "/2f/7a42653dbb/1/content_hash.txt",
+      "prompt": "/2f/7a42653dbb/1/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 23,
-    "cache_creation_tokens": 99418,
-    "cache_read_tokens": 1071179,
-    "output_tokens": 21728,
-    "api_call_count": 16
+    "input_tokens": 31,
+    "cache_creation_tokens": 133882,
+    "cache_read_tokens": 1212713,
+    "output_tokens": 24064,
+    "api_call_count": 21
   }
 }
