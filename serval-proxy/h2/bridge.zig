@@ -14,6 +14,7 @@ const assert = std.debug.assert;
 
 const core = @import("serval-core");
 const config = core.config;
+const time = core.time;
 const types = core.types;
 const log = core.log.scoped(.proxy);
 
@@ -77,6 +78,7 @@ pub const StreamBridge = struct {
     client: *serval_client.Client,
     sessions: *serval_client.H2UpstreamSessionPool,
     binding_table: bindings.BindingTable = bindings.BindingTable.init(),
+    debug_connection_id: u64 = 0,
 
     pub fn init(client: *serval_client.Client, sessions: *serval_client.H2UpstreamSessionPool) StreamBridge {
         assert(@intFromPtr(client) != 0);
@@ -93,6 +95,11 @@ pub const StreamBridge = struct {
 
         self.binding_table = bindings.BindingTable.init();
         self.sessions.closeAll();
+    }
+
+    pub fn setDebugConnectionId(self: *StreamBridge, connection_id: u64) void {
+        assert(@intFromPtr(self) != 0);
+        self.debug_connection_id = connection_id;
     }
 
     pub fn openDownstreamStream(
@@ -284,15 +291,21 @@ pub const StreamBridge = struct {
         const stream = session.h2.runtime.state.getStream(binding.upstream_stream_id);
         const stream_send_window: u32 = if (stream) |entry| entry.send_window.available_bytes else 0;
         const stream_recv_window: u32 = if (stream) |entry| entry.recv_window.available_bytes else 0;
+        const fd = session.connection.socket.get_fd();
+        const now_ns = time.monotonicNanos();
+        const since_last_action_ns: u64 = if (now_ns >= session.last_used_ns) now_ns - session.last_used_ns else 0;
 
         log.debug(
-            "h2 bridge: wait upstream action downstream_stream={d} upstream_stream={d} idx={d} gen={d} timeout={any} active_bindings={d} active_streams={d} conn_send_window={d} conn_recv_window={d} stream_send_window={d} stream_recv_window={d}",
+            "h2 bridge: conn={d} wait upstream action downstream_stream={d} upstream_stream={d} idx={d} gen={d} fd={d} timeout={any} since_last_action_ns={d} active_bindings={d} active_streams={d} conn_send_window={d} conn_recv_window={d} stream_send_window={d} stream_recv_window={d}",
             .{
+                self.debug_connection_id,
                 downstream_stream_id,
                 binding.upstream_stream_id,
                 binding.upstream_index,
                 binding.upstream_session_generation,
+                fd,
                 timeout,
+                since_last_action_ns,
                 self.binding_table.count,
                 session.h2.runtime.state.streams.active_count,
                 session.h2.runtime.state.flow.send_window.available_bytes,
@@ -304,12 +317,14 @@ pub const StreamBridge = struct {
 
         const action = session.receiveActionHandlingControlTimeout(io, timeout) catch |err| {
             log.debug(
-                "h2 bridge: upstream wait failed downstream_stream={d} upstream_stream={d} idx={d} gen={d} err={s}",
+                "h2 bridge: conn={d} upstream wait failed downstream_stream={d} upstream_stream={d} idx={d} gen={d} fd={d} err={s}",
                 .{
+                    self.debug_connection_id,
                     downstream_stream_id,
                     binding.upstream_stream_id,
                     binding.upstream_index,
                     binding.upstream_session_generation,
+                    fd,
                     @errorName(err),
                 },
             );
@@ -317,12 +332,14 @@ pub const StreamBridge = struct {
         };
 
         log.debug(
-            "h2 bridge: upstream action ready downstream_stream={d} upstream_stream={d} idx={d} gen={d} action={s}",
+            "h2 bridge: conn={d} upstream action ready downstream_stream={d} upstream_stream={d} idx={d} gen={d} fd={d} action={s}",
             .{
+                self.debug_connection_id,
                 downstream_stream_id,
                 binding.upstream_stream_id,
                 binding.upstream_index,
                 binding.upstream_session_generation,
+                fd,
                 @tagName(action),
             },
         );

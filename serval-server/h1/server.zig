@@ -1150,12 +1150,14 @@ pub fn Server(
                 assert(@intFromPtr(bridge_sessions) != 0);
                 assert(@intFromPtr(connection_ctx) != 0);
 
-                return .{
+                var instance = @This(){
                     .inner = inner,
                     .io = io,
                     .bridge = serval_proxy.H2StreamBridge.init(bridge_client, bridge_sessions),
                     .connection_ctx = connection_ctx,
                 };
+                instance.bridge.setDebugConnectionId(connection_ctx.connection_id);
+                return instance;
             }
 
             pub fn deinit(self: *@This()) void {
