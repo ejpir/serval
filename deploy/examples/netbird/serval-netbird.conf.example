@@ -33,9 +33,9 @@ tls_h2_frontend_mode=terminated_only
 
 # ALPN negotiation policy for TLS frontend connections
 #   prefer_http11    -> accept h2 if client only offers h2, prefer http/1.1 on mixed offers
-#   prefer_h2        -> prefer h2 on mixed offers
+#   prefer_h2        -> prefer h2 on mixed offers (recommended when you want browser/UI paths to negotiate h2)
 #   http11_only      -> reject h2 ALPN; forces gRPC clients to use WebSocket fallback
-alpn_mixed_offer_policy=prefer_http11
+alpn_mixed_offer_policy=prefer_h2
 
 # Upstream matrix
 #

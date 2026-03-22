@@ -121,6 +121,7 @@ Policy enforced by the binary:
 - WebSocket/API/relay/dashboard paths must use `.h1` upstreams.
 - Mixed protocol on same host:port is supported only via explicit split entries (`management_grpc` + `management_http`).
 - Frontend ALPN behavior is configurable via `alpn_mixed_offer_policy` and `tls_h2_frontend_mode` in `/etc/serval/netbird.conf`.
+- To prefer h2 when clients offer both `h2,http/1.1`, set `alpn_mixed_offer_policy=prefer_h2` and restart `serval-netbird-proxy`.
 
 ## 5) Firewall (fw4 / nftables)
 
