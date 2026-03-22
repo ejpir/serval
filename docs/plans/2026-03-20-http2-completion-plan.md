@@ -284,3 +284,8 @@ These are intentionally tracked as follow-up hardening/feature-depth work after 
 7. Cross-feature interaction matrix
 - Expand tests where h2 transport, retries/timeouts, metrics/tracing hooks, and policy hooks are all active.
 - Verify deterministic stream outcomes and observability consistency under combined feature load.
+
+8. Upstream bridge I/O model evolution
+- Current upstream bridge reader uses bounded timed polling for fairness and cancellation semantics.
+- A push/edge-triggered design (epoll/io_uring readiness queue per upstream fd) could avoid timed polling noise/overhead, but is more complex.
+- Follow-up: prototype readiness-queue dispatch and compare latency/jitter, CPU overhead, and implementation complexity against the current polling model.
