@@ -199,7 +199,9 @@ fn handleSettings(self: *Runtime, header: h2.FrameHeader, payload: []const u8) E
     try self.state.receivePeerSettings(header, payload);
     if (is_ack) return .none;
 
-    try self.header_decoder.setMaxDynamicTableSize(self.state.peer_settings.header_table_size_bytes);
+    // Peer SETTINGS_HEADER_TABLE_SIZE applies to our encoder when sending
+    // headers to the peer, not to the decoder for inbound peer headers.
+    // Inbound decoder bounds are governed by local advertised limits.
     return .send_settings_ack;
 }
 
