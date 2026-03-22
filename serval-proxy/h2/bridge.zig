@@ -406,15 +406,18 @@ pub const StreamBridge = struct {
             },
             .response_data => |response_data| {
                 const binding = self.binding_table.getByUpstreamForSession(upstream_index, upstream_session_generation, response_data.stream_id) orelse return error.BindingNotFound;
-                if (self.sessions.getByGeneration(binding.upstream_index, binding.upstream_session_generation)) |session| {
-                    const consumed_bytes: u32 = @intCast(response_data.payload.len);
-                    session.replenishReceiveWindows(response_data.stream_id, consumed_bytes) catch |err| switch (err) {
-                        error.ConnectionClosed,
-                        error.ConnectionClosing,
-                        error.WriteFailed,
-                        => {},
-                        else => return err,
-                    };
+                if (!response_data.end_stream) {
+                    if (self.sessions.getByGeneration(binding.upstream_index, binding.upstream_session_generation)) |session| {
+                        const consumed_bytes: u32 = @intCast(response_data.payload.len);
+                        session.replenishReceiveWindows(response_data.stream_id, consumed_bytes) catch |err| switch (err) {
+                            error.ConnectionClosed,
+                            error.ConnectionClosing,
+                            error.WriteFailed,
+                            error.StreamNotFound,
+                            => {},
+                            else => return err,
+                        };
+                    }
                 }
 
                 if (response_data.end_stream) {
