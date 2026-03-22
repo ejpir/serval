@@ -281,7 +281,52 @@ pub const StreamBridge = struct {
         const binding = self.binding_table.getByDownstream(downstream_stream_id) orelse return error.BindingNotFound;
         const session = self.sessions.getByGeneration(binding.upstream_index, binding.upstream_session_generation) orelse return error.SessionNotFound;
 
-        const action = try session.receiveActionHandlingControlTimeout(io, timeout);
+        const stream = session.h2.runtime.state.getStream(binding.upstream_stream_id);
+        const stream_send_window: u32 = if (stream) |entry| entry.send_window.available_bytes else 0;
+        const stream_recv_window: u32 = if (stream) |entry| entry.recv_window.available_bytes else 0;
+
+        log.debug(
+            "h2 bridge: wait upstream action downstream_stream={d} upstream_stream={d} idx={d} gen={d} timeout={any} active_bindings={d} active_streams={d} conn_send_window={d} conn_recv_window={d} stream_send_window={d} stream_recv_window={d}",
+            .{
+                downstream_stream_id,
+                binding.upstream_stream_id,
+                binding.upstream_index,
+                binding.upstream_session_generation,
+                timeout,
+                self.binding_table.count,
+                session.h2.runtime.state.streams.active_count,
+                session.h2.runtime.state.flow.send_window.available_bytes,
+                session.h2.runtime.state.flow.recv_window.available_bytes,
+                stream_send_window,
+                stream_recv_window,
+            },
+        );
+
+        const action = session.receiveActionHandlingControlTimeout(io, timeout) catch |err| {
+            log.debug(
+                "h2 bridge: upstream wait failed downstream_stream={d} upstream_stream={d} idx={d} gen={d} err={s}",
+                .{
+                    downstream_stream_id,
+                    binding.upstream_stream_id,
+                    binding.upstream_index,
+                    binding.upstream_session_generation,
+                    @errorName(err),
+                },
+            );
+            return err;
+        };
+
+        log.debug(
+            "h2 bridge: upstream action ready downstream_stream={d} upstream_stream={d} idx={d} gen={d} action={s}",
+            .{
+                downstream_stream_id,
+                binding.upstream_stream_id,
+                binding.upstream_index,
+                binding.upstream_session_generation,
+                @tagName(action),
+            },
+        );
+
         return self.mapReceiveAction(binding.upstream_index, binding.upstream_session_generation, action);
     }
 
