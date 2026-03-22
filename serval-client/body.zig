@@ -102,11 +102,11 @@ pub const BodyReader = struct {
     done: bool,
     /// Iteration counter for bounded loops (TigerStyle S4).
     iterations: u32,
-    /// Buffer for incomplete chunk header data between reads.
-    /// Used when chunk size line spans multiple socket reads.
-    chunk_header_buf: [64]u8,
+    /// Buffer for incomplete chunk header data between reads and
+    /// optional pre-read chunked bytes captured during header parsing.
+    chunk_header_buf: [config.MAX_HEADER_SIZE_BYTES]u8,
     /// Bytes currently in chunk_header_buf.
-    chunk_header_len: u8,
+    chunk_header_len: u16,
     /// Bytes remaining in current chunk (for chunked encoding).
     current_chunk_remaining: u64,
     /// True if we need to skip CRLF after chunk data.
@@ -139,11 +139,28 @@ pub const BodyReader = struct {
                 .none => true, // No body to read
             },
             .iterations = 0,
-            .chunk_header_buf = std.mem.zeroes([64]u8),
+            .chunk_header_buf = std.mem.zeroes([config.MAX_HEADER_SIZE_BYTES]u8),
             .chunk_header_len = 0,
             .current_chunk_remaining = 0,
             .awaiting_chunk_crlf = false,
         };
+    }
+
+    /// Preload chunked body bytes that were read together with response headers.
+    ///
+    /// This allows callers that parsed headers from a single read to seed the
+    /// chunked decoder with already-buffered body bytes.
+    pub fn preloadChunkedBytes(self: *Self, bytes: []const u8) BodyError!void {
+        assert(@intFromPtr(self) != 0);
+        if (bytes.len == 0) return;
+        if (self.framing != .chunked) return;
+
+        const existing_len: usize = self.chunk_header_len;
+        const next_len: usize = existing_len + bytes.len;
+        if (next_len > self.chunk_header_buf.len) return error.BufferTooSmall;
+
+        @memcpy(self.chunk_header_buf[existing_len..next_len], bytes);
+        self.chunk_header_len = @intCast(next_len);
     }
 
     /// Read entire body into caller-owned buffer.
@@ -383,7 +400,7 @@ pub const BodyReader = struct {
             bytes_read = from_buf;
 
             // Shift remaining data in chunk_header_buf
-            const remaining: u8 = self.chunk_header_len - @as(u8, @intCast(from_buf));
+            const remaining: u16 = self.chunk_header_len - @as(u16, @intCast(from_buf));
             if (remaining > 0) {
                 std.mem.copyForwards(
                     u8,
@@ -431,7 +448,7 @@ pub const BodyReader = struct {
                 if (parseChunkSize(header_slice)) |parse_result| {
                     // Successfully parsed - save unconsumed bytes
                     const consumed = parse_result.consumed;
-                    const remaining = self.chunk_header_len - @as(u8, @intCast(consumed));
+                    const remaining: u16 = self.chunk_header_len - @as(u16, @intCast(consumed));
                     if (remaining > 0) {
                         std.mem.copyForwards(
                             u8,
@@ -745,6 +762,23 @@ test "BodyReader.init none" {
     var reader = BodyReader.init(&socket, .none);
 
     // No body means already done
+    try std.testing.expect(reader.done);
+}
+
+test "BodyReader.preloadChunkedBytes decodes fully buffered chunked body" {
+    const fds = posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch return;
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    var socket = Socket.Plain.init_client(fds[0]);
+    var reader = BodyReader.init(&socket, .chunked);
+
+    const preloaded = "5\r\nHello\r\n6\r\n World\r\n0\r\n\r\n";
+    try reader.preloadChunkedBytes(preloaded);
+
+    var out: [64]u8 = undefined;
+    const decoded = try reader.readAll(&out);
+    try std.testing.expectEqualStrings("Hello World", decoded);
     try std.testing.expect(reader.done);
 }
 

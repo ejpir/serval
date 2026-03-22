@@ -425,10 +425,9 @@ pub fn GenericTlsH2FrontendHandler(
                     if (remaining > 0) return error.ResponseFrameLimitExceeded;
                 },
                 .chunked => {
-                    if (pre_read.len != 0) return error.UnsupportedChunkedWithPreRead;
-
                     try writer.sendHeaders(response_headers.status, h2_headers, false);
                     var body_reader = serval_client.BodyReader.init(&conn.socket, response_headers.body_framing);
+                    body_reader.preloadChunkedBytes(pre_read) catch return error.UpstreamResponseBodyReadFailed;
                     var response_buf: [config.H2_MAX_FRAME_SIZE_BYTES]u8 = undefined;
 
                     var frame_count: u32 = 0;
