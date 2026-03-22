@@ -28,6 +28,7 @@ const preface_settings_buffer_size_bytes: usize =
 const request_headers_frame_overhead_bytes: usize = h2.frame_header_size_bytes * (@as(usize, config.H2_MAX_CONTINUATION_FRAMES) + 1);
 const request_headers_frame_buffer_size_bytes: usize = config.H2_MAX_HEADER_BLOCK_SIZE_BYTES + request_headers_frame_overhead_bytes;
 const data_frame_buffer_size_bytes: usize = h2.frame_header_size_bytes + config.H2_MAX_FRAME_SIZE_BYTES;
+const window_update_frame_size_bytes: usize = h2.frame_header_size_bytes + h2.control.window_update_payload_size_bytes;
 
 pub const Error = error{
     ReadFailed,
@@ -289,6 +290,24 @@ pub const ClientConnection = struct {
             .error_code_raw = error_code_raw,
         });
         try self.writeAll(frame);
+    }
+
+    pub fn replenishReceiveWindows(self: *ClientConnection, stream_id: u32, consumed_bytes: u32) Error!void {
+        assert(@intFromPtr(self) != 0);
+        assert(stream_id > 0);
+
+        if (consumed_bytes == 0) return;
+
+        try self.runtime.state.incrementRecvWindow(consumed_bytes);
+        try self.runtime.state.incrementStreamRecvWindow(stream_id, consumed_bytes);
+
+        var conn_window_update_buf: [window_update_frame_size_bytes]u8 = undefined;
+        const conn_window_update = try h2.buildWindowUpdateFrame(&conn_window_update_buf, 0, consumed_bytes);
+        try self.writeAll(conn_window_update);
+
+        var stream_window_update_buf: [window_update_frame_size_bytes]u8 = undefined;
+        const stream_window_update = try h2.buildWindowUpdateFrame(&stream_window_update_buf, stream_id, consumed_bytes);
+        try self.writeAll(stream_window_update);
     }
 
     pub fn receiveAction(self: *ClientConnection) Error!runtime_mod.ReceiveAction {
@@ -753,6 +772,63 @@ test "ClientConnection completeHandshake sends settings ACK" {
     try std.testing.expectEqual(h2.FrameType.settings, ack_header.frame_type);
     try std.testing.expectEqual(h2.flags_ack, ack_header.flags);
     try std.testing.expectEqual(@as(u32, 0), ack_header.length);
+}
+
+test "ClientConnection replenishes receive windows for active stream" {
+    const fds = try testSocketPair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+
+    var peer_settings_buf: [h2.frame_header_size_bytes]u8 = undefined;
+    const peer_settings = try buildPeerSettingsFrame(&peer_settings_buf);
+    try writeAllFd(fds[1], peer_settings);
+
+    var socket = Socket.Plain.init_client(fds[0]);
+    var conn = try ClientConnection.init(&socket);
+    try conn.completeHandshake();
+
+    var expected_runtime = try runtime_mod.Runtime.init();
+    var expected_preface_buf: [preface_settings_buffer_size_bytes]u8 = undefined;
+    const expected_preface = try expected_runtime.writeClientPrefaceAndSettings(&expected_preface_buf);
+    var handshake_wire: [preface_settings_buffer_size_bytes + h2.frame_header_size_bytes]u8 = undefined;
+    try readExact(fds[1], handshake_wire[0 .. expected_preface.len + h2.frame_header_size_bytes]);
+
+    var request = try makeGrpcRequest("/grpc.test.Echo/WindowUpdate");
+    const stream_id = try conn.sendRequestHeaders(&request, null, false);
+    try std.testing.expectEqual(@as(u32, 1), stream_id);
+
+    var request_headers_wire_header: [h2.frame_header_size_bytes]u8 = undefined;
+    try readExact(fds[1], &request_headers_wire_header);
+    const request_headers_header = try h2.parseFrameHeader(&request_headers_wire_header);
+    try std.testing.expectEqual(h2.FrameType.headers, request_headers_header.frame_type);
+
+    var request_header_block_buf: [config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+    const request_header_block_len: usize = @intCast(request_headers_header.length);
+    try readExact(fds[1], request_header_block_buf[0..request_header_block_len]);
+
+    try conn.replenishReceiveWindows(stream_id, 16);
+
+    var conn_update_frame_buf: [window_update_frame_size_bytes]u8 = undefined;
+    try readExact(fds[1], &conn_update_frame_buf);
+    const conn_update_header = try h2.parseFrameHeader(&conn_update_frame_buf);
+    try std.testing.expectEqual(h2.FrameType.window_update, conn_update_header.frame_type);
+    try std.testing.expectEqual(@as(u32, 0), conn_update_header.stream_id);
+    const conn_update_increment = try h2.parseWindowUpdateFrame(
+        conn_update_header,
+        conn_update_frame_buf[h2.frame_header_size_bytes .. h2.frame_header_size_bytes + h2.control.window_update_payload_size_bytes],
+    );
+    try std.testing.expectEqual(@as(u32, 16), conn_update_increment);
+
+    var stream_update_frame_buf: [window_update_frame_size_bytes]u8 = undefined;
+    try readExact(fds[1], &stream_update_frame_buf);
+    const stream_update_header = try h2.parseFrameHeader(&stream_update_frame_buf);
+    try std.testing.expectEqual(h2.FrameType.window_update, stream_update_header.frame_type);
+    try std.testing.expectEqual(stream_id, stream_update_header.stream_id);
+    const stream_update_increment = try h2.parseWindowUpdateFrame(
+        stream_update_header,
+        stream_update_frame_buf[h2.frame_header_size_bytes .. h2.frame_header_size_bytes + h2.control.window_update_payload_size_bytes],
+    );
+    try std.testing.expectEqual(@as(u32, 16), stream_update_increment);
 }
 
 test "ClientConnection request send and response receive round-trip" {

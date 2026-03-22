@@ -92,6 +92,14 @@ pub const UpstreamSession = struct {
         self.last_used_ns = time.monotonicNanos();
     }
 
+    pub fn replenishReceiveWindows(self: *UpstreamSession, stream_id: u32, consumed_bytes: u32) Error!void {
+        assert(@intFromPtr(self) != 0);
+        assert(stream_id > 0);
+
+        try self.h2.replenishReceiveWindows(stream_id, consumed_bytes);
+        self.last_used_ns = time.monotonicNanos();
+    }
+
     pub fn receiveAction(self: *UpstreamSession) Error!runtime_mod.ReceiveAction {
         assert(@intFromPtr(self) != 0);
         assert(self.connection.socket.get_fd() >= 0);
