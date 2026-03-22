@@ -3690,6 +3690,31 @@ fn grpcH2BackendMain(config: GrpcH2BackendConfig) !void {
         return error.MissingExpectedHeaderName;
     }
 
+    var cursor: usize = parsed.consumed_bytes;
+    var saw_end_stream = false;
+    var frame_reads: u32 = 0;
+    while (!saw_end_stream and frame_reads < H2_MAX_FRAME_READS) : (frame_reads += 1) {
+        while (total - cursor < serval_h2.frame_header_size_bytes) {
+            const n = try conn_io.read(request_buf[total..]);
+            total += n;
+        }
+
+        const header = try serval_h2.parseFrameHeader(request_buf[cursor..]);
+        const payload_start = cursor + serval_h2.frame_header_size_bytes;
+        const payload_end = payload_start + header.length;
+        while (total < payload_end) {
+            const n = try conn_io.read(request_buf[total..]);
+            total += n;
+        }
+
+        if (header.stream_id == parsed.stream_id and (header.flags & serval_h2.flags_end_stream) != 0) {
+            saw_end_stream = true;
+        }
+
+        cursor = payload_end;
+    }
+    if (!saw_end_stream) return error.ReadTimeout;
+
     if (config.response_trailer_name != null and config.response_trailer_value == null) {
         return error.MissingResponseTrailerValue;
     }
