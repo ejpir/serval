@@ -217,6 +217,7 @@ Current stack-level completeness status:
 
 - generic (non-gRPC-specific) stream-aware h2 proxy parity is covered by focused ALPN + h2c prior-knowledge + h2c upgrade integration suites
 - mixed-workload multiplexed hardening (GOAWAY/reset/cancel overlaps + non-gRPC interactions) is covered by focused loop + soak integration suites
+- PRIORITY/dependency policy is explicit: frame validity is enforced (including self-dependency rejection), while priority scheduling hints are currently treated as non-operative for forwarding decisions
 
 ## TigerStyle Compliance
 

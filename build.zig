@@ -1333,6 +1333,16 @@ pub fn build(b: *std.Build) void {
     integration_test_h2_mixed_hardening_fast_step.dependOn(&run_integration_test_h2c_reset_isolation.step);
     integration_test_h2_mixed_hardening_fast_step.dependOn(&run_integration_test_h2c_reset_isolation_soak.step);
 
+    const integration_test_h2_mixed_hardening_soak_step = b.step(
+        "test-integration-h2-mixed-hardening-soak",
+        "Run extended HTTP/2 mixed-workload soak set (GOAWAY/reset/cancel overlaps + upgrade rollover)",
+    );
+    integration_test_h2_mixed_hardening_soak_step.dependOn(&run_integration_test_h2c_mixed_goaway_nongrpc_soak.step);
+    integration_test_h2_mixed_hardening_soak_step.dependOn(&run_integration_test_h2c_cancel_goaway_overlap_soak.step);
+    integration_test_h2_mixed_hardening_soak_step.dependOn(&run_integration_test_h2c_reset_isolation_soak.step);
+    integration_test_h2_mixed_hardening_soak_step.dependOn(&run_integration_test_h2c_goaway_rollover_soak.step);
+    integration_test_h2_mixed_hardening_soak_step.dependOn(&run_integration_test_h2c_upgrade_goaway_rollover_soak.step);
+
     const acme_issue_once_mod = b.createModule(.{
         .root_source_file = b.path("integration/acme_issue_once.zig"),
         .target = target,
@@ -1654,6 +1664,17 @@ pub fn build(b: *std.Build) void {
 
     const run_h2_conformance_server_step = b.step("run-h2-conformance-server", "Run HTTP/2 conformance target server");
     run_h2_conformance_server_step.dependOn(&run_h2_conformance_server.step);
+
+    const test_h2_conformance_ci = b.addSystemCommand(&.{
+        "bash",
+        "integration/h2_conformance_ci.sh",
+        "--h2c-port",
+        "28080",
+        "--tls-port",
+        "28443",
+    });
+    const test_h2_conformance_ci_step = b.step("test-h2-conformance-ci", "Run h2spec conformance sweep against plain+TLS h2 conformance server");
+    test_h2_conformance_ci_step.dependOn(&test_h2_conformance_ci.step);
 
     // OTLP test example
     // Note: Links SSL libraries since serval-otel uses serval-client which uses serval-tls
