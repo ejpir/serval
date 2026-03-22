@@ -74,6 +74,15 @@ pub const ReceiveAction = union(enum) {
     connection_close: ConnectionCloseAction,
 };
 
+fn shouldLogIdleWait(since_last_action_ns: u64) bool {
+    // Reduce WouldBlock log flood while preserving periodic visibility.
+    // Log aggressively during first 250ms, then roughly once per second.
+    if (since_last_action_ns <= 250 * std.time.ns_per_ms) return true;
+    const second_ns: u64 = std.time.ns_per_s;
+    const phase_ns = since_last_action_ns % second_ns;
+    return phase_ns <= 50 * std.time.ns_per_ms;
+}
+
 pub const StreamBridge = struct {
     client: *serval_client.Client,
     sessions: *serval_client.H2UpstreamSessionPool,
@@ -319,29 +328,9 @@ pub const StreamBridge = struct {
             } };
         }
 
-        log.debug(
-            "h2 bridge: conn={d} wait upstream action downstream_stream={d} upstream_stream={d} idx={d} gen={d} fd={d} timeout={any} since_last_action_ns={d} active_bindings={d} active_streams={d} conn_send_window={d} conn_recv_window={d} stream_send_window={d} stream_recv_window={d}",
-            .{
-                self.debug_connection_id,
-                downstream_stream_id,
-                binding.upstream_stream_id,
-                binding.upstream_index,
-                binding.upstream_session_generation,
-                fd,
-                timeout,
-                since_last_action_ns,
-                self.binding_table.count,
-                session.h2.runtime.state.streams.active_count,
-                session.h2.runtime.state.flow.send_window.available_bytes,
-                session.h2.runtime.state.flow.recv_window.available_bytes,
-                stream_send_window,
-                stream_recv_window,
-            },
-        );
-
-        const action = session.receiveActionHandlingControlTimeout(io, timeout) catch |err| {
+        if (shouldLogIdleWait(since_last_action_ns)) {
             log.debug(
-                "h2 bridge: conn={d} upstream wait failed downstream_stream={d} upstream_stream={d} idx={d} gen={d} fd={d} err={s}",
+                "h2 bridge: conn={d} wait upstream action downstream_stream={d} upstream_stream={d} idx={d} gen={d} fd={d} timeout={any} since_last_action_ns={d} active_bindings={d} active_streams={d} conn_send_window={d} conn_recv_window={d} stream_send_window={d} stream_recv_window={d}",
                 .{
                     self.debug_connection_id,
                     downstream_stream_id,
@@ -349,24 +338,50 @@ pub const StreamBridge = struct {
                     binding.upstream_index,
                     binding.upstream_session_generation,
                     fd,
-                    @errorName(err),
+                    timeout,
+                    since_last_action_ns,
+                    self.binding_table.count,
+                    session.h2.runtime.state.streams.active_count,
+                    session.h2.runtime.state.flow.send_window.available_bytes,
+                    session.h2.runtime.state.flow.recv_window.available_bytes,
+                    stream_send_window,
+                    stream_recv_window,
                 },
             );
+        }
+
+        const action = session.receiveActionHandlingControlTimeout(io, timeout) catch |err| {
+            if (err != error.WouldBlock or shouldLogIdleWait(since_last_action_ns)) {
+                log.debug(
+                    "h2 bridge: conn={d} upstream wait failed downstream_stream={d} upstream_stream={d} idx={d} gen={d} fd={d} err={s}",
+                    .{
+                        self.debug_connection_id,
+                        downstream_stream_id,
+                        binding.upstream_stream_id,
+                        binding.upstream_index,
+                        binding.upstream_session_generation,
+                        fd,
+                        @errorName(err),
+                    },
+                );
+            }
             return err;
         };
 
-        log.debug(
-            "h2 bridge: conn={d} upstream action ready downstream_stream={d} upstream_stream={d} idx={d} gen={d} fd={d} action={s}",
-            .{
-                self.debug_connection_id,
-                downstream_stream_id,
-                binding.upstream_stream_id,
-                binding.upstream_index,
-                binding.upstream_session_generation,
-                fd,
-                @tagName(action),
-            },
-        );
+        if (action != .none or shouldLogIdleWait(since_last_action_ns)) {
+            log.debug(
+                "h2 bridge: conn={d} upstream action ready downstream_stream={d} upstream_stream={d} idx={d} gen={d} fd={d} action={s}",
+                .{
+                    self.debug_connection_id,
+                    downstream_stream_id,
+                    binding.upstream_stream_id,
+                    binding.upstream_index,
+                    binding.upstream_session_generation,
+                    fd,
+                    @tagName(action),
+                },
+            );
+        }
 
         return self.mapReceiveAction(binding.upstream_index, binding.upstream_session_generation, action);
     }
