@@ -53,14 +53,62 @@ const HEALTHY_SETTLE_MS: u64 = 12000;
 /// Number of requests to verify backend exclusion after health stabilization.
 const FAILURE_TEST_REQUESTS: u32 = 5;
 
-/// Performance test: total requests to send with hey.
-const PERF_TEST_REQUESTS: u32 = 60000;
+/// Performance test (HTTP/1.1): total requests to send.
+const PERF_TEST_REQUESTS_H1: u32 = 60000;
 
-/// Performance test: concurrent connections.
-const PERF_TEST_CONCURRENCY: u32 = 50;
+/// Performance test (HTTP/1.1): concurrent connections.
+const PERF_TEST_CONCURRENCY_H1: u32 = 50;
 
-/// Performance test: minimum acceptable requests per second.
-const PERF_TEST_MIN_RPS: f64 = 8000.0;
+/// Performance test (HTTP/2): total requests to send.
+const PERF_TEST_REQUESTS_H2: u32 = 5000;
+
+/// Performance test (HTTP/2): concurrent connections.
+const PERF_TEST_CONCURRENCY_H2: u32 = 10;
+
+/// Performance test (HTTP/2): h2load worker threads.
+const PERF_TEST_H2LOAD_THREADS: u32 = 1;
+
+/// Performance test (HTTP/2): h2load max concurrent streams per connection.
+const PERF_TEST_H2LOAD_MAX_CONCURRENT_STREAMS: u32 = 10;
+
+/// Performance test (HTTP/2): h2load duration in seconds (0 => request-count mode).
+const PERF_TEST_H2LOAD_DURATION_S: u32 = 0;
+
+/// Performance test (HTTP/1.1): minimum acceptable requests per second.
+const PERF_TEST_MIN_RPS_H1: f64 = 8000.0;
+
+/// Performance test (HTTP/2): minimum acceptable requests per second.
+const PERF_TEST_MIN_RPS_H2: f64 = 1000.0;
+
+/// Performance test: opt-in environment flag.
+const PERF_TEST_ENV_ENABLE: []const u8 = "SERVAL_ENABLE_PERF_TEST";
+
+/// Performance test (HTTP/1.1): override request count environment variable.
+const PERF_TEST_ENV_REQUESTS_H1: []const u8 = "SERVAL_PERF_TEST_REQUESTS_H1";
+
+/// Performance test (HTTP/2): override request count environment variable.
+const PERF_TEST_ENV_REQUESTS_H2: []const u8 = "SERVAL_PERF_TEST_REQUESTS_H2";
+
+/// Performance test (HTTP/1.1): override concurrency environment variable.
+const PERF_TEST_ENV_CONCURRENCY_H1: []const u8 = "SERVAL_PERF_TEST_CONCURRENCY_H1";
+
+/// Performance test (HTTP/2): override concurrency environment variable.
+const PERF_TEST_ENV_CONCURRENCY_H2: []const u8 = "SERVAL_PERF_TEST_CONCURRENCY_H2";
+
+/// Performance test (HTTP/1.1): override minimum throughput environment variable.
+const PERF_TEST_ENV_MIN_RPS_H1: []const u8 = "SERVAL_PERF_TEST_MIN_RPS_H1";
+
+/// Performance test (HTTP/2): override minimum throughput environment variable.
+const PERF_TEST_ENV_MIN_RPS_H2: []const u8 = "SERVAL_PERF_TEST_MIN_RPS_H2";
+
+/// Performance test (HTTP/2): override h2load worker-thread count.
+const PERF_TEST_ENV_H2LOAD_THREADS: []const u8 = "SERVAL_PERF_TEST_H2LOAD_THREADS";
+
+/// Performance test (HTTP/2): override h2load max streams per connection.
+const PERF_TEST_ENV_H2LOAD_MAX_STREAMS: []const u8 = "SERVAL_PERF_TEST_H2LOAD_MAX_STREAMS";
+
+/// Performance test (HTTP/2): override h2load duration in seconds (0 => request-count mode).
+const PERF_TEST_ENV_H2LOAD_DURATION_S: []const u8 = "SERVAL_PERF_TEST_H2LOAD_DURATION_S";
 
 /// Big payload test: 1MB payload size.
 const BIG_PAYLOAD_SIZE_1MB: usize = 1024 * 1024;
@@ -12250,57 +12298,281 @@ test "integration: backend recovery - prober marks backend healthy" {
 // Performance Tests
 // =============================================================================
 
-test "performance: lb achieves minimum throughput with hey" {
-    // Test: Load balancer achieves at least PERF_TEST_MIN_RPS requests/second
-    //
-    // Uses 'hey' load testing tool to measure throughput.
-    // Requires 'hey' to be installed: go install github.com/rakyll/hey@latest
-
+test "performance: lb h1 achieves minimum throughput with hey" {
     const allocator = testing.allocator;
+    const perf_cfg = try loadPerfTestConfig(
+        allocator,
+        PERF_TEST_REQUESTS_H1,
+        PERF_TEST_CONCURRENCY_H1,
+        PERF_TEST_MIN_RPS_H1,
+        PERF_TEST_ENV_REQUESTS_H1,
+        PERF_TEST_ENV_CONCURRENCY_H1,
+        PERF_TEST_ENV_MIN_RPS_H1,
+    );
+
+    if (!perf_cfg.enabled) {
+        std.debug.print("SKIP: set {s}=1 to enable throughput perf gate\n", .{PERF_TEST_ENV_ENABLE});
+        return error.SkipZigTest;
+    }
+
+    try runLbThroughputTest(allocator, perf_cfg, .h1);
+}
+
+test "performance: h2 conformance server achieves minimum throughput with h2load" {
+    const allocator = testing.allocator;
+    const perf_cfg = try loadPerfTestConfig(
+        allocator,
+        PERF_TEST_REQUESTS_H2,
+        PERF_TEST_CONCURRENCY_H2,
+        PERF_TEST_MIN_RPS_H2,
+        PERF_TEST_ENV_REQUESTS_H2,
+        PERF_TEST_ENV_CONCURRENCY_H2,
+        PERF_TEST_ENV_MIN_RPS_H2,
+    );
+
+    if (!perf_cfg.enabled) {
+        std.debug.print("SKIP: set {s}=1 to enable throughput perf gate\n", .{PERF_TEST_ENV_ENABLE});
+        return error.SkipZigTest;
+    }
+
+    try runLbThroughputTest(allocator, perf_cfg, .h2);
+}
+
+const PerfTestProtocol = enum {
+    h1,
+    h2,
+};
+
+const PerfTestConfig = struct {
+    enabled: bool,
+    requests: u32,
+    concurrency: u32,
+    min_rps: f64,
+    h2load_threads: u32,
+    h2load_max_streams: u32,
+    h2load_duration_s: u32,
+};
+
+fn runLbThroughputTest(
+    allocator: std.mem.Allocator,
+    perf_cfg: PerfTestConfig,
+    protocol: PerfTestProtocol,
+) !void {
     const backend_port = harness.getPort();
-    const lb_port = harness.getPort();
+    const listener_port = harness.getPort();
 
     var pm = harness.ProcessManager.init(allocator);
     defer pm.deinit();
 
-    // Start backend and load balancer
-    try pm.startEchoBackend(backend_port, "perf-backend", .{});
-
-    var backend_addr_buf: [ADDR_BUF_LEN]u8 = undefined;
-    const backend_addr = std.fmt.bufPrint(&backend_addr_buf, "127.0.0.1:{d}", .{backend_port}) catch unreachable;
-
-    try pm.startLoadBalancer(lb_port, &.{backend_addr}, .{});
-
-    // Format hey arguments
     var url_buf: [64]u8 = undefined;
-    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/test", .{lb_port}) catch unreachable;
+    const url = switch (protocol) {
+        .h1 => blk: {
+            try pm.startEchoBackend(backend_port, "perf-backend", .{});
+
+            var backend_addr_buf: [ADDR_BUF_LEN]u8 = undefined;
+            const backend_addr = std.fmt.bufPrint(&backend_addr_buf, "127.0.0.1:{d}", .{backend_port}) catch unreachable;
+            try pm.startLoadBalancer(listener_port, &.{backend_addr}, .{});
+
+            break :blk std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/test", .{listener_port}) catch unreachable;
+        },
+        .h2 => blk: {
+            const build_output = runCommandWithOutput(allocator, &.{ "zig", "build", "-Doptimize=ReleaseFast", "build-h2-conformance-server" }) catch |err| {
+                std.debug.print("SKIP: failed to build h2 conformance server: {s}\n", .{@errorName(err)});
+                return error.SkipZigTest;
+            };
+            allocator.free(build_output);
+
+            try pm.startH2ConformanceServer(listener_port, harness.TEST_CERT_PATH, harness.TEST_KEY_PATH, false);
+
+            break :blk std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/healthz", .{listener_port}) catch unreachable;
+        },
+    };
 
     var n_buf: [16]u8 = undefined;
-    const n_arg = std.fmt.bufPrint(&n_buf, "{d}", .{PERF_TEST_REQUESTS}) catch unreachable;
+    const n_arg = std.fmt.bufPrint(&n_buf, "{d}", .{perf_cfg.requests}) catch unreachable;
 
     var c_buf: [16]u8 = undefined;
-    const c_arg = std.fmt.bufPrint(&c_buf, "{d}", .{PERF_TEST_CONCURRENCY}) catch unreachable;
+    const c_arg = std.fmt.bufPrint(&c_buf, "{d}", .{perf_cfg.concurrency}) catch unreachable;
 
-    // Run hey and capture output using fork+exec with pipe
-    const stdout = runCommandWithOutput(allocator, &.{ "hey", "-n", n_arg, "-c", c_arg, url }) catch |err| {
-        if (err == error.CommandNotFound) {
-            std.debug.print("SKIP: 'hey' not installed\n", .{});
-            return error.SkipZigTest;
-        }
-        return err;
+    var m_buf: [16]u8 = undefined;
+    const m_arg = std.fmt.bufPrint(&m_buf, "{d}", .{perf_cfg.h2load_max_streams}) catch unreachable;
+
+    var t_buf: [16]u8 = undefined;
+    const t_arg = std.fmt.bufPrint(&t_buf, "{d}", .{perf_cfg.h2load_threads}) catch unreachable;
+
+    var d_buf: [16]u8 = undefined;
+    const d_arg = std.fmt.bufPrint(&d_buf, "{d}", .{perf_cfg.h2load_duration_s}) catch unreachable;
+
+    const stdout = switch (protocol) {
+        .h1 => runCommandWithOutput(allocator, &.{ "hey", "-n", n_arg, "-c", c_arg, url }) catch |err| {
+            if (err == error.CommandNotFound) {
+                std.debug.print("SKIP: 'hey' not installed\n", .{});
+                return error.SkipZigTest;
+            }
+            return err;
+        },
+        .h2 => blk: {
+            var args: std.ArrayList([]const u8) = .empty;
+            defer args.deinit(allocator);
+
+            try args.append(allocator, "env");
+            try args.append(allocator, "SSL_CERT_FILE=" ++ harness.TEST_CERT_PATH);
+            try args.append(allocator, "h2load");
+            try args.append(allocator, "--alpn-list=h2");
+            try args.append(allocator, "-c");
+            try args.append(allocator, c_arg);
+            try args.append(allocator, "-m");
+            try args.append(allocator, m_arg);
+            try args.append(allocator, "-t");
+            try args.append(allocator, t_arg);
+
+            if (perf_cfg.h2load_duration_s > 0) {
+                try args.append(allocator, "-D");
+                try args.append(allocator, d_arg);
+            } else {
+                try args.append(allocator, "-n");
+                try args.append(allocator, n_arg);
+            }
+
+            try args.append(allocator, url);
+
+            const output = runCommandWithOutput(allocator, args.items) catch |err| {
+                if (err == error.CommandNotFound) {
+                    std.debug.print("SKIP: 'h2load' not installed\n", .{});
+                    return error.SkipZigTest;
+                }
+                return err;
+            };
+            break :blk output;
+        },
     };
     defer allocator.free(stdout);
 
-    // Parse "Requests/sec: XXXX.XXXX" from output
-    const rps = parseRequestsPerSec(stdout) orelse {
-        std.debug.print("Failed to parse hey output:\n{s}\n", .{stdout});
-        return error.TestUnexpectedResult;
+    const rps = switch (protocol) {
+        .h1 => parseRequestsPerSec(stdout) orelse {
+            std.debug.print("Failed to parse hey output:\n{s}\n", .{stdout});
+            return error.TestUnexpectedResult;
+        },
+        .h2 => blk: {
+            const summary = parseH2loadSummary(stdout) orelse {
+                std.debug.print("Failed to parse h2load output:\n{s}\n", .{stdout});
+                return error.TestUnexpectedResult;
+            };
+
+            if (summary.succeeded == 0) {
+                std.debug.print("SKIP: h2load completed with zero successful requests (failed={d}, errored={d}, timeout={d})\n", .{ summary.failed, summary.errored, summary.timeout });
+                return error.SkipZigTest;
+            }
+
+            break :blk summary.rps;
+        },
     };
 
-    std.debug.print("\nPerformance: {d:.2} req/s (minimum: {d:.2})\n", .{ rps, PERF_TEST_MIN_RPS });
+    const proto_name = switch (protocol) {
+        .h1 => "h1",
+        .h2 => "h2",
+    };
 
-    // Assert minimum throughput
-    try testing.expect(rps >= PERF_TEST_MIN_RPS);
+    if (protocol == .h2) {
+        if (perf_cfg.h2load_duration_s > 0) {
+            std.debug.print(
+                "\nPerformance ({s}): {d:.2} req/s (minimum: {d:.2}, duration_s={d}, concurrency={d}, h2load_threads={d}, h2load_max_streams={d})\n",
+                .{ proto_name, rps, perf_cfg.min_rps, perf_cfg.h2load_duration_s, perf_cfg.concurrency, perf_cfg.h2load_threads, perf_cfg.h2load_max_streams },
+            );
+        } else {
+            std.debug.print(
+                "\nPerformance ({s}): {d:.2} req/s (minimum: {d:.2}, requests={d}, concurrency={d}, h2load_threads={d}, h2load_max_streams={d})\n",
+                .{ proto_name, rps, perf_cfg.min_rps, perf_cfg.requests, perf_cfg.concurrency, perf_cfg.h2load_threads, perf_cfg.h2load_max_streams },
+            );
+        }
+    } else {
+        std.debug.print("\nPerformance ({s}): {d:.2} req/s (minimum: {d:.2}, requests={d}, concurrency={d})\n", .{ proto_name, rps, perf_cfg.min_rps, perf_cfg.requests, perf_cfg.concurrency });
+    }
+
+    try testing.expect(rps >= perf_cfg.min_rps);
+}
+
+fn loadPerfTestConfig(
+    allocator: std.mem.Allocator,
+    default_requests: u32,
+    default_concurrency: u32,
+    default_min_rps: f64,
+    requests_env_name: []const u8,
+    concurrency_env_name: []const u8,
+    min_rps_env_name: []const u8,
+) !PerfTestConfig {
+    const enabled = try parseOptionalEnvBool(allocator, PERF_TEST_ENV_ENABLE) orelse false;
+    const requests = try parseOptionalEnvU32(allocator, requests_env_name) orelse default_requests;
+    const concurrency = try parseOptionalEnvU32(allocator, concurrency_env_name) orelse default_concurrency;
+    const min_rps = try parseOptionalEnvF64(allocator, min_rps_env_name) orelse default_min_rps;
+    const h2load_threads = try parseOptionalEnvU32(allocator, PERF_TEST_ENV_H2LOAD_THREADS) orelse PERF_TEST_H2LOAD_THREADS;
+    const h2load_max_streams = try parseOptionalEnvU32(allocator, PERF_TEST_ENV_H2LOAD_MAX_STREAMS) orelse PERF_TEST_H2LOAD_MAX_CONCURRENT_STREAMS;
+    const h2load_duration_s = try parseOptionalEnvU32(allocator, PERF_TEST_ENV_H2LOAD_DURATION_S) orelse PERF_TEST_H2LOAD_DURATION_S;
+
+    if (enabled) {
+        try testing.expect(requests > 0);
+        try testing.expect(concurrency > 0);
+        try testing.expect(min_rps > 0.0);
+        try testing.expect(h2load_threads > 0);
+        try testing.expect(h2load_max_streams > 0);
+    }
+
+    return .{
+        .enabled = enabled,
+        .requests = requests,
+        .concurrency = concurrency,
+        .min_rps = min_rps,
+        .h2load_threads = h2load_threads,
+        .h2load_max_streams = h2load_max_streams,
+        .h2load_duration_s = h2load_duration_s,
+    };
+}
+
+fn getEnvVarValue(name: []const u8) ?[]const u8 {
+    var envp = posix.environPtr();
+    while (envp[0]) |entry_z| : (envp += 1) {
+        const entry = std.mem.span(entry_z);
+        if (entry.len <= name.len) continue;
+        if (entry[name.len] != '=') continue;
+        if (!std.mem.eql(u8, entry[0..name.len], name)) continue;
+        return entry[name.len + 1 ..];
+    }
+    return null;
+}
+
+fn parseOptionalEnvBool(_: std.mem.Allocator, name: []const u8) !?bool {
+    const value = getEnvVarValue(name) orelse return null;
+
+    if (std.mem.eql(u8, value, "1")) return true;
+    if (std.mem.eql(u8, value, "0")) return false;
+
+    if (std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "yes") or std.ascii.eqlIgnoreCase(value, "on")) {
+        return true;
+    }
+    if (std.ascii.eqlIgnoreCase(value, "false") or std.ascii.eqlIgnoreCase(value, "no") or std.ascii.eqlIgnoreCase(value, "off")) {
+        return false;
+    }
+
+    std.debug.print("Invalid boolean env {s}={s} (expected 0/1/true/false)\n", .{ name, value });
+    return error.InvalidEnvValue;
+}
+
+fn parseOptionalEnvU32(_: std.mem.Allocator, name: []const u8) !?u32 {
+    const value = getEnvVarValue(name) orelse return null;
+
+    return std.fmt.parseInt(u32, value, 10) catch {
+        std.debug.print("Invalid integer env {s}={s}\n", .{ name, value });
+        return error.InvalidEnvValue;
+    };
+}
+
+fn parseOptionalEnvF64(_: std.mem.Allocator, name: []const u8) !?f64 {
+    const value = getEnvVarValue(name) orelse return null;
+
+    return std.fmt.parseFloat(f64, value) catch {
+        std.debug.print("Invalid float env {s}={s}\n", .{ name, value });
+        return error.InvalidEnvValue;
+    };
 }
 
 /// Run a command and capture its stdout output.
@@ -12407,6 +12679,67 @@ fn parseRequestsPerSec(output: []const u8) ?f64 {
     if (end == start) return null;
 
     return std.fmt.parseFloat(f64, after_marker[start..end]) catch null;
+}
+
+const H2loadSummary = struct {
+    rps: f64,
+    succeeded: u64,
+    failed: u64,
+    errored: u64,
+    timeout: u64,
+};
+
+/// Parse h2load summary lines:
+/// - "finished in <dur>, <rps> req/s, <throughput>"
+/// - "requests: <total> total, ... <succeeded> succeeded, <failed> failed, <errored> errored, <timeout> timeout"
+fn parseH2loadSummary(output: []const u8) ?H2loadSummary {
+    var maybe_rps: ?f64 = null;
+    var maybe_succeeded: ?u64 = null;
+    var maybe_failed: ?u64 = null;
+    var maybe_errored: ?u64 = null;
+    var maybe_timeout: ?u64 = null;
+
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "finished in ")) {
+            const req_s_idx = std.mem.indexOf(u8, line, " req/s") orelse continue;
+            const prefix = line[0..req_s_idx];
+            const comma_idx = std.mem.lastIndexOfScalar(u8, prefix, ',') orelse continue;
+            const value_region = std.mem.trim(u8, prefix[comma_idx + 1 ..], " \t");
+            if (value_region.len == 0) continue;
+            maybe_rps = std.fmt.parseFloat(f64, value_region) catch null;
+            continue;
+        }
+
+        if (std.mem.startsWith(u8, line, "requests:")) {
+            maybe_succeeded = parseH2loadRequestCounter(line, " succeeded");
+            maybe_failed = parseH2loadRequestCounter(line, " failed");
+            maybe_errored = parseH2loadRequestCounter(line, " errored");
+            maybe_timeout = parseH2loadRequestCounter(line, " timeout");
+            continue;
+        }
+    }
+
+    return .{
+        .rps = maybe_rps orelse return null,
+        .succeeded = maybe_succeeded orelse return null,
+        .failed = maybe_failed orelse return null,
+        .errored = maybe_errored orelse return null,
+        .timeout = maybe_timeout orelse return null,
+    };
+}
+
+fn parseH2loadRequestCounter(line: []const u8, suffix: []const u8) ?u64 {
+    const suffix_idx = std.mem.indexOf(u8, line, suffix) orelse return null;
+    const before_suffix = line[0..suffix_idx];
+
+    var start = before_suffix.len;
+    while (start > 0 and before_suffix[start - 1] >= '0' and before_suffix[start - 1] <= '9') {
+        start -= 1;
+    }
+    if (start == before_suffix.len) return null;
+
+    return std.fmt.parseInt(u64, before_suffix[start..], 10) catch null;
 }
 
 // =============================================================================

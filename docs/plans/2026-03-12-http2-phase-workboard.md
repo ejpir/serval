@@ -133,7 +133,10 @@ Related execution plan:
 ## Phase 5 — Rollout + Promotion Gates
 
 ### Open implementation queue
-- [ ] P5-A: Keep stable profile conservative until gates are green
+- [~] P5-A: Keep stable profile conservative until gates are green
+  - Integration perf throughput gates are deterministic by default in mixed environments: `integration: lb h1 achieves minimum throughput with hey` and `integration: h2 conformance server achieves minimum throughput with h2load` are opt-in via `SERVAL_ENABLE_PERF_TEST=1`, so `zig build test-integration` stays reproducible without host-specific throughput floors.
+  - Dedicated perf steps remain available and explicitly enable the gate: `zig build test-integration-perf-throughput-h1`, `zig build test-integration-perf-throughput-h2`, and aggregate `zig build test-integration-perf-throughput`.
+  - Optional env overrides for perf calibration: `SERVAL_PERF_TEST_REQUESTS_H1`, `SERVAL_PERF_TEST_CONCURRENCY_H1`, `SERVAL_PERF_TEST_MIN_RPS_H1`, `SERVAL_PERF_TEST_REQUESTS_H2`, `SERVAL_PERF_TEST_CONCURRENCY_H2`, `SERVAL_PERF_TEST_MIN_RPS_H2`.
 - [ ] P5-B: Canary h2-first profile with full conformance+interop suite
 - [ ] P5-C: Production promotion only after all phase gates pass
 

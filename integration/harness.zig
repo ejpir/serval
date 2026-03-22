@@ -498,6 +498,65 @@ pub const ProcessManager = struct {
         posix.nanosleep(0, READY_POLL_INTERVAL_MS * std.time.ns_per_ms);
     }
 
+    /// Start dedicated HTTP/2 conformance server.
+    pub fn startH2ConformanceServer(
+        self: *ProcessManager,
+        port: u16,
+        cert_path: []const u8,
+        key_path: []const u8,
+        debug: bool,
+    ) !void {
+        assert(port > 0);
+        assert(cert_path.len > 0);
+        assert(key_path.len > 0);
+
+        var args: std.ArrayList([]const u8) = .empty;
+        defer args.deinit(self.allocator);
+
+        var allocated_strings: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (allocated_strings.items) |s| self.allocator.free(s);
+            allocated_strings.deinit(self.allocator);
+        }
+
+        try args.append(self.allocator, "./zig-out/bin/h2_conformance_server");
+        try args.append(self.allocator, "--port");
+
+        var port_buf: [PORT_BUF_LEN]u8 = undefined;
+        const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch unreachable;
+        const port_dup = try self.allocator.dupe(u8, port_str);
+        try allocated_strings.append(self.allocator, port_dup);
+        try args.append(self.allocator, port_dup);
+
+        try args.append(self.allocator, "--cert");
+        try args.append(self.allocator, cert_path);
+        try args.append(self.allocator, "--key");
+        try args.append(self.allocator, key_path);
+
+        if (debug) {
+            try args.append(self.allocator, "--debug");
+        }
+
+        const pid = try spawnProcess(self.allocator, args.items);
+        errdefer {
+            posix.kill(pid, posix.SIG.KILL) catch |err| {
+                if (err != error.ProcessNotFound) {
+                    std.log.warn("errdefer kill({d}) failed: {s}", .{ pid, @errorName(err) });
+                }
+            };
+            _ = posix.waitpid(pid, 0);
+        }
+
+        try self.processes.append(self.allocator, .{
+            .pid = pid,
+            .name = try self.allocator.dupe(u8, "h2_conformance_server"),
+            .allocator = self.allocator,
+        });
+
+        try waitForPort(port, SERVER_READY_TIMEOUT_MS);
+        posix.nanosleep(0, READY_POLL_INTERVAL_MS * std.time.ns_per_ms);
+    }
+
     /// Start load balancer with given backends.
     pub fn startLoadBalancer(
         self: *ProcessManager,

@@ -733,20 +733,60 @@ pub fn build(b: *std.Build) void {
     );
     integration_test_64_step.dependOn(&run_integration_test_64.step);
 
-    const integration_test_perf_throughput = b.addTest(.{
-        .name = "integration_test_perf_throughput",
+    const integration_test_perf_throughput_h1 = b.addTest(.{
+        .name = "integration_test_perf_throughput_h1",
         .root_module = integration_tests_mod,
-        .filters = &.{"performance: lb achieves minimum throughput with hey"},
+        .filters = &.{"performance: lb h1 achieves minimum throughput with hey"},
         .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
     });
-    force_llvm_lld(integration_test_perf_throughput);
-    const run_integration_test_perf_throughput = b.addRunArtifact(integration_test_perf_throughput);
+    force_llvm_lld(integration_test_perf_throughput_h1);
+    const run_integration_test_perf_throughput_h1 = b.addRunArtifact(integration_test_perf_throughput_h1);
+
+    const integration_test_perf_throughput_h2 = b.addTest(.{
+        .name = "integration_test_perf_throughput_h2",
+        .root_module = integration_tests_mod,
+        .filters = &.{"performance: h2 conformance server achieves minimum throughput with h2load"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_perf_throughput_h2);
+    const run_integration_test_perf_throughput_h2 = b.addRunArtifact(integration_test_perf_throughput_h2);
+    const run_integration_test_perf_throughput_h2_max = b.addRunArtifact(integration_test_perf_throughput_h2);
+
+    // Perf throughput gates are opt-in in integration/tests.zig; force-enable for dedicated steps.
+    run_integration_test_perf_throughput_h1.setEnvironmentVariable("SERVAL_ENABLE_PERF_TEST", "1");
+    run_integration_test_perf_throughput_h2.setEnvironmentVariable("SERVAL_ENABLE_PERF_TEST", "1");
+    run_integration_test_perf_throughput_h2_max.setEnvironmentVariable("SERVAL_ENABLE_PERF_TEST", "1");
+    run_integration_test_perf_throughput_h2_max.setEnvironmentVariable("SERVAL_PERF_TEST_REQUESTS_H2", "500000");
+    run_integration_test_perf_throughput_h2_max.setEnvironmentVariable("SERVAL_PERF_TEST_CONCURRENCY_H2", "100");
+    run_integration_test_perf_throughput_h2_max.setEnvironmentVariable("SERVAL_PERF_TEST_H2LOAD_THREADS", "8");
+    run_integration_test_perf_throughput_h2_max.setEnvironmentVariable("SERVAL_PERF_TEST_H2LOAD_MAX_STREAMS", "64");
+    run_integration_test_perf_throughput_h2_max.setEnvironmentVariable("SERVAL_PERF_TEST_H2LOAD_DURATION_S", "15");
+    run_integration_test_perf_throughput_h2_max.setEnvironmentVariable("SERVAL_PERF_TEST_MIN_RPS_H2", "1");
+
+    const integration_test_perf_throughput_h1_step = b.step(
+        "test-integration-perf-throughput-h1",
+        "Run integration perf test (lb HTTP/1.1 minimum throughput with hey)",
+    );
+    integration_test_perf_throughput_h1_step.dependOn(&run_integration_test_perf_throughput_h1.step);
+
+    const integration_test_perf_throughput_h2_step = b.step(
+        "test-integration-perf-throughput-h2",
+        "Run integration perf test (terminated HTTP/2 server minimum throughput with h2load)",
+    );
+    integration_test_perf_throughput_h2_step.dependOn(&run_integration_test_perf_throughput_h2.step);
+
+    const integration_test_perf_throughput_h2_max_step = b.step(
+        "test-integration-perf-throughput-h2-max",
+        "Run integration perf test (terminated HTTP/2 server, max-profile h2load: -D15 -t8 -c100 -m64)",
+    );
+    integration_test_perf_throughput_h2_max_step.dependOn(&run_integration_test_perf_throughput_h2_max.step);
 
     const integration_test_perf_throughput_step = b.step(
         "test-integration-perf-throughput",
-        "Run integration perf test (lb minimum throughput with hey)",
+        "Run integration perf tests (lb HTTP/1.1 with hey + terminated HTTP/2 with h2load)",
     );
-    integration_test_perf_throughput_step.dependOn(&run_integration_test_perf_throughput.step);
+    integration_test_perf_throughput_step.dependOn(&run_integration_test_perf_throughput_h1.step);
+    integration_test_perf_throughput_step.dependOn(&run_integration_test_perf_throughput_h2.step);
 
     const integration_test_h2c_reset_isolation = b.addTest(.{
         .name = "integration_test_h2c_reset_isolation",
@@ -1183,6 +1223,15 @@ pub fn build(b: *std.Build) void {
     );
     integration_test_h2c_upgrade_grpc_success_step.dependOn(&run_integration_test_h2c_upgrade_grpc_success.step);
 
+    const integration_test_h2c_grpc_completion_fast_step = b.step(
+        "test-integration-h2c-grpc-completion-fast",
+        "Run focused gRPC completion checks (bridge+upgrade, fail-closed+success)",
+    );
+    integration_test_h2c_grpc_completion_fast_step.dependOn(&run_integration_test_h2c_bridge_missing_grpc_status.step);
+    integration_test_h2c_grpc_completion_fast_step.dependOn(&run_integration_test_h2c_upgrade_missing_grpc_status.step);
+    integration_test_h2c_grpc_completion_fast_step.dependOn(&run_integration_test_h2c_bridge_grpc_trailers_only.step);
+    integration_test_h2c_grpc_completion_fast_step.dependOn(&run_integration_test_h2c_upgrade_grpc_success.step);
+
     const integration_test_h2c_upgrade_generic_trailers = b.addTest(.{
         .name = "integration_test_h2c_upgrade_generic_trailers",
         .root_module = integration_tests_mod,
@@ -1491,7 +1540,8 @@ pub fn build(b: *std.Build) void {
     run_integration_test_34.step.dependOn(&build_echo_backend.step);
     run_integration_test_5.step.dependOn(&build_echo_backend.step);
     run_integration_test_64.step.dependOn(&build_echo_backend.step);
-    run_integration_test_perf_throughput.step.dependOn(&build_echo_backend.step);
+    run_integration_test_perf_throughput_h1.step.dependOn(&build_echo_backend.step);
+    run_integration_test_perf_throughput_h2.step.dependOn(&build_echo_backend.step);
     run_integration_test_h2c_reset_isolation.step.dependOn(&build_echo_backend.step);
     run_integration_test_h2c_reset_isolation_soak.step.dependOn(&build_echo_backend.step);
     run_integration_test_h2c_goaway_last_stream.step.dependOn(&build_echo_backend.step);

@@ -216,6 +216,8 @@ Build/test baseline:
 - `zig build`
 - `zig build test`
 - `zig build test-integration`
+  - Note: perf throughput checks are now opt-in by env gate for deterministic cross-environment runs.
+  - Dedicated perf commands explicitly enable them: `zig build test-integration-perf-throughput-h1`, `zig build test-integration-perf-throughput-h2`, aggregate `zig build test-integration-perf-throughput`.
 
 Conformance:
 - `integration/h2_conformance_runner.sh`
@@ -225,6 +227,7 @@ Interop:
 - grpcurl plaintext + TLS cases
 - grpc-go plaintext + TLS cases
 - nghttp and curl HTTP/2 generic cases
+- Focused completion fast-loop: `zig build test-integration-h2c-grpc-completion-fast`
 
 Stress/soak:
 - stream churn near `H2_MAX_CONCURRENT_STREAMS`

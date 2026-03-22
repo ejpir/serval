@@ -27,6 +27,7 @@ RUN apt-get update && \
         patch \
         pkg-config \
         xz-utils && \
+    command -v h2load >/dev/null && \
     rm -rf /var/lib/apt/lists/*
 
 RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go.tar.gz && \

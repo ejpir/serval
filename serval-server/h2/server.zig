@@ -36,7 +36,7 @@ const read_max_retry_count: u32 = 30_000;
 const write_retry_sleep_ns: u64 = time.ns_per_ms;
 const write_stall_timeout_ns: u64 = 30 * time.ns_per_s;
 const write_max_retry_count: u32 = 30_000;
-const response_send_chunk_size_bytes: usize = 1;
+const response_send_chunk_size_bytes: usize = config.H2_MAX_FRAME_SIZE_BYTES;
 
 const ConnectionIo = union(enum) {
     plain_fd: i32,
