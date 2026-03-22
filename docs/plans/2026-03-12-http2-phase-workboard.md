@@ -50,8 +50,10 @@ Related execution plan:
   - Existing ALPN policy unit coverage in `serval-tls/ssl.zig` continues to validate mixed-offer selection (`prefer_http11` vs `prefer_h2`)
 
 ### Exit gate
-- [ ] h2spec connection/setup chapters green
-- [ ] no `expected SETTINGS frame` failures in curl/nghttp/grpc repros
+- [x] h2spec connection/setup chapters green
+  - Local rerun (2026-03-22): `integration/h2_conformance_ci.sh --h2c-port 29081 --tls-port 29443 --h2spec-timeout 1` passed cleartext + TLS (`145/145` each)
+- [x] no `expected SETTINGS frame` failures in curl/nghttp/grpc repros
+  - Local rerun (2026-03-22): nghttp cleartext/TLS checks passed in same conformance run
 
 ---
 
@@ -87,7 +89,8 @@ Related execution plan:
   - Implemented in `serval-h2/request.zig` and covered by unit tests
 
 ### Exit gate
-- [ ] h2spec header semantics + compression chapters green
+- [x] h2spec header semantics + compression chapters green
+  - Local rerun (2026-03-22): `integration/h2_conformance_ci.sh --h2c-port 29081 --tls-port 29443 --h2spec-timeout 1` passed header semantics + HPACK chapters (`145/145` cleartext + TLS)
 - [ ] metadata/trailer interop corpus green
 
 ---
@@ -117,6 +120,7 @@ Related execution plan:
   - Added targeted integration coverage for invalid `TE` on generic h2 requests (`TE: gzip`) to assert fail-closed `RST_STREAM(PROTOCOL_ERROR)`
   - Added targeted runtime/bridge warning logs for frame-level protocol failures and connection-closing send path failures
   - Bridge completion validation is now request-class aware: `grpc-status` is enforced fail-closed only for streams classified as gRPC, while non-gRPC streams accept normal HTTP/2 terminal headers/trailers; targeted integration coverage added (`integration: h2c bridge forwards non-gRPC response trailers without grpc-status`, `integration: h2c bridge accepts non-gRPC headers-only end-stream response`)
+  - Bridge architecture split progressed to transport-first handler + explicit policy layer: stream transport and frame mapping now live in `H2cBridgeHandler`, with gRPC completion tracking isolated in `GrpcCompletionPolicy` (bounded stream table, explicit track/untrack lifecycle)
   - Added bridge ingress coverage for non-gRPC request-trailer fail-closed semantics on both entry paths: prior-knowledge and upgrade now assert downstream `RST_STREAM(PROTOCOL_ERROR)` for unsupported request trailers (`integration: h2c bridge prior-knowledge resets non-gRPC request trailers with protocol error`, `integration: h2c bridge upgrade resets non-gRPC request trailers on additional stream`)
   - Remaining stream-churn cleanup on graceful GOAWAY paths stays open under P4-A/P4-B
 

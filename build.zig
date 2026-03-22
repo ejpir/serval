@@ -1123,6 +1123,66 @@ pub fn build(b: *std.Build) void {
     );
     integration_test_h2c_bridge_upgrade_nongrpc_request_trailers_step.dependOn(&run_integration_test_h2c_bridge_upgrade_nongrpc_request_trailers.step);
 
+    const integration_test_h2c_bridge_missing_grpc_status = b.addTest(.{
+        .name = "integration_test_h2c_bridge_missing_grpc_status",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: grpc h2c missing grpc-status trailer maps to downstream reset"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_h2c_bridge_missing_grpc_status);
+    const run_integration_test_h2c_bridge_missing_grpc_status = b.addRunArtifact(integration_test_h2c_bridge_missing_grpc_status);
+
+    const integration_test_h2c_bridge_missing_grpc_status_step = b.step(
+        "test-integration-h2c-bridge-missing-grpc-status",
+        "Run integration test (h2c prior-knowledge missing grpc-status -> downstream reset)",
+    );
+    integration_test_h2c_bridge_missing_grpc_status_step.dependOn(&run_integration_test_h2c_bridge_missing_grpc_status.step);
+
+    const integration_test_h2c_bridge_grpc_trailers_only = b.addTest(.{
+        .name = "integration_test_h2c_bridge_grpc_trailers_only",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: grpc h2c forwards trailers-only response with grpc-status"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_h2c_bridge_grpc_trailers_only);
+    const run_integration_test_h2c_bridge_grpc_trailers_only = b.addRunArtifact(integration_test_h2c_bridge_grpc_trailers_only);
+
+    const integration_test_h2c_bridge_grpc_trailers_only_step = b.step(
+        "test-integration-h2c-bridge-grpc-trailers-only",
+        "Run integration test (h2c prior-knowledge gRPC trailers-only response includes grpc-status)",
+    );
+    integration_test_h2c_bridge_grpc_trailers_only_step.dependOn(&run_integration_test_h2c_bridge_grpc_trailers_only.step);
+
+    const integration_test_h2c_upgrade_missing_grpc_status = b.addTest(.{
+        .name = "integration_test_h2c_upgrade_missing_grpc_status",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: grpc h2c upgrade missing grpc-status trailer maps to downstream reset"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_h2c_upgrade_missing_grpc_status);
+    const run_integration_test_h2c_upgrade_missing_grpc_status = b.addRunArtifact(integration_test_h2c_upgrade_missing_grpc_status);
+
+    const integration_test_h2c_upgrade_missing_grpc_status_step = b.step(
+        "test-integration-h2c-upgrade-missing-grpc-status",
+        "Run integration test (h2c upgrade missing grpc-status -> downstream reset)",
+    );
+    integration_test_h2c_upgrade_missing_grpc_status_step.dependOn(&run_integration_test_h2c_upgrade_missing_grpc_status.step);
+
+    const integration_test_h2c_upgrade_grpc_success = b.addTest(.{
+        .name = "integration_test_h2c_upgrade_grpc_success",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: grpc h2c upgrade request is proxied end-to-end"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_h2c_upgrade_grpc_success);
+    const run_integration_test_h2c_upgrade_grpc_success = b.addRunArtifact(integration_test_h2c_upgrade_grpc_success);
+
+    const integration_test_h2c_upgrade_grpc_success_step = b.step(
+        "test-integration-h2c-upgrade-grpc-success",
+        "Run integration test (h2c upgrade gRPC success path with grpc-status trailers)",
+    );
+    integration_test_h2c_upgrade_grpc_success_step.dependOn(&run_integration_test_h2c_upgrade_grpc_success.step);
+
     const integration_test_h2c_upgrade_generic_trailers = b.addTest(.{
         .name = "integration_test_h2c_upgrade_generic_trailers",
         .root_module = integration_tests_mod,
@@ -1452,6 +1512,10 @@ pub fn build(b: *std.Build) void {
     run_integration_test_h2c_bridge_generic_headers_only.step.dependOn(&build_echo_backend.step);
     run_integration_test_h2c_bridge_prior_nongrpc_request_trailers.step.dependOn(&build_echo_backend.step);
     run_integration_test_h2c_bridge_upgrade_nongrpc_request_trailers.step.dependOn(&build_echo_backend.step);
+    run_integration_test_h2c_bridge_missing_grpc_status.step.dependOn(&build_echo_backend.step);
+    run_integration_test_h2c_bridge_grpc_trailers_only.step.dependOn(&build_echo_backend.step);
+    run_integration_test_h2c_upgrade_missing_grpc_status.step.dependOn(&build_echo_backend.step);
+    run_integration_test_h2c_upgrade_grpc_success.step.dependOn(&build_echo_backend.step);
     run_integration_test_h2c_upgrade_generic_trailers.step.dependOn(&build_echo_backend.step);
     run_integration_test_h2c_upgrade_generic_headers_only.step.dependOn(&build_echo_backend.step);
     run_integration_test_h2c_mixed_goaway_nongrpc.step.dependOn(&build_echo_backend.step);

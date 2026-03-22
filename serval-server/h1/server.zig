@@ -1036,7 +1036,68 @@ pub fn Server(
             }
         };
 
-        const GrpcH2cBridgeHandler = struct {
+        const GrpcCompletionPolicy = struct {
+            tracked_streams: [config.H2_MAX_CONCURRENT_STREAMS]u32 = [_]u32{0} ** config.H2_MAX_CONCURRENT_STREAMS,
+            tracked_stream_count: u16 = 0,
+
+            const PolicyError = error{TooManyTrackedGrpcCompletionStreams};
+
+            fn isGrpcRequest(self: *const @This(), request: *const Request) bool {
+                assert(@intFromPtr(self) != 0);
+                assert(@intFromPtr(request) != 0);
+
+                serval_grpc.validateRequest(request) catch return false;
+                return true;
+            }
+
+            fn trackStream(self: *@This(), stream_id: u32) PolicyError!void {
+                assert(@intFromPtr(self) != 0);
+                assert(stream_id > 0);
+
+                if (self.isTrackedStream(stream_id)) return;
+                if (self.tracked_stream_count >= config.H2_MAX_CONCURRENT_STREAMS) {
+                    return error.TooManyTrackedGrpcCompletionStreams;
+                }
+
+                var index: usize = 0;
+                while (index < self.tracked_streams.len) : (index += 1) {
+                    if (self.tracked_streams[index] != 0) continue;
+                    self.tracked_streams[index] = stream_id;
+                    self.tracked_stream_count += 1;
+                    return;
+                }
+
+                return error.TooManyTrackedGrpcCompletionStreams;
+            }
+
+            fn untrackStream(self: *@This(), stream_id: u32) void {
+                assert(@intFromPtr(self) != 0);
+                if (stream_id == 0) return;
+
+                var index: usize = 0;
+                while (index < self.tracked_streams.len) : (index += 1) {
+                    if (self.tracked_streams[index] != stream_id) continue;
+                    self.tracked_streams[index] = 0;
+                    if (self.tracked_stream_count > 0) {
+                        self.tracked_stream_count -= 1;
+                    }
+                    return;
+                }
+            }
+
+            fn isTrackedStream(self: *@This(), stream_id: u32) bool {
+                assert(@intFromPtr(self) != 0);
+                if (stream_id == 0) return false;
+
+                var index: usize = 0;
+                while (index < self.tracked_streams.len) : (index += 1) {
+                    if (self.tracked_streams[index] == stream_id) return true;
+                }
+                return false;
+            }
+        };
+
+        const H2cBridgeHandler = struct {
             const pending_reset_capacity: usize = @intCast(config.H2_MAX_CONCURRENT_STREAMS);
             const upstream_reader_idle_ms: i64 = 10;
             const upstream_read_timeout_ms: i64 = 50;
@@ -1064,8 +1125,7 @@ pub fn Server(
             upstream_reader_stop: bool = false,
             upstream_reader_scan_cursor: u16 = 0,
             pending_resets: [pending_reset_capacity]PendingReset = [_]PendingReset{.{}} ** pending_reset_capacity,
-            tracked_grpc_completion_streams: [config.H2_MAX_CONCURRENT_STREAMS]u32 = [_]u32{0} ** config.H2_MAX_CONCURRENT_STREAMS,
-            tracked_grpc_completion_stream_count: u16 = 0,
+            grpc_completion_policy: GrpcCompletionPolicy = .{},
 
             pub const BridgeError = error{
                 UpstreamRejected,
@@ -1219,7 +1279,7 @@ pub fn Server(
                     return error.UpstreamConnectionClosing;
                 }
 
-                const expects_grpc_completion = isGrpcCompletionRequest(request);
+                const expects_grpc_completion = self.grpc_completion_policy.isGrpcRequest(request);
 
                 const upstream = try self.selectUpstream(request);
                 if (!supportsBridgeUpstreamProtocol(upstream)) return error.UnsupportedProtocol;
@@ -1267,9 +1327,9 @@ pub fn Server(
                 );
 
                 if (expects_grpc_completion) {
-                    try self.trackGrpcCompletionStream(stream_id);
+                    try self.grpc_completion_policy.trackStream(stream_id);
                 } else {
-                    self.untrackGrpcCompletionStream(stream_id);
+                    self.grpc_completion_policy.untrackStream(stream_id);
                 }
             }
 
@@ -1304,7 +1364,7 @@ pub fn Server(
                 if (stream_id == 0) return;
 
                 _ = self.takePendingReset(stream_id);
-                self.untrackGrpcCompletionStream(stream_id);
+                self.grpc_completion_policy.untrackStream(stream_id);
                 self.bridge_mutex.lockUncancelable(self.io);
                 defer self.bridge_mutex.unlock(self.io);
                 self.bridge.cancelDownstreamStream(stream_id, error_code_raw) catch |err| switch (err) {
@@ -1346,9 +1406,9 @@ pub fn Server(
                 assert(@intFromPtr(self) != 0);
                 assert(action.downstream_stream_id > 0);
 
-                const requires_grpc_completion = self.isTrackedGrpcCompletionStream(action.downstream_stream_id);
+                const requires_grpc_completion = self.grpc_completion_policy.isTrackedStream(action.downstream_stream_id);
                 if (action.end_stream) {
-                    defer self.untrackGrpcCompletionStream(action.downstream_stream_id);
+                    defer self.grpc_completion_policy.untrackStream(action.downstream_stream_id);
                     if (requires_grpc_completion) {
                         try mapGrpcStatusValidationError(serval_grpc.requireGrpcStatus(&action.response.headers));
                     }
@@ -1380,7 +1440,7 @@ pub fn Server(
                 assert(action.downstream_stream_id > 0);
 
                 if (action.end_stream) {
-                    defer self.untrackGrpcCompletionStream(action.downstream_stream_id);
+                    defer self.grpc_completion_policy.untrackStream(action.downstream_stream_id);
                 }
 
                 log.debug(
@@ -1405,8 +1465,8 @@ pub fn Server(
                 assert(@intFromPtr(self) != 0);
                 assert(action.downstream_stream_id > 0);
 
-                const requires_grpc_completion = self.isTrackedGrpcCompletionStream(action.downstream_stream_id);
-                defer self.untrackGrpcCompletionStream(action.downstream_stream_id);
+                const requires_grpc_completion = self.grpc_completion_policy.isTrackedStream(action.downstream_stream_id);
+                defer self.grpc_completion_policy.untrackStream(action.downstream_stream_id);
 
                 log.debug(
                     "h2 bridge: conn={d} response trailers stream={d} trailer_count={d} grpc_status_present={any} grpc_status_value={s} grpc_expected={any}",
@@ -1493,59 +1553,6 @@ pub fn Server(
                 }
 
                 return out[0..source.len];
-            }
-
-            fn isGrpcCompletionRequest(request: *const Request) bool {
-                assert(@intFromPtr(request) != 0);
-
-                serval_grpc.validateRequest(request) catch return false;
-                return true;
-            }
-
-            fn trackGrpcCompletionStream(self: *@This(), stream_id: u32) BridgeError!void {
-                assert(@intFromPtr(self) != 0);
-                assert(stream_id > 0);
-
-                if (self.isTrackedGrpcCompletionStream(stream_id)) return;
-                if (self.tracked_grpc_completion_stream_count >= config.H2_MAX_CONCURRENT_STREAMS) {
-                    return error.TooManyTrackedGrpcCompletionStreams;
-                }
-
-                var index: usize = 0;
-                while (index < self.tracked_grpc_completion_streams.len) : (index += 1) {
-                    if (self.tracked_grpc_completion_streams[index] != 0) continue;
-                    self.tracked_grpc_completion_streams[index] = stream_id;
-                    self.tracked_grpc_completion_stream_count += 1;
-                    return;
-                }
-
-                return error.TooManyTrackedGrpcCompletionStreams;
-            }
-
-            fn untrackGrpcCompletionStream(self: *@This(), stream_id: u32) void {
-                assert(@intFromPtr(self) != 0);
-                if (stream_id == 0) return;
-
-                var index: usize = 0;
-                while (index < self.tracked_grpc_completion_streams.len) : (index += 1) {
-                    if (self.tracked_grpc_completion_streams[index] != stream_id) continue;
-                    self.tracked_grpc_completion_streams[index] = 0;
-                    if (self.tracked_grpc_completion_stream_count > 0) {
-                        self.tracked_grpc_completion_stream_count -= 1;
-                    }
-                    return;
-                }
-            }
-
-            fn isTrackedGrpcCompletionStream(self: *@This(), stream_id: u32) bool {
-                assert(@intFromPtr(self) != 0);
-                if (stream_id == 0) return false;
-
-                var index: usize = 0;
-                while (index < self.tracked_grpc_completion_streams.len) : (index += 1) {
-                    if (self.tracked_grpc_completion_streams[index] == stream_id) return true;
-                }
-                return false;
             }
 
             fn upstreamReaderTask(self: *@This()) Io.Cancelable!void {
@@ -1774,7 +1781,7 @@ pub fn Server(
                 assert(downstream_stream_id > 0);
                 assert(@intFromPtr(writer_template) != 0);
 
-                self.untrackGrpcCompletionStream(downstream_stream_id);
+                self.grpc_completion_policy.untrackStream(downstream_stream_id);
                 self.emitDownstreamReset(downstream_stream_id, error_code_raw, writer_template) catch {
                     log.debug(
                         "h2 bridge: conn={d} defer downstream reset stream={d} error_code=0x{x}",
@@ -1833,7 +1840,7 @@ pub fn Server(
                 var emit_index: u16 = 0;
                 while (emit_index < downstream_count) : (emit_index += 1) {
                     const downstream_stream_id = downstream_ids[emit_index];
-                    self.untrackGrpcCompletionStream(downstream_stream_id);
+                    self.grpc_completion_policy.untrackStream(downstream_stream_id);
                     self.emitDownstreamReset(downstream_stream_id, reset_error_code_raw, writer_template) catch {
                         self.notePendingReset(downstream_stream_id, reset_error_code_raw);
                     };
@@ -1841,7 +1848,7 @@ pub fn Server(
             }
         };
 
-        fn forwardGrpcH2cWithBridge(
+        fn forwardH2cWithBridge(
             handler: *Handler,
             forwarder: *forwarder_mod.Forwarder(Pool, Tracer),
             io: Io,
@@ -1871,7 +1878,7 @@ pub fn Server(
                 std.heap.page_allocator.destroy(bridge_sessions);
             }
 
-            var bridge_handler = GrpcH2cBridgeHandler.init(
+            var bridge_handler = H2cBridgeHandler.init(
                 handler,
                 io,
                 &bridge_client,
@@ -1882,7 +1889,7 @@ pub fn Server(
 
             const start_ns = time.monotonicNanos();
             h2_server.servePlainConnectionWithInitialBytesOptions(
-                GrpcH2cBridgeHandler,
+                H2cBridgeHandler,
                 &bridge_handler,
                 @intCast(stream.socket.handle),
                 io,
@@ -1916,7 +1923,7 @@ pub fn Server(
             };
         }
 
-        fn forwardGrpcH2cUpgradeWithBridge(
+        fn forwardH2cUpgradeWithBridge(
             handler: *Handler,
             forwarder: *forwarder_mod.Forwarder(Pool, Tracer),
             io: Io,
@@ -1968,7 +1975,7 @@ pub fn Server(
                 std.heap.page_allocator.destroy(bridge_sessions);
             }
 
-            var bridge_handler = GrpcH2cBridgeHandler.init(
+            var bridge_handler = H2cBridgeHandler.init(
                 handler,
                 io,
                 &bridge_client,
@@ -1979,7 +1986,7 @@ pub fn Server(
 
             const start_ns = time.monotonicNanos();
             h2_server.serveUpgradedConnection(
-                GrpcH2cBridgeHandler,
+                H2cBridgeHandler,
                 &bridge_handler,
                 @intCast(stream.socket.handle),
                 io,
@@ -2214,7 +2221,7 @@ pub fn Server(
             return true;
         }
 
-        fn tryHandleGrpcH2cPriorKnowledge(
+        fn tryHandleH2cPriorKnowledge(
             handler: *Handler,
             forwarder: *forwarder_mod.Forwarder(Pool, Tracer),
             metrics: *Metrics,
@@ -2326,7 +2333,7 @@ pub fn Server(
             const use_stream_bridge = maybe_tls == null and (supports_h2c_plain or supports_h2_tls);
 
             const forward_result = if (use_stream_bridge)
-                forwardGrpcH2cWithBridge(
+                forwardH2cWithBridge(
                     handler,
                     forwarder,
                     io.*,
@@ -2506,7 +2513,7 @@ pub fn Server(
                         Handler,
                         Pool,
                         Tracer,
-                        GrpcH2cBridgeHandler,
+                        H2cBridgeHandler,
                         handler,
                         forwarder,
                         &ctx,
@@ -2585,7 +2592,7 @@ pub fn Server(
                     connection_id,
                 )) return;
 
-                if (tryHandleGrpcH2cPriorKnowledge(
+                if (tryHandleH2cPriorKnowledge(
                     handler,
                     forwarder,
                     metrics,
@@ -3102,7 +3109,7 @@ pub fn Server(
                     const supports_h2c_plain = upstream.http_protocol == .h2c and !upstream.tls;
                     const supports_h2_tls = upstream.http_protocol == .h2 and upstream.tls;
                     const h2c_upgrade_result = if (supports_h2c_plain or supports_h2_tls)
-                        forwardGrpcH2cUpgradeWithBridge(
+                        forwardH2cUpgradeWithBridge(
                             handler,
                             forwarder,
                             io,

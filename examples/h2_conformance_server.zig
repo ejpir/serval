@@ -60,10 +60,11 @@ const Handler = struct {
     ) !void {
         _ = self;
         _ = request;
+        _ = end_stream;
         assert(stream_id > 0);
 
-        if (!end_stream) return;
-
+        // Respond immediately for conformance probes, including requests that
+        // continue with DATA + trailer frames.
         send_h2_ok(writer) catch |err| switch (err) {
             error.HeadersAlreadySent, error.ResponseClosed => return,
             else => return err,
@@ -79,10 +80,12 @@ const Handler = struct {
     ) !void {
         _ = self;
         _ = payload;
+        _ = end_stream;
         assert(stream_id > 0);
 
-        if (!end_stream) return;
-
+        // Conformance target should respond even when request trailers follow DATA.
+        // RFC 9113 permits the server to send a final response before consuming all
+        // request-body/trailer octets, as long as stream state is coherent.
         send_h2_ok(writer) catch |err| switch (err) {
             error.HeadersAlreadySent, error.ResponseClosed => return,
             else => return err,

@@ -46,6 +46,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ "${H2_CONFORMANCE_SKIP_BUILD:-0}" != "1" ]]; then
+  zig build build-h2-conformance-server >/dev/null || {
+    echo "ERROR: failed to build h2 conformance server" >&2
+    exit 1
+  }
+fi
+
 if [[ ! -x "$SERVER_BIN" ]]; then
   echo "ERROR: missing server binary: $SERVER_BIN" >&2
   exit 1

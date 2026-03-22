@@ -30,7 +30,7 @@ gRPC transport contract:
 - Full generic HTTP/2 stream-aware behavior is still incomplete.
 - Generic frontend currently rejects non-gRPC request bodies with 413.
 - Prior-knowledge cleartext routing is protocol-split today:
-  - `.h2c` cleartext upstream uses bridge path (`forwardGrpcH2cWithBridge`).
+  - `.h2c` cleartext upstream uses bridge path (`forwardH2cWithBridge`).
   - `.h2` TLS upstream is routed to raw tunnel relay (`forwardGrpcH2c`).
   - This is explicit branch routing, not a retry fallback sequence.
 - Upgrade path bridge choice is still constrained by upstream protocol checks.
@@ -47,13 +47,13 @@ Existing references:
 For execution clarity, this plan uses the current symbol names:
 
 - Prior-knowledge cleartext entry dispatcher:
-  - `tryHandleGrpcH2cPriorKnowledge` (`serval-server/h1/server.zig`)
+  - `tryHandleH2cPriorKnowledge` (`serval-server/h1/server.zig`)
 - Prior-knowledge bridge driver:
-  - `forwardGrpcH2cWithBridge` (`serval-server/h1/server.zig`)
+  - `forwardH2cWithBridge` (`serval-server/h1/server.zig`)
 - Prior-knowledge tunnel driver:
   - `forwardGrpcH2c` (`serval-proxy/forwarder.zig`)
 - Upgrade bridge driver:
-  - `forwardGrpcH2cUpgradeWithBridge` (`serval-server/h1/server.zig`)
+  - `forwardH2cUpgradeWithBridge` (`serval-server/h1/server.zig`)
 - Upgrade legacy driver:
   - `forwardGrpcH2cUpgrade` (`serval-proxy/forwarder.zig`)
 - Core stream bridge:
