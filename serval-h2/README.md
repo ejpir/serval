@@ -215,8 +215,8 @@ How these primitives are currently used in the stack:
 
 What is still broader-work-in-progress in the stack:
 
-- full generic stream-aware proxying for arbitrary (non-gRPC-specific) h2 traffic classes
-- complete production-grade multiplexed runtime behavior across all traffic classes
+- generic (non-gRPC-specific) stream-aware h2 proxy parity across all HTTP semantics
+- additional multiplexed churn/soak hardening for mixed traffic classes beyond the validated high-throughput and gRPC-focused paths
 
 ## TigerStyle Compliance
 

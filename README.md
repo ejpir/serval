@@ -516,7 +516,7 @@ zig build run-echo-backend -- --help
 | K8s Gateway API types | Complete |
 | Rate limiting | Planned |
 | WAF | Planned |
-| HTTP/2 full stream-aware proxy/server stack | In progress (current implementation is gRPC-focused; broader generic h2 stream-aware stack is still pending) |
+| HTTP/2 full stream-aware proxy/server stack | In progress (high-throughput terminated h2 serving and gRPC stream-aware proxy paths are active; remaining work is generic non-gRPC parity + additional mixed-workload churn/soak hardening) |
 | Native gRPC endpoints | Not implemented (high priority) |
 
 ## License
