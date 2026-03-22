@@ -206,6 +206,27 @@ pub const StreamBridge = struct {
                 self.sessions.closeGeneration(binding.upstream_index, binding.upstream_session_generation);
                 return err;
             },
+            error.WriteFailed => {
+                if (end_stream) {
+                    log.warn(
+                        "h2 bridge: downstream={d} upstream={d} idx={d} gen={d} final sendRequestData saw WriteFailed; preserving binding for in-flight response",
+                        .{
+                            downstream_stream_id,
+                            binding.upstream_stream_id,
+                            binding.upstream_index,
+                            binding.upstream_session_generation,
+                        },
+                    );
+                    return;
+                }
+
+                _ = self.binding_table.removeByDownstream(downstream_stream_id) catch |remove_err| switch (remove_err) {
+                    error.BindingNotFound => return err,
+                    else => return remove_err,
+                };
+                self.sessions.closeGeneration(binding.upstream_index, binding.upstream_session_generation);
+                return err;
+            },
             else => return err,
         };
     }

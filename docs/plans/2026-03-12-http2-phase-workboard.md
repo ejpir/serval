@@ -7,6 +7,7 @@ This file tracks active execution across Phases 0–5 from
 
 Related execution plan:
 - `docs/plans/2026-03-13-generic-tls-h2-wiring-plan.md`
+- `docs/plans/2026-03-20-http2-completion-plan.md`
 
 ## Overall status
 
@@ -94,12 +95,29 @@ Related execution plan:
 ## Phase 4 — Proxy + gRPC Semantics
 
 ### Open implementation queue
-- [ ] P4-A: Stream-binding correctness audit under churn
-- [ ] P4-B: Deterministic cancellation/reset propagation audit
+- [~] P4-A: Stream-binding correctness audit under churn
+  - Added focused integration coverage for sibling stream isolation on upstream reset (`integration: grpc h2c upstream reset on one stream preserves sibling stream`)
+  - Added focused fast-loop coverage for GOAWAY `last_stream_id` race via dedicated step over existing churn test (`integration: grpc h2c goaway last_stream_id resets higher stream and keeps lower stream`)
+  - Added repeated GOAWAY rollover loop coverage to verify fresh upstream session opens across cycles (`integration: grpc h2c repeated goaway rollover opens fresh upstream sessions`)
+  - Added targeted soak loops for reset isolation and GOAWAY rollover (`integration: grpc h2c reset isolation soak loop`, `integration: grpc h2c repeated goaway rollover soak loop`)
+  - Added upgrade-path rollover loop/soak coverage to verify repeated graceful GOAWAY handling remains deterministic after `Upgrade: h2c` bootstrap (`integration: grpc h2c upgrade repeated goaway rollover opens fresh upstream sessions`, soak variant)
+  - Remaining: larger multi-minute mixed reset/GOAWAY soak remains open
+- [~] P4-B: Deterministic cancellation/reset propagation audit
+  - Added focused integration coverage for downstream cancel propagation under active upstream response (`integration: grpc h2c downstream cancel propagates upstream and preserves next stream`)
+  - Added cancel+GOAWAY overlap loop coverage across repeated cycles to verify continued progress on subsequent streams (`integration: grpc h2c cancel and goaway overlap loop preserves subsequent streams`)
+  - Added targeted overlap soak loop coverage (`integration: grpc h2c cancel and goaway overlap soak loop`)
+  - Added mixed protocol-class churn loop coverage to interleave graceful GOAWAY rollover with non-gRPC request-trailer fail-closed resets while preserving subsequent gRPC stream progress (`integration: grpc h2c mixed goaway and non-grpc trailer reset loop preserves progress`, soak variant)
+  - Remaining: higher-duration soak for cancel-race + GOAWAY overlap remains open
 - [~] P4-C: Remove remaining retry-masked correctness paths
   - Removed bridge `sendDownstreamData` retry-on-`ConnectionClosing` behavior; now fail-closed, drop binding, and close affected session generation
   - ALPN `h2` frontend dispatch now falls back to generic h2 when terminated hooks are absent (prevents h1 parsing on negotiated h2 connections)
+  - Prior-knowledge and `Upgrade: h2c` ingress now route both supported `.h2c` and `.h2` upstreams through the stream-aware bridge path (no raw-tunnel steady-state fallback for supported HTTP/2 upstream protocols)
+  - Generic h2->h1 request-body translation now has focused integration coverage for both framed modes: explicit `content-length` forwarding and no-`content-length` conversion to HTTP/1.1 `Transfer-Encoding: chunked`
+  - Generic request trailers on active streams now fail closed at runtime with `RST_STREAM(PROTOCOL_ERROR)`; targeted integration step added
+  - Added targeted integration coverage for invalid `TE` on generic h2 requests (`TE: gzip`) to assert fail-closed `RST_STREAM(PROTOCOL_ERROR)`
   - Added targeted runtime/bridge warning logs for frame-level protocol failures and connection-closing send path failures
+  - Bridge completion validation is now request-class aware: `grpc-status` is enforced fail-closed only for streams classified as gRPC, while non-gRPC streams accept normal HTTP/2 terminal headers/trailers; targeted integration coverage added (`integration: h2c bridge forwards non-gRPC response trailers without grpc-status`, `integration: h2c bridge accepts non-gRPC headers-only end-stream response`)
+  - Added bridge ingress coverage for non-gRPC request-trailer fail-closed semantics on both entry paths: prior-knowledge and upgrade now assert downstream `RST_STREAM(PROTOCOL_ERROR)` for unsupported request trailers (`integration: h2c bridge prior-knowledge resets non-gRPC request trailers with protocol error`, `integration: h2c bridge upgrade resets non-gRPC request trailers on additional stream`)
   - Remaining stream-churn cleanup on graceful GOAWAY paths stays open under P4-A/P4-B
 
 ### Exit gate

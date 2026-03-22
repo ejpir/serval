@@ -733,6 +733,171 @@ pub fn build(b: *std.Build) void {
     );
     integration_test_64_step.dependOn(&run_integration_test_64.step);
 
+    const integration_test_perf_throughput = b.addTest(.{
+        .name = "integration_test_perf_throughput",
+        .root_module = integration_tests_mod,
+        .filters = &.{"performance: lb achieves minimum throughput with hey"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_perf_throughput);
+    const run_integration_test_perf_throughput = b.addRunArtifact(integration_test_perf_throughput);
+
+    const integration_test_perf_throughput_step = b.step(
+        "test-integration-perf-throughput",
+        "Run integration perf test (lb minimum throughput with hey)",
+    );
+    integration_test_perf_throughput_step.dependOn(&run_integration_test_perf_throughput.step);
+
+    const integration_test_h2c_reset_isolation = b.addTest(.{
+        .name = "integration_test_h2c_reset_isolation",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: grpc h2c upstream reset on one stream preserves sibling stream"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_h2c_reset_isolation);
+    const run_integration_test_h2c_reset_isolation = b.addRunArtifact(integration_test_h2c_reset_isolation);
+
+    const integration_test_h2c_reset_isolation_step = b.step(
+        "test-integration-h2c-reset-isolation",
+        "Run integration test (grpc h2c reset on one stream preserves sibling stream)",
+    );
+    integration_test_h2c_reset_isolation_step.dependOn(&run_integration_test_h2c_reset_isolation.step);
+
+    const integration_test_h2c_reset_isolation_soak = b.addTest(.{
+        .name = "integration_test_h2c_reset_isolation_soak",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: grpc h2c reset isolation soak loop"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_h2c_reset_isolation_soak);
+    const run_integration_test_h2c_reset_isolation_soak = b.addRunArtifact(integration_test_h2c_reset_isolation_soak);
+
+    const integration_test_h2c_reset_isolation_soak_step = b.step(
+        "test-integration-h2c-reset-isolation-soak",
+        "Run integration test (grpc h2c reset-isolation soak loop)",
+    );
+    integration_test_h2c_reset_isolation_soak_step.dependOn(&run_integration_test_h2c_reset_isolation_soak.step);
+
+    const integration_test_h2c_goaway_last_stream = b.addTest(.{
+        .name = "integration_test_h2c_goaway_last_stream",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: grpc h2c goaway last_stream_id resets higher stream and keeps lower stream"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_h2c_goaway_last_stream);
+    const run_integration_test_h2c_goaway_last_stream = b.addRunArtifact(integration_test_h2c_goaway_last_stream);
+
+    const integration_test_h2c_goaway_last_stream_step = b.step(
+        "test-integration-h2c-goaway-last-stream",
+        "Run integration test (grpc h2c GOAWAY last_stream_id resets higher stream)",
+    );
+    integration_test_h2c_goaway_last_stream_step.dependOn(&run_integration_test_h2c_goaway_last_stream.step);
+
+    const integration_test_h2c_goaway_rollover_loop = b.addTest(.{
+        .name = "integration_test_h2c_goaway_rollover_loop",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: grpc h2c repeated goaway rollover opens fresh upstream sessions"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_h2c_goaway_rollover_loop);
+    const run_integration_test_h2c_goaway_rollover_loop = b.addRunArtifact(integration_test_h2c_goaway_rollover_loop);
+
+    const integration_test_h2c_goaway_rollover_loop_step = b.step(
+        "test-integration-h2c-goaway-rollover-loop",
+        "Run integration test (grpc h2c repeated GOAWAY rollover opens fresh upstream sessions)",
+    );
+    integration_test_h2c_goaway_rollover_loop_step.dependOn(&run_integration_test_h2c_goaway_rollover_loop.step);
+
+    const integration_test_h2c_goaway_rollover_soak = b.addTest(.{
+        .name = "integration_test_h2c_goaway_rollover_soak",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: grpc h2c repeated goaway rollover soak loop"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_h2c_goaway_rollover_soak);
+    const run_integration_test_h2c_goaway_rollover_soak = b.addRunArtifact(integration_test_h2c_goaway_rollover_soak);
+
+    const integration_test_h2c_goaway_rollover_soak_step = b.step(
+        "test-integration-h2c-goaway-rollover-soak",
+        "Run integration test (grpc h2c repeated GOAWAY rollover soak loop)",
+    );
+    integration_test_h2c_goaway_rollover_soak_step.dependOn(&run_integration_test_h2c_goaway_rollover_soak.step);
+
+    const integration_test_h2c_upgrade_goaway_rollover_loop = b.addTest(.{
+        .name = "integration_test_h2c_upgrade_goaway_rollover_loop",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: grpc h2c upgrade repeated goaway rollover opens fresh upstream sessions"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_h2c_upgrade_goaway_rollover_loop);
+    const run_integration_test_h2c_upgrade_goaway_rollover_loop = b.addRunArtifact(integration_test_h2c_upgrade_goaway_rollover_loop);
+
+    const integration_test_h2c_upgrade_goaway_rollover_loop_step = b.step(
+        "test-integration-h2c-upgrade-goaway-rollover-loop",
+        "Run integration test (grpc h2c upgrade repeated GOAWAY rollover opens fresh upstream sessions)",
+    );
+    integration_test_h2c_upgrade_goaway_rollover_loop_step.dependOn(&run_integration_test_h2c_upgrade_goaway_rollover_loop.step);
+
+    const integration_test_h2c_upgrade_goaway_rollover_soak = b.addTest(.{
+        .name = "integration_test_h2c_upgrade_goaway_rollover_soak",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: grpc h2c upgrade repeated goaway rollover soak loop"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_h2c_upgrade_goaway_rollover_soak);
+    const run_integration_test_h2c_upgrade_goaway_rollover_soak = b.addRunArtifact(integration_test_h2c_upgrade_goaway_rollover_soak);
+
+    const integration_test_h2c_upgrade_goaway_rollover_soak_step = b.step(
+        "test-integration-h2c-upgrade-goaway-rollover-soak",
+        "Run integration test (grpc h2c upgrade repeated GOAWAY rollover soak loop)",
+    );
+    integration_test_h2c_upgrade_goaway_rollover_soak_step.dependOn(&run_integration_test_h2c_upgrade_goaway_rollover_soak.step);
+
+    const integration_test_h2c_cancel_propagation = b.addTest(.{
+        .name = "integration_test_h2c_cancel_propagation",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: grpc h2c downstream cancel propagates upstream and preserves next stream"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_h2c_cancel_propagation);
+    const run_integration_test_h2c_cancel_propagation = b.addRunArtifact(integration_test_h2c_cancel_propagation);
+
+    const integration_test_h2c_cancel_propagation_step = b.step(
+        "test-integration-h2c-cancel-propagation",
+        "Run integration test (grpc h2c downstream cancel propagates upstream)",
+    );
+    integration_test_h2c_cancel_propagation_step.dependOn(&run_integration_test_h2c_cancel_propagation.step);
+
+    const integration_test_h2c_cancel_goaway_overlap = b.addTest(.{
+        .name = "integration_test_h2c_cancel_goaway_overlap",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: grpc h2c cancel and goaway overlap loop preserves subsequent streams"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_h2c_cancel_goaway_overlap);
+    const run_integration_test_h2c_cancel_goaway_overlap = b.addRunArtifact(integration_test_h2c_cancel_goaway_overlap);
+
+    const integration_test_h2c_cancel_goaway_overlap_step = b.step(
+        "test-integration-h2c-cancel-goaway-overlap",
+        "Run integration test (grpc h2c cancel + GOAWAY overlap loop)",
+    );
+    integration_test_h2c_cancel_goaway_overlap_step.dependOn(&run_integration_test_h2c_cancel_goaway_overlap.step);
+
+    const integration_test_h2c_cancel_goaway_overlap_soak = b.addTest(.{
+        .name = "integration_test_h2c_cancel_goaway_overlap_soak",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: grpc h2c cancel and goaway overlap soak loop"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_h2c_cancel_goaway_overlap_soak);
+    const run_integration_test_h2c_cancel_goaway_overlap_soak = b.addRunArtifact(integration_test_h2c_cancel_goaway_overlap_soak);
+
+    const integration_test_h2c_cancel_goaway_overlap_soak_step = b.step(
+        "test-integration-h2c-cancel-goaway-overlap-soak",
+        "Run integration test (grpc h2c cancel + GOAWAY overlap soak loop)",
+    );
+    integration_test_h2c_cancel_goaway_overlap_soak_step.dependOn(&run_integration_test_h2c_cancel_goaway_overlap_soak.step);
+
     const integration_test_32 = b.addTest(.{
         .name = "integration_test_32",
         .root_module = integration_tests_mod,
@@ -837,6 +1002,186 @@ pub fn build(b: *std.Build) void {
         "Run integration test 77 (lb forwards 100KB payload correctly)",
     );
     integration_test_77_step.dependOn(&run_integration_test_77.step);
+
+    const integration_test_h2_generic_post_no_cl = b.addTest(.{
+        .name = "integration_test_h2_generic_post_no_cl",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: TLS ALPN h2 generic frontend forwards POST body without content-length for non-gRPC route"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_h2_generic_post_no_cl);
+    const run_integration_test_h2_generic_post_no_cl = b.addRunArtifact(integration_test_h2_generic_post_no_cl);
+
+    const integration_test_h2_generic_post_no_cl_step = b.step(
+        "test-integration-h2-generic-post-no-cl",
+        "Run integration test (TLS ALPN h2 generic frontend POST without content-length)",
+    );
+    integration_test_h2_generic_post_no_cl_step.dependOn(&run_integration_test_h2_generic_post_no_cl.step);
+
+    const integration_test_h2_generic_post = b.addTest(.{
+        .name = "integration_test_h2_generic_post",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: TLS ALPN h2 generic frontend forwards POST body for non-gRPC route"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_h2_generic_post);
+    const run_integration_test_h2_generic_post = b.addRunArtifact(integration_test_h2_generic_post);
+
+    const integration_test_h2_generic_post_step = b.step(
+        "test-integration-h2-generic-post",
+        "Run integration test (TLS ALPN h2 generic frontend POST with content-length)",
+    );
+    integration_test_h2_generic_post_step.dependOn(&run_integration_test_h2_generic_post.step);
+
+    const integration_test_h2_generic_invalid_te = b.addTest(.{
+        .name = "integration_test_h2_generic_invalid_te",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: TLS ALPN h2 generic frontend resets stream on invalid TE value for non-gRPC route"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_h2_generic_invalid_te);
+    const run_integration_test_h2_generic_invalid_te = b.addRunArtifact(integration_test_h2_generic_invalid_te);
+
+    const integration_test_h2_generic_invalid_te_step = b.step(
+        "test-integration-h2-generic-invalid-te",
+        "Run integration test (TLS ALPN h2 generic frontend resets stream on invalid TE)",
+    );
+    integration_test_h2_generic_invalid_te_step.dependOn(&run_integration_test_h2_generic_invalid_te.step);
+
+    const integration_test_h2_generic_trailers_reset = b.addTest(.{
+        .name = "integration_test_h2_generic_trailers_reset",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: TLS ALPN h2 generic frontend resets stream on request trailers for non-gRPC route"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_h2_generic_trailers_reset);
+    const run_integration_test_h2_generic_trailers_reset = b.addRunArtifact(integration_test_h2_generic_trailers_reset);
+
+    const integration_test_h2_generic_trailers_reset_step = b.step(
+        "test-integration-h2-generic-trailers-reset",
+        "Run integration test (TLS ALPN h2 generic frontend resets stream on request trailers)",
+    );
+    integration_test_h2_generic_trailers_reset_step.dependOn(&run_integration_test_h2_generic_trailers_reset.step);
+
+    const integration_test_h2c_bridge_generic_trailers = b.addTest(.{
+        .name = "integration_test_h2c_bridge_generic_trailers",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: h2c bridge forwards non-gRPC response trailers without grpc-status"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_h2c_bridge_generic_trailers);
+    const run_integration_test_h2c_bridge_generic_trailers = b.addRunArtifact(integration_test_h2c_bridge_generic_trailers);
+
+    const integration_test_h2c_bridge_generic_trailers_step = b.step(
+        "test-integration-h2c-bridge-generic-trailers",
+        "Run integration test (h2c bridge non-gRPC response trailers without grpc-status)",
+    );
+    integration_test_h2c_bridge_generic_trailers_step.dependOn(&run_integration_test_h2c_bridge_generic_trailers.step);
+
+    const integration_test_h2c_bridge_generic_headers_only = b.addTest(.{
+        .name = "integration_test_h2c_bridge_generic_headers_only",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: h2c bridge accepts non-gRPC headers-only end-stream response"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_h2c_bridge_generic_headers_only);
+    const run_integration_test_h2c_bridge_generic_headers_only = b.addRunArtifact(integration_test_h2c_bridge_generic_headers_only);
+
+    const integration_test_h2c_bridge_generic_headers_only_step = b.step(
+        "test-integration-h2c-bridge-generic-headers-only",
+        "Run integration test (h2c bridge non-gRPC headers-only end-stream response)",
+    );
+    integration_test_h2c_bridge_generic_headers_only_step.dependOn(&run_integration_test_h2c_bridge_generic_headers_only.step);
+
+    const integration_test_h2c_bridge_prior_nongrpc_request_trailers = b.addTest(.{
+        .name = "integration_test_h2c_bridge_prior_nongrpc_request_trailers",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: h2c bridge prior-knowledge resets non-gRPC request trailers with protocol error"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_h2c_bridge_prior_nongrpc_request_trailers);
+    const run_integration_test_h2c_bridge_prior_nongrpc_request_trailers = b.addRunArtifact(integration_test_h2c_bridge_prior_nongrpc_request_trailers);
+
+    const integration_test_h2c_bridge_prior_nongrpc_request_trailers_step = b.step(
+        "test-integration-h2c-bridge-prior-nongrpc-request-trailers",
+        "Run integration test (h2c bridge prior-knowledge non-gRPC request trailers -> PROTOCOL_ERROR)",
+    );
+    integration_test_h2c_bridge_prior_nongrpc_request_trailers_step.dependOn(&run_integration_test_h2c_bridge_prior_nongrpc_request_trailers.step);
+
+    const integration_test_h2c_bridge_upgrade_nongrpc_request_trailers = b.addTest(.{
+        .name = "integration_test_h2c_bridge_upgrade_nongrpc_request_trailers",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: h2c bridge upgrade resets non-gRPC request trailers on additional stream"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_h2c_bridge_upgrade_nongrpc_request_trailers);
+    const run_integration_test_h2c_bridge_upgrade_nongrpc_request_trailers = b.addRunArtifact(integration_test_h2c_bridge_upgrade_nongrpc_request_trailers);
+
+    const integration_test_h2c_bridge_upgrade_nongrpc_request_trailers_step = b.step(
+        "test-integration-h2c-bridge-upgrade-nongrpc-request-trailers",
+        "Run integration test (h2c bridge upgrade non-gRPC request trailers -> PROTOCOL_ERROR)",
+    );
+    integration_test_h2c_bridge_upgrade_nongrpc_request_trailers_step.dependOn(&run_integration_test_h2c_bridge_upgrade_nongrpc_request_trailers.step);
+
+    const integration_test_h2c_upgrade_generic_trailers = b.addTest(.{
+        .name = "integration_test_h2c_upgrade_generic_trailers",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: h2c upgrade non-gRPC response trailers are proxied without grpc-status enforcement"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_h2c_upgrade_generic_trailers);
+    const run_integration_test_h2c_upgrade_generic_trailers = b.addRunArtifact(integration_test_h2c_upgrade_generic_trailers);
+
+    const integration_test_h2c_upgrade_generic_trailers_step = b.step(
+        "test-integration-h2c-upgrade-generic-trailers",
+        "Run integration test (h2c upgrade non-gRPC response trailers)",
+    );
+    integration_test_h2c_upgrade_generic_trailers_step.dependOn(&run_integration_test_h2c_upgrade_generic_trailers.step);
+
+    const integration_test_h2c_upgrade_generic_headers_only = b.addTest(.{
+        .name = "integration_test_h2c_upgrade_generic_headers_only",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: h2c upgrade non-gRPC headers-only end-stream response is proxied"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_h2c_upgrade_generic_headers_only);
+    const run_integration_test_h2c_upgrade_generic_headers_only = b.addRunArtifact(integration_test_h2c_upgrade_generic_headers_only);
+
+    const integration_test_h2c_upgrade_generic_headers_only_step = b.step(
+        "test-integration-h2c-upgrade-generic-headers-only",
+        "Run integration test (h2c upgrade non-gRPC headers-only end-stream response)",
+    );
+    integration_test_h2c_upgrade_generic_headers_only_step.dependOn(&run_integration_test_h2c_upgrade_generic_headers_only.step);
+
+    const integration_test_h2c_mixed_goaway_nongrpc = b.addTest(.{
+        .name = "integration_test_h2c_mixed_goaway_nongrpc",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: grpc h2c mixed goaway and non-grpc trailer reset loop preserves progress"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_h2c_mixed_goaway_nongrpc);
+    const run_integration_test_h2c_mixed_goaway_nongrpc = b.addRunArtifact(integration_test_h2c_mixed_goaway_nongrpc);
+
+    const integration_test_h2c_mixed_goaway_nongrpc_step = b.step(
+        "test-integration-h2c-mixed-goaway-nongrpc",
+        "Run integration test (h2c mixed GOAWAY + non-gRPC trailer reset loop)",
+    );
+    integration_test_h2c_mixed_goaway_nongrpc_step.dependOn(&run_integration_test_h2c_mixed_goaway_nongrpc.step);
+
+    const integration_test_h2c_mixed_goaway_nongrpc_soak = b.addTest(.{
+        .name = "integration_test_h2c_mixed_goaway_nongrpc_soak",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: grpc h2c mixed goaway and non-grpc trailer reset soak loop"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_h2c_mixed_goaway_nongrpc_soak);
+    const run_integration_test_h2c_mixed_goaway_nongrpc_soak = b.addRunArtifact(integration_test_h2c_mixed_goaway_nongrpc_soak);
+
+    const integration_test_h2c_mixed_goaway_nongrpc_soak_step = b.step(
+        "test-integration-h2c-mixed-goaway-nongrpc-soak",
+        "Run integration test (h2c mixed GOAWAY + non-gRPC trailer reset soak loop)",
+    );
+    integration_test_h2c_mixed_goaway_nongrpc_soak_step.dependOn(&run_integration_test_h2c_mixed_goaway_nongrpc_soak.step);
 
     const acme_issue_once_mod = b.createModule(.{
         .root_source_file = b.path("integration/acme_issue_once.zig"),
@@ -1086,8 +1431,31 @@ pub fn build(b: *std.Build) void {
     run_integration_test_34.step.dependOn(&build_echo_backend.step);
     run_integration_test_5.step.dependOn(&build_echo_backend.step);
     run_integration_test_64.step.dependOn(&build_echo_backend.step);
+    run_integration_test_perf_throughput.step.dependOn(&build_echo_backend.step);
+    run_integration_test_h2c_reset_isolation.step.dependOn(&build_echo_backend.step);
+    run_integration_test_h2c_reset_isolation_soak.step.dependOn(&build_echo_backend.step);
+    run_integration_test_h2c_goaway_last_stream.step.dependOn(&build_echo_backend.step);
+    run_integration_test_h2c_goaway_rollover_loop.step.dependOn(&build_echo_backend.step);
+    run_integration_test_h2c_goaway_rollover_soak.step.dependOn(&build_echo_backend.step);
+    run_integration_test_h2c_upgrade_goaway_rollover_loop.step.dependOn(&build_echo_backend.step);
+    run_integration_test_h2c_upgrade_goaway_rollover_soak.step.dependOn(&build_echo_backend.step);
+    run_integration_test_h2c_cancel_propagation.step.dependOn(&build_echo_backend.step);
+    run_integration_test_h2c_cancel_goaway_overlap.step.dependOn(&build_echo_backend.step);
+    run_integration_test_h2c_cancel_goaway_overlap_soak.step.dependOn(&build_echo_backend.step);
     run_integration_test_77.step.dependOn(&build_echo_backend.step);
     run_integration_test_78.step.dependOn(&build_echo_backend.step);
+    run_integration_test_h2_generic_post_no_cl.step.dependOn(&build_echo_backend.step);
+    run_integration_test_h2_generic_post.step.dependOn(&build_echo_backend.step);
+    run_integration_test_h2_generic_invalid_te.step.dependOn(&build_echo_backend.step);
+    run_integration_test_h2_generic_trailers_reset.step.dependOn(&build_echo_backend.step);
+    run_integration_test_h2c_bridge_generic_trailers.step.dependOn(&build_echo_backend.step);
+    run_integration_test_h2c_bridge_generic_headers_only.step.dependOn(&build_echo_backend.step);
+    run_integration_test_h2c_bridge_prior_nongrpc_request_trailers.step.dependOn(&build_echo_backend.step);
+    run_integration_test_h2c_bridge_upgrade_nongrpc_request_trailers.step.dependOn(&build_echo_backend.step);
+    run_integration_test_h2c_upgrade_generic_trailers.step.dependOn(&build_echo_backend.step);
+    run_integration_test_h2c_upgrade_generic_headers_only.step.dependOn(&build_echo_backend.step);
+    run_integration_test_h2c_mixed_goaway_nongrpc.step.dependOn(&build_echo_backend.step);
+    run_integration_test_h2c_mixed_goaway_nongrpc_soak.step.dependOn(&build_echo_backend.step);
     run_integration_test_2.step.dependOn(&build_lb_example.step);
     run_integration_test_77.step.dependOn(&build_lb_example.step);
     run_integration_test_78.step.dependOn(&build_lb_example.step);

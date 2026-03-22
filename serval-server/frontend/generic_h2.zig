@@ -14,8 +14,11 @@ const types = serval_core.types;
 const context = serval_core.context;
 
 const serval_client = @import("serval-client");
+const client_request = serval_client.request;
 const Connection = serval_client.Connection;
 const serval_grpc = @import("serval-grpc");
+const serval_http = @import("serval-http");
+const parseContentLengthValue = serval_http.parseContentLengthValue;
 const serval_proxy = @import("serval-proxy");
 const serval_proxy_h1 = serval_proxy.h1;
 const Socket = @import("serval-socket").Socket;
@@ -40,6 +43,21 @@ pub fn GenericTlsH2FrontendHandler(
         const Self = @This();
         const websocket_stream_capacity: usize = config.H2_MAX_CONCURRENT_STREAMS;
         const websocket_read_timeout_ms: i64 = 1000;
+        const generic_request_stream_capacity: usize = config.H2_MAX_CONCURRENT_STREAMS;
+
+        const GenericRequestBodyMode = enum {
+            content_length,
+            chunked,
+        };
+
+        const GenericRequestStreamState = struct {
+            used: bool = false,
+            stream_id: u32 = 0,
+            body_mode: GenericRequestBodyMode = .content_length,
+            expected_content_length: u64 = 0,
+            forwarded_body_bytes: u64 = 0,
+            upstream_conn: Connection = undefined,
+        };
 
         const WebSocketStreamState = struct {
             used: bool = false,
@@ -51,6 +69,10 @@ pub fn GenericTlsH2FrontendHandler(
         pub const Error = error{
             TooManyTrackedGrpcStreams,
             TooManyTrackedWebSocketStreams,
+            TooManyTrackedGenericRequestStreams,
+            GenericRequestStreamNotFound,
+            InvalidContentLength,
+            UnexpectedRequestBodyLength,
             HeaderForwardingFailed,
             UnsupportedChunkedWithPreRead,
             UpstreamResponseBodyReadFailed,
@@ -77,6 +99,8 @@ pub fn GenericTlsH2FrontendHandler(
         connection_mutex: ?*Io.Mutex = null,
         websocket_streams: [websocket_stream_capacity]WebSocketStreamState = [_]WebSocketStreamState{.{}} ** websocket_stream_capacity,
         tracked_websocket_stream_count: u16 = 0,
+        generic_request_streams: [generic_request_stream_capacity]GenericRequestStreamState = [_]GenericRequestStreamState{.{}} ** generic_request_stream_capacity,
+        tracked_generic_request_stream_count: u16 = 0,
 
         pub fn init(
             inner: *Handler,
@@ -143,6 +167,14 @@ pub fn GenericTlsH2FrontendHandler(
                 self.websocket_streams[index] = .{};
             }
             self.tracked_websocket_stream_count = 0;
+
+            index = 0;
+            while (index < self.generic_request_streams.len) : (index += 1) {
+                if (!self.generic_request_streams[index].used) continue;
+                self.generic_request_streams[index].upstream_conn.close();
+                self.generic_request_streams[index] = .{};
+            }
+            self.tracked_generic_request_stream_count = 0;
         }
 
         pub fn handleH2Headers(
@@ -170,10 +202,8 @@ pub fn GenericTlsH2FrontendHandler(
                 return;
             }
 
-            if (!end_stream) {
-                try sendSimpleTextResponse(writer, 413, "request body over generic h2 frontend not supported");
-                return;
-            }
+            // Generic (non-gRPC) requests with body are supported via stream-aware
+            // h2->h1 forwarding state tracked per stream.
 
             if (comptime hooks.hasHook(Handler, "onRequest")) {
                 var stream_ctx = self.makeStreamContext();
@@ -199,7 +229,17 @@ pub fn GenericTlsH2FrontendHandler(
 
             const upstream = try self.selectUpstream(request, writer);
             if (upstream == null) return;
-            try self.forwardHttpRequest(request, upstream.?, writer);
+
+            if (end_stream) {
+                try self.forwardHttpRequest(request, upstream.?, writer);
+                return;
+            }
+
+            self.startGenericRequestBodyStream(stream_id, request, upstream.?) catch |err| switch (err) {
+                error.InvalidContentLength => try sendSimpleTextResponse(writer, 400, "invalid content-length header"),
+                error.TooManyTrackedGenericRequestStreams => try sendSimpleStatusResponse(writer, 503),
+                else => return err,
+            };
         }
 
         pub fn handleH2Data(
@@ -226,6 +266,11 @@ pub fn GenericTlsH2FrontendHandler(
                 return;
             }
 
+            if (self.getGenericRequestStreamState(stream_id) != null) {
+                try self.forwardGenericRequestBodyData(stream_id, payload, end_stream, writer);
+                return;
+            }
+
             try sendSimpleTextResponse(writer, 413, "request body over generic h2 frontend not supported");
         }
 
@@ -237,6 +282,7 @@ pub fn GenericTlsH2FrontendHandler(
                 self.grpc_handler.handleH2StreamReset(stream_id, error_code_raw);
             }
             self.markWebSocketStreamClosing(stream_id);
+            self.removeGenericRequestStream(stream_id);
         }
 
         pub fn handleH2ConnectionClose(self: *Self, goaway: @import("serval-h2").GoAway) void {
@@ -248,6 +294,7 @@ pub fn GenericTlsH2FrontendHandler(
             assert(@intFromPtr(self) != 0);
             self.untrackGrpcStream(summary.stream_id);
             self.markWebSocketStreamClosing(summary.stream_id);
+            self.removeGenericRequestStream(summary.stream_id);
         }
 
         fn makeStreamContext(self: *Self) Context {
@@ -313,8 +360,15 @@ pub fn GenericTlsH2FrontendHandler(
 
             client.sendRequest(&connect_result.conn, request, null) catch return error.UpstreamSendFailed;
 
+            try self.forwardHttpResponseFromConnection(&connect_result.conn, writer);
+        }
+
+        fn forwardHttpResponseFromConnection(self: *Self, conn: *Connection, writer: *h2_server.ResponseWriter) Error!void {
+            _ = self;
+            assert(@intFromPtr(conn) != 0);
+
             var header_buf: [config.MAX_HEADER_SIZE_BYTES]u8 = undefined;
-            const response_headers = client.readResponseHeaders(&connect_result.conn, header_buf[0..]) catch return error.UpstreamResponseHeadersFailed;
+            const response_headers = serval_client.readResponseHeaders(&conn.socket, header_buf[0..]) catch return error.UpstreamResponseHeadersFailed;
 
             var h2_headers_buf: [config.MAX_HEADERS]h2_server.Header = undefined;
             const h2_headers = try filterResponseHeaders(&response_headers.headers, &h2_headers_buf);
@@ -342,7 +396,7 @@ pub fn GenericTlsH2FrontendHandler(
                     var frame_count: u32 = 0;
                     while (remaining > 0 and frame_count < config.H2_SERVER_MAX_FRAME_COUNT) : (frame_count += 1) {
                         const to_read: usize = @intCast(@min(@as(u64, response_buf.len), remaining));
-                        const n = connect_result.conn.socket.read(response_buf[0..to_read]) catch return error.UpstreamResponseBodyReadFailed;
+                        const n = conn.socket.read(response_buf[0..to_read]) catch return error.UpstreamResponseBodyReadFailed;
                         if (n == 0) return error.UpstreamResponseBodyReadFailed;
 
                         remaining -= n;
@@ -355,7 +409,7 @@ pub fn GenericTlsH2FrontendHandler(
                     if (pre_read.len != 0) return error.UnsupportedChunkedWithPreRead;
 
                     try writer.sendHeaders(response_headers.status, h2_headers, false);
-                    var body_reader = serval_client.BodyReader.init(&connect_result.conn.socket, response_headers.body_framing);
+                    var body_reader = serval_client.BodyReader.init(&conn.socket, response_headers.body_framing);
                     var response_buf: [config.H2_MAX_FRAME_SIZE_BYTES]u8 = undefined;
 
                     var frame_count: u32 = 0;
@@ -371,6 +425,169 @@ pub fn GenericTlsH2FrontendHandler(
 
                     return error.ResponseFrameLimitExceeded;
                 },
+            }
+        }
+
+        fn startGenericRequestBodyStream(self: *Self, stream_id: u32, request: *const Request, upstream: types.Upstream) Error!void {
+            assert(@intFromPtr(self) != 0);
+            assert(stream_id > 0);
+
+            if (upstream.http_protocol != .h1) return error.UnsupportedProtocol;
+
+            const body_mode: GenericRequestBodyMode, const content_length: u64 = blk: {
+                if (request.headers.getContentLength()) |content_length_value| {
+                    const parsed = parseContentLengthValue(content_length_value) orelse return error.InvalidContentLength;
+                    break :blk .{ .content_length, parsed };
+                }
+                break :blk .{ .chunked, 0 };
+            };
+
+            var client = serval_client.Client.init(
+                std.heap.page_allocator,
+                &self.forwarder.dns_resolver,
+                self.forwarder.client_ctx,
+                self.forwarder.verify_upstream_tls,
+            );
+            var connect_result = client.connect(upstream, self.io) catch return error.UpstreamConnectFailed;
+            errdefer connect_result.conn.close();
+
+            switch (body_mode) {
+                .content_length => {
+                    client.sendRequest(&connect_result.conn, request, null) catch return error.UpstreamSendFailed;
+                },
+                .chunked => {
+                    sendChunkedRequestHeaders(&connect_result.conn, self.io, request) catch return error.UpstreamSendFailed;
+                },
+            }
+
+            try self.trackGenericRequestStream(stream_id, connect_result.conn, body_mode, content_length);
+        }
+
+        fn forwardGenericRequestBodyData(
+            self: *Self,
+            stream_id: u32,
+            payload: []const u8,
+            end_stream: bool,
+            writer: *h2_server.ResponseWriter,
+        ) Error!void {
+            assert(@intFromPtr(self) != 0);
+            assert(stream_id > 0);
+            assert(@intFromPtr(writer) != 0);
+
+            const state = self.getGenericRequestStreamState(stream_id) orelse return error.GenericRequestStreamNotFound;
+
+            switch (state.body_mode) {
+                .content_length => {
+                    if (payload.len > 0) {
+                        writeAllConnection(&state.upstream_conn, self.io, payload) catch return error.UpstreamSendFailed;
+                        state.forwarded_body_bytes += payload.len;
+                    }
+
+                    if (state.forwarded_body_bytes > state.expected_content_length) {
+                        self.removeGenericRequestStream(stream_id);
+                        try sendSimpleTextResponse(writer, 400, "request body exceeded declared content-length");
+                        return;
+                    }
+
+                    if (!end_stream) return;
+                    if (state.forwarded_body_bytes != state.expected_content_length) {
+                        self.removeGenericRequestStream(stream_id);
+                        try sendSimpleTextResponse(writer, 400, "request body shorter than declared content-length");
+                        return;
+                    }
+                },
+                .chunked => {
+                    if (payload.len > 0) {
+                        sendChunkedBodyData(&state.upstream_conn, self.io, payload) catch return error.UpstreamSendFailed;
+                        state.forwarded_body_bytes += payload.len;
+                    }
+
+                    if (!end_stream) return;
+                    sendChunkedBodyTerminator(&state.upstream_conn, self.io) catch return error.UpstreamSendFailed;
+                },
+            }
+
+            const local_conn = state.upstream_conn;
+            self.removeGenericRequestStreamWithoutClose(stream_id);
+            var conn = local_conn;
+            defer conn.close();
+
+            try self.forwardHttpResponseFromConnection(&conn, writer);
+        }
+
+        fn trackGenericRequestStream(
+            self: *Self,
+            stream_id: u32,
+            conn: Connection,
+            body_mode: GenericRequestBodyMode,
+            expected_content_length: u64,
+        ) Error!void {
+            assert(stream_id > 0);
+
+            var mutable_conn = conn;
+            if (self.getGenericRequestStreamState(stream_id) != null) {
+                mutable_conn.close();
+                return error.TooManyTrackedGenericRequestStreams;
+            }
+
+            if (self.tracked_generic_request_stream_count >= config.H2_MAX_CONCURRENT_STREAMS) {
+                mutable_conn.close();
+                return error.TooManyTrackedGenericRequestStreams;
+            }
+
+            var index: usize = 0;
+            while (index < self.generic_request_streams.len) : (index += 1) {
+                if (self.generic_request_streams[index].used) continue;
+                self.generic_request_streams[index] = .{
+                    .used = true,
+                    .stream_id = stream_id,
+                    .body_mode = body_mode,
+                    .expected_content_length = expected_content_length,
+                    .upstream_conn = mutable_conn,
+                };
+                self.tracked_generic_request_stream_count += 1;
+                return;
+            }
+
+            mutable_conn.close();
+            return error.TooManyTrackedGenericRequestStreams;
+        }
+
+        fn getGenericRequestStreamState(self: *Self, stream_id: u32) ?*GenericRequestStreamState {
+            if (stream_id == 0) return null;
+
+            var index: usize = 0;
+            while (index < self.generic_request_streams.len) : (index += 1) {
+                if (!self.generic_request_streams[index].used) continue;
+                if (self.generic_request_streams[index].stream_id == stream_id) return &self.generic_request_streams[index];
+            }
+            return null;
+        }
+
+        fn removeGenericRequestStreamWithoutClose(self: *Self, stream_id: u32) void {
+            if (stream_id == 0) return;
+
+            var index: usize = 0;
+            while (index < self.generic_request_streams.len) : (index += 1) {
+                if (!self.generic_request_streams[index].used) continue;
+                if (self.generic_request_streams[index].stream_id != stream_id) continue;
+                self.generic_request_streams[index] = .{};
+                if (self.tracked_generic_request_stream_count > 0) self.tracked_generic_request_stream_count -= 1;
+                return;
+            }
+        }
+
+        fn removeGenericRequestStream(self: *Self, stream_id: u32) void {
+            if (stream_id == 0) return;
+
+            var index: usize = 0;
+            while (index < self.generic_request_streams.len) : (index += 1) {
+                if (!self.generic_request_streams[index].used) continue;
+                if (self.generic_request_streams[index].stream_id != stream_id) continue;
+                self.generic_request_streams[index].upstream_conn.close();
+                self.generic_request_streams[index] = .{};
+                if (self.tracked_generic_request_stream_count > 0) self.tracked_generic_request_stream_count -= 1;
+                return;
             }
         }
 
@@ -670,6 +887,88 @@ pub fn GenericTlsH2FrontendHandler(
             return false;
         }
     };
+}
+
+fn sendChunkedRequestHeaders(conn: *Connection, io: Io, request: *const Request) WebSocketIoError!void {
+    assert(@intFromPtr(conn) != 0);
+    assert(@intFromPtr(request) != 0);
+    assert(request.path.len > 0);
+
+    var buffer: [config.MAX_HEADER_SIZE_BYTES]u8 = std.mem.zeroes([config.MAX_HEADER_SIZE_BYTES]u8);
+    const header_len = buildChunkedRequestHeaderBuffer(&buffer, request) orelse return error.WriteFailed;
+    try writeAllConnection(conn, io, buffer[0..header_len]);
+}
+
+fn buildChunkedRequestHeaderBuffer(buffer: []u8, request: *const Request) ?usize {
+    assert(buffer.len > 0);
+    assert(request.path.len > 0);
+
+    var pos: usize = 0;
+
+    const method_str = client_request.methodToString(request.method);
+    const version_str = " HTTP/1.1\r\n";
+    const line_len = method_str.len + 1 + request.path.len + version_str.len;
+    if (pos + line_len > buffer.len) return null;
+
+    @memcpy(buffer[pos..][0..method_str.len], method_str);
+    pos += method_str.len;
+    buffer[pos] = ' ';
+    pos += 1;
+    @memcpy(buffer[pos..][0..request.path.len], request.path);
+    pos += request.path.len;
+    @memcpy(buffer[pos..][0..version_str.len], version_str);
+    pos += version_str.len;
+
+    var index: u8 = 0;
+    while (index < request.headers.count) : (index += 1) {
+        const header = request.headers.headers[index];
+        if (client_request.isHopByHopHeader(header.name)) continue;
+        if (std.ascii.eqlIgnoreCase(header.name, "content-length")) continue;
+
+        const needed = header.name.len + 2 + header.value.len + 2;
+        if (pos + needed > buffer.len) return null;
+
+        @memcpy(buffer[pos..][0..header.name.len], header.name);
+        pos += header.name.len;
+        @memcpy(buffer[pos..][0..2], ": ");
+        pos += 2;
+        @memcpy(buffer[pos..][0..header.value.len], header.value);
+        pos += header.value.len;
+        @memcpy(buffer[pos..][0..2], "\r\n");
+        pos += 2;
+    }
+
+    const transfer_encoding_header = "Transfer-Encoding: chunked\r\n";
+    if (pos + transfer_encoding_header.len > buffer.len) return null;
+    @memcpy(buffer[pos..][0..transfer_encoding_header.len], transfer_encoding_header);
+    pos += transfer_encoding_header.len;
+
+    if (pos + client_request.VIA_HEADER.len > buffer.len) return null;
+    @memcpy(buffer[pos..][0..client_request.VIA_HEADER.len], client_request.VIA_HEADER);
+    pos += client_request.VIA_HEADER.len;
+
+    if (pos + 2 > buffer.len) return null;
+    @memcpy(buffer[pos..][0..2], "\r\n");
+    pos += 2;
+
+    return pos;
+}
+
+fn sendChunkedBodyData(conn: *Connection, io: Io, payload: []const u8) WebSocketIoError!void {
+    assert(@intFromPtr(conn) != 0);
+    if (payload.len == 0) return;
+
+    var chunk_size_buf: [18]u8 = undefined;
+    const chunk_size = std.fmt.bufPrint(&chunk_size_buf, "{x}\r\n", .{payload.len}) catch return error.WriteFailed;
+
+    try writeAllConnection(conn, io, chunk_size);
+    try writeAllConnection(conn, io, payload);
+    try writeAllConnection(conn, io, "\r\n");
+}
+
+fn sendChunkedBodyTerminator(conn: *Connection, io: Io) WebSocketIoError!void {
+    assert(@intFromPtr(conn) != 0);
+    try writeAllConnection(conn, io, "0\r\n\r\n");
 }
 
 pub fn tryServeTlsAlpnConnection(

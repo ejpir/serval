@@ -237,6 +237,7 @@ fn handleExistingStreamTrailerHeaders(
     header_block: []const u8,
     end_stream: bool,
 ) Error!?ReceiveAction {
+    _ = header_block;
     assert(@intFromPtr(self) != 0);
     assert(header.stream_id > 0);
 
@@ -245,14 +246,10 @@ fn handleExistingStreamTrailerHeaders(
     if ((header.flags & h2.flags_end_headers) == 0) return error.StreamProtocolError;
     if (!end_stream) return error.StreamProtocolError;
 
-    try validateTrailerHeaderBlock(self, header_block);
-    try finalizeRequestBodyOnEndStream(self, header.stream_id);
-    try self.state.endRemoteStream(header.stream_id);
-    return .{ .request_data = .{
-        .stream_id = header.stream_id,
-        .end_stream = true,
-        .payload = &[_]u8{},
-    } };
+    // Generic request-trailer forwarding semantics are not implemented in the
+    // current server handler contract. Reject trailers fail-closed to avoid
+    // implicit translation behavior.
+    return error.StreamProtocolError;
 }
 
 fn validateNewInboundHeadersStream(self: *const Runtime, stream_id: u32) Error!void {
@@ -496,18 +493,6 @@ fn noteRequestData(self: *Runtime, stream_id: u32, data_len: usize, end_stream: 
     if (end_stream) removeRequestBodyTracker(self, stream_id);
 }
 
-fn finalizeRequestBodyOnEndStream(self: *Runtime, stream_id: u32) Error!void {
-    assert(@intFromPtr(self) != 0);
-    assert(stream_id > 0);
-
-    if (getRequestBodyTracker(self, stream_id)) |tracker| {
-        if (tracker.expected_content_length) |expected| {
-            if (tracker.received_data_bytes != expected) return error.StreamProtocolError;
-        }
-    }
-    removeRequestBodyTracker(self, stream_id);
-}
-
 fn parseExpectedContentLength(request: *const types.Request) Error!?u64 {
     assert(@intFromPtr(request) != 0);
     assert(request.path.len > 0);
@@ -515,18 +500,6 @@ fn parseExpectedContentLength(request: *const types.Request) Error!?u64 {
     const raw = request.headers.get("content-length") orelse return null;
     const parsed = std.fmt.parseInt(u64, raw, 10) catch return error.StreamProtocolError;
     return parsed;
-}
-
-fn validateTrailerHeaderBlock(self: *Runtime, header_block: []const u8) Error!void {
-    assert(@intFromPtr(self) != 0);
-    assert(header_block.len <= config.H2_MAX_HEADER_BLOCK_SIZE_BYTES);
-
-    var fields_buf: [config.MAX_HEADERS]h2.HeaderField = undefined;
-    const fields = try h2.decodeHeaderBlockWithDecoder(&self.header_decoder, header_block, &fields_buf);
-    for (fields) |field| {
-        if (field.name.len == 0) return error.StreamProtocolError;
-        if (field.name[0] == ':') return error.StreamProtocolError;
-    }
 }
 
 fn getRequestBodyTracker(self: *Runtime, stream_id: u32) ?*RequestBodyTracker {

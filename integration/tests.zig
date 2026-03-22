@@ -1684,6 +1684,22 @@ const GrpcH2BackendConfig = struct {
     response_trailer_value: ?[]const u8 = null,
 };
 
+const GenericH2BackendConfig = struct {
+    port: u16,
+    path: []const u8,
+    response_status: []const u8 = "200",
+    response_content_type: ?[]const u8 = "text/plain",
+    response_payload: ?[]const u8 = "generic-h2-backend-response",
+    headers_end_stream: bool = false,
+    send_response_trailers: bool = false,
+    response_trailer_name: ?[]const u8 = null,
+    response_trailer_value: ?[]const u8 = null,
+};
+
+const MinimalH2BridgeBackendConfig = struct {
+    port: u16,
+};
+
 const GrpcH2ResetBackendConfig = struct {
     port: u16,
     path: []const u8,
@@ -1893,6 +1909,283 @@ fn buildSimpleH2GetRequest(path: []const u8, authority: []const u8, scheme: []co
         header_block,
     );
     pos += headers_frame.len;
+
+    return out[0..pos];
+}
+
+fn buildSimpleH2GetRequestWithInvalidTe(path: []const u8, authority: []const u8, scheme: []const u8, out: []u8) ![]const u8 {
+    assert(path.len > 0);
+    assert(authority.len > 0);
+    assert(scheme.len > 0);
+
+    var header_block_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const header_block = try buildH2HeaderBlock(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = path },
+        .{ .name = ":scheme", .value = scheme },
+        .{ .name = ":authority", .value = authority },
+        .{ .name = "te", .value = "gzip" },
+    }, &header_block_buf);
+
+    var pos: usize = 0;
+    if (out.len < serval_h2.client_connection_preface.len) return error.BufferTooSmall;
+    @memcpy(out[0..serval_h2.client_connection_preface.len], serval_h2.client_connection_preface);
+    pos += serval_h2.client_connection_preface.len;
+
+    const settings_frame = try appendH2Frame(out[pos..], .settings, 0, 0, &[_]u8{});
+    pos += settings_frame.len;
+
+    const headers_frame = try appendH2Frame(
+        out[pos..],
+        .headers,
+        serval_h2.flags_end_headers | serval_h2.flags_end_stream,
+        1,
+        header_block,
+    );
+    pos += headers_frame.len;
+
+    return out[0..pos];
+}
+
+fn buildSimpleH2PostRequest(
+    path: []const u8,
+    authority: []const u8,
+    scheme: []const u8,
+    body: []const u8,
+    out: []u8,
+) ![]const u8 {
+    assert(path.len > 0);
+    assert(authority.len > 0);
+    assert(scheme.len > 0);
+
+    var content_length_buf: [20]u8 = undefined;
+    const content_length = try std.fmt.bufPrint(&content_length_buf, "{d}", .{body.len});
+
+    var header_block_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const header_block = try buildH2HeaderBlock(&.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = path },
+        .{ .name = ":scheme", .value = scheme },
+        .{ .name = ":authority", .value = authority },
+        .{ .name = "content-type", .value = "text/plain" },
+        .{ .name = "content-length", .value = content_length },
+    }, &header_block_buf);
+
+    var pos: usize = 0;
+    if (out.len < serval_h2.client_connection_preface.len) return error.BufferTooSmall;
+    @memcpy(out[0..serval_h2.client_connection_preface.len], serval_h2.client_connection_preface);
+    pos += serval_h2.client_connection_preface.len;
+
+    const settings_frame = try appendH2Frame(out[pos..], .settings, 0, 0, &[_]u8{});
+    pos += settings_frame.len;
+
+    const headers_frame = try appendH2Frame(
+        out[pos..],
+        .headers,
+        serval_h2.flags_end_headers,
+        1,
+        header_block,
+    );
+    pos += headers_frame.len;
+
+    const data_frame = try appendH2Frame(
+        out[pos..],
+        .data,
+        serval_h2.flags_end_stream,
+        1,
+        body,
+    );
+    pos += data_frame.len;
+
+    return out[0..pos];
+}
+
+fn buildSimpleH2PostRequestWithoutContentLength(
+    path: []const u8,
+    authority: []const u8,
+    scheme: []const u8,
+    body_part1: []const u8,
+    body_part2: []const u8,
+    out: []u8,
+) ![]const u8 {
+    assert(path.len > 0);
+    assert(authority.len > 0);
+    assert(scheme.len > 0);
+    assert(body_part1.len + body_part2.len > 0);
+
+    var header_block_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const header_block = try buildH2HeaderBlock(&.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = path },
+        .{ .name = ":scheme", .value = scheme },
+        .{ .name = ":authority", .value = authority },
+        .{ .name = "content-type", .value = "text/plain" },
+    }, &header_block_buf);
+
+    var pos: usize = 0;
+    if (out.len < serval_h2.client_connection_preface.len) return error.BufferTooSmall;
+    @memcpy(out[0..serval_h2.client_connection_preface.len], serval_h2.client_connection_preface);
+    pos += serval_h2.client_connection_preface.len;
+
+    const settings_frame = try appendH2Frame(out[pos..], .settings, 0, 0, &[_]u8{});
+    pos += settings_frame.len;
+
+    const headers_frame = try appendH2Frame(
+        out[pos..],
+        .headers,
+        serval_h2.flags_end_headers,
+        1,
+        header_block,
+    );
+    pos += headers_frame.len;
+
+    const data_frame_1 = try appendH2Frame(
+        out[pos..],
+        .data,
+        0,
+        1,
+        body_part1,
+    );
+    pos += data_frame_1.len;
+
+    const data_frame_2 = try appendH2Frame(
+        out[pos..],
+        .data,
+        serval_h2.flags_end_stream,
+        1,
+        body_part2,
+    );
+    pos += data_frame_2.len;
+
+    return out[0..pos];
+}
+
+fn buildSimpleH2PostStreamWithTrailersFrames(
+    path: []const u8,
+    authority: []const u8,
+    scheme: []const u8,
+    body: []const u8,
+    stream_id: u32,
+    out: []u8,
+) ![]const u8 {
+    assert(path.len > 0);
+    assert(authority.len > 0);
+    assert(scheme.len > 0);
+    assert(stream_id > 0);
+
+    var content_length_buf: [20]u8 = undefined;
+    const content_length = try std.fmt.bufPrint(&content_length_buf, "{d}", .{body.len});
+
+    var request_header_block_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const request_header_block = try buildH2HeaderBlock(&.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = path },
+        .{ .name = ":scheme", .value = scheme },
+        .{ .name = ":authority", .value = authority },
+        .{ .name = "content-type", .value = "text/plain" },
+        .{ .name = "content-length", .value = content_length },
+    }, &request_header_block_buf);
+
+    var trailer_header_block_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const trailer_header_block = try buildH2HeaderBlock(&.{
+        .{ .name = "x-extra-trailer", .value = "trailer-value" },
+    }, &trailer_header_block_buf);
+
+    var pos: usize = 0;
+
+    const headers_frame = try appendH2Frame(
+        out[pos..],
+        .headers,
+        serval_h2.flags_end_headers,
+        stream_id,
+        request_header_block,
+    );
+    pos += headers_frame.len;
+
+    const data_frame = try appendH2Frame(
+        out[pos..],
+        .data,
+        0,
+        stream_id,
+        body,
+    );
+    pos += data_frame.len;
+
+    const trailers_frame = try appendH2Frame(
+        out[pos..],
+        .headers,
+        serval_h2.flags_end_headers | serval_h2.flags_end_stream,
+        stream_id,
+        trailer_header_block,
+    );
+    pos += trailers_frame.len;
+
+    return out[0..pos];
+}
+
+fn buildSimpleH2PostRequestWithTrailers(
+    path: []const u8,
+    authority: []const u8,
+    scheme: []const u8,
+    body: []const u8,
+    out: []u8,
+) ![]const u8 {
+    assert(path.len > 0);
+    assert(authority.len > 0);
+    assert(scheme.len > 0);
+
+    var content_length_buf: [20]u8 = undefined;
+    const content_length = try std.fmt.bufPrint(&content_length_buf, "{d}", .{body.len});
+
+    var request_header_block_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const request_header_block = try buildH2HeaderBlock(&.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = path },
+        .{ .name = ":scheme", .value = scheme },
+        .{ .name = ":authority", .value = authority },
+        .{ .name = "content-type", .value = "text/plain" },
+        .{ .name = "content-length", .value = content_length },
+    }, &request_header_block_buf);
+
+    var trailer_header_block_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const trailer_header_block = try buildH2HeaderBlock(&.{
+        .{ .name = "x-extra-trailer", .value = "trailer-value" },
+    }, &trailer_header_block_buf);
+
+    var pos: usize = 0;
+    if (out.len < serval_h2.client_connection_preface.len) return error.BufferTooSmall;
+    @memcpy(out[0..serval_h2.client_connection_preface.len], serval_h2.client_connection_preface);
+    pos += serval_h2.client_connection_preface.len;
+
+    const settings_frame = try appendH2Frame(out[pos..], .settings, 0, 0, &[_]u8{});
+    pos += settings_frame.len;
+
+    const headers_frame = try appendH2Frame(
+        out[pos..],
+        .headers,
+        serval_h2.flags_end_headers,
+        1,
+        request_header_block,
+    );
+    pos += headers_frame.len;
+
+    const data_frame = try appendH2Frame(
+        out[pos..],
+        .data,
+        0,
+        1,
+        body,
+    );
+    pos += data_frame.len;
+
+    const trailers_frame = try appendH2Frame(
+        out[pos..],
+        .headers,
+        serval_h2.flags_end_headers | serval_h2.flags_end_stream,
+        1,
+        trailer_header_block,
+    );
+    pos += trailers_frame.len;
 
     return out[0..pos];
 }
@@ -2204,6 +2497,28 @@ fn buildGrpcH2UpgradeRequest(path: []const u8, authority: []const u8, payload: [
     return out[0 .. headers.len + grpc_message.len];
 }
 
+fn buildTextH2UpgradeRequest(path: []const u8, authority: []const u8, payload: []const u8, out: []u8) ![]const u8 {
+    const settings_payload = [_]u8{ 0x00, 0x03, 0x00, 0x00, 0x00, 0x64 };
+    var settings_buf: [16]u8 = undefined;
+    const settings_encoded = std.base64.url_safe_no_pad.Encoder.encode(&settings_buf, &settings_payload);
+
+    const headers = try std.fmt.bufPrint(
+        out,
+        "POST {s} HTTP/1.1\r\n" ++
+            "Host: {s}\r\n" ++
+            "Connection: Upgrade, HTTP2-Settings\r\n" ++
+            "Upgrade: h2c\r\n" ++
+            "HTTP2-Settings: {s}\r\n" ++
+            "Content-Type: text/plain\r\n" ++
+            "Content-Length: {d}\r\n" ++
+            "\r\n",
+        .{ path, authority, settings_encoded, payload.len },
+    );
+    if (out.len - headers.len < payload.len) return error.BufferTooSmall;
+    @memcpy(out[headers.len..][0..payload.len], payload);
+    return out[0 .. headers.len + payload.len];
+}
+
 fn readH2Frame(sock: posix.socket_t, initial: []const u8, out: []u8) !H2FrameView {
     var total: usize = 0;
     if (initial.len > 0) {
@@ -2248,7 +2563,7 @@ fn readH2FrameSocket(socket: *serval.Socket, initial: []const u8, out: []u8) !H2
     }
 
     while (total < serval_h2.frame_header_size_bytes) {
-        const n_u32 = try socket.read(out[total..]);
+        const n_u32 = try readSocketRetry(socket, out[total..]);
         if (n_u32 == 0) return error.ConnectionClosed;
         const n: usize = @intCast(n_u32);
         total += n;
@@ -2257,7 +2572,7 @@ fn readH2FrameSocket(socket: *serval.Socket, initial: []const u8, out: []u8) !H2
     const header = try serval_h2.parseFrameHeader(out[0..serval_h2.frame_header_size_bytes]);
     const frame_len: usize = serval_h2.frame_header_size_bytes + header.length;
     while (total < frame_len) {
-        const n_u32 = try socket.read(out[total..]);
+        const n_u32 = try readSocketRetry(socket, out[total..]);
         if (n_u32 == 0) return error.ConnectionClosed;
         const n: usize = @intCast(n_u32);
         total += n;
@@ -2268,6 +2583,28 @@ fn readH2FrameSocket(socket: *serval.Socket, initial: []const u8, out: []u8) !H2
         .payload = out[serval_h2.frame_header_size_bytes..frame_len],
         .remaining = out[frame_len..total],
     };
+}
+
+fn readSocketRetry(socket: *serval.Socket, out: []u8) !u32 {
+    assert(@intFromPtr(socket) != 0);
+    assert(out.len > 0);
+
+    const max_retry_count: u16 = 2000;
+    const retry_sleep_ns: u64 = 1 * std.time.ns_per_ms;
+
+    var retry_count: u16 = 0;
+    while (retry_count < max_retry_count) : (retry_count += 1) {
+        const n = socket.read(out) catch |err| switch (err) {
+            error.Timeout, error.Unexpected => {
+                posix.nanosleep(0, retry_sleep_ns);
+                continue;
+            },
+            else => return err,
+        };
+        return n;
+    }
+
+    return error.ReadTimeout;
 }
 
 fn decodeH2Fields(payload: []const u8, out: []serval_h2.HeaderField) ![]const serval_h2.HeaderField {
@@ -2316,6 +2653,13 @@ fn expectGrpcStatusTrailer(fields: []const serval_h2.HeaderField, expected: []co
         }
     }
     return error.MissingGrpcStatus;
+}
+
+fn findH2FieldValue(fields: []const serval_h2.HeaderField, name: []const u8) ?[]const u8 {
+    for (fields) |field| {
+        if (std.mem.eql(u8, field.name, name)) return field.value;
+    }
+    return null;
 }
 
 fn sendGrpcUnaryViaUpstreamSession(
@@ -3488,6 +3832,139 @@ fn startGrpcH2Backend(config: GrpcH2BackendConfig) !std.Thread {
     return thread;
 }
 
+fn genericH2BackendMain(config: GenericH2BackendConfig) !void {
+    const listener = try createTcpListener(config.port);
+    defer posix.close(listener);
+
+    const conn = try acceptTcp(listener);
+    defer posix.close(conn);
+
+    var request_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var total: usize = 0;
+    var parsed: serval_h2.InitialRequest = undefined;
+    var request_storage_buf: [serval_h2.request_stable_storage_size_bytes]u8 = undefined;
+
+    while (true) {
+        const n = try posix.recv(conn, request_buf[total..], 0);
+        if (n == 0) return error.ConnectionClosed;
+        total += n;
+        parsed = serval_h2.parseInitialRequest(request_buf[0..total], &request_storage_buf) catch |err| switch (err) {
+            error.NeedMoreData => continue,
+            else => return err,
+        };
+        break;
+    }
+
+    try testing.expectEqualStrings(config.path, parsed.request.path);
+
+    if (config.send_response_trailers and config.headers_end_stream) {
+        return error.InvalidConfiguration;
+    }
+    if (config.response_trailer_name != null and config.response_trailer_value == null) {
+        return error.MissingResponseTrailerValue;
+    }
+    if (config.response_trailer_name == null and config.response_trailer_value != null) {
+        return error.MissingResponseTrailerName;
+    }
+
+    var send_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var pos: usize = 0;
+
+    const settings = try appendH2Frame(send_buf[pos..], .settings, 0, 0, &[_]u8{});
+    pos += settings.len;
+
+    const settings_ack = try appendH2Frame(send_buf[pos..], .settings, serval_h2.flags_ack, 0, &[_]u8{});
+    pos += settings_ack.len;
+
+    var response_headers_buf: [256]u8 = undefined;
+    const response_headers = if (config.response_content_type) |content_type|
+        try buildH2HeaderBlock(&.{
+            .{ .name = ":status", .value = config.response_status },
+            .{ .name = "content-type", .value = content_type },
+        }, &response_headers_buf)
+    else
+        try buildH2HeaderBlock(&.{
+            .{ .name = ":status", .value = config.response_status },
+        }, &response_headers_buf);
+
+    const headers_flags: u8 = if (config.headers_end_stream)
+        serval_h2.flags_end_headers | serval_h2.flags_end_stream
+    else
+        serval_h2.flags_end_headers;
+
+    const headers_frame = try appendH2Frame(
+        send_buf[pos..],
+        .headers,
+        headers_flags,
+        parsed.stream_id,
+        response_headers,
+    );
+    pos += headers_frame.len;
+
+    if (!config.headers_end_stream) {
+        const payload = config.response_payload orelse "";
+        if (payload.len > 0 or !config.send_response_trailers) {
+            const data_flags: u8 = if (config.send_response_trailers) 0 else serval_h2.flags_end_stream;
+            const data_frame = try appendH2Frame(send_buf[pos..], .data, data_flags, parsed.stream_id, payload);
+            pos += data_frame.len;
+        }
+
+        if (config.send_response_trailers) {
+            const trailer_name = config.response_trailer_name orelse "x-generic-trailer";
+            const trailer_value = config.response_trailer_value orelse "ok";
+
+            var trailer_buf: [128]u8 = undefined;
+            const trailers = try buildH2HeaderBlock(&.{.{ .name = trailer_name, .value = trailer_value }}, &trailer_buf);
+            const trailer_frame = try appendH2Frame(
+                send_buf[pos..],
+                .headers,
+                serval_h2.flags_end_headers | serval_h2.flags_end_stream,
+                parsed.stream_id,
+                trailers,
+            );
+            pos += trailer_frame.len;
+        }
+    }
+
+    try sendAllTcp(conn, send_buf[0..pos]);
+}
+
+fn startGenericH2Backend(config: GenericH2BackendConfig) !std.Thread {
+    const thread = try std.Thread.spawn(.{}, genericH2BackendMain, .{config});
+    posix.nanosleep(0, H2_SERVER_STARTUP_DELAY_MS * std.time.ns_per_ms);
+    return thread;
+}
+
+fn minimalH2BridgeBackendMain(config: MinimalH2BridgeBackendConfig) !void {
+    const listener = try createTcpListener(config.port);
+    defer posix.close(listener);
+
+    const conn = try acceptTcp(listener);
+    defer posix.close(conn);
+
+    var recv_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const n = try posix.recv(conn, &recv_buf, 0);
+    if (n == 0) return;
+
+    var send_buf: [128]u8 = undefined;
+    var pos: usize = 0;
+
+    const settings = try appendH2Frame(send_buf[pos..], .settings, 0, 0, &[_]u8{});
+    pos += settings.len;
+
+    const settings_ack = try appendH2Frame(send_buf[pos..], .settings, serval_h2.flags_ack, 0, &[_]u8{});
+    pos += settings_ack.len;
+
+    try sendAllTcp(conn, send_buf[0..pos]);
+    posix.nanosleep(0, 200 * std.time.ns_per_ms);
+}
+
+fn startMinimalH2BridgeBackend(config: MinimalH2BridgeBackendConfig) !std.Thread {
+    const thread = try std.Thread.spawn(.{}, minimalH2BridgeBackendMain, .{config});
+    posix.nanosleep(0, H2_SERVER_STARTUP_DELAY_MS * std.time.ns_per_ms);
+    return thread;
+}
+
 fn grpcH2ResetBackendMain(config: GrpcH2ResetBackendConfig) !void {
     const listener = try createTcpListener(config.port);
     defer posix.close(listener);
@@ -3797,6 +4274,238 @@ fn grpcH2MultiBackendMain(config: GrpcH2MultiBackendConfig) !void {
 
 fn startGrpcH2MultiBackend(config: GrpcH2MultiBackendConfig) !std.Thread {
     const thread = try std.Thread.spawn(.{}, grpcH2MultiBackendMain, .{config});
+    posix.nanosleep(0, H2_SERVER_STARTUP_DELAY_MS * std.time.ns_per_ms);
+    return thread;
+}
+
+const GrpcH2ResetThenUnaryBackendConfig = struct {
+    port: u16,
+    reset_path: []const u8,
+    pass_path: []const u8,
+    reset_error_code_raw: u32,
+    pass_response: []const u8,
+};
+
+fn grpcH2ResetThenUnaryBackendMain(config: GrpcH2ResetThenUnaryBackendConfig) !void {
+    const listener = try createTcpListener(config.port);
+    defer posix.close(listener);
+
+    const conn = try acceptTcp(listener);
+    defer posix.close(conn);
+
+    var request_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var total: usize = 0;
+    var parsed: serval_h2.InitialRequest = undefined;
+    var request_storage_buf: [serval_h2.request_stable_storage_size_bytes]u8 = undefined;
+
+    while (true) {
+        const n = try posix.recv(conn, request_buf[total..], 0);
+        if (n == 0) return error.ConnectionClosed;
+        total += n;
+        parsed = serval_h2.parseInitialRequest(request_buf[0..total], &request_storage_buf) catch |err| switch (err) {
+            error.NeedMoreData => continue,
+            else => return err,
+        };
+        break;
+    }
+
+    try serval_grpc.validateRequest(&parsed.request);
+    try testing.expectEqualStrings(config.reset_path, parsed.request.path);
+
+    var send_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var send_pos: usize = 0;
+
+    const settings = try appendH2Frame(send_buf[send_pos..], .settings, 0, 0, &[_]u8{});
+    send_pos += settings.len;
+
+    const settings_ack = try appendH2Frame(send_buf[send_pos..], .settings, serval_h2.flags_ack, 0, &[_]u8{});
+    send_pos += settings_ack.len;
+
+    var rst_buf: [serval_h2.frame_header_size_bytes + serval_h2.control.rst_stream_payload_size_bytes]u8 = undefined;
+    const rst = try serval_h2.buildRstStreamFrame(&rst_buf, parsed.stream_id, config.reset_error_code_raw);
+    @memcpy(send_buf[send_pos..][0..rst.len], rst);
+    send_pos += rst.len;
+
+    try sendAllTcp(conn, send_buf[0..send_pos]);
+
+    var second_request_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var second_payload_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var second_total: usize = 0;
+
+    const consumed_bytes: usize = @intCast(parsed.consumed_bytes);
+    assert(consumed_bytes <= total);
+    if (total > consumed_bytes) {
+        const carried_len = total - consumed_bytes;
+        assert(carried_len <= second_request_buf.len);
+        @memcpy(second_request_buf[0..carried_len], request_buf[consumed_bytes..total]);
+        second_total = carried_len;
+    }
+
+    while (true) {
+        if (second_total > 0) {
+            const parsed_second = parseGrpcStreamRequestFrames(second_request_buf[0..second_total], &second_payload_buf) catch |err| switch (err) {
+                error.NeedMoreData => null,
+                else => return err,
+            };
+            if (parsed_second) |second| {
+                try testing.expectEqualStrings(config.pass_path, second.path);
+                try sendGrpcUnaryResponse(conn, second.stream_id, config.pass_response);
+                return;
+            }
+        }
+
+        const n = try posix.recv(conn, second_request_buf[second_total..], 0);
+        if (n == 0) return error.ConnectionClosed;
+        second_total += n;
+    }
+}
+
+fn startGrpcH2ResetThenUnaryBackend(config: GrpcH2ResetThenUnaryBackendConfig) !std.Thread {
+    const thread = try std.Thread.spawn(.{}, grpcH2ResetThenUnaryBackendMain, .{config});
+    posix.nanosleep(0, H2_SERVER_STARTUP_DELAY_MS * std.time.ns_per_ms);
+    return thread;
+}
+
+const GrpcH2CancelPropagationBackendConfig = struct {
+    port: u16,
+    cancel_path: []const u8,
+    survivor_path: []const u8,
+    first_payload: []const u8,
+    survivor_payload: []const u8,
+    goaway_last_stream_id: ?u32 = null,
+    await_survivor_on_same_session: bool = true,
+};
+
+fn waitForProxyRstStream(conn: posix.socket_t, stream_id: u32) !u32 {
+    assert(stream_id > 0);
+
+    var recv_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var total: usize = 0;
+    var iterations: u32 = 0;
+
+    while (iterations < H2_MAX_FRAME_READS * 4) : (iterations += 1) {
+        const n = try posix.recv(conn, recv_buf[total..], 0);
+        if (n == 0) return error.ConnectionClosed;
+        total += n;
+
+        var cursor: usize = 0;
+        while (total - cursor >= serval_h2.frame_header_size_bytes) {
+            const header = try serval_h2.parseFrameHeader(recv_buf[cursor..total]);
+            const payload_start = cursor + serval_h2.frame_header_size_bytes;
+            const payload_end = payload_start + header.length;
+            if (payload_end > total) break;
+
+            const payload = recv_buf[payload_start..payload_end];
+            if (header.frame_type == .rst_stream and header.stream_id == stream_id) {
+                const error_code_raw = try serval_h2.parseRstStreamFrame(header, payload);
+                return error_code_raw;
+            }
+
+            cursor = payload_end;
+        }
+
+        if (cursor > 0) {
+            const remaining = total - cursor;
+            if (remaining > 0) {
+                std.mem.copyForwards(u8, recv_buf[0..remaining], recv_buf[cursor..total]);
+            }
+            total = remaining;
+        }
+    }
+
+    return error.ReadTimeout;
+}
+
+fn grpcH2CancelPropagationBackendMain(config: GrpcH2CancelPropagationBackendConfig) !void {
+    const listener = try createTcpListener(config.port);
+    defer posix.close(listener);
+
+    const conn = try acceptTcp(listener);
+    defer posix.close(conn);
+
+    var request_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var total: usize = 0;
+    var parsed: serval_h2.InitialRequest = undefined;
+    var request_storage_buf: [serval_h2.request_stable_storage_size_bytes]u8 = undefined;
+
+    while (true) {
+        const n = try posix.recv(conn, request_buf[total..], 0);
+        if (n == 0) return error.ConnectionClosed;
+        total += n;
+        parsed = serval_h2.parseInitialRequest(request_buf[0..total], &request_storage_buf) catch |err| switch (err) {
+            error.NeedMoreData => continue,
+            else => return err,
+        };
+        break;
+    }
+
+    try serval_grpc.validateRequest(&parsed.request);
+    try testing.expectEqualStrings(config.cancel_path, parsed.request.path);
+
+    var send_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var pos: usize = 0;
+
+    const settings = try appendH2Frame(send_buf[pos..], .settings, 0, 0, &[_]u8{});
+    pos += settings.len;
+
+    const settings_ack = try appendH2Frame(send_buf[pos..], .settings, serval_h2.flags_ack, 0, &[_]u8{});
+    pos += settings_ack.len;
+
+    if (config.goaway_last_stream_id) |last_stream_id| {
+        var goaway_buf: [serval_h2.frame_header_size_bytes + 32]u8 = undefined;
+        const goaway = try serval_h2.buildGoAwayFrame(
+            &goaway_buf,
+            last_stream_id,
+            @intFromEnum(serval_h2.ErrorCode.no_error),
+            "cancel-overlap",
+        );
+        @memcpy(send_buf[pos..][0..goaway.len], goaway);
+        pos += goaway.len;
+    }
+
+    var response_headers_buf: [256]u8 = undefined;
+    const response_headers = try buildH2HeaderBlock(&.{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = "content-type", .value = "application/grpc" },
+    }, &response_headers_buf);
+    const headers_frame = try appendH2Frame(send_buf[pos..], .headers, serval_h2.flags_end_headers, parsed.stream_id, response_headers);
+    pos += headers_frame.len;
+
+    var grpc_payload_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const first_message = try serval_grpc.buildMessage(&grpc_payload_buf, false, config.first_payload);
+    const first_data = try appendH2Frame(send_buf[pos..], .data, 0, parsed.stream_id, first_message);
+    pos += first_data.len;
+
+    try sendAllTcp(conn, send_buf[0..pos]);
+
+    const reset_error_code_raw = try waitForProxyRstStream(conn, parsed.stream_id);
+    try testing.expectEqual(@as(u32, @intFromEnum(serval_h2.ErrorCode.cancel)), reset_error_code_raw);
+
+    if (!config.await_survivor_on_same_session) return;
+
+    var second_request_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var second_payload_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var second_total: usize = 0;
+
+    while (true) {
+        const n = try posix.recv(conn, second_request_buf[second_total..], 0);
+        if (n == 0) return error.ConnectionClosed;
+        second_total += n;
+
+        const parsed_second = parseGrpcStreamRequestFrames(second_request_buf[0..second_total], &second_payload_buf) catch |err| switch (err) {
+            error.NeedMoreData => null,
+            else => return err,
+        };
+        if (parsed_second) |second| {
+            try testing.expectEqualStrings(config.survivor_path, second.path);
+            try sendGrpcUnaryResponse(conn, second.stream_id, config.survivor_payload);
+            return;
+        }
+    }
+}
+
+fn startGrpcH2CancelPropagationBackend(config: GrpcH2CancelPropagationBackendConfig) !std.Thread {
+    const thread = try std.Thread.spawn(.{}, grpcH2CancelPropagationBackendMain, .{config});
     posix.nanosleep(0, H2_SERVER_STARTUP_DELAY_MS * std.time.ns_per_ms);
     return thread;
 }
@@ -5804,6 +6513,643 @@ test "integration: TLS ALPN h2 generic frontend sends SETTINGS first and forward
     try testing.expect(saw_response_headers);
     try testing.expect(saw_response_data);
     try testing.expect(std.mem.indexOf(u8, body_buf[0..body_len], "/h2-generic") != null);
+}
+
+test "integration: TLS ALPN h2 generic frontend resets stream on invalid TE value for non-gRPC route" {
+    const allocator = testing.allocator;
+    const backend_port = harness.getPort();
+    const proxy_port = harness.getPort();
+
+    var pm = harness.ProcessManager.init(allocator);
+    defer pm.deinit();
+
+    try pm.startEchoBackend(backend_port, "h2-generic-invalid-te-backend", .{});
+
+    var proxy = try GrpcH2ProxyServer.startWithFrontendOptions(
+        proxy_port,
+        .{
+            .host = "127.0.0.1",
+            .port = backend_port,
+            .idx = 0,
+            .http_protocol = .h1,
+        },
+        false,
+        true,
+        .generic,
+        .prefer_h2,
+    );
+    defer proxy.stop();
+
+    var socket = try connectTcpTls(proxy_port, "h2");
+    defer socket.close();
+
+    var authority_buf: [32]u8 = undefined;
+    const authority = try std.fmt.bufPrint(&authority_buf, "127.0.0.1:{d}", .{proxy_port});
+
+    var request_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const request = try buildSimpleH2GetRequestWithInvalidTe("/h2-invalid-te", authority, "https", &request_buf);
+    try sendAllSocket(&socket, request);
+
+    var frame_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var initial: []const u8 = &[_]u8{};
+    var saw_rst_stream = false;
+    var rst_error_code_raw: u32 = 0;
+
+    var iterations: u32 = 0;
+    while (iterations < H2_MAX_FRAME_READS) : (iterations += 1) {
+        const frame_view = try readH2FrameSocket(&socket, initial, &frame_buf);
+        initial = frame_view.remaining;
+
+        switch (frame_view.header.frame_type) {
+            .settings => {
+                if ((frame_view.header.flags & serval_h2.flags_ack) == 0) {
+                    try sendH2SettingsAckSocket(&socket);
+                }
+            },
+            .rst_stream => {
+                rst_error_code_raw = try serval_h2.parseRstStreamFrame(frame_view.header, frame_view.payload);
+                saw_rst_stream = true;
+                break;
+            },
+            else => {},
+        }
+    }
+
+    try testing.expect(saw_rst_stream);
+    try testing.expectEqual(@intFromEnum(serval_h2.ErrorCode.protocol_error), rst_error_code_raw);
+}
+
+test "integration: TLS ALPN h2 generic frontend forwards POST body for non-gRPC route" {
+    const allocator = testing.allocator;
+    const backend_port = harness.getPort();
+    const proxy_port = harness.getPort();
+
+    var pm = harness.ProcessManager.init(allocator);
+    defer pm.deinit();
+
+    try pm.startEchoBackend(backend_port, "h2-generic-post-backend", .{});
+
+    var proxy = try GrpcH2ProxyServer.startWithFrontendOptions(
+        proxy_port,
+        .{
+            .host = "127.0.0.1",
+            .port = backend_port,
+            .idx = 0,
+            .http_protocol = .h1,
+        },
+        false,
+        true,
+        .generic,
+        .prefer_h2,
+    );
+    defer proxy.stop();
+
+    var socket = try connectTcpTls(proxy_port, "h2");
+    defer socket.close();
+
+    var authority_buf: [32]u8 = undefined;
+    const authority = try std.fmt.bufPrint(&authority_buf, "127.0.0.1:{d}", .{proxy_port});
+
+    const request_body = "generic-h2-post-body";
+    var request_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const request = try buildSimpleH2PostRequest("/h2-generic-post", authority, "https", request_body, &request_buf);
+    try sendAllSocket(&socket, request);
+
+    var frame_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var initial: []const u8 = &[_]u8{};
+    var body_buf: [4096]u8 = undefined;
+    var body_len: usize = 0;
+
+    var saw_server_settings = false;
+    var saw_response_headers = false;
+    var saw_response_data = false;
+
+    var iterations: u32 = 0;
+    while (iterations < H2_MAX_FRAME_READS) : (iterations += 1) {
+        const frame_view = try readH2FrameSocket(&socket, initial, &frame_buf);
+        initial = frame_view.remaining;
+
+        switch (frame_view.header.frame_type) {
+            .settings => {
+                if ((frame_view.header.flags & serval_h2.flags_ack) == 0) {
+                    saw_server_settings = true;
+                    try sendH2SettingsAckSocket(&socket);
+                }
+            },
+            .headers => {
+                var fields_buf: [H2_MAX_HEADER_FIELDS]serval_h2.HeaderField = undefined;
+                const fields = try decodeH2Fields(frame_view.payload, &fields_buf);
+                if (fields.len == 0) return error.InvalidFrame;
+                try testing.expectEqualStrings(":status", fields[0].name);
+                try testing.expectEqualStrings("200", fields[0].value);
+                saw_response_headers = true;
+
+                if ((frame_view.header.flags & serval_h2.flags_end_stream) != 0) break;
+            },
+            .data => {
+                saw_response_data = true;
+                if (body_len + frame_view.payload.len > body_buf.len) return error.BufferTooSmall;
+                @memcpy(body_buf[body_len..][0..frame_view.payload.len], frame_view.payload);
+                body_len += frame_view.payload.len;
+
+                if ((frame_view.header.flags & serval_h2.flags_end_stream) != 0) break;
+            },
+            else => {},
+        }
+
+        if (saw_response_headers and saw_response_data) {
+            const body = body_buf[0..body_len];
+            if (std.mem.indexOf(u8, body, "Path: /h2-generic-post") != null) break;
+        }
+    }
+
+    try testing.expect(saw_server_settings);
+    try testing.expect(saw_response_headers);
+    try testing.expect(saw_response_data);
+    try testing.expect(std.mem.indexOf(u8, body_buf[0..body_len], "Method: POST") != null);
+    try testing.expect(std.mem.indexOf(u8, body_buf[0..body_len], "Path: /h2-generic-post") != null);
+    try testing.expect(std.mem.indexOf(u8, body_buf[0..body_len], "Content-Length: 20") != null or std.mem.indexOf(u8, body_buf[0..body_len], "content-length: 20") != null);
+    try testing.expect(std.mem.indexOf(u8, body_buf[0..body_len], "Transfer-Encoding:") == null);
+    try testing.expect(std.mem.indexOf(u8, body_buf[0..body_len], "transfer-encoding:") == null);
+}
+
+test "integration: TLS ALPN h2 generic frontend forwards POST body without content-length for non-gRPC route" {
+    const allocator = testing.allocator;
+    const backend_port = harness.getPort();
+    const proxy_port = harness.getPort();
+
+    var pm = harness.ProcessManager.init(allocator);
+    defer pm.deinit();
+
+    try pm.startEchoBackend(backend_port, "h2-generic-post-no-cl-backend", .{});
+
+    var proxy = try GrpcH2ProxyServer.startWithFrontendOptions(
+        proxy_port,
+        .{
+            .host = "127.0.0.1",
+            .port = backend_port,
+            .idx = 0,
+            .http_protocol = .h1,
+        },
+        false,
+        true,
+        .generic,
+        .prefer_h2,
+    );
+    defer proxy.stop();
+
+    var socket = try connectTcpTls(proxy_port, "h2");
+    defer socket.close();
+
+    var authority_buf: [32]u8 = undefined;
+    const authority = try std.fmt.bufPrint(&authority_buf, "127.0.0.1:{d}", .{proxy_port});
+
+    const request_body_part1 = "generic-h2-post-";
+    const request_body_part2 = "without-content-length";
+
+    var request_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const request = try buildSimpleH2PostRequestWithoutContentLength(
+        "/h2-generic-post-no-cl",
+        authority,
+        "https",
+        request_body_part1,
+        request_body_part2,
+        &request_buf,
+    );
+    try sendAllSocket(&socket, request);
+
+    var frame_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var initial: []const u8 = &[_]u8{};
+    var body_buf: [4096]u8 = undefined;
+    var body_len: usize = 0;
+
+    var saw_server_settings = false;
+    var saw_response_headers = false;
+    var saw_response_data = false;
+
+    var iterations: u32 = 0;
+    while (iterations < H2_MAX_FRAME_READS) : (iterations += 1) {
+        const frame_view = try readH2FrameSocket(&socket, initial, &frame_buf);
+        initial = frame_view.remaining;
+
+        switch (frame_view.header.frame_type) {
+            .settings => {
+                if ((frame_view.header.flags & serval_h2.flags_ack) == 0) {
+                    saw_server_settings = true;
+                    try sendH2SettingsAckSocket(&socket);
+                }
+            },
+            .headers => {
+                var fields_buf: [H2_MAX_HEADER_FIELDS]serval_h2.HeaderField = undefined;
+                const fields = try decodeH2Fields(frame_view.payload, &fields_buf);
+                if (fields.len == 0) return error.InvalidFrame;
+                try testing.expectEqualStrings(":status", fields[0].name);
+                try testing.expectEqualStrings("200", fields[0].value);
+                saw_response_headers = true;
+
+                if ((frame_view.header.flags & serval_h2.flags_end_stream) != 0) break;
+            },
+            .data => {
+                saw_response_data = true;
+                if (body_len + frame_view.payload.len > body_buf.len) return error.BufferTooSmall;
+                @memcpy(body_buf[body_len..][0..frame_view.payload.len], frame_view.payload);
+                body_len += frame_view.payload.len;
+
+                if ((frame_view.header.flags & serval_h2.flags_end_stream) != 0) break;
+            },
+            else => {},
+        }
+
+        if (saw_response_headers and saw_response_data) {
+            const body = body_buf[0..body_len];
+            if (std.mem.indexOf(u8, body, "Path: /h2-generic-post-no-cl") != null) break;
+        }
+    }
+
+    try testing.expect(saw_server_settings);
+    try testing.expect(saw_response_headers);
+    try testing.expect(saw_response_data);
+    try testing.expect(std.mem.indexOf(u8, body_buf[0..body_len], "Method: POST") != null);
+    try testing.expect(std.mem.indexOf(u8, body_buf[0..body_len], "Path: /h2-generic-post-no-cl") != null);
+    try testing.expect(std.mem.indexOf(u8, body_buf[0..body_len], "Transfer-Encoding: chunked") != null or std.mem.indexOf(u8, body_buf[0..body_len], "transfer-encoding: chunked") != null);
+    try testing.expect(std.mem.indexOf(u8, body_buf[0..body_len], "Content-Length:") == null);
+    try testing.expect(std.mem.indexOf(u8, body_buf[0..body_len], "content-length:") == null);
+}
+
+test "integration: TLS ALPN h2 generic frontend resets stream on request trailers for non-gRPC route" {
+    const allocator = testing.allocator;
+    const backend_port = harness.getPort();
+    const proxy_port = harness.getPort();
+
+    var pm = harness.ProcessManager.init(allocator);
+    defer pm.deinit();
+
+    try pm.startEchoBackend(backend_port, "h2-generic-post-trailers-backend", .{});
+
+    var proxy = try GrpcH2ProxyServer.startWithFrontendOptions(
+        proxy_port,
+        .{
+            .host = "127.0.0.1",
+            .port = backend_port,
+            .idx = 0,
+            .http_protocol = .h1,
+        },
+        false,
+        true,
+        .generic,
+        .prefer_h2,
+    );
+    defer proxy.stop();
+
+    var socket = try connectTcpTls(proxy_port, "h2");
+    defer socket.close();
+
+    var authority_buf: [32]u8 = undefined;
+    const authority = try std.fmt.bufPrint(&authority_buf, "127.0.0.1:{d}", .{proxy_port});
+
+    const request_body = "h2-body-before-trailers";
+    var request_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const request = try buildSimpleH2PostRequestWithTrailers(
+        "/h2-generic-post-trailers",
+        authority,
+        "https",
+        request_body,
+        &request_buf,
+    );
+    try sendAllSocket(&socket, request);
+
+    var frame_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var initial: []const u8 = &[_]u8{};
+    var saw_rst_stream = false;
+    var rst_error_code_raw: u32 = 0;
+
+    var iterations: u32 = 0;
+    while (iterations < H2_MAX_FRAME_READS) : (iterations += 1) {
+        const frame_view = try readH2FrameSocket(&socket, initial, &frame_buf);
+        initial = frame_view.remaining;
+
+        switch (frame_view.header.frame_type) {
+            .settings => {
+                if ((frame_view.header.flags & serval_h2.flags_ack) == 0) {
+                    try sendH2SettingsAckSocket(&socket);
+                }
+            },
+            .rst_stream => {
+                rst_error_code_raw = try serval_h2.parseRstStreamFrame(frame_view.header, frame_view.payload);
+                saw_rst_stream = true;
+                break;
+            },
+            else => {},
+        }
+    }
+
+    try testing.expect(saw_rst_stream);
+    try testing.expectEqual(@intFromEnum(serval_h2.ErrorCode.protocol_error), rst_error_code_raw);
+}
+
+test "integration: h2c bridge forwards non-gRPC response trailers without grpc-status" {
+    const backend_port = harness.getPort();
+    const proxy_port = harness.getPort();
+
+    const backend_thread = try startGenericH2Backend(.{
+        .port = backend_port,
+        .path = "/h2-bridge-generic-trailers",
+        .response_payload = "bridge-generic-trailer-body",
+        .send_response_trailers = true,
+        .response_trailer_name = "x-upstream-trailer",
+        .response_trailer_value = "generic-ok",
+    });
+    defer backend_thread.join();
+
+    var proxy = try GrpcH2ProxyServer.start(proxy_port, .{
+        .host = "127.0.0.1",
+        .port = backend_port,
+        .idx = 0,
+        .http_protocol = .h2c,
+    });
+    defer proxy.stop();
+
+    const sock = try connectTcp(proxy_port);
+    defer posix.close(sock);
+
+    var authority_buf: [32]u8 = undefined;
+    const authority = try std.fmt.bufPrint(&authority_buf, "127.0.0.1:{d}", .{proxy_port});
+    var request_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const request = try buildSimpleH2GetRequest("/h2-bridge-generic-trailers", authority, "http", &request_buf);
+    try sendAllTcp(sock, request);
+
+    var frame_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var initial: []const u8 = &[_]u8{};
+    var headers_seen: u8 = 0;
+    var saw_data = false;
+    var saw_trailers = false;
+    var saw_rst_stream = false;
+    var response_body_buf: [256]u8 = undefined;
+
+    var iterations: u32 = 0;
+    while (iterations < H2_MAX_FRAME_READS) : (iterations += 1) {
+        const frame_view = try readH2Frame(sock, initial, &frame_buf);
+        initial = frame_view.remaining;
+
+        switch (frame_view.header.frame_type) {
+            .settings => {
+                if ((frame_view.header.flags & serval_h2.flags_ack) == 0) {
+                    try sendH2SettingsAck(sock);
+                }
+            },
+            .headers => {
+                var fields_buf: [H2_MAX_HEADER_FIELDS]serval_h2.HeaderField = undefined;
+                const fields = try decodeH2Fields(frame_view.payload, &fields_buf);
+                headers_seen += 1;
+
+                if (headers_seen == 1) {
+                    try testing.expectEqualStrings(":status", fields[0].name);
+                    try testing.expectEqualStrings("200", fields[0].value);
+                    try testing.expect((frame_view.header.flags & serval_h2.flags_end_stream) == 0);
+                    continue;
+                }
+
+                const trailer_value = findH2FieldValue(fields, "x-upstream-trailer") orelse return error.MissingExpectedTrailer;
+                try testing.expectEqualStrings("generic-ok", trailer_value);
+                try testing.expect(findH2FieldValue(fields, "grpc-status") == null);
+                try testing.expect((frame_view.header.flags & serval_h2.flags_end_stream) != 0);
+                saw_trailers = true;
+                break;
+            },
+            .data => {
+                try testing.expect(!saw_data);
+                saw_data = true;
+                try testing.expectEqualStrings("bridge-generic-trailer-body", frame_view.payload);
+                try testing.expect((frame_view.header.flags & serval_h2.flags_end_stream) == 0);
+                @memcpy(response_body_buf[0..frame_view.payload.len], frame_view.payload);
+            },
+            .rst_stream => {
+                saw_rst_stream = true;
+                break;
+            },
+            else => {},
+        }
+
+        if (saw_trailers) break;
+    }
+
+    try testing.expectEqual(@as(u8, 2), headers_seen);
+    try testing.expect(saw_data);
+    try testing.expect(saw_trailers);
+    try testing.expect(!saw_rst_stream);
+}
+
+test "integration: h2c bridge accepts non-gRPC headers-only end-stream response" {
+    const backend_port = harness.getPort();
+    const proxy_port = harness.getPort();
+
+    const backend_thread = try startGenericH2Backend(.{
+        .port = backend_port,
+        .path = "/h2-bridge-generic-headers-only",
+        .response_status = "204",
+        .response_content_type = null,
+        .response_payload = null,
+        .headers_end_stream = true,
+    });
+    defer backend_thread.join();
+
+    var proxy = try GrpcH2ProxyServer.start(proxy_port, .{
+        .host = "127.0.0.1",
+        .port = backend_port,
+        .idx = 0,
+        .http_protocol = .h2c,
+    });
+    defer proxy.stop();
+
+    const sock = try connectTcp(proxy_port);
+    defer posix.close(sock);
+
+    var authority_buf: [32]u8 = undefined;
+    const authority = try std.fmt.bufPrint(&authority_buf, "127.0.0.1:{d}", .{proxy_port});
+    var request_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const request = try buildSimpleH2GetRequest("/h2-bridge-generic-headers-only", authority, "http", &request_buf);
+    try sendAllTcp(sock, request);
+
+    var frame_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var initial: []const u8 = &[_]u8{};
+    var saw_response_headers = false;
+    var saw_response_data = false;
+    var saw_trailers = false;
+    var saw_rst_stream = false;
+
+    var iterations: u32 = 0;
+    while (iterations < H2_MAX_FRAME_READS) : (iterations += 1) {
+        const frame_view = try readH2Frame(sock, initial, &frame_buf);
+        initial = frame_view.remaining;
+
+        switch (frame_view.header.frame_type) {
+            .settings => {
+                if ((frame_view.header.flags & serval_h2.flags_ack) == 0) {
+                    try sendH2SettingsAck(sock);
+                }
+            },
+            .headers => {
+                var fields_buf: [H2_MAX_HEADER_FIELDS]serval_h2.HeaderField = undefined;
+                const fields = try decodeH2Fields(frame_view.payload, &fields_buf);
+                if (!saw_response_headers) {
+                    saw_response_headers = true;
+                    try testing.expectEqualStrings(":status", fields[0].name);
+                    try testing.expectEqualStrings("204", fields[0].value);
+                    try testing.expect((frame_view.header.flags & serval_h2.flags_end_stream) != 0);
+                    break;
+                }
+                saw_trailers = true;
+            },
+            .data => saw_response_data = true,
+            .rst_stream => {
+                saw_rst_stream = true;
+                break;
+            },
+            else => {},
+        }
+    }
+
+    try testing.expect(saw_response_headers);
+    try testing.expect(!saw_response_data);
+    try testing.expect(!saw_trailers);
+    try testing.expect(!saw_rst_stream);
+}
+
+test "integration: h2c bridge prior-knowledge resets non-gRPC request trailers with protocol error" {
+    const backend_port = harness.getPort();
+    const proxy_port = harness.getPort();
+
+    const backend_thread = try startMinimalH2BridgeBackend(.{ .port = backend_port });
+    defer backend_thread.join();
+
+    var proxy = try GrpcH2ProxyServer.start(proxy_port, .{
+        .host = "127.0.0.1",
+        .port = backend_port,
+        .idx = 0,
+        .http_protocol = .h2c,
+    });
+    defer proxy.stop();
+
+    const sock = try connectTcp(proxy_port);
+    defer posix.close(sock);
+
+    var authority_buf: [32]u8 = undefined;
+    const authority = try std.fmt.bufPrint(&authority_buf, "127.0.0.1:{d}", .{proxy_port});
+
+    var request_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const request = try buildSimpleH2PostRequestWithTrailers(
+        "/h2-bridge-prior-nongrpc-trailers",
+        authority,
+        "http",
+        "bridge-trailer-body",
+        &request_buf,
+    );
+    try sendAllTcp(sock, request);
+
+    var frame_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var initial: []const u8 = &[_]u8{};
+    var saw_rst_stream = false;
+    var rst_error_code_raw: u32 = 0;
+
+    var iterations: u32 = 0;
+    while (iterations < H2_MAX_FRAME_READS) : (iterations += 1) {
+        const frame_view = try readH2Frame(sock, initial, &frame_buf);
+        initial = frame_view.remaining;
+
+        switch (frame_view.header.frame_type) {
+            .settings => {
+                if ((frame_view.header.flags & serval_h2.flags_ack) == 0) {
+                    try sendH2SettingsAck(sock);
+                }
+            },
+            .rst_stream => {
+                if (frame_view.header.stream_id != 1) continue;
+                rst_error_code_raw = try serval_h2.parseRstStreamFrame(frame_view.header, frame_view.payload);
+                saw_rst_stream = true;
+                break;
+            },
+            else => {},
+        }
+    }
+
+    try testing.expect(saw_rst_stream);
+    try testing.expectEqual(@intFromEnum(serval_h2.ErrorCode.protocol_error), rst_error_code_raw);
+}
+
+test "integration: h2c bridge upgrade resets non-gRPC request trailers on additional stream" {
+    const backend_port = harness.getPort();
+    const proxy_port = harness.getPort();
+
+    const backend_thread = try startMinimalH2BridgeBackend(.{ .port = backend_port });
+    defer backend_thread.join();
+
+    var proxy = try GrpcH2ProxyServer.start(proxy_port, .{
+        .host = "127.0.0.1",
+        .port = backend_port,
+        .idx = 0,
+        .http_protocol = .h2c,
+    });
+    defer proxy.stop();
+
+    const sock = try connectTcp(proxy_port);
+    defer posix.close(sock);
+
+    var authority_buf: [32]u8 = undefined;
+    const authority = try std.fmt.bufPrint(&authority_buf, "127.0.0.1:{d}", .{proxy_port});
+
+    var upgrade_request_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const upgrade_request = try buildTextH2UpgradeRequest(
+        "/h2-bridge-upgrade-nongrpc-trailers",
+        authority,
+        "",
+        &upgrade_request_buf,
+    );
+    try sendAllTcp(sock, upgrade_request);
+
+    var response_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const response_len = try readUntilHeadersComplete(sock, &response_buf);
+    try testing.expectEqual(@as(u16, 101), harness.TestClient.parseStatusCode(response_buf[0..response_len]).?);
+
+    var stream3_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const stream3_frames = try buildSimpleH2PostStreamWithTrailersFrames(
+        "/h2-bridge-upgrade-nongrpc-trailers",
+        authority,
+        "http",
+        "stream-three-body",
+        3,
+        &stream3_buf,
+    );
+    try sendAllTcp(sock, stream3_frames);
+
+    const headers_end = std.mem.indexOf(u8, response_buf[0..response_len], "\r\n\r\n").? + 4;
+    var initial: []const u8 = response_buf[headers_end..response_len];
+    var frame_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var saw_rst_stream = false;
+    var rst_error_code_raw: u32 = 0;
+
+    var iterations: u32 = 0;
+    while (iterations < H2_MAX_FRAME_READS) : (iterations += 1) {
+        const frame_view = try readH2Frame(sock, initial, &frame_buf);
+        initial = frame_view.remaining;
+
+        switch (frame_view.header.frame_type) {
+            .settings => {
+                if ((frame_view.header.flags & serval_h2.flags_ack) == 0) {
+                    try sendH2SettingsAck(sock);
+                }
+            },
+            .rst_stream => {
+                if (frame_view.header.stream_id != 3) continue;
+                rst_error_code_raw = try serval_h2.parseRstStreamFrame(frame_view.header, frame_view.payload);
+                saw_rst_stream = true;
+                break;
+            },
+            else => {},
+        }
+    }
+
+    try testing.expect(saw_rst_stream);
+    try testing.expectEqual(@intFromEnum(serval_h2.ErrorCode.protocol_error), rst_error_code_raw);
 }
 
 test "integration: grpc h2 prior-knowledge unary request is proxied to tls h2 upstream" {
@@ -7974,6 +9320,267 @@ test "integration: grpc h2c upgrade request is proxied end-to-end" {
     try testing.expect(saw_trailers);
 }
 
+test "integration: h2c upgrade non-gRPC response trailers are proxied without grpc-status enforcement" {
+    const backend_port = harness.getPort();
+    const proxy_port = harness.getPort();
+
+    const backend_thread = try startGenericH2Backend(.{
+        .port = backend_port,
+        .path = "/h2-upgrade-generic-trailers",
+        .response_payload = "upgrade-generic-body",
+        .send_response_trailers = true,
+        .response_trailer_name = "x-upgrade-trailer",
+        .response_trailer_value = "upgrade-ok",
+    });
+    defer backend_thread.join();
+
+    var proxy = try GrpcH2ProxyServer.start(proxy_port, .{
+        .host = "127.0.0.1",
+        .port = backend_port,
+        .idx = 0,
+        .http_protocol = .h2c,
+    });
+    defer proxy.stop();
+
+    const sock = try connectTcp(proxy_port);
+    defer posix.close(sock);
+
+    var authority_buf: [32]u8 = undefined;
+    const authority = try std.fmt.bufPrint(&authority_buf, "127.0.0.1:{d}", .{proxy_port});
+    var request_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const request = try buildTextH2UpgradeRequest(
+        "/h2-upgrade-generic-trailers",
+        authority,
+        "",
+        &request_buf,
+    );
+    try sendAllTcp(sock, request);
+
+    var response_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const response_len = try readUntilHeadersComplete(sock, &response_buf);
+    try testing.expectEqual(@as(u16, 101), harness.TestClient.parseStatusCode(response_buf[0..response_len]).?);
+
+    const headers_end = std.mem.indexOf(u8, response_buf[0..response_len], "\r\n\r\n").? + 4;
+    var initial: []const u8 = response_buf[headers_end..response_len];
+    var frame_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var saw_response_headers = false;
+    var saw_response_data = false;
+    var saw_response_trailers = false;
+    var saw_rst = false;
+    var iterations: u32 = 0;
+
+    while (iterations < H2_MAX_FRAME_READS) : (iterations += 1) {
+        const frame_view = try readH2Frame(sock, initial, &frame_buf);
+        initial = frame_view.remaining;
+
+        switch (frame_view.header.frame_type) {
+            .settings => {
+                if ((frame_view.header.flags & serval_h2.flags_ack) == 0) {
+                    try sendH2SettingsAck(sock);
+                }
+            },
+            .headers => {
+                var fields_buf: [H2_MAX_HEADER_FIELDS]serval_h2.HeaderField = undefined;
+                const fields = try decodeH2Fields(frame_view.payload, &fields_buf);
+
+                if (!saw_response_headers) {
+                    saw_response_headers = true;
+                    try testing.expectEqualStrings(":status", fields[0].name);
+                    try testing.expectEqualStrings("200", fields[0].value);
+                    continue;
+                }
+
+                const trailer_value = findH2FieldValue(fields, "x-upgrade-trailer") orelse return error.MissingExpectedTrailer;
+                try testing.expectEqualStrings("upgrade-ok", trailer_value);
+                try testing.expect(findH2FieldValue(fields, "grpc-status") == null);
+                try testing.expect((frame_view.header.flags & serval_h2.flags_end_stream) != 0);
+                saw_response_trailers = true;
+                break;
+            },
+            .data => {
+                try testing.expectEqualStrings("upgrade-generic-body", frame_view.payload);
+                saw_response_data = true;
+            },
+            .rst_stream => {
+                saw_rst = true;
+                break;
+            },
+            else => {},
+        }
+    }
+
+    try testing.expect(saw_response_headers);
+    try testing.expect(saw_response_data);
+    try testing.expect(saw_response_trailers);
+    try testing.expect(!saw_rst);
+}
+
+test "integration: h2c upgrade non-gRPC headers-only end-stream response is proxied" {
+    const backend_port = harness.getPort();
+    const proxy_port = harness.getPort();
+
+    const backend_thread = try startGenericH2Backend(.{
+        .port = backend_port,
+        .path = "/h2-upgrade-generic-headers-only",
+        .response_status = "204",
+        .response_content_type = null,
+        .response_payload = null,
+        .headers_end_stream = true,
+    });
+    defer backend_thread.join();
+
+    var proxy = try GrpcH2ProxyServer.start(proxy_port, .{
+        .host = "127.0.0.1",
+        .port = backend_port,
+        .idx = 0,
+        .http_protocol = .h2c,
+    });
+    defer proxy.stop();
+
+    const sock = try connectTcp(proxy_port);
+    defer posix.close(sock);
+
+    var authority_buf: [32]u8 = undefined;
+    const authority = try std.fmt.bufPrint(&authority_buf, "127.0.0.1:{d}", .{proxy_port});
+    var request_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const request = try buildTextH2UpgradeRequest(
+        "/h2-upgrade-generic-headers-only",
+        authority,
+        "",
+        &request_buf,
+    );
+    try sendAllTcp(sock, request);
+
+    var response_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const response_len = try readUntilHeadersComplete(sock, &response_buf);
+    try testing.expectEqual(@as(u16, 101), harness.TestClient.parseStatusCode(response_buf[0..response_len]).?);
+
+    const headers_end = std.mem.indexOf(u8, response_buf[0..response_len], "\r\n\r\n").? + 4;
+    var initial: []const u8 = response_buf[headers_end..response_len];
+    var frame_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var saw_response_headers = false;
+    var saw_response_data = false;
+    var saw_response_trailers = false;
+    var saw_rst = false;
+    var iterations: u32 = 0;
+
+    while (iterations < H2_MAX_FRAME_READS) : (iterations += 1) {
+        const frame_view = try readH2Frame(sock, initial, &frame_buf);
+        initial = frame_view.remaining;
+
+        switch (frame_view.header.frame_type) {
+            .settings => {
+                if ((frame_view.header.flags & serval_h2.flags_ack) == 0) {
+                    try sendH2SettingsAck(sock);
+                }
+            },
+            .headers => {
+                var fields_buf: [H2_MAX_HEADER_FIELDS]serval_h2.HeaderField = undefined;
+                const fields = try decodeH2Fields(frame_view.payload, &fields_buf);
+                if (!saw_response_headers) {
+                    saw_response_headers = true;
+                    try testing.expectEqualStrings(":status", fields[0].name);
+                    try testing.expectEqualStrings("204", fields[0].value);
+                    try testing.expect((frame_view.header.flags & serval_h2.flags_end_stream) != 0);
+                    break;
+                }
+                saw_response_trailers = true;
+            },
+            .data => saw_response_data = true,
+            .rst_stream => {
+                saw_rst = true;
+                break;
+            },
+            else => {},
+        }
+    }
+
+    try testing.expect(saw_response_headers);
+    try testing.expect(!saw_response_data);
+    try testing.expect(!saw_response_trailers);
+    try testing.expect(!saw_rst);
+}
+
+test "integration: grpc h2c upgrade request is proxied to tls h2 upstream" {
+    const backend_port = harness.getPort();
+    const proxy_port = harness.getPort();
+
+    const backend_thread = try startGrpcH2Backend(.{
+        .port = backend_port,
+        .path = "/grpc.test.Echo/UpgradeTlsUpstream",
+        .mode = .unary,
+        .first_response = "upgrade-tls-pong",
+        .tls = true,
+    });
+    defer backend_thread.join();
+
+    var proxy = try GrpcH2ProxyServer.startWithOptions(proxy_port, .{
+        .host = "127.0.0.1",
+        .port = backend_port,
+        .idx = 0,
+        .tls = true,
+        .http_protocol = .h2,
+    }, true);
+    defer proxy.stop();
+
+    const sock = try connectTcp(proxy_port);
+    defer posix.close(sock);
+
+    var authority_buf: [32]u8 = undefined;
+    const authority = try std.fmt.bufPrint(&authority_buf, "127.0.0.1:{d}", .{proxy_port});
+    var request_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const request = try buildGrpcH2UpgradeRequest("/grpc.test.Echo/UpgradeTlsUpstream", authority, "ping", &request_buf);
+    try sendAllTcp(sock, request);
+
+    var response_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const response_len = try readUntilHeadersComplete(sock, &response_buf);
+    try testing.expectEqual(@as(u16, 101), harness.TestClient.parseStatusCode(response_buf[0..response_len]).?);
+    try testing.expectEqualStrings("h2c", harness.TestClient.findHeader(response_buf[0..response_len], "Upgrade").?);
+    try testing.expectEqualStrings("Upgrade", harness.TestClient.findHeader(response_buf[0..response_len], "Connection").?);
+
+    const headers_end = std.mem.indexOf(u8, response_buf[0..response_len], "\r\n\r\n").? + 4;
+    var initial: []const u8 = response_buf[headers_end..response_len];
+    var frame_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var payload_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var saw_headers = false;
+    var saw_trailers = false;
+    var iterations: u32 = 0;
+
+    while (iterations < H2_MAX_FRAME_READS) : (iterations += 1) {
+        const frame_view = try readH2Frame(sock, initial, &frame_buf);
+        initial = frame_view.remaining;
+
+        switch (frame_view.header.frame_type) {
+            .settings => {
+                if ((frame_view.header.flags & serval_h2.flags_ack) == 0) {
+                    try sendH2SettingsAck(sock);
+                }
+            },
+            .headers => {
+                var fields_buf: [H2_MAX_HEADER_FIELDS]serval_h2.HeaderField = undefined;
+                const fields = try decodeH2Fields(frame_view.payload, &fields_buf);
+                if (!saw_headers) {
+                    saw_headers = true;
+                    try testing.expect(std.mem.eql(u8, fields[0].name, ":status"));
+                    try testing.expectEqualStrings("200", fields[0].value);
+                } else {
+                    try expectGrpcStatusTrailer(fields, "0");
+                    saw_trailers = true;
+                    break;
+                }
+            },
+            .data => {
+                const grpc_payload = try readGrpcPayloadFromDataFrame(frame_view, &payload_buf);
+                try testing.expectEqualStrings("upgrade-tls-pong", grpc_payload);
+            },
+            else => {},
+        }
+    }
+
+    try testing.expect(saw_headers);
+    try testing.expect(saw_trailers);
+}
+
 test "integration: grpc h2c upgrade server streaming relays multiple DATA frames" {
     const backend_port = harness.getPort();
     const proxy_port = harness.getPort();
@@ -8515,6 +10122,126 @@ test "integration: grpc h2c goaway last_stream_id resets higher stream and keeps
     try run_goaway_last_stream_resets_higher_scenario();
 }
 
+fn waitForGrpcDataOnStream(
+    sock: posix.socket_t,
+    initial: *[]const u8,
+    frame_buf: []u8,
+    payload_buf: []u8,
+    stream_id: u32,
+    expected_payload: []const u8,
+) !void {
+    assert(frame_buf.len >= H2_TEST_BUFFER_SIZE_BYTES);
+    assert(stream_id > 0);
+
+    var iterations: u32 = 0;
+    while (iterations < H2_MAX_FRAME_READS * 3) : (iterations += 1) {
+        const frame_view = try readH2Frame(sock, initial.*, frame_buf);
+        initial.* = frame_view.remaining;
+
+        switch (frame_view.header.frame_type) {
+            .settings => {
+                if ((frame_view.header.flags & serval_h2.flags_ack) == 0) {
+                    try sendH2SettingsAck(sock);
+                }
+            },
+            .data => {
+                if (frame_view.header.stream_id != stream_id) continue;
+                const payload = try readGrpcPayloadFromDataFrame(frame_view, payload_buf);
+                try testing.expectEqualStrings(expected_payload, payload);
+                return;
+            },
+            .rst_stream => return error.UnexpectedReset,
+            else => {},
+        }
+    }
+
+    return error.ReadTimeout;
+}
+
+fn waitForGrpcUnaryResponseOnStream(
+    sock: posix.socket_t,
+    initial: *[]const u8,
+    frame_buf: []u8,
+    payload_buf: []u8,
+    stream_id: u32,
+    expected_payload: []const u8,
+) !void {
+    assert(frame_buf.len >= H2_TEST_BUFFER_SIZE_BYTES);
+    assert(stream_id > 0);
+
+    var saw_data = false;
+    var saw_trailers = false;
+    var iterations: u32 = 0;
+
+    while (iterations < H2_MAX_FRAME_READS * 3) : (iterations += 1) {
+        const frame_view = try readH2Frame(sock, initial.*, frame_buf);
+        initial.* = frame_view.remaining;
+
+        switch (frame_view.header.frame_type) {
+            .settings => {
+                if ((frame_view.header.flags & serval_h2.flags_ack) == 0) {
+                    try sendH2SettingsAck(sock);
+                }
+            },
+            .headers => {
+                if (frame_view.header.stream_id != stream_id) continue;
+                var fields_buf: [H2_MAX_HEADER_FIELDS]serval_h2.HeaderField = undefined;
+                const fields = try decodeH2Fields(frame_view.payload, &fields_buf);
+                if (fields.len > 0 and std.mem.eql(u8, fields[0].name, ":status")) continue;
+                try expectGrpcStatusTrailer(fields, "0");
+                saw_trailers = true;
+            },
+            .data => {
+                if (frame_view.header.stream_id != stream_id) continue;
+                const payload = try readGrpcPayloadFromDataFrame(frame_view, payload_buf);
+                try testing.expectEqualStrings(expected_payload, payload);
+                saw_data = true;
+            },
+            .rst_stream => return error.UnexpectedReset,
+            else => {},
+        }
+
+        if (saw_data and saw_trailers) break;
+    }
+
+    try testing.expect(saw_data);
+    try testing.expect(saw_trailers);
+}
+
+fn waitForRstOnStream(
+    sock: posix.socket_t,
+    initial: *[]const u8,
+    frame_buf: []u8,
+    stream_id: u32,
+    expected_error_code_raw: u32,
+) !void {
+    assert(frame_buf.len >= H2_TEST_BUFFER_SIZE_BYTES);
+    assert(stream_id > 0);
+
+    var iterations: u32 = 0;
+    while (iterations < H2_MAX_FRAME_READS * 3) : (iterations += 1) {
+        const frame_view = try readH2Frame(sock, initial.*, frame_buf);
+        initial.* = frame_view.remaining;
+
+        switch (frame_view.header.frame_type) {
+            .settings => {
+                if ((frame_view.header.flags & serval_h2.flags_ack) == 0) {
+                    try sendH2SettingsAck(sock);
+                }
+            },
+            .rst_stream => {
+                if (frame_view.header.stream_id != stream_id) continue;
+                const error_code_raw = try serval_h2.parseRstStreamFrame(frame_view.header, frame_view.payload);
+                try testing.expectEqual(expected_error_code_raw, error_code_raw);
+                return;
+            },
+            else => {},
+        }
+    }
+
+    return error.ReadTimeout;
+}
+
 test "integration: grpc h2c opens new upstream session after goaway for next stream" {
     const backend_port = harness.getPort();
     const proxy_port = harness.getPort();
@@ -8648,6 +10375,312 @@ test "integration: grpc h2c opens new upstream session after goaway for next str
 
     try testing.expect(saw_second_data);
     try testing.expect(saw_second_trailers);
+}
+
+fn run_goaway_rollover_cycles(cycle_count: u8) !void {
+    assert(cycle_count > 0);
+
+    const backend_port = harness.getPort();
+    const proxy_port = harness.getPort();
+
+    var proxy = try GrpcH2ProxyServer.start(proxy_port, .{
+        .host = "127.0.0.1",
+        .port = backend_port,
+        .idx = 0,
+        .http_protocol = .h2c,
+    });
+    defer proxy.stop();
+
+    const sock = try connectTcp(proxy_port);
+    defer posix.close(sock);
+
+    var authority_buf: [32]u8 = undefined;
+    const authority = try std.fmt.bufPrint(&authority_buf, "127.0.0.1:{d}", .{proxy_port});
+
+    var frame_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var payload_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var initial: []const u8 = &[_]u8{};
+
+    var stream_id: u32 = 1;
+    var cycle: u8 = 0;
+    while (cycle < cycle_count) : (cycle += 1) {
+        var goaway_path_buf: [96]u8 = undefined;
+        const goaway_path = try std.fmt.bufPrint(&goaway_path_buf, "/grpc.test.Echo/GoAwayCycle{d}", .{cycle});
+        var goaway_response_buf: [64]u8 = undefined;
+        const goaway_response = try std.fmt.bufPrint(&goaway_response_buf, "goaway-reply-{d}", .{cycle});
+
+        const goaway_backend_thread = try startGrpcH2GoAwayBackend(.{
+            .port = backend_port,
+            .path = goaway_path,
+            .last_stream_id = stream_id,
+            .error_code_raw = @intFromEnum(serval_h2.ErrorCode.no_error),
+            .response_payload = goaway_response,
+        });
+
+        var goaway_request_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+        if (stream_id == 1) {
+            const goaway_request = try buildGrpcH2Request(
+                goaway_path,
+                authority,
+                "goaway-ping",
+                &goaway_request_buf,
+            );
+            try sendAllTcp(sock, goaway_request);
+        } else {
+            const goaway_request = try buildGrpcH2StreamFrames(
+                goaway_path,
+                authority,
+                "goaway-ping",
+                stream_id,
+                &goaway_request_buf,
+            );
+            try sendAllTcp(sock, goaway_request);
+        }
+
+        try waitForGrpcUnaryResponseOnStream(
+            sock,
+            &initial,
+            &frame_buf,
+            &payload_buf,
+            stream_id,
+            goaway_response,
+        );
+        goaway_backend_thread.join();
+
+        var unary_path_buf: [96]u8 = undefined;
+        const unary_path = try std.fmt.bufPrint(&unary_path_buf, "/grpc.test.Echo/AfterGoAwayCycle{d}", .{cycle});
+        var unary_response_buf: [64]u8 = undefined;
+        const unary_response = try std.fmt.bufPrint(&unary_response_buf, "fresh-reply-{d}", .{cycle});
+
+        const unary_backend_thread = try startGrpcH2Backend(.{
+            .port = backend_port,
+            .path = unary_path,
+            .mode = .unary,
+            .first_response = unary_response,
+        });
+
+        var unary_request_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+        const unary_stream_id = stream_id + 2;
+        const unary_request = try buildGrpcH2StreamFrames(
+            unary_path,
+            authority,
+            "fresh-ping",
+            unary_stream_id,
+            &unary_request_buf,
+        );
+        try sendAllTcp(sock, unary_request);
+
+        try waitForGrpcUnaryResponseOnStream(
+            sock,
+            &initial,
+            &frame_buf,
+            &payload_buf,
+            unary_stream_id,
+            unary_response,
+        );
+        unary_backend_thread.join();
+
+        stream_id = unary_stream_id + 2;
+    }
+
+    try testing.expectEqual(@as(u32, 1 + @as(u32, cycle_count) * 4), stream_id);
+}
+
+test "integration: grpc h2c repeated goaway rollover opens fresh upstream sessions" {
+    try run_goaway_rollover_cycles(3);
+}
+
+test "integration: grpc h2c repeated goaway rollover soak loop" {
+    try run_goaway_rollover_cycles(16);
+}
+
+fn run_upgrade_goaway_rollover_cycles(cycle_count: u8) !void {
+    assert(cycle_count > 0);
+
+    const backend_port = harness.getPort();
+    const proxy_port = harness.getPort();
+
+    var proxy = try GrpcH2ProxyServer.start(proxy_port, .{
+        .host = "127.0.0.1",
+        .port = backend_port,
+        .idx = 0,
+        .http_protocol = .h2c,
+    });
+    defer proxy.stop();
+
+    const sock = try connectTcp(proxy_port);
+    defer posix.close(sock);
+
+    var authority_buf: [32]u8 = undefined;
+    const authority = try std.fmt.bufPrint(&authority_buf, "127.0.0.1:{d}", .{proxy_port});
+
+    var response_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var frame_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var payload_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var initial: []const u8 = &[_]u8{};
+    var upgrade_established = false;
+
+    var stream_id: u32 = 1;
+    var cycle: u8 = 0;
+    while (cycle < cycle_count) : (cycle += 1) {
+        var goaway_path_buf: [96]u8 = undefined;
+        const goaway_path = try std.fmt.bufPrint(&goaway_path_buf, "/grpc.test.Echo/UpgradeGoAwayCycle{d}", .{cycle});
+        var goaway_response_buf: [64]u8 = undefined;
+        const goaway_response = try std.fmt.bufPrint(&goaway_response_buf, "upgrade-goaway-reply-{d}", .{cycle});
+
+        const goaway_backend_thread = try startGrpcH2GoAwayBackend(.{
+            .port = backend_port,
+            .path = goaway_path,
+            .last_stream_id = stream_id,
+            .error_code_raw = @intFromEnum(serval_h2.ErrorCode.no_error),
+            .response_payload = goaway_response,
+        });
+
+        var goaway_request_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+        if (!upgrade_established) {
+            const goaway_request = try buildGrpcH2UpgradeRequest(
+                goaway_path,
+                authority,
+                "upgrade-goaway-ping",
+                &goaway_request_buf,
+            );
+            try sendAllTcp(sock, goaway_request);
+
+            const response_len = try readUntilHeadersComplete(sock, &response_buf);
+            try testing.expectEqual(@as(u16, 101), harness.TestClient.parseStatusCode(response_buf[0..response_len]).?);
+            try testing.expectEqualStrings("h2c", harness.TestClient.findHeader(response_buf[0..response_len], "Upgrade").?);
+            try testing.expectEqualStrings("Upgrade", harness.TestClient.findHeader(response_buf[0..response_len], "Connection").?);
+
+            const headers_end = std.mem.indexOf(u8, response_buf[0..response_len], "\r\n\r\n").? + 4;
+            initial = response_buf[headers_end..response_len];
+            upgrade_established = true;
+        } else {
+            const goaway_request = try buildGrpcH2StreamFrames(
+                goaway_path,
+                authority,
+                "upgrade-goaway-ping",
+                stream_id,
+                &goaway_request_buf,
+            );
+            try sendAllTcp(sock, goaway_request);
+        }
+
+        try waitForGrpcUnaryResponseOnStream(
+            sock,
+            &initial,
+            &frame_buf,
+            &payload_buf,
+            stream_id,
+            goaway_response,
+        );
+        goaway_backend_thread.join();
+
+        var unary_path_buf: [96]u8 = undefined;
+        const unary_path = try std.fmt.bufPrint(&unary_path_buf, "/grpc.test.Echo/AfterUpgradeGoAwayCycle{d}", .{cycle});
+        var unary_response_buf: [64]u8 = undefined;
+        const unary_response = try std.fmt.bufPrint(&unary_response_buf, "upgrade-fresh-reply-{d}", .{cycle});
+
+        const unary_backend_thread = try startGrpcH2Backend(.{
+            .port = backend_port,
+            .path = unary_path,
+            .mode = .unary,
+            .first_response = unary_response,
+        });
+
+        var unary_request_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+        const unary_stream_id = stream_id + 2;
+        const unary_request = try buildGrpcH2StreamFrames(
+            unary_path,
+            authority,
+            "upgrade-fresh-ping",
+            unary_stream_id,
+            &unary_request_buf,
+        );
+        try sendAllTcp(sock, unary_request);
+
+        try waitForGrpcUnaryResponseOnStream(
+            sock,
+            &initial,
+            &frame_buf,
+            &payload_buf,
+            unary_stream_id,
+            unary_response,
+        );
+        unary_backend_thread.join();
+
+        stream_id = unary_stream_id + 2;
+    }
+
+    try testing.expect(upgrade_established);
+    try testing.expectEqual(@as(u32, 1 + @as(u32, cycle_count) * 4), stream_id);
+}
+
+test "integration: grpc h2c upgrade repeated goaway rollover opens fresh upstream sessions" {
+    try run_upgrade_goaway_rollover_cycles(3);
+}
+
+test "integration: grpc h2c upgrade repeated goaway rollover soak loop" {
+    try run_upgrade_goaway_rollover_cycles(12);
+}
+
+fn run_mixed_goaway_and_nongrpc_trailer_cycles(cycle_count: u8) !void {
+    assert(cycle_count > 0);
+
+    var cycle: u8 = 0;
+    while (cycle < cycle_count) : (cycle += 1) {
+        try run_goaway_rollover_cycles(1);
+
+        const backend_port = harness.getPort();
+        const proxy_port = harness.getPort();
+
+        const nongrpc_backend_thread = try startMinimalH2BridgeBackend(.{ .port = backend_port });
+        defer nongrpc_backend_thread.join();
+
+        var proxy = try GrpcH2ProxyServer.start(proxy_port, .{
+            .host = "127.0.0.1",
+            .port = backend_port,
+            .idx = 0,
+            .http_protocol = .h2c,
+        });
+        defer proxy.stop();
+
+        const sock = try connectTcp(proxy_port);
+        defer posix.close(sock);
+
+        var authority_buf: [32]u8 = undefined;
+        const authority = try std.fmt.bufPrint(&authority_buf, "127.0.0.1:{d}", .{proxy_port});
+
+        var nongrpc_path_buf: [96]u8 = undefined;
+        const nongrpc_path = try std.fmt.bufPrint(&nongrpc_path_buf, "/h2-mixed-trailer-cycle-{d}", .{cycle});
+
+        var request_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+        const request = try buildSimpleH2PostRequestWithTrailers(
+            nongrpc_path,
+            authority,
+            "http",
+            "mixed-nongrpc-body",
+            &request_buf,
+        );
+        try sendAllTcp(sock, request);
+
+        var frame_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+        var initial: []const u8 = &[_]u8{};
+        try waitForRstOnStream(
+            sock,
+            &initial,
+            &frame_buf,
+            1,
+            @intFromEnum(serval_h2.ErrorCode.protocol_error),
+        );
+    }
+}
+
+test "integration: grpc h2c mixed goaway and non-grpc trailer reset loop preserves progress" {
+    try run_mixed_goaway_and_nongrpc_trailer_cycles(4);
+}
+
+test "integration: grpc h2c mixed goaway and non-grpc trailer reset soak loop" {
+    try run_mixed_goaway_and_nongrpc_trailer_cycles(20);
 }
 
 test "integration: grpc h2c missing grpc-status trailer maps to downstream reset" {
@@ -9189,6 +11222,330 @@ test "integration: grpc h2c upstream rst maps to downstream reset" {
     }
 
     try testing.expect(saw_reset);
+}
+
+fn run_reset_isolation_cycles(cycle_count: u8) !void {
+    assert(cycle_count > 0);
+
+    const backend_port = harness.getPort();
+    const proxy_port = harness.getPort();
+
+    var proxy = try GrpcH2ProxyServer.start(proxy_port, .{
+        .host = "127.0.0.1",
+        .port = backend_port,
+        .idx = 0,
+        .http_protocol = .h2c,
+    });
+    defer proxy.stop();
+
+    var authority_buf: [32]u8 = undefined;
+    const authority = try std.fmt.bufPrint(&authority_buf, "127.0.0.1:{d}", .{proxy_port});
+
+    var cycle: u8 = 0;
+    while (cycle < cycle_count) : (cycle += 1) {
+        var reset_path_buf: [96]u8 = undefined;
+        const reset_path = try std.fmt.bufPrint(&reset_path_buf, "/grpc.test.Echo/ResetRaceOne{d}", .{cycle});
+        var survivor_path_buf: [96]u8 = undefined;
+        const survivor_path = try std.fmt.bufPrint(&survivor_path_buf, "/grpc.test.Echo/ResetRaceTwo{d}", .{cycle});
+        var survivor_payload_buf: [64]u8 = undefined;
+        const survivor_payload = try std.fmt.bufPrint(&survivor_payload_buf, "survivor-{d}", .{cycle});
+
+        const backend_thread = try startGrpcH2ResetThenUnaryBackend(.{
+            .port = backend_port,
+            .reset_path = reset_path,
+            .pass_path = survivor_path,
+            .reset_error_code_raw = @intFromEnum(serval_h2.ErrorCode.cancel),
+            .pass_response = survivor_payload,
+        });
+
+        const sock = try connectTcp(proxy_port);
+        defer posix.close(sock);
+
+        var frame_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+        var initial: []const u8 = &[_]u8{};
+
+        var stream_one_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+        const stream_one_request = try buildGrpcH2Request(
+            reset_path,
+            authority,
+            "one",
+            &stream_one_buf,
+        );
+        try sendAllTcp(sock, stream_one_request);
+
+        var saw_stream_one_reset = false;
+        var iterations: u32 = 0;
+        while (iterations < H2_MAX_FRAME_READS * 2) : (iterations += 1) {
+            const frame_view = try readH2Frame(sock, initial, &frame_buf);
+            initial = frame_view.remaining;
+
+            switch (frame_view.header.frame_type) {
+                .settings => {
+                    if ((frame_view.header.flags & serval_h2.flags_ack) == 0) {
+                        try sendH2SettingsAck(sock);
+                    }
+                },
+                .rst_stream => {
+                    if (frame_view.header.stream_id != 1) continue;
+                    const error_code_raw = try serval_h2.parseRstStreamFrame(frame_view.header, frame_view.payload);
+                    try testing.expectEqual(@as(u32, @intFromEnum(serval_h2.ErrorCode.cancel)), error_code_raw);
+                    saw_stream_one_reset = true;
+                    break;
+                },
+                else => {},
+            }
+        }
+        try testing.expect(saw_stream_one_reset);
+
+        var stream_three_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+        const stream_three_request = try buildGrpcH2StreamFrames(
+            survivor_path,
+            authority,
+            "two",
+            3,
+            &stream_three_buf,
+        );
+        try sendAllTcp(sock, stream_three_request);
+
+        var payload_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+        var saw_stream_three_data = false;
+        var saw_stream_three_trailer = false;
+        iterations = 0;
+        while (iterations < H2_MAX_FRAME_READS * 2) : (iterations += 1) {
+            const frame_view = try readH2Frame(sock, initial, &frame_buf);
+            initial = frame_view.remaining;
+
+            switch (frame_view.header.frame_type) {
+                .headers => {
+                    if (frame_view.header.stream_id != 3) continue;
+                    var fields_buf: [H2_MAX_HEADER_FIELDS]serval_h2.HeaderField = undefined;
+                    const fields = try decodeH2Fields(frame_view.payload, &fields_buf);
+                    if (fields.len > 0 and std.mem.eql(u8, fields[0].name, ":status")) continue;
+                    try expectGrpcStatusTrailer(fields, "0");
+                    saw_stream_three_trailer = true;
+                },
+                .data => {
+                    if (frame_view.header.stream_id != 3) continue;
+                    const payload = try readGrpcPayloadFromDataFrame(frame_view, &payload_buf);
+                    try testing.expectEqualStrings(survivor_payload, payload);
+                    saw_stream_three_data = true;
+                },
+                else => {},
+            }
+
+            if (saw_stream_three_data and saw_stream_three_trailer) break;
+        }
+
+        try testing.expect(saw_stream_three_data);
+        try testing.expect(saw_stream_three_trailer);
+        backend_thread.join();
+    }
+
+    try testing.expectEqual(cycle_count, cycle);
+}
+
+test "integration: grpc h2c upstream reset on one stream preserves sibling stream" {
+    try run_reset_isolation_cycles(1);
+}
+
+test "integration: grpc h2c reset isolation soak loop" {
+    try run_reset_isolation_cycles(12);
+}
+
+test "integration: grpc h2c downstream cancel propagates upstream and preserves next stream" {
+    const backend_port = harness.getPort();
+    const proxy_port = harness.getPort();
+
+    const backend_thread = try startGrpcH2CancelPropagationBackend(.{
+        .port = backend_port,
+        .cancel_path = "/grpc.test.Echo/CancelMe",
+        .survivor_path = "/grpc.test.Echo/AfterCancel",
+        .first_payload = "partial",
+        .survivor_payload = "after-cancel",
+    });
+    defer backend_thread.join();
+
+    var proxy = try GrpcH2ProxyServer.start(proxy_port, .{
+        .host = "127.0.0.1",
+        .port = backend_port,
+        .idx = 0,
+        .http_protocol = .h2c,
+    });
+    defer proxy.stop();
+
+    const sock = try connectTcp(proxy_port);
+    defer posix.close(sock);
+
+    var authority_buf: [32]u8 = undefined;
+    const authority = try std.fmt.bufPrint(&authority_buf, "127.0.0.1:{d}", .{proxy_port});
+
+    var first_request_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const first_request = try buildGrpcH2Request(
+        "/grpc.test.Echo/CancelMe",
+        authority,
+        "cancel-ping",
+        &first_request_buf,
+    );
+    try sendAllTcp(sock, first_request);
+
+    var frame_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var payload_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var initial: []const u8 = &[_]u8{};
+
+    var saw_first_data = false;
+    var iterations: u32 = 0;
+
+    while (iterations < H2_MAX_FRAME_READS * 2) : (iterations += 1) {
+        const frame_view = try readH2Frame(sock, initial, &frame_buf);
+        initial = frame_view.remaining;
+
+        switch (frame_view.header.frame_type) {
+            .settings => {
+                if ((frame_view.header.flags & serval_h2.flags_ack) == 0) {
+                    try sendH2SettingsAck(sock);
+                }
+            },
+            .data => {
+                if (frame_view.header.stream_id != 1) continue;
+                const payload = try readGrpcPayloadFromDataFrame(frame_view, &payload_buf);
+                try testing.expectEqualStrings("partial", payload);
+                saw_first_data = true;
+                break;
+            },
+            else => {},
+        }
+    }
+
+    try testing.expect(saw_first_data);
+
+    var rst_buf: [serval_h2.frame_header_size_bytes + serval_h2.control.rst_stream_payload_size_bytes]u8 = undefined;
+    const rst_frame = try serval_h2.buildRstStreamFrame(&rst_buf, 1, @intFromEnum(serval_h2.ErrorCode.cancel));
+    try sendAllTcp(sock, rst_frame);
+
+    var second_request_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const second_request = try buildGrpcH2StreamFrames(
+        "/grpc.test.Echo/AfterCancel",
+        authority,
+        "after-ping",
+        3,
+        &second_request_buf,
+    );
+    try sendAllTcp(sock, second_request);
+
+    try waitForGrpcUnaryResponseOnStream(
+        sock,
+        &initial,
+        &frame_buf,
+        &payload_buf,
+        3,
+        "after-cancel",
+    );
+}
+
+fn run_cancel_goaway_overlap_cycles(cycle_count: u8) !void {
+    assert(cycle_count > 0);
+
+    const backend_port = harness.getPort();
+    const proxy_port = harness.getPort();
+
+    var proxy = try GrpcH2ProxyServer.start(proxy_port, .{
+        .host = "127.0.0.1",
+        .port = backend_port,
+        .idx = 0,
+        .http_protocol = .h2c,
+    });
+    defer proxy.stop();
+
+    var authority_buf: [32]u8 = undefined;
+    const authority = try std.fmt.bufPrint(&authority_buf, "127.0.0.1:{d}", .{proxy_port});
+
+    var cycle: u8 = 0;
+    while (cycle < cycle_count) : (cycle += 1) {
+        const sock = try connectTcp(proxy_port);
+        defer posix.close(sock);
+
+        var frame_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+        var payload_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+        var initial: []const u8 = &[_]u8{};
+
+        var cancel_path_buf: [96]u8 = undefined;
+        const cancel_path = try std.fmt.bufPrint(&cancel_path_buf, "/grpc.test.Echo/CancelOverlapCycle{d}", .{cycle});
+
+        const cancel_backend_thread = try startGrpcH2CancelPropagationBackend(.{
+            .port = backend_port,
+            .cancel_path = cancel_path,
+            .survivor_path = "unused",
+            .first_payload = "partial-overlap",
+            .survivor_payload = "unused",
+            .goaway_last_stream_id = 1,
+            .await_survivor_on_same_session = false,
+        });
+
+        var cancel_request_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+        const cancel_request = try buildGrpcH2Request(
+            cancel_path,
+            authority,
+            "cancel-overlap",
+            &cancel_request_buf,
+        );
+        try sendAllTcp(sock, cancel_request);
+
+        try waitForGrpcDataOnStream(
+            sock,
+            &initial,
+            &frame_buf,
+            &payload_buf,
+            1,
+            "partial-overlap",
+        );
+
+        var rst_buf: [serval_h2.frame_header_size_bytes + serval_h2.control.rst_stream_payload_size_bytes]u8 = undefined;
+        const rst_frame = try serval_h2.buildRstStreamFrame(&rst_buf, 1, @intFromEnum(serval_h2.ErrorCode.cancel));
+        try sendAllTcp(sock, rst_frame);
+        cancel_backend_thread.join();
+
+        var survivor_path_buf: [96]u8 = undefined;
+        const survivor_path = try std.fmt.bufPrint(&survivor_path_buf, "/grpc.test.Echo/AfterCancelOverlapCycle{d}", .{cycle});
+        var survivor_response_buf: [64]u8 = undefined;
+        const survivor_response = try std.fmt.bufPrint(&survivor_response_buf, "after-overlap-{d}", .{cycle});
+
+        const survivor_backend_thread = try startGrpcH2Backend(.{
+            .port = backend_port,
+            .path = survivor_path,
+            .mode = .unary,
+            .first_response = survivor_response,
+        });
+
+        var survivor_request_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+        const survivor_request = try buildGrpcH2StreamFrames(
+            survivor_path,
+            authority,
+            "survivor-overlap",
+            3,
+            &survivor_request_buf,
+        );
+        try sendAllTcp(sock, survivor_request);
+
+        try waitForGrpcUnaryResponseOnStream(
+            sock,
+            &initial,
+            &frame_buf,
+            &payload_buf,
+            3,
+            survivor_response,
+        );
+        survivor_backend_thread.join();
+    }
+
+    try testing.expectEqual(cycle_count, cycle);
+}
+
+test "integration: grpc h2c cancel and goaway overlap loop preserves subsequent streams" {
+    try run_cancel_goaway_overlap_cycles(2);
+}
+
+test "integration: grpc h2c cancel and goaway overlap soak loop" {
+    try run_cancel_goaway_overlap_cycles(12);
 }
 
 test "integration: grpc h2c upstream goaway maps to downstream reset" {
