@@ -92,6 +92,8 @@ pub fn GenericTlsH2FrontendHandler(
         grpc_handler: BridgeHandler,
         tracked_grpc_streams: [config.H2_MAX_CONCURRENT_STREAMS]u32 = [_]u32{0} ** config.H2_MAX_CONCURRENT_STREAMS,
         tracked_grpc_stream_count: u16 = 0,
+        tracked_h2_bridge_streams: [config.H2_MAX_CONCURRENT_STREAMS]u32 = [_]u32{0} ** config.H2_MAX_CONCURRENT_STREAMS,
+        tracked_h2_bridge_stream_count: u16 = 0,
         websocket_mutex: Io.Mutex = .init,
         websocket_reader_group: Io.Group = .init,
         websocket_reader_started: bool = false,
@@ -230,6 +232,15 @@ pub fn GenericTlsH2FrontendHandler(
             const upstream = try self.selectUpstream(request, writer);
             if (upstream == null) return;
 
+            if (supportsH2BridgeUpstream(upstream.?)) {
+                try self.trackH2BridgeStream(stream_id);
+                self.grpc_handler.handleH2Headers(stream_id, request, end_stream, writer) catch |err| {
+                    self.untrackH2BridgeStream(stream_id);
+                    return err;
+                };
+                return;
+            }
+
             if (end_stream) {
                 self.forwardHttpRequest(request, upstream.?, writer) catch |err| switch (err) {
                     error.UpstreamConnectFailed,
@@ -279,6 +290,13 @@ pub fn GenericTlsH2FrontendHandler(
                 return;
             }
 
+            if (self.isTrackedH2BridgeStream(stream_id)) {
+                self.grpc_handler.handleH2Data(stream_id, payload, end_stream, writer) catch |err| {
+                    return err;
+                };
+                return;
+            }
+
             if (self.isTrackedWebSocketStream(stream_id)) {
                 try self.forwardWebSocketData(stream_id, payload);
                 if (end_stream) self.markWebSocketStreamClosing(stream_id);
@@ -300,6 +318,10 @@ pub fn GenericTlsH2FrontendHandler(
                 self.untrackGrpcStream(stream_id);
                 self.grpc_handler.handleH2StreamReset(stream_id, error_code_raw);
             }
+            if (self.isTrackedH2BridgeStream(stream_id)) {
+                self.untrackH2BridgeStream(stream_id);
+                self.grpc_handler.handleH2StreamReset(stream_id, error_code_raw);
+            }
             self.markWebSocketStreamClosing(stream_id);
             self.removeGenericRequestStream(stream_id);
         }
@@ -312,6 +334,7 @@ pub fn GenericTlsH2FrontendHandler(
         pub fn handleH2StreamClose(self: *Self, summary: h2_server.StreamSummary) void {
             assert(@intFromPtr(self) != 0);
             self.untrackGrpcStream(summary.stream_id);
+            self.untrackH2BridgeStream(summary.stream_id);
             self.markWebSocketStreamClosing(summary.stream_id);
             self.removeGenericRequestStream(summary.stream_id);
         }
@@ -852,6 +875,12 @@ pub fn GenericTlsH2FrontendHandler(
             return true;
         }
 
+        fn supportsH2BridgeUpstream(upstream: types.Upstream) bool {
+            const supports_h2c_plain = upstream.http_protocol == .h2c and !upstream.tls;
+            const supports_h2_tls = upstream.http_protocol == .h2 and upstream.tls;
+            return supports_h2c_plain or supports_h2_tls;
+        }
+
         fn isExtendedConnectWebSocketRequest(request: *const Request) bool {
             assert(@intFromPtr(request) != 0);
 
@@ -864,6 +893,45 @@ pub fn GenericTlsH2FrontendHandler(
 
             return request.headers.get("sec-websocket-key") != null or
                 request.headers.get("Sec-WebSocket-Key") != null;
+        }
+
+        fn trackH2BridgeStream(self: *Self, stream_id: u32) Error!void {
+            assert(stream_id > 0);
+
+            if (self.isTrackedH2BridgeStream(stream_id)) return;
+            if (self.tracked_h2_bridge_stream_count >= config.H2_MAX_CONCURRENT_STREAMS) return error.TooManyTrackedGenericRequestStreams;
+
+            var index: usize = 0;
+            while (index < self.tracked_h2_bridge_streams.len) : (index += 1) {
+                if (self.tracked_h2_bridge_streams[index] != 0) continue;
+                self.tracked_h2_bridge_streams[index] = stream_id;
+                self.tracked_h2_bridge_stream_count += 1;
+                return;
+            }
+
+            return error.TooManyTrackedGenericRequestStreams;
+        }
+
+        fn untrackH2BridgeStream(self: *Self, stream_id: u32) void {
+            if (stream_id == 0) return;
+
+            var index: usize = 0;
+            while (index < self.tracked_h2_bridge_streams.len) : (index += 1) {
+                if (self.tracked_h2_bridge_streams[index] != stream_id) continue;
+                self.tracked_h2_bridge_streams[index] = 0;
+                if (self.tracked_h2_bridge_stream_count > 0) self.tracked_h2_bridge_stream_count -= 1;
+                return;
+            }
+        }
+
+        fn isTrackedH2BridgeStream(self: *Self, stream_id: u32) bool {
+            if (stream_id == 0) return false;
+
+            var index: usize = 0;
+            while (index < self.tracked_h2_bridge_streams.len) : (index += 1) {
+                if (self.tracked_h2_bridge_streams[index] == stream_id) return true;
+            }
+            return false;
         }
 
         fn trackGrpcStream(self: *Self, stream_id: u32) Error!void {

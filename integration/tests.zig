@@ -6591,6 +6591,90 @@ test "integration: TLS ALPN h2 generic frontend sends SETTINGS first and forward
     try testing.expect(std.mem.indexOf(u8, body_buf[0..body_len], "/h2-generic") != null);
 }
 
+test "integration: TLS ALPN h2 generic frontend forwards non-gRPC route to h2c upstream" {
+    const backend_port = harness.getPort();
+    const proxy_port = harness.getPort();
+
+    const backend_thread = try startGenericH2Backend(.{
+        .port = backend_port,
+        .path = "/h2-generic-upstream-h2c",
+        .response_payload = "generic-h2-upstream-h2c-response",
+    });
+    defer backend_thread.join();
+
+    var proxy = try GrpcH2ProxyServer.startWithFrontendOptions(
+        proxy_port,
+        .{
+            .host = "127.0.0.1",
+            .port = backend_port,
+            .idx = 0,
+            .http_protocol = .h2c,
+        },
+        false,
+        true,
+        .generic,
+        .prefer_h2,
+    );
+    defer proxy.stop();
+
+    var socket = try connectTcpTls(proxy_port, "h2");
+    defer socket.close();
+
+    var authority_buf: [32]u8 = undefined;
+    const authority = try std.fmt.bufPrint(&authority_buf, "127.0.0.1:{d}", .{proxy_port});
+
+    var request_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const request = try buildSimpleH2GetRequest("/h2-generic-upstream-h2c", authority, "https", &request_buf);
+    try sendAllSocket(&socket, request);
+
+    var frame_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var initial: []const u8 = &[_]u8{};
+    var saw_response_headers = false;
+    var saw_response_data = false;
+    var body_buf: [2048]u8 = undefined;
+    var body_len: usize = 0;
+
+    var iterations: u32 = 0;
+    while (iterations < H2_MAX_FRAME_READS) : (iterations += 1) {
+        const frame_view = try readH2FrameSocket(&socket, initial, &frame_buf);
+        initial = frame_view.remaining;
+
+        switch (frame_view.header.frame_type) {
+            .settings => {
+                if ((frame_view.header.flags & serval_h2.flags_ack) == 0) {
+                    try sendH2SettingsAckSocket(&socket);
+                }
+            },
+            .headers => {
+                var fields_buf: [H2_MAX_HEADER_FIELDS]serval_h2.HeaderField = undefined;
+                const fields = try decodeH2Fields(frame_view.payload, &fields_buf);
+                if (fields.len == 0) return error.InvalidFrame;
+                try testing.expectEqualStrings(":status", fields[0].name);
+                try testing.expectEqualStrings("200", fields[0].value);
+                saw_response_headers = true;
+                if ((frame_view.header.flags & serval_h2.flags_end_stream) != 0) break;
+            },
+            .data => {
+                saw_response_data = true;
+                if (body_len + frame_view.payload.len > body_buf.len) return error.BufferTooSmall;
+                @memcpy(body_buf[body_len..][0..frame_view.payload.len], frame_view.payload);
+                body_len += frame_view.payload.len;
+                if ((frame_view.header.flags & serval_h2.flags_end_stream) != 0) break;
+            },
+            .rst_stream => return error.UnexpectedReset,
+            else => {},
+        }
+
+        if (saw_response_headers and saw_response_data) {
+            if (std.mem.indexOf(u8, body_buf[0..body_len], "generic-h2-upstream-h2c-response") != null) break;
+        }
+    }
+
+    try testing.expect(saw_response_headers);
+    try testing.expect(saw_response_data);
+    try testing.expect(std.mem.indexOf(u8, body_buf[0..body_len], "generic-h2-upstream-h2c-response") != null);
+}
+
 test "integration: TLS ALPN h2 generic frontend resets stream on invalid TE value for non-gRPC route" {
     const allocator = testing.allocator;
     const backend_port = harness.getPort();
