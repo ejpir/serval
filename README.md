@@ -514,7 +514,7 @@ zig build run-echo-backend -- --help
 | Chunked encoding | Complete |
 | WebSocket proxy tunneling | Complete |
 | Native WebSocket endpoint serving | Complete |
-| gRPC over HTTP/2 proxying (prior knowledge + inbound upgrade) | In progress (stream-aware gRPC bridge active for cleartext prior-knowledge + `Upgrade: h2c` downstream entry, with upstream support for both cleartext `.h2c` and TLS `.h2`; request-class-aware completion and fail-closed `grpc-status` enforcement are active) |
+| gRPC over HTTP/2 proxying (prior knowledge + inbound upgrade) | Complete for current Serval scope (stream-aware gRPC bridge active for cleartext prior-knowledge + `Upgrade: h2c` downstream entry, with upstream support for both cleartext `.h2c` and TLS `.h2`; request-class-aware completion and fail-closed `grpc-status` enforcement are active) |
 | Content-based routing | Complete |
 | Path rewriting | Complete |
 | K8s Gateway API types | Complete |
