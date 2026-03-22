@@ -1,0 +1,26 @@
+{
+  "cli_version": "0.4.3",
+  "checkpoint_id": "fc537bbaec64",
+  "strategy": "manual-commit",
+  "branch": "main",
+  "checkpoints_count": 3,
+  "files_touched": [
+    "experiments/tls-poc/boringssl"
+  ],
+  "sessions": [
+    {
+      "metadata": "/fc/537bbaec64/0/metadata.json",
+      "transcript": "/fc/537bbaec64/0/full.jsonl",
+      "context": "/fc/537bbaec64/0/context.md",
+      "content_hash": "/fc/537bbaec64/0/content_hash.txt",
+      "prompt": "/fc/537bbaec64/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 21,
+    "cache_creation_tokens": 30833,
+    "cache_read_tokens": 347245,
+    "output_tokens": 4344,
+    "api_call_count": 12
+  }
+}
