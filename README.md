@@ -183,6 +183,8 @@ zig build test-grpc             # Run serval-grpc tests
 zig build test-acme             # Run serval-acme tests
 zig build test-integration      # Run end-to-end integration tests
 zig build test-integration-h2c-grpc-completion-fast  # Focused gRPC h2c completion checks
+zig build test-integration-h2-generic-completeness-fast # Focused non-gRPC h2 parity checks
+zig build test-integration-h2-mixed-hardening-fast      # Focused mixed GOAWAY/reset/cancel hardening checks
 zig build test-integration-h2c-upgrade-tls-upstream   # Focused h2c upgrade -> TLS h2 upstream check
 zig build test-integration-perf-throughput-h2         # Optional h2 throughput check (h2load, opt-in)
 zig build test-integration-perf-throughput-h2-max     # Optional high-throughput h2 profile (h2load, opt-in)
@@ -516,7 +518,7 @@ zig build run-echo-backend -- --help
 | K8s Gateway API types | Complete |
 | Rate limiting | Planned |
 | WAF | Planned |
-| HTTP/2 full stream-aware proxy/server stack | In progress (high-throughput terminated h2 serving and gRPC stream-aware proxy paths are active; remaining work is generic non-gRPC parity + additional mixed-workload churn/soak hardening) |
+| HTTP/2 full stream-aware proxy/server stack | Complete for current Serval scope (high-throughput terminated h2 serving, gRPC + non-gRPC stream-aware proxy paths, and mixed-workload churn/soak coverage) |
 | Native gRPC endpoints | Not implemented (high priority) |
 
 ## License

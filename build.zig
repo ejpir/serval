@@ -1307,6 +1307,32 @@ pub fn build(b: *std.Build) void {
     );
     integration_test_h2c_mixed_goaway_nongrpc_soak_step.dependOn(&run_integration_test_h2c_mixed_goaway_nongrpc_soak.step);
 
+    const integration_test_h2_generic_completeness_fast_step = b.step(
+        "test-integration-h2-generic-completeness-fast",
+        "Run focused HTTP/2 generic parity checks (non-gRPC semantics across ALPN + h2c prior-knowledge + h2c upgrade)",
+    );
+    integration_test_h2_generic_completeness_fast_step.dependOn(&run_integration_test_h2_generic_post.step);
+    integration_test_h2_generic_completeness_fast_step.dependOn(&run_integration_test_h2_generic_post_no_cl.step);
+    integration_test_h2_generic_completeness_fast_step.dependOn(&run_integration_test_h2_generic_invalid_te.step);
+    integration_test_h2_generic_completeness_fast_step.dependOn(&run_integration_test_h2_generic_trailers_reset.step);
+    integration_test_h2_generic_completeness_fast_step.dependOn(&run_integration_test_h2c_bridge_generic_trailers.step);
+    integration_test_h2_generic_completeness_fast_step.dependOn(&run_integration_test_h2c_bridge_generic_headers_only.step);
+    integration_test_h2_generic_completeness_fast_step.dependOn(&run_integration_test_h2c_bridge_prior_nongrpc_request_trailers.step);
+    integration_test_h2_generic_completeness_fast_step.dependOn(&run_integration_test_h2c_bridge_upgrade_nongrpc_request_trailers.step);
+    integration_test_h2_generic_completeness_fast_step.dependOn(&run_integration_test_h2c_upgrade_generic_trailers.step);
+    integration_test_h2_generic_completeness_fast_step.dependOn(&run_integration_test_h2c_upgrade_generic_headers_only.step);
+
+    const integration_test_h2_mixed_hardening_fast_step = b.step(
+        "test-integration-h2-mixed-hardening-fast",
+        "Run focused HTTP/2 mixed-workload hardening checks (GOAWAY/reset/cancel overlap + non-gRPC interactions)",
+    );
+    integration_test_h2_mixed_hardening_fast_step.dependOn(&run_integration_test_h2c_mixed_goaway_nongrpc.step);
+    integration_test_h2_mixed_hardening_fast_step.dependOn(&run_integration_test_h2c_mixed_goaway_nongrpc_soak.step);
+    integration_test_h2_mixed_hardening_fast_step.dependOn(&run_integration_test_h2c_cancel_goaway_overlap.step);
+    integration_test_h2_mixed_hardening_fast_step.dependOn(&run_integration_test_h2c_cancel_goaway_overlap_soak.step);
+    integration_test_h2_mixed_hardening_fast_step.dependOn(&run_integration_test_h2c_reset_isolation.step);
+    integration_test_h2_mixed_hardening_fast_step.dependOn(&run_integration_test_h2c_reset_isolation_soak.step);
+
     const acme_issue_once_mod = b.createModule(.{
         .root_source_file = b.path("integration/acme_issue_once.zig"),
         .target = target,

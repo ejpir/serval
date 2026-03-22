@@ -878,7 +878,7 @@ pub const WeightedHandler = struct {
 
 | Feature | Module | Complexity |
 |---------|--------|------------|
-| HTTP/2 generic non-gRPC stream-aware parity + additional mixed-workload hardening | serval-proxy/h2 | High |
+| HTTP/2 priority/dependency optimization beyond current runtime semantics | serval-proxy/h2 | Medium |
 | Native gRPC endpoints | serval-server, serval-grpc | High |
 | Weighted round-robin | serval-lb | Low |
 | Least connections LB | serval-lb | Low |

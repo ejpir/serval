@@ -310,7 +310,7 @@ The mod.zig would dispatch based on negotiated protocol (via ALPN or h2c preface
 | WebSocket upgrade proxy handoff | ✅ Complete |
 | Native WebSocket endpoint serving | ✅ Complete |
 | gRPC over h2 proxy handoff (TLS ALPN `h2`, prior knowledge, + inbound upgrade) | ✅ Stream-aware bridge active for downstream TLS `h2`, cleartext prior-knowledge, and cleartext `Upgrade: h2c` entry, with `.h2c` (cleartext) and `.h2` (TLS) upstream support; includes GOAWAY `last_stream_id`-aware active-stream handling, stale-binding retirement plus round-robin upstream-action scanning, and request-class-aware fail-closed `grpc-status` enforcement (gRPC only); background h2 bridge/websocket readers now use `std.Io.Group.concurrent()` instead of `Group.async()` so the per-connection h2 startup path cannot be hijacked by eager inline task execution; unsupported upstream protocol combinations fail closed |
-| HTTP/2 full stream-aware stack | ⏳ In progress (terminated h2 and gRPC stream-aware proxy behavior are active; remaining work is generic non-gRPC parity and mixed-workload churn/soak hardening) |
+| HTTP/2 full stream-aware stack | ✅ Complete for current Serval scope (terminated h2 + stream-aware proxy across gRPC and non-gRPC paths, with focused mixed-workload churn/soak coverage) |
 | Native gRPC endpoints | ❌ Not implemented (high priority) |
 | Daemon mode | ❌ Not implemented |
 | Hot reload | ⏳ TLS context generation/refcount scaffolding integrated; PEM-driven activation API wired in TLS layer, external trigger/watch path pending |
