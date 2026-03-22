@@ -168,7 +168,7 @@ pub fn encodeLiteralHeaderWithoutIndexing(
 
     out[cursor] = 0x00;
     cursor += 1;
-    cursor = try encodeString(out, cursor, name);
+    cursor = try encodeHeaderNameLowercase(out, cursor, name);
     cursor = try encodeString(out, cursor, value);
     return out[0..cursor];
 }
@@ -186,7 +186,7 @@ pub fn encodeLiteralHeaderWithIncrementalIndexing(
 
     out[cursor] = 0x40;
     cursor += 1;
-    cursor = try encodeString(out, cursor, name);
+    cursor = try encodeHeaderNameLowercase(out, cursor, name);
     cursor = try encodeString(out, cursor, value);
     return out[0..cursor];
 }
@@ -484,6 +484,22 @@ fn encodeString(out: []u8, cursor_start: usize, data: []const u8) Error!usize {
     return cursor;
 }
 
+fn encodeHeaderNameLowercase(out: []u8, cursor_start: usize, name: []const u8) Error!usize {
+    assert(cursor_start <= out.len);
+    assert(name.len > 0);
+
+    var cursor = try encodeInteger(out, cursor_start, 7, 0x00, @intCast(name.len));
+    if (cursor + name.len > out.len) return error.BufferTooSmall;
+
+    var index: usize = 0;
+    while (index < name.len) : (index += 1) {
+        out[cursor + index] = std.ascii.toLower(name[index]);
+    }
+
+    cursor += name.len;
+    return cursor;
+}
+
 const static_table = [_]HeaderField{
     .{ .name = ":authority", .value = "" },
     .{ .name = ":method", .value = "GET" },
@@ -558,6 +574,18 @@ test "encode and decode literal header without indexing" {
     try std.testing.expectEqual(@as(usize, 1), fields.len);
     try std.testing.expectEqualStrings(":path", fields[0].name);
     try std.testing.expectEqualStrings("/grpc.Health/Check", fields[0].value);
+}
+
+test "encodeLiteralHeaderWithoutIndexing lowercases header names" {
+    var encoded_buf: [128]u8 = undefined;
+    const encoded = try encodeLiteralHeaderWithoutIndexing(&encoded_buf, "Server", "nginx");
+
+    var fields_buf: [4]HeaderField = undefined;
+    const fields = try decodeHeaderBlock(encoded, &fields_buf);
+
+    try std.testing.expectEqual(@as(usize, 1), fields.len);
+    try std.testing.expectEqualStrings("server", fields[0].name);
+    try std.testing.expectEqualStrings("nginx", fields[0].value);
 }
 
 test "decodeHeaderBlock decodes indexed static header fields" {
