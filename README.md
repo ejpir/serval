@@ -11,7 +11,7 @@ High-performance HTTP infrastructure for Zig — reverse proxies, load balancers
 - **Zero-copy forwarding** — Linux splice() for body transfer (including kTLS)
 - **WebSocket proxying** — RFC 6455 upgrade validation and bidirectional tunnel relay
 - **Native WebSocket serving** — Accept WebSocket endpoints directly in Serval handlers with message-oriented session API
-- **gRPC over h2c/h2 proxying** — Stream-aware gRPC proxy paths for cleartext `.h2c` and TLS `.h2` upstreams, with bounded fallback behavior for non-h2 upstream targets
+- **gRPC over h2c/h2 proxying** — Stream-aware gRPC proxy paths for prior-knowledge and `Upgrade: h2c` downstream entry, with cleartext `.h2c` and TLS `.h2` upstream support, request-class-aware completion semantics, and fail-closed `grpc-status` enforcement for gRPC streams
 - **Connection pooling** — Reuse upstream connections across requests
 - **Pluggable components** — Custom handlers, metrics, tracing, and explicit upstream protocol selection (`.h1`, `.h2c`, `.h2`)
 - **No runtime allocation** — All memory allocated at startup
@@ -182,6 +182,10 @@ zig build test-h2               # Run serval-h2 tests
 zig build test-grpc             # Run serval-grpc tests
 zig build test-acme             # Run serval-acme tests
 zig build test-integration      # Run end-to-end integration tests
+zig build test-integration-h2c-grpc-completion-fast  # Focused gRPC h2c completion checks
+zig build test-integration-h2c-upgrade-tls-upstream   # Focused h2c upgrade -> TLS h2 upstream check
+zig build test-integration-perf-throughput-h2         # Optional h2 throughput check (h2load, opt-in)
+zig build test-integration-perf-throughput-h2-max     # Optional high-throughput h2 profile (h2load, opt-in)
 ```
 
 ## Examples
@@ -506,7 +510,7 @@ zig build run-echo-backend -- --help
 | Chunked encoding | Complete |
 | WebSocket proxy tunneling | Complete |
 | Native WebSocket endpoint serving | Complete |
-| gRPC over HTTP/2 proxying (prior knowledge + inbound upgrade) | In progress (stream-aware gRPC bridge active for cleartext frontend entry paths, with upstream support for both cleartext `.h2c` and TLS `.h2`) |
+| gRPC over HTTP/2 proxying (prior knowledge + inbound upgrade) | In progress (stream-aware gRPC bridge active for cleartext prior-knowledge + `Upgrade: h2c` downstream entry, with upstream support for both cleartext `.h2c` and TLS `.h2`; request-class-aware completion and fail-closed `grpc-status` enforcement are active) |
 | Content-based routing | Complete |
 | Path rewriting | Complete |
 | K8s Gateway API types | Complete |

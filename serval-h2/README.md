@@ -201,13 +201,21 @@ What is complete here:
 - bounded HTTP/2 framing helpers
 - bounded SETTINGS/control-frame helpers
 - bounded HPACK decode + helper encoding
-- bounded request-head validation
+- bounded request-head validation (including bounded HEADERS+CONTINUATION assembly and fail-closed pseudo-header/TE validation)
 - stream/flow-control primitives
 - h2c upgrade bootstrap helpers
 
+How these primitives are currently used in the stack:
+
+- prior-knowledge bootstrap parsing (`parseInitialRequest`) for route selection and bridge handoff
+- `Upgrade: h2c` validation + preamble generation for stream-aware bridge startup
+- terminated h2 runtime/server paths in `serval-server/h2/*`
+- outbound h2 session/runtime paths in `serval-client/h2/*`
+- stream-aware bridge mechanics in `serval-proxy/h2/*`
+
 What is still broader-work-in-progress in the stack:
 
-- full generic stream-aware proxying
+- full generic stream-aware proxying for arbitrary (non-gRPC-specific) h2 traffic classes
 - complete production-grade multiplexed runtime behavior across all traffic classes
 
 ## TigerStyle Compliance
