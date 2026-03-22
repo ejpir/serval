@@ -1223,6 +1223,21 @@ pub fn build(b: *std.Build) void {
     );
     integration_test_h2c_upgrade_grpc_success_step.dependOn(&run_integration_test_h2c_upgrade_grpc_success.step);
 
+    const integration_test_h2c_upgrade_tls_upstream = b.addTest(.{
+        .name = "integration_test_h2c_upgrade_tls_upstream",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: grpc h2c upgrade request is proxied to tls h2 upstream"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_h2c_upgrade_tls_upstream);
+    const run_integration_test_h2c_upgrade_tls_upstream = b.addRunArtifact(integration_test_h2c_upgrade_tls_upstream);
+
+    const integration_test_h2c_upgrade_tls_upstream_step = b.step(
+        "test-integration-h2c-upgrade-tls-upstream",
+        "Run integration test (h2c upgrade gRPC request proxied to TLS h2 upstream)",
+    );
+    integration_test_h2c_upgrade_tls_upstream_step.dependOn(&run_integration_test_h2c_upgrade_tls_upstream.step);
+
     const integration_test_h2c_grpc_completion_fast_step = b.step(
         "test-integration-h2c-grpc-completion-fast",
         "Run focused gRPC completion checks (bridge+upgrade, fail-closed+success)",

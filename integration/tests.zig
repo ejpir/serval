@@ -9588,7 +9588,6 @@ test "integration: grpc h2c upgrade request is proxied to tls h2 upstream" {
         .mode = .unary,
         .first_response = "upgrade-tls-pong",
         .tls = true,
-        .drain_request_until_end_stream = true,
     });
     defer backend_thread.join();
 
