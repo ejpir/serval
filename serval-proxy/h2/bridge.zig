@@ -295,6 +295,30 @@ pub const StreamBridge = struct {
         const now_ns = time.monotonicNanos();
         const since_last_action_ns: u64 = if (now_ns >= session.last_used_ns) now_ns - session.last_used_ns else 0;
 
+        if (stream == null) {
+            log.warn(
+                "h2 bridge: conn={d} stale binding with missing upstream stream downstream_stream={d} upstream_stream={d} idx={d} gen={d} fd={d} active_bindings={d} active_streams={d}; issuing downstream cancel reset",
+                .{
+                    self.debug_connection_id,
+                    downstream_stream_id,
+                    binding.upstream_stream_id,
+                    binding.upstream_index,
+                    binding.upstream_session_generation,
+                    fd,
+                    self.binding_table.count,
+                    session.h2.runtime.state.streams.active_count,
+                },
+            );
+            _ = self.binding_table.removeByDownstream(downstream_stream_id) catch |remove_err| switch (remove_err) {
+                error.BindingNotFound => {},
+                else => return remove_err,
+            };
+            return .{ .stream_reset = .{
+                .downstream_stream_id = downstream_stream_id,
+                .error_code_raw = @intFromEnum(h2.ErrorCode.cancel),
+            } };
+        }
+
         log.debug(
             "h2 bridge: conn={d} wait upstream action downstream_stream={d} upstream_stream={d} idx={d} gen={d} fd={d} timeout={any} since_last_action_ns={d} active_bindings={d} active_streams={d} conn_send_window={d} conn_recv_window={d} stream_send_window={d} stream_recv_window={d}",
             .{
