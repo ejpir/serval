@@ -231,13 +231,32 @@ pub fn GenericTlsH2FrontendHandler(
             if (upstream == null) return;
 
             if (end_stream) {
-                try self.forwardHttpRequest(request, upstream.?, writer);
+                self.forwardHttpRequest(request, upstream.?, writer) catch |err| switch (err) {
+                    error.UpstreamConnectFailed,
+                    error.UpstreamSendFailed,
+                    error.UpstreamResponseHeadersFailed,
+                    error.UpstreamResponseBodyReadFailed,
+                    error.HeaderForwardingFailed,
+                    error.UnsupportedChunkedWithPreRead,
+                    error.ResponseFrameLimitExceeded,
+                    => {
+                        log.warn("generic h2: stream={d} upstream request failed err={s}; returning 502", .{ stream_id, @errorName(err) });
+                        try sendSimpleStatusResponse(writer, 502);
+                    },
+                    else => return err,
+                };
                 return;
             }
 
             self.startGenericRequestBodyStream(stream_id, request, upstream.?) catch |err| switch (err) {
                 error.InvalidContentLength => try sendSimpleTextResponse(writer, 400, "invalid content-length header"),
                 error.TooManyTrackedGenericRequestStreams => try sendSimpleStatusResponse(writer, 503),
+                error.UpstreamConnectFailed,
+                error.UpstreamSendFailed,
+                => {
+                    log.warn("generic h2: stream={d} upstream request stream setup failed err={s}; returning 502", .{ stream_id, @errorName(err) });
+                    try sendSimpleStatusResponse(writer, 502);
+                },
                 else => return err,
             };
         }
