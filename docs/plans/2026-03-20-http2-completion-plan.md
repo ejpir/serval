@@ -252,3 +252,35 @@ Item A and Item B are complete only when all are true:
 - Required phase deliverables are merged.
 - Mandatory protocol/interop/stress gates are green in CI and local reproducible runs.
 - `serval-server/README.md` and `docs/plans/http2-rfc9113-matrix.md` reflect final behavior with no "pending" ambiguity for these two items.
+
+## Future Follow-up Backlog (Post-Completion Edge Cases)
+
+These are intentionally tracked as follow-up hardening/feature-depth work after current-scope completion.
+
+1. Priority/dependency scheduling depth
+- Current policy validates PRIORITY semantics and rejects invalid self-dependency.
+- Follow-up: evaluate optional priority-aware scheduling/fairness policy and document strict guarantees if enabled.
+
+2. Extreme multiplexing fairness
+- Expand mixed long-lived + short-burst stream tests at higher concurrent-stream pressure.
+- Add starvation/fairness assertions under sustained burst traffic.
+
+3. Flow-control adversarial patterns
+- Add targeted tests for aggressive WINDOW_UPDATE churn and near-limit window transitions.
+- Verify deterministic behavior near 2^31 window bounds for connection and stream windows.
+
+4. Lifecycle race hardening
+- Expand GOAWAY + new-stream + in-flight completion race matrix.
+- Expand RST_STREAM/CANCEL overlap coverage during partial headers/data/trailer phases.
+
+5. Sustained malformed-frame abuse profiles
+- Add repeat/flood patterns for invalid frames to validate fail-closed behavior under prolonged adversarial input.
+- Ensure no state leaks/stalls when malformed sequences are interleaved with valid streams.
+
+6. Long-haul operational soak
+- Add multi-hour mixed workload soak profile with memory/fd stability assertions.
+- Include reload/drain/reconnect behavior checks for long-lived h2 connections.
+
+7. Cross-feature interaction matrix
+- Expand tests where h2 transport, retries/timeouts, metrics/tracing hooks, and policy hooks are all active.
+- Verify deterministic stream outcomes and observability consistency under combined feature load.
