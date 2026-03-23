@@ -154,6 +154,14 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // WAF module - depends on core (Layer 2 - Infrastructure)
+    const serval_waf_module = b.addModule("serval-waf", .{
+        .root_source_file = b.path("serval-waf/mod.zig"),
+        .imports = &.{
+            .{ .name = "serval-core", .module = serval_core_module },
+        },
+    });
+
     // Client module - depends on core, http, net, socket, pool, tls, h2 (Layer 3 - Mechanics)
     // HTTP/1.1 client plus bounded HTTP/2 client primitives for upstream sessions
     const serval_client_module = b.addModule("serval-client", .{
@@ -295,6 +303,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "serval-metrics", .module = serval_metrics_module },
             .{ .name = "serval-tracing", .module = serval_tracing_module },
             .{ .name = "serval-otel", .module = serval_otel_module },
+            .{ .name = "serval-waf", .module = serval_waf_module },
             .{ .name = "serval-server", .module = serval_server_module },
             .{ .name = "serval-router", .module = serval_router_module },
         },
@@ -327,6 +336,7 @@ pub fn build(b: *std.Build) void {
     serval_tests_mod.addImport("serval-metrics", serval_metrics_module);
     serval_tests_mod.addImport("serval-tracing", serval_tracing_module);
     serval_tests_mod.addImport("serval-otel", serval_otel_module);
+    serval_tests_mod.addImport("serval-waf", serval_waf_module);
     serval_tests_mod.addImport("serval-server", serval_server_module);
     serval_tests_mod.addImport("serval-client", serval_client_module);
     const serval_tests = b.addTest(.{
@@ -449,6 +459,23 @@ pub fn build(b: *std.Build) void {
 
     const health_test_step = b.step("test-health", "Run serval-health library tests");
     health_test_step.dependOn(&run_health_tests.step);
+
+    // WAF module tests
+    const waf_tests_mod = b.createModule(.{
+        .root_source_file = b.path("serval-waf/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    waf_tests_mod.addImport("serval-core", serval_core_module);
+    const waf_tests = b.addTest(.{
+        .name = "waf_tests",
+        .root_module = waf_tests_mod,
+    });
+    force_llvm_lld(waf_tests);
+    const run_waf_tests = b.addRunArtifact(waf_tests);
+
+    const waf_test_step = b.step("test-waf", "Run serval-waf library tests");
+    waf_test_step.dependOn(&run_waf_tests.step);
 
     // TLS module tests
     // Note: Uses system-installed OpenSSL/BoringSSL (libssl + libcrypto)

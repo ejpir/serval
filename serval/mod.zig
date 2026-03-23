@@ -240,6 +240,24 @@ pub const PrometheusMetrics = metrics.PrometheusMetrics;
 pub const verifyMetrics = metrics.verifyMetrics;
 
 // =============================================================================
+// WAF (from serval-waf)
+// =============================================================================
+
+pub const waf = @import("serval-waf");
+pub const WafConfig = waf.Config;
+pub const WafScannerRule = waf.ScannerRule;
+pub const WafInspectionInput = waf.InspectionInput;
+pub const WafDecision = waf.Decision;
+pub const WafDecisionAction = waf.DecisionAction;
+pub const WafBehavioralSnapshot = waf.BehavioralSnapshot;
+pub const WafEnforcementMode = waf.EnforcementMode;
+pub const WafFailureMode = waf.FailureMode;
+pub const WafFailureReason = waf.FailureReason;
+pub const WafIsMissFn = waf.IsMissFn;
+pub const ShieldedHandler = waf.ShieldedHandler;
+pub const default_scanner_rules = waf.default_scanner_rules;
+
+// =============================================================================
 // Tracing (from serval-tracing)
 // =============================================================================
 
@@ -297,5 +315,6 @@ test {
     _ = @import("serval-metrics");
     _ = @import("serval-tracing");
     _ = @import("serval-otel");
+    _ = @import("serval-waf");
     _ = @import("serval-server");
 }

@@ -84,15 +84,15 @@ const NetbirdProxyConfig = struct {
     acme_state_dir_path: []const u8 = DEFAULT_ACME_STATE_DIR,
     acme_domain: []const u8 = "",
     acme_renew_before_ns: u64 = serval.config.ACME_DEFAULT_RENEW_BEFORE_NS,
-    waf_block_threshold: u16 = 100,
+    waf_block_threshold: u16 = serval.WafConfig.DEFAULT_BLOCK_THRESHOLD,
     waf_enforcement_mode: serval.WafEnforcementMode = .detect_only,
     waf_failure_mode: serval.WafFailureMode = .fail_open,
-    waf_burst_window_ns: u64 = 10 * serval.time.ns_per_s,
-    waf_burst_tracker_capacity: u16 = 256,
-    waf_burst_request_threshold: u16 = 20,
-    waf_burst_unique_path_threshold: u8 = 16,
-    waf_burst_namespace_threshold: u8 = 3,
-    waf_burst_miss_reject_threshold: u16 = 10,
+    waf_burst_window_ns: u64 = serval.WafConfig.DEFAULT_BURST_WINDOW_NS,
+    waf_burst_tracker_capacity: u16 = serval.WafConfig.DEFAULT_BURST_TRACKER_CAPACITY,
+    waf_burst_request_threshold: u16 = serval.WafConfig.DEFAULT_BURST_REQUEST_THRESHOLD,
+    waf_burst_unique_path_threshold: u8 = serval.WafConfig.DEFAULT_BURST_UNIQUE_PATH_THRESHOLD,
+    waf_burst_namespace_threshold: u8 = serval.WafConfig.DEFAULT_BURST_NAMESPACE_THRESHOLD,
+    waf_burst_miss_reject_threshold: u16 = serval.WafConfig.DEFAULT_BURST_MISS_REJECT_THRESHOLD,
 };
 
 const ParsedUpstreamSpec = struct {
@@ -257,7 +257,9 @@ fn netbirdWriteStaticBody(response_buf: []u8, body: []const u8) []const u8 {
 }
 
 fn parseBoolean(value: []const u8) !bool {
+    assert(value.len > 0);
     const trimmed = std.mem.trim(u8, value, " \t\r");
+    assert(trimmed.len <= value.len);
     if (std.ascii.eqlIgnoreCase(trimmed, "true")) return true;
     if (std.ascii.eqlIgnoreCase(trimmed, "false")) return false;
     if (std.mem.eql(u8, trimmed, "1")) return true;
@@ -266,6 +268,7 @@ fn parseBoolean(value: []const u8) !bool {
 }
 
 fn parseTlsH2FrontendMode(value: []const u8) !serval.config.TlsH2FrontendMode {
+    assert(value.len > 0);
     const trimmed = std.mem.trim(u8, value, " \t\r");
     if (std.ascii.eqlIgnoreCase(trimmed, "disabled")) return .disabled;
     if (std.ascii.eqlIgnoreCase(trimmed, "terminated_only")) return .terminated_only;
@@ -274,6 +277,7 @@ fn parseTlsH2FrontendMode(value: []const u8) !serval.config.TlsH2FrontendMode {
 }
 
 fn parseAlpnMixedOfferPolicy(value: []const u8) !serval.config.AlpnMixedOfferPolicy {
+    assert(value.len > 0);
     const trimmed = std.mem.trim(u8, value, " \t\r");
     if (std.ascii.eqlIgnoreCase(trimmed, "prefer_http11")) return .prefer_http11;
     if (std.ascii.eqlIgnoreCase(trimmed, "prefer_h2")) return .prefer_h2;
@@ -282,6 +286,7 @@ fn parseAlpnMixedOfferPolicy(value: []const u8) !serval.config.AlpnMixedOfferPol
 }
 
 fn parseWafEnforcementMode(value: []const u8) !serval.WafEnforcementMode {
+    assert(value.len > 0);
     const trimmed = std.mem.trim(u8, value, " \t\r");
     if (std.ascii.eqlIgnoreCase(trimmed, "detect_only")) return .detect_only;
     if (std.ascii.eqlIgnoreCase(trimmed, "enforce")) return .enforce;
@@ -289,6 +294,7 @@ fn parseWafEnforcementMode(value: []const u8) !serval.WafEnforcementMode {
 }
 
 fn parseWafFailureMode(value: []const u8) !serval.WafFailureMode {
+    assert(value.len > 0);
     const trimmed = std.mem.trim(u8, value, " \t\r");
     if (std.ascii.eqlIgnoreCase(trimmed, "fail_open")) return .fail_open;
     if (std.ascii.eqlIgnoreCase(trimmed, "fail_closed")) return .fail_closed;
@@ -296,14 +302,18 @@ fn parseWafFailureMode(value: []const u8) !serval.WafFailureMode {
 }
 
 fn parsePort(value: []const u8) !u16 {
+    assert(value.len > 0);
     const trimmed = std.mem.trim(u8, value, " \t\r");
+    assert(trimmed.len <= value.len);
     const parsed = try std.fmt.parseInt(u16, trimmed, 10);
     if (parsed == 0) return error.InvalidPort;
     return parsed;
 }
 
 fn parseU64(value: []const u8) !u64 {
+    assert(value.len > 0);
     const trimmed = std.mem.trim(u8, value, " \t\r");
+    assert(trimmed.len <= value.len);
     return std.fmt.parseInt(u64, trimmed, 10);
 }
 
@@ -312,14 +322,18 @@ fn parseU16NonZero(value: []const u8) !u16 {
 }
 
 fn parseU8NonZero(value: []const u8) !u8 {
+    assert(value.len > 0);
     const trimmed = std.mem.trim(u8, value, " \t\r");
+    assert(trimmed.len <= value.len);
     const parsed = try std.fmt.parseInt(u8, trimmed, 10);
     if (parsed == 0) return error.InvalidThreshold;
     return parsed;
 }
 
 fn parseListenHost(value: []const u8) ![]const u8 {
+    assert(value.len > 0);
     const trimmed = std.mem.trim(u8, value, " \t\r");
+    assert(trimmed.len <= value.len);
     if (trimmed.len == 0) return error.InvalidListenHost;
     return trimmed;
 }
@@ -427,136 +441,187 @@ fn validateHttpUpstream(name: []const u8, upstream: serval.Upstream) !void {
     if (upstream.http_protocol != .h1) return error.InvalidHttpUpstream;
 }
 
+const ConfigKeyValue = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+fn parseConfigKeyValue(trimmed_line: []const u8) !ConfigKeyValue {
+    assert(trimmed_line.len > 0);
+
+    const eq_idx = std.mem.indexOfScalar(u8, trimmed_line, '=') orelse
+        return error.InvalidConfigLine;
+    if (eq_idx == 0) return error.InvalidConfigLine;
+    if (eq_idx + 1 >= trimmed_line.len) return error.InvalidConfigLine;
+
+    const key = std.mem.trim(u8, trimmed_line[0..eq_idx], " \t");
+    const value = std.mem.trim(u8, trimmed_line[eq_idx + 1 ..], " \t");
+    if (key.len == 0 or value.len == 0) return error.InvalidConfigLine;
+    return .{ .key = key, .value = value };
+}
+
+fn applyConfigNetworkTls(
+    cfg: *NetbirdProxyConfig,
+    kv: *const ConfigKeyValue,
+    saw_listen_port: *bool,
+) !bool {
+    assert(@intFromPtr(cfg) != 0);
+    assert(@intFromPtr(kv) != 0);
+
+    if (std.mem.eql(u8, kv.key, "listen_host")) {
+        cfg.listen_host = try parseListenHost(kv.value);
+        return true;
+    }
+    if (std.mem.eql(u8, kv.key, "listen_port")) {
+        cfg.listen_port = try parsePort(kv.value);
+        saw_listen_port.* = true;
+        return true;
+    }
+    if (std.mem.eql(u8, kv.key, "cert_path")) {
+        cfg.cert_path = kv.value;
+        return true;
+    }
+    if (std.mem.eql(u8, kv.key, "key_path")) {
+        cfg.key_path = kv.value;
+        return true;
+    }
+    if (std.mem.eql(u8, kv.key, "verify_upstream")) {
+        cfg.verify_upstream = try parseBoolean(kv.value);
+        return true;
+    }
+    if (std.mem.eql(u8, kv.key, "tls_h2_frontend_mode")) {
+        cfg.tls_h2_frontend_mode = try parseTlsH2FrontendMode(kv.value);
+        return true;
+    }
+    if (std.mem.eql(u8, kv.key, "alpn_mixed_offer_policy")) {
+        cfg.alpn_mixed_offer_policy = try parseAlpnMixedOfferPolicy(kv.value);
+        return true;
+    }
+    return false;
+}
+
+fn applyConfigUpstreams(cfg: *NetbirdProxyConfig, kv: *const ConfigKeyValue) bool {
+    assert(@intFromPtr(cfg) != 0);
+    assert(@intFromPtr(kv) != 0);
+
+    if (std.mem.eql(u8, kv.key, "signal_grpc")) {
+        cfg.signal_grpc_spec = kv.value;
+        return true;
+    }
+    if (std.mem.eql(u8, kv.key, "management_grpc")) {
+        cfg.management_grpc_spec = kv.value;
+        return true;
+    }
+    if (std.mem.eql(u8, kv.key, "signal_http")) {
+        cfg.signal_http_spec = kv.value;
+        return true;
+    }
+    if (std.mem.eql(u8, kv.key, "management_http")) {
+        cfg.management_http_spec = kv.value;
+        return true;
+    }
+    if (std.mem.eql(u8, kv.key, "relay_http")) {
+        cfg.relay_http_spec = kv.value;
+        return true;
+    }
+    if (std.mem.eql(u8, kv.key, "dashboard_http")) {
+        cfg.dashboard_http_spec = kv.value;
+        return true;
+    }
+    if (std.mem.eql(u8, kv.key, "zitadel_http")) {
+        cfg.zitadel_http_spec = kv.value;
+        return true;
+    }
+    return false;
+}
+
+fn applyConfigAcme(cfg: *NetbirdProxyConfig, kv: *const ConfigKeyValue) !bool {
+    assert(@intFromPtr(cfg) != 0);
+    assert(@intFromPtr(kv) != 0);
+
+    if (std.mem.eql(u8, kv.key, "acme_enabled")) {
+        cfg.acme_enabled = try parseBoolean(kv.value);
+        return true;
+    }
+    if (std.mem.eql(u8, kv.key, "acme_directory_url")) {
+        cfg.acme_directory_url = kv.value;
+        return true;
+    }
+    if (std.mem.eql(u8, kv.key, "acme_contact_email")) {
+        cfg.acme_contact_email = kv.value;
+        return true;
+    }
+    if (std.mem.eql(u8, kv.key, "acme_state_dir_path")) {
+        cfg.acme_state_dir_path = kv.value;
+        return true;
+    }
+    if (std.mem.eql(u8, kv.key, "acme_domain")) {
+        cfg.acme_domain = kv.value;
+        return true;
+    }
+    return false;
+}
+
+fn applyConfigWaf(cfg: *NetbirdProxyConfig, kv: *const ConfigKeyValue) !bool {
+    assert(@intFromPtr(cfg) != 0);
+    assert(@intFromPtr(kv) != 0);
+
+    if (std.mem.eql(u8, kv.key, "waf_block_threshold")) {
+        cfg.waf_block_threshold = try parseU16NonZero(kv.value);
+        return true;
+    }
+    if (std.mem.eql(u8, kv.key, "waf_enforcement_mode")) {
+        cfg.waf_enforcement_mode = try parseWafEnforcementMode(kv.value);
+        return true;
+    }
+    if (std.mem.eql(u8, kv.key, "waf_failure_mode")) {
+        cfg.waf_failure_mode = try parseWafFailureMode(kv.value);
+        return true;
+    }
+    if (std.mem.eql(u8, kv.key, "waf_burst_window_ns")) {
+        cfg.waf_burst_window_ns = try parseU64(kv.value);
+        return true;
+    }
+    if (std.mem.eql(u8, kv.key, "waf_burst_tracker_capacity")) {
+        cfg.waf_burst_tracker_capacity = try parseU16NonZero(kv.value);
+        return true;
+    }
+    if (std.mem.eql(u8, kv.key, "waf_burst_request_threshold")) {
+        cfg.waf_burst_request_threshold = try parseU16NonZero(kv.value);
+        return true;
+    }
+    if (std.mem.eql(u8, kv.key, "waf_burst_unique_path_threshold")) {
+        cfg.waf_burst_unique_path_threshold = try parseU8NonZero(kv.value);
+        return true;
+    }
+    if (std.mem.eql(u8, kv.key, "waf_burst_namespace_threshold")) {
+        cfg.waf_burst_namespace_threshold = try parseU8NonZero(kv.value);
+        return true;
+    }
+    if (std.mem.eql(u8, kv.key, "waf_burst_miss_reject_threshold")) {
+        cfg.waf_burst_miss_reject_threshold = try parseU16NonZero(kv.value);
+        return true;
+    }
+    return false;
+}
+
 fn parseConfigLine(
     cfg: *NetbirdProxyConfig,
     line: []const u8,
     saw_listen_port: *bool,
 ) !void {
+    assert(@intFromPtr(cfg) != 0);
+    assert(@intFromPtr(saw_listen_port) != 0);
+
     const trimmed = std.mem.trim(u8, line, " \t\r");
     if (trimmed.len == 0) return;
     if (trimmed[0] == '#') return;
 
-    const eq_idx = std.mem.indexOfScalar(u8, trimmed, '=') orelse return error.InvalidConfigLine;
-    if (eq_idx == 0) return error.InvalidConfigLine;
-    if (eq_idx + 1 >= trimmed.len) return error.InvalidConfigLine;
-
-    const key = std.mem.trim(u8, trimmed[0..eq_idx], " \t");
-    const value = std.mem.trim(u8, trimmed[eq_idx + 1 ..], " \t");
-    if (value.len == 0) return error.InvalidConfigLine;
-
-    if (std.mem.eql(u8, key, "listen_host")) {
-        cfg.listen_host = try parseListenHost(value);
-        return;
-    }
-    if (std.mem.eql(u8, key, "listen_port")) {
-        cfg.listen_port = try parsePort(value);
-        saw_listen_port.* = true;
-        return;
-    }
-    if (std.mem.eql(u8, key, "cert_path")) {
-        cfg.cert_path = value;
-        return;
-    }
-    if (std.mem.eql(u8, key, "key_path")) {
-        cfg.key_path = value;
-        return;
-    }
-    if (std.mem.eql(u8, key, "verify_upstream")) {
-        cfg.verify_upstream = try parseBoolean(value);
-        return;
-    }
-    if (std.mem.eql(u8, key, "tls_h2_frontend_mode")) {
-        cfg.tls_h2_frontend_mode = try parseTlsH2FrontendMode(value);
-        return;
-    }
-    if (std.mem.eql(u8, key, "alpn_mixed_offer_policy")) {
-        cfg.alpn_mixed_offer_policy = try parseAlpnMixedOfferPolicy(value);
-        return;
-    }
-    if (std.mem.eql(u8, key, "signal_grpc")) {
-        cfg.signal_grpc_spec = value;
-        return;
-    }
-    if (std.mem.eql(u8, key, "management_grpc")) {
-        cfg.management_grpc_spec = value;
-        return;
-    }
-    if (std.mem.eql(u8, key, "signal_http")) {
-        cfg.signal_http_spec = value;
-        return;
-    }
-    if (std.mem.eql(u8, key, "management_http")) {
-        cfg.management_http_spec = value;
-        return;
-    }
-    if (std.mem.eql(u8, key, "relay_http")) {
-        cfg.relay_http_spec = value;
-        return;
-    }
-    if (std.mem.eql(u8, key, "dashboard_http")) {
-        cfg.dashboard_http_spec = value;
-        return;
-    }
-    if (std.mem.eql(u8, key, "zitadel_http")) {
-        cfg.zitadel_http_spec = value;
-        return;
-    }
-    if (std.mem.eql(u8, key, "acme_enabled")) {
-        cfg.acme_enabled = try parseBoolean(value);
-        return;
-    }
-    if (std.mem.eql(u8, key, "acme_directory_url")) {
-        cfg.acme_directory_url = value;
-        return;
-    }
-    if (std.mem.eql(u8, key, "acme_contact_email")) {
-        cfg.acme_contact_email = value;
-        return;
-    }
-    if (std.mem.eql(u8, key, "acme_state_dir_path")) {
-        cfg.acme_state_dir_path = value;
-        return;
-    }
-    if (std.mem.eql(u8, key, "acme_domain")) {
-        cfg.acme_domain = value;
-        return;
-    }
-    if (std.mem.eql(u8, key, "waf_block_threshold")) {
-        cfg.waf_block_threshold = try parseU16NonZero(value);
-        return;
-    }
-    if (std.mem.eql(u8, key, "waf_enforcement_mode")) {
-        cfg.waf_enforcement_mode = try parseWafEnforcementMode(value);
-        return;
-    }
-    if (std.mem.eql(u8, key, "waf_failure_mode")) {
-        cfg.waf_failure_mode = try parseWafFailureMode(value);
-        return;
-    }
-    if (std.mem.eql(u8, key, "waf_burst_window_ns")) {
-        cfg.waf_burst_window_ns = try parseU64(value);
-        return;
-    }
-    if (std.mem.eql(u8, key, "waf_burst_tracker_capacity")) {
-        cfg.waf_burst_tracker_capacity = try parseU16NonZero(value);
-        return;
-    }
-    if (std.mem.eql(u8, key, "waf_burst_request_threshold")) {
-        cfg.waf_burst_request_threshold = try parseU16NonZero(value);
-        return;
-    }
-    if (std.mem.eql(u8, key, "waf_burst_unique_path_threshold")) {
-        cfg.waf_burst_unique_path_threshold = try parseU8NonZero(value);
-        return;
-    }
-    if (std.mem.eql(u8, key, "waf_burst_namespace_threshold")) {
-        cfg.waf_burst_namespace_threshold = try parseU8NonZero(value);
-        return;
-    }
-    if (std.mem.eql(u8, key, "waf_burst_miss_reject_threshold")) {
-        cfg.waf_burst_miss_reject_threshold = try parseU16NonZero(value);
-        return;
-    }
+    const kv = try parseConfigKeyValue(trimmed);
+    if (try applyConfigNetworkTls(cfg, &kv, saw_listen_port)) return;
+    if (applyConfigUpstreams(cfg, &kv)) return;
+    if (try applyConfigAcme(cfg, &kv)) return;
+    if (try applyConfigWaf(cfg, &kv)) return;
     return error.UnknownConfigKey;
 }
 
@@ -586,6 +651,10 @@ fn netbirdWafObserver(
     request: *const serval.Request,
     decision: *const serval.WafDecision,
 ) void {
+    assert(@intFromPtr(ctx) != 0);
+    assert(@intFromPtr(request) != 0);
+    assert(@intFromPtr(decision) != 0);
+
     const client = std.mem.sliceTo(&ctx.client_addr, 0);
     const action_label = switch (decision.action) {
         .allow => "allow",

@@ -41,6 +41,7 @@ serval (umbrella - re-exports all modules)
 ├── serval-metrics  # Request metrics (real-time + Prometheus)
 ├── serval-tracing  # Distributed tracing interface
 ├── serval-otel     # OpenTelemetry implementation
+├── serval-waf      # Scanner-focused request inspection and blocking
 └── serval-server   # HTTP server implementation (h1/ subdirectory)
 
 Standalone modules:
@@ -51,7 +52,6 @@ Standalone modules:
 
 Future modules (API gateway):
 ├── serval-ratelimit  # Rate limiting (token bucket, sliding window)
-├── serval-waf        # Web Application Firewall (SQLi, XSS detection)
 ├── serval-cache      # Response caching (keys, TTL, eviction)
 └── serval-auth       # Authentication/authorization (JWT, API keys)
 ```
@@ -121,6 +121,8 @@ Layer 2 (Infrastructure):                                          │
                                                            │       │
   serval-metrics ──────────────────────────────────────────┤       │
                                                            │       │
+  serval-waf (scanner-focused request inspection) ─────────┤       │
+                                                           │       │
   serval-tracing ──────────────────────────────────────────┤       │
        ↑                                                   │       │
   serval-otel (implements serval-tracing interface) ───────┤       │
@@ -159,6 +161,7 @@ Standalone:
 | serval-prober | Background health probing (HTTP/HTTPS) | `ProberContext`, `probeLoop` |
 | serval-proxy | Request forwarding + initial stream-aware h2 bridge primitives | `Forwarder`, `ForwardResult`, `BodyInfo`, `Protocol`, `H2StreamBridge` |
 | serval-metrics | Observability | `NoopMetrics`, `PrometheusMetrics`, `RealTimeMetrics` |
+| serval-waf | Scanner-focused request blocking | `Config`, `ScannerRule`, `Decision`, `ShieldedHandler` |
 | serval-tracing | Distributed tracing interface | `NoopTracer`, `SpanHandle` |
 | serval-otel | OpenTelemetry tracing | `Tracer`, `Span`, `OTLPExporter`, `BatchingProcessor` |
 | serval-server | HTTP/1.1 server + early HTTP/2 dispatch (h2c + TLS ALPN h2 for terminated handlers and configurable generic h2 adapter) | `Server`, `MinimalServer`, `servePlainH2Connection`, `serveTlsH2Connection` |

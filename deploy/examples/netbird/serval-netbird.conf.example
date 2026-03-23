@@ -37,6 +37,28 @@ tls_h2_frontend_mode=terminated_only
 #   http11_only      -> reject h2 ALPN; forces gRPC clients to use WebSocket fallback
 alpn_mixed_offer_policy=prefer_h2
 
+# Scanner-blocking WAF controls
+#   waf_block_threshold   -> cumulative score threshold for non-direct-block rules
+#   waf_enforcement_mode  -> detect_only | enforce
+#   waf_failure_mode      -> fail_open | fail_closed
+waf_block_threshold=100
+waf_enforcement_mode=enforce
+waf_failure_mode=fail_open
+
+# Behavioral burst detection controls
+#   waf_burst_window_ns              -> tumbling window duration (nanoseconds)
+#   waf_burst_tracker_capacity       -> max tracked clients in table
+#   waf_burst_request_threshold      -> requests per window signal threshold
+#   waf_burst_unique_path_threshold  -> distinct normalized paths per window threshold
+#   waf_burst_namespace_threshold    -> sensitive namespace family threshold
+#   waf_burst_miss_reject_threshold  -> misses/rejects per window threshold
+waf_burst_window_ns=10000000000
+waf_burst_tracker_capacity=256
+waf_burst_request_threshold=20
+waf_burst_unique_path_threshold=16
+waf_burst_namespace_threshold=3
+waf_burst_miss_reject_threshold=10
+
 # Upstream matrix
 #
 # Allowed schemes:

@@ -24,6 +24,7 @@
         "serval-proxy",
         "serval-server",
         "serval-tracing",
+        "serval-waf",
         "examples",
     },
 }

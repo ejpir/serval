@@ -105,7 +105,14 @@ fn lockTlsReloadControlMutex(mutex: *std.atomic.Mutex) void {
     @panic("Server TLS reload control mutex lock timeout");
 }
 
-fn write_client_addr_ipv4(client_addr: *[46]u8, addr_be: *const [4]u8) void {
+const EndpointResolveError = error{
+    GetPeerNameFailed,
+    ShortPeerSockaddr,
+    UnsupportedPeerFamily,
+    AddressRenderTooLong,
+};
+
+fn write_client_addr_ipv4(client_addr: *[46]u8, addr_be: *const [4]u8) EndpointResolveError!void {
     assert(@intFromPtr(client_addr) != 0);
     assert(@intFromPtr(addr_be) != 0);
 
@@ -114,11 +121,11 @@ fn write_client_addr_ipv4(client_addr: *[46]u8, addr_be: *const [4]u8) void {
         client_addr[0 .. client_addr.len - 1],
         "{d}.{d}.{d}.{d}",
         .{ addr_be[0], addr_be[1], addr_be[2], addr_be[3] },
-    ) catch return;
+    ) catch return error.AddressRenderTooLong;
     client_addr[rendered.len] = 0;
 }
 
-fn write_client_addr_ipv6(client_addr: *[46]u8, addr_be: *const [16]u8) void {
+fn write_client_addr_ipv6(client_addr: *[46]u8, addr_be: *const [16]u8) EndpointResolveError!void {
     assert(@intFromPtr(client_addr) != 0);
     assert(@intFromPtr(addr_be) != 0);
 
@@ -136,33 +143,35 @@ fn write_client_addr_ipv6(client_addr: *[46]u8, addr_be: *const [16]u8) void {
         client_addr[0 .. client_addr.len - 1],
         "{x}:{x}:{x}:{x}:{x}:{x}:{x}:{x}",
         .{ g0, g1, g2, g3, g4, g5, g6, g7 },
-    ) catch return;
+    ) catch return error.AddressRenderTooLong;
     client_addr[rendered.len] = 0;
 }
 
-fn set_client_endpoint_from_socket(ctx: *Context, socket_fd: i32) void {
+fn set_client_endpoint_from_socket(ctx: *Context, socket_fd: i32) EndpointResolveError!void {
     assert(@intFromPtr(ctx) != 0);
     assert(socket_fd >= 0);
 
     var storage: std.posix.sockaddr.storage = std.mem.zeroes(std.posix.sockaddr.storage);
     var addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
-    std.posix.getpeername(socket_fd, @ptrCast(&storage), &addr_len) catch return;
+    std.posix.getpeername(socket_fd, @ptrCast(&storage), &addr_len) catch {
+        return error.GetPeerNameFailed;
+    };
 
     switch (storage.family) {
         std.posix.AF.INET => {
-            if (addr_len < @sizeOf(std.posix.sockaddr.in)) return;
+            if (addr_len < @sizeOf(std.posix.sockaddr.in)) return error.ShortPeerSockaddr;
             const peer4: *const std.posix.sockaddr.in = @ptrCast(@alignCast(&storage));
             const addr_be: *const [4]u8 = @ptrCast(&peer4.addr);
-            write_client_addr_ipv4(&ctx.client_addr, addr_be);
+            try write_client_addr_ipv4(&ctx.client_addr, addr_be);
             ctx.client_port = std.mem.bigToNative(u16, peer4.port);
         },
         std.posix.AF.INET6 => {
-            if (addr_len < @sizeOf(std.posix.sockaddr.in6)) return;
+            if (addr_len < @sizeOf(std.posix.sockaddr.in6)) return error.ShortPeerSockaddr;
             const peer6: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(&storage));
-            write_client_addr_ipv6(&ctx.client_addr, &peer6.addr);
+            try write_client_addr_ipv6(&ctx.client_addr, &peer6.addr);
             ctx.client_port = std.mem.bigToNative(u16, peer6.port);
         },
-        else => {},
+        else => return error.UnsupportedPeerFamily,
     }
 }
 
@@ -2529,7 +2538,16 @@ pub fn Server(
             ctx.connection_id = connection_id;
             ctx.connection_start_ns = connection_start_ns;
             ctx.request_number = 0;
-            set_client_endpoint_from_socket(&ctx, stream.socket.handle);
+            set_client_endpoint_from_socket(&ctx, stream.socket.handle) catch |err| {
+                const unknown_addr: []const u8 = "unknown";
+                @memset(&ctx.client_addr, 0);
+                @memcpy(ctx.client_addr[0..unknown_addr.len], unknown_addr);
+                ctx.client_port = 0;
+                log.warn(
+                    "server: conn={d} client endpoint unavailable err={s}",
+                    .{ connection_id, @errorName(err) },
+                );
+            };
             log.debug(
                 "server: conn={d} client={s}:{d}",
                 .{ connection_id, std.mem.sliceTo(&ctx.client_addr, 0), ctx.client_port },

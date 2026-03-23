@@ -109,6 +109,7 @@ exe.root_module.addImport("serval-lb", serval.module("serval-lb"));
 | `serval-metrics` | Metrics interfaces |
 | `serval-tracing` | Distributed tracing interfaces |
 | `serval-otel` | OpenTelemetry implementation |
+| `serval-waf` | Scanner-focused request inspection and blocking |
 | `serval-cli` | CLI argument parsing |
 
 **Future modules (API gateway):**
@@ -116,7 +117,6 @@ exe.root_module.addImport("serval-lb", serval.module("serval-lb"));
 | Module | Purpose |
 |--------|---------|
 | `serval-ratelimit` | Rate limiting (token bucket, sliding window) |
-| `serval-waf` | Web Application Firewall (SQLi, XSS detection) |
 | `serval-cache` | Response caching (keys, TTL, eviction) |
 | `serval-auth` | Authentication/authorization (JWT, API keys) |
 
@@ -312,6 +312,8 @@ Route contract enforced by the binary:
 - gRPC service paths (`/signalexchange.SignalExchange/*`, `/management.ManagementService/*`) route to h2 upstreams (`h2c://` or `h2://`).
 - Zitadel paths (`/admin/v1/*`, `/auth/v1/*`, `/management/v1/*`, `/system/v1/*`, `/assets/v1/*`, `/ui/*`, `/oidc/v1/*`, `/saml/v2/*`, `/oauth/v2/*`, `/openapi/*`, `/debug/*`, `/device*`, `/.well-known/openid-configuration`, `/zitadel.*`) route to h2 upstreams (`h2c://` or `h2://`).
 - WebSocket/API/relay/dashboard paths route to HTTP/1.1 upstreams (`http://` or `https://`).
+- Obvious scanner traffic is rejected before upstream selection using the default `serval-waf` scanner rules.
+- NetBird WAF behavior is configurable in `netbird.conf` via `waf_block_threshold`, `waf_enforcement_mode`, and `waf_failure_mode`.
 - Mixed protocol backends on the same host:port must be configured as explicit separate entries (example: `management_grpc` + `management_http`).
 - Frontend ALPN policy is configurable in the NetBird config template via `alpn_mixed_offer_policy` and `tls_h2_frontend_mode`.
 
