@@ -84,6 +84,15 @@ const NetbirdProxyConfig = struct {
     acme_state_dir_path: []const u8 = DEFAULT_ACME_STATE_DIR,
     acme_domain: []const u8 = "",
     acme_renew_before_ns: u64 = serval.config.ACME_DEFAULT_RENEW_BEFORE_NS,
+    waf_block_threshold: u16 = 100,
+    waf_enforcement_mode: serval.WafEnforcementMode = .detect_only,
+    waf_failure_mode: serval.WafFailureMode = .fail_open,
+    waf_burst_window_ns: u64 = 10 * serval.time.ns_per_s,
+    waf_burst_tracker_capacity: u16 = 256,
+    waf_burst_request_threshold: u16 = 20,
+    waf_burst_unique_path_threshold: u8 = 16,
+    waf_burst_namespace_threshold: u8 = 3,
+    waf_burst_miss_reject_threshold: u16 = 10,
 };
 
 const ParsedUpstreamSpec = struct {
@@ -272,10 +281,40 @@ fn parseAlpnMixedOfferPolicy(value: []const u8) !serval.config.AlpnMixedOfferPol
     return error.InvalidAlpnMixedOfferPolicy;
 }
 
+fn parseWafEnforcementMode(value: []const u8) !serval.WafEnforcementMode {
+    const trimmed = std.mem.trim(u8, value, " \t\r");
+    if (std.ascii.eqlIgnoreCase(trimmed, "detect_only")) return .detect_only;
+    if (std.ascii.eqlIgnoreCase(trimmed, "enforce")) return .enforce;
+    return error.InvalidWafEnforcementMode;
+}
+
+fn parseWafFailureMode(value: []const u8) !serval.WafFailureMode {
+    const trimmed = std.mem.trim(u8, value, " \t\r");
+    if (std.ascii.eqlIgnoreCase(trimmed, "fail_open")) return .fail_open;
+    if (std.ascii.eqlIgnoreCase(trimmed, "fail_closed")) return .fail_closed;
+    return error.InvalidWafFailureMode;
+}
+
 fn parsePort(value: []const u8) !u16 {
     const trimmed = std.mem.trim(u8, value, " \t\r");
     const parsed = try std.fmt.parseInt(u16, trimmed, 10);
     if (parsed == 0) return error.InvalidPort;
+    return parsed;
+}
+
+fn parseU64(value: []const u8) !u64 {
+    const trimmed = std.mem.trim(u8, value, " \t\r");
+    return std.fmt.parseInt(u64, trimmed, 10);
+}
+
+fn parseU16NonZero(value: []const u8) !u16 {
+    return parsePort(value);
+}
+
+fn parseU8NonZero(value: []const u8) !u8 {
+    const trimmed = std.mem.trim(u8, value, " \t\r");
+    const parsed = try std.fmt.parseInt(u8, trimmed, 10);
+    if (parsed == 0) return error.InvalidThreshold;
     return parsed;
 }
 
@@ -482,6 +521,42 @@ fn parseConfigLine(
         cfg.acme_domain = value;
         return;
     }
+    if (std.mem.eql(u8, key, "waf_block_threshold")) {
+        cfg.waf_block_threshold = try parseU16NonZero(value);
+        return;
+    }
+    if (std.mem.eql(u8, key, "waf_enforcement_mode")) {
+        cfg.waf_enforcement_mode = try parseWafEnforcementMode(value);
+        return;
+    }
+    if (std.mem.eql(u8, key, "waf_failure_mode")) {
+        cfg.waf_failure_mode = try parseWafFailureMode(value);
+        return;
+    }
+    if (std.mem.eql(u8, key, "waf_burst_window_ns")) {
+        cfg.waf_burst_window_ns = try parseU64(value);
+        return;
+    }
+    if (std.mem.eql(u8, key, "waf_burst_tracker_capacity")) {
+        cfg.waf_burst_tracker_capacity = try parseU16NonZero(value);
+        return;
+    }
+    if (std.mem.eql(u8, key, "waf_burst_request_threshold")) {
+        cfg.waf_burst_request_threshold = try parseU16NonZero(value);
+        return;
+    }
+    if (std.mem.eql(u8, key, "waf_burst_unique_path_threshold")) {
+        cfg.waf_burst_unique_path_threshold = try parseU8NonZero(value);
+        return;
+    }
+    if (std.mem.eql(u8, key, "waf_burst_namespace_threshold")) {
+        cfg.waf_burst_namespace_threshold = try parseU8NonZero(value);
+        return;
+    }
+    if (std.mem.eql(u8, key, "waf_burst_miss_reject_threshold")) {
+        cfg.waf_burst_miss_reject_threshold = try parseU16NonZero(value);
+        return;
+    }
     return error.UnknownConfigKey;
 }
 
@@ -504,6 +579,41 @@ fn parseConfigFile(
     }
 
     return error.ConfigTooManyLines;
+}
+
+fn netbirdWafObserver(
+    ctx: *const serval.Context,
+    request: *const serval.Request,
+    decision: *const serval.WafDecision,
+) void {
+    const client = std.mem.sliceTo(&ctx.client_addr, 0);
+    const action_label = switch (decision.action) {
+        .allow => "allow",
+        .flag => "flag",
+        .block => "block",
+    };
+    const failure_label = if (decision.failure_reason) |reason| @tagName(reason) else "none";
+
+    std.log.err(
+        "[WAF] client={s} path={s} action={s} score={d} matches={d} behavioral={d} degraded={} failure={s}",
+        .{
+            client,
+            request.path,
+            action_label,
+            decision.score,
+            decision.effectiveMatchCount(),
+            decision.behavioral_match_count,
+            decision.tracker_degraded,
+            failure_label,
+        },
+    );
+
+    const max_matches = decision.effectiveMatchCount();
+    var idx: u8 = 0;
+    while (idx < max_matches) : (idx += 1) {
+        const rule = decision.matched_rule_ids[idx] orelse continue;
+        std.log.err("[WAF] client={s} matched rule={s}", .{ client, rule });
+    }
 }
 
 fn printUpstream(name: []const u8, upstream: serval.Upstream) void {
@@ -823,16 +933,51 @@ pub fn main(process_init: std.process.Init) !void {
     printUpstream("relay_http", upstreams.relay_http);
     printUpstream("zitadel_http", upstreams.zitadel_http);
     printUpstream("dashboard_http", upstreams.dashboard_http);
+    std.debug.print("WAF mode: {s}\n", .{@tagName(cfg.waf_enforcement_mode)});
+    std.debug.print("WAF failure mode: {s}\n", .{@tagName(cfg.waf_failure_mode)});
+    std.debug.print("WAF threshold: {d}\n", .{cfg.waf_block_threshold});
+    std.debug.print(
+        "WAF burst: window_ns={d} capacity={d} req={d} unique_path={d} namespace={d} miss_reject={d}\n",
+        .{
+            cfg.waf_burst_window_ns,
+            cfg.waf_burst_tracker_capacity,
+            cfg.waf_burst_request_threshold,
+            cfg.waf_burst_unique_path_threshold,
+            cfg.waf_burst_namespace_threshold,
+            cfg.waf_burst_miss_reject_threshold,
+        },
+    );
     printRouteMatrix();
 
+    const waf_config = serval.WafConfig{
+        .rules = serval.default_scanner_rules[0..],
+        .block_threshold = cfg.waf_block_threshold,
+        .enforcement_mode = cfg.waf_enforcement_mode,
+        .failure_mode = cfg.waf_failure_mode,
+        .burst_enabled = true,
+        .burst_window_ns = cfg.waf_burst_window_ns,
+        .burst_tracker_capacity = cfg.waf_burst_tracker_capacity,
+        .burst_request_threshold = cfg.waf_burst_request_threshold,
+        .burst_unique_path_threshold = cfg.waf_burst_unique_path_threshold,
+        .burst_namespace_threshold = cfg.waf_burst_namespace_threshold,
+        .burst_miss_reject_threshold = cfg.waf_burst_miss_reject_threshold,
+    };
+
+    var protected_handler = try serval.ShieldedHandler(NetbirdProxyHandler).init(
+        &handler,
+        waf_config,
+        netbirdWafObserver,
+        null,
+    );
+
     const ServerType = serval.Server(
-        NetbirdProxyHandler,
+        @TypeOf(protected_handler),
         serval.SimplePool,
         serval.NoopMetrics,
         serval.NoopTracer,
     );
     var server = ServerType.init(
-        &handler,
+        &protected_handler,
         &pool,
         &metrics,
         &tracer,
@@ -890,6 +1035,18 @@ test "parseAlpnMixedOfferPolicy supports all valid values" {
     try std.testing.expectError(error.InvalidAlpnMixedOfferPolicy, parseAlpnMixedOfferPolicy("invalid"));
 }
 
+test "parseWafEnforcementMode supports all valid values" {
+    try std.testing.expectEqual(serval.WafEnforcementMode.detect_only, try parseWafEnforcementMode("detect_only"));
+    try std.testing.expectEqual(serval.WafEnforcementMode.enforce, try parseWafEnforcementMode("enforce"));
+    try std.testing.expectError(error.InvalidWafEnforcementMode, parseWafEnforcementMode("invalid"));
+}
+
+test "parseWafFailureMode supports all valid values" {
+    try std.testing.expectEqual(serval.WafFailureMode.fail_open, try parseWafFailureMode("fail_open"));
+    try std.testing.expectEqual(serval.WafFailureMode.fail_closed, try parseWafFailureMode("fail_closed"));
+    try std.testing.expectError(error.InvalidWafFailureMode, parseWafFailureMode("invalid"));
+}
+
 test "parseConfigLine parses ALPN and frontend h2 policy keys" {
     var cfg = NetbirdProxyConfig{};
     var saw_listen_port = false;
@@ -931,6 +1088,31 @@ test "parseConfigLine parses acme keys" {
     try std.testing.expectEqualStrings("ops@coreworks.be", cfg.acme_contact_email);
     try std.testing.expectEqualStrings("/var/lib/netbird-proxy/acme", cfg.acme_state_dir_path);
     try std.testing.expectEqualStrings("netbird.coreworks.be", cfg.acme_domain);
+}
+
+test "parseConfigLine parses waf keys" {
+    var cfg = NetbirdProxyConfig{};
+    var saw_listen_port = false;
+
+    try parseConfigLine(&cfg, "waf_block_threshold=100", &saw_listen_port);
+    try parseConfigLine(&cfg, "waf_enforcement_mode=detect_only", &saw_listen_port);
+    try parseConfigLine(&cfg, "waf_failure_mode=fail_open", &saw_listen_port);
+    try parseConfigLine(&cfg, "waf_burst_window_ns=10000000000", &saw_listen_port);
+    try parseConfigLine(&cfg, "waf_burst_tracker_capacity=256", &saw_listen_port);
+    try parseConfigLine(&cfg, "waf_burst_request_threshold=20", &saw_listen_port);
+    try parseConfigLine(&cfg, "waf_burst_unique_path_threshold=16", &saw_listen_port);
+    try parseConfigLine(&cfg, "waf_burst_namespace_threshold=3", &saw_listen_port);
+    try parseConfigLine(&cfg, "waf_burst_miss_reject_threshold=10", &saw_listen_port);
+
+    try std.testing.expectEqual(@as(u16, 100), cfg.waf_block_threshold);
+    try std.testing.expectEqual(serval.WafEnforcementMode.detect_only, cfg.waf_enforcement_mode);
+    try std.testing.expectEqual(serval.WafFailureMode.fail_open, cfg.waf_failure_mode);
+    try std.testing.expectEqual(@as(u64, 10_000_000_000), cfg.waf_burst_window_ns);
+    try std.testing.expectEqual(@as(u16, 256), cfg.waf_burst_tracker_capacity);
+    try std.testing.expectEqual(@as(u16, 20), cfg.waf_burst_request_threshold);
+    try std.testing.expectEqual(@as(u8, 16), cfg.waf_burst_unique_path_threshold);
+    try std.testing.expectEqual(@as(u8, 3), cfg.waf_burst_namespace_threshold);
+    try std.testing.expectEqual(@as(u16, 10), cfg.waf_burst_miss_reject_threshold);
 }
 
 test "ensureBootstrapTlsCredentials generates cert and key when acme enabled" {

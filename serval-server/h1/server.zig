@@ -105,6 +105,67 @@ fn lockTlsReloadControlMutex(mutex: *std.atomic.Mutex) void {
     @panic("Server TLS reload control mutex lock timeout");
 }
 
+fn write_client_addr_ipv4(client_addr: *[46]u8, addr_be: *const [4]u8) void {
+    assert(@intFromPtr(client_addr) != 0);
+    assert(@intFromPtr(addr_be) != 0);
+
+    @memset(client_addr, 0);
+    const rendered = std.fmt.bufPrint(
+        client_addr[0 .. client_addr.len - 1],
+        "{d}.{d}.{d}.{d}",
+        .{ addr_be[0], addr_be[1], addr_be[2], addr_be[3] },
+    ) catch return;
+    client_addr[rendered.len] = 0;
+}
+
+fn write_client_addr_ipv6(client_addr: *[46]u8, addr_be: *const [16]u8) void {
+    assert(@intFromPtr(client_addr) != 0);
+    assert(@intFromPtr(addr_be) != 0);
+
+    const g0: u16 = (@as(u16, addr_be[0]) << 8) | @as(u16, addr_be[1]);
+    const g1: u16 = (@as(u16, addr_be[2]) << 8) | @as(u16, addr_be[3]);
+    const g2: u16 = (@as(u16, addr_be[4]) << 8) | @as(u16, addr_be[5]);
+    const g3: u16 = (@as(u16, addr_be[6]) << 8) | @as(u16, addr_be[7]);
+    const g4: u16 = (@as(u16, addr_be[8]) << 8) | @as(u16, addr_be[9]);
+    const g5: u16 = (@as(u16, addr_be[10]) << 8) | @as(u16, addr_be[11]);
+    const g6: u16 = (@as(u16, addr_be[12]) << 8) | @as(u16, addr_be[13]);
+    const g7: u16 = (@as(u16, addr_be[14]) << 8) | @as(u16, addr_be[15]);
+
+    @memset(client_addr, 0);
+    const rendered = std.fmt.bufPrint(
+        client_addr[0 .. client_addr.len - 1],
+        "{x}:{x}:{x}:{x}:{x}:{x}:{x}:{x}",
+        .{ g0, g1, g2, g3, g4, g5, g6, g7 },
+    ) catch return;
+    client_addr[rendered.len] = 0;
+}
+
+fn set_client_endpoint_from_socket(ctx: *Context, socket_fd: i32) void {
+    assert(@intFromPtr(ctx) != 0);
+    assert(socket_fd >= 0);
+
+    var storage: std.posix.sockaddr.storage = std.mem.zeroes(std.posix.sockaddr.storage);
+    var addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
+    std.posix.getpeername(socket_fd, @ptrCast(&storage), &addr_len) catch return;
+
+    switch (storage.family) {
+        std.posix.AF.INET => {
+            if (addr_len < @sizeOf(std.posix.sockaddr.in)) return;
+            const peer4: *const std.posix.sockaddr.in = @ptrCast(@alignCast(&storage));
+            const addr_be: *const [4]u8 = @ptrCast(&peer4.addr);
+            write_client_addr_ipv4(&ctx.client_addr, addr_be);
+            ctx.client_port = std.mem.bigToNative(u16, peer4.port);
+        },
+        std.posix.AF.INET6 => {
+            if (addr_len < @sizeOf(std.posix.sockaddr.in6)) return;
+            const peer6: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(&storage));
+            write_client_addr_ipv6(&ctx.client_addr, &peer6.addr);
+            ctx.client_port = std.mem.bigToNative(u16, peer6.port);
+        },
+        else => {},
+    }
+}
+
 // =============================================================================
 // Server
 // =============================================================================
@@ -2373,7 +2434,7 @@ pub fn Server(
                         .upstream = upstream,
                         .is_retry = false,
                     };
-                    handler.onError(ctx, error_ctx);
+                    _ = handler.onError(ctx, &error_ctx);
                 }
                 metrics.requestEnd(502, duration_ns);
                 sendH2GoAway(maybe_tls, io, stream, parsed.stream_id, H2_ERROR_INTERNAL);
@@ -2468,6 +2529,11 @@ pub fn Server(
             ctx.connection_id = connection_id;
             ctx.connection_start_ns = connection_start_ns;
             ctx.request_number = 0;
+            set_client_endpoint_from_socket(&ctx, stream.socket.handle);
+            log.debug(
+                "server: conn={d} client={s}:{d}",
+                .{ connection_id, std.mem.sliceTo(&ctx.client_addr, 0), ctx.client_port },
+            );
 
             // Connection lifecycle hooks
             if (comptime hooks.hasHook(Handler, "onConnectionOpen")) {
@@ -3393,7 +3459,7 @@ pub fn Server(
                     .upstream = upstream,
                     .is_retry = false,
                 };
-                handler.onError(ctx, error_ctx);
+                _ = handler.onError(ctx, &error_ctx);
             }
 
             sendErrorResponseTls(maybe_tls, io, stream, 502, "Bad Gateway");
