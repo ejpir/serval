@@ -1,8 +1,7 @@
 # TigerStyle + Serval Enforcement Notes
 
 References:
-- https://tigerstyle.dev/
-- https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md
+- `docs/standards/tigerstyle-rule-matrix.md` (Serval S/P/C/Y checklist definitions)
 
 Priority order: **Safety > Performance > Developer Experience**.
 

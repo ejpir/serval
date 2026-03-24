@@ -16,6 +16,7 @@ references:
   component_usage: docs/engineering/component-usage.md
   code_placement: docs/engineering/code-placement.md
   tigerstyle: docs/standards/tigerstyle-serval.md
+  tigerstyle_matrix: docs/standards/tigerstyle-rule-matrix.md
   testing: docs/standards/testing-and-verification.md
 completion_gate_required: true
 ---
@@ -93,6 +94,7 @@ Compiler path:
 
 TigerStyle and testing details:
 - `docs/standards/tigerstyle-serval.md`
+- `docs/standards/tigerstyle-rule-matrix.md` (S1-S7, P1-P4, C1-C5, Y1-Y6 definitions)
 - `docs/standards/testing-and-verification.md`
 
 ---
@@ -162,6 +164,7 @@ New split references from previous AGENTS content:
 - `docs/engineering/component-usage.md`
 - `docs/engineering/code-placement.md`
 - `docs/standards/tigerstyle-serval.md`
+- `docs/standards/tigerstyle-rule-matrix.md`
 - `docs/standards/testing-and-verification.md`
 
 ---
