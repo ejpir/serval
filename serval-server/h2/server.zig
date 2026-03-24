@@ -18,7 +18,13 @@ const time = serval_core.time;
 const log = serval_core.log.scoped(.server);
 const h2 = @import("serval-h2");
 const runtime_mod = @import("runtime.zig");
-const TLSStream = @import("serval-tls").TLSStream;
+const h2_bootstrap = @import("bootstrap.zig");
+const frontend = @import("../frontend/mod.zig");
+const serval_net = @import("serval-net");
+const set_tcp_no_delay = serval_net.set_tcp_no_delay;
+const serval_tls = @import("serval-tls");
+const TLSStream = serval_tls.TLSStream;
+const ssl = serval_tls.ssl;
 
 const Request = types.Request;
 
@@ -957,6 +963,130 @@ pub fn serveTlsConnection(comptime Handler: type, handler: *Handler, tls_stream:
     assert(@intFromPtr(handler) != 0);
     assert(@intFromPtr(tls_stream) != 0);
     return serveTlsConnectionWithInitialBytes(Handler, handler, tls_stream, io, connection_id, &[_]u8{});
+}
+
+pub const RunError = h2_bootstrap.H2BootstrapError || frontend.FrontendOrchestratorError || error{
+    ListenFailed,
+    LoadCertFailed,
+    LoadKeyFailed,
+    NoTlsMethod,
+    SslCtxNew,
+    OutOfMemory,
+};
+
+pub fn run(
+    comptime Handler: type,
+    handler: *Handler,
+    cfg: config.Config,
+    io: Io,
+    shutdown: *std.atomic.Value(bool),
+    listener_fd_out: ?*std.atomic.Value(i32),
+) RunError!void {
+    assert(@intFromPtr(handler) != 0);
+    assert(@intFromPtr(shutdown) != 0);
+    assert(cfg.port > 0);
+    assert(cfg.listen_host.len > 0);
+
+    const addr = try h2_bootstrap.preflightAndResolveListenAddress(&cfg);
+
+    const verify_upstream_tls = if (cfg.tls) |tls_cfg| tls_cfg.verify_upstream else true;
+
+    var runtime_orchestrator: frontend.RuntimeOrchestrator = undefined;
+    runtime_orchestrator.init(
+        shutdown,
+        .{},
+        null,
+        verify_upstream_tls,
+    );
+    try runtime_orchestrator.start(&cfg);
+    defer runtime_orchestrator.stop();
+
+    var tcp_server = addr.listen(io, .{
+        .kernel_backlog = cfg.kernel_backlog,
+        .reuse_address = true,
+    }) catch return error.ListenFailed;
+
+    if (listener_fd_out) |fd_out| {
+        fd_out.store(@intCast(tcp_server.socket.handle), .release);
+    }
+    defer {
+        if (listener_fd_out) |fd_out| {
+            fd_out.store(-1, .release);
+        }
+        tcp_server.deinit(io);
+    }
+
+    const server_tls_ctx: ?*ssl.SSL_CTX = if (cfg.tls) |tls_cfg| blk: {
+        const cert_path = tls_cfg.cert_path orelse break :blk null;
+        const key_path = tls_cfg.key_path orelse break :blk null;
+
+        const ctx = ssl.createServerCtxFromPemFiles(cert_path, key_path) catch |err| switch (err) {
+            error.InvalidCertPath, error.LoadCertFailed => return error.LoadCertFailed,
+            error.InvalidKeyPath, error.LoadKeyFailed => return error.LoadKeyFailed,
+            error.NoTlsMethod => return error.NoTlsMethod,
+            error.SslCtxNew => return error.SslCtxNew,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        break :blk ctx;
+    } else null;
+    defer if (server_tls_ctx) |ctx| ssl.SSL_CTX_free(ctx);
+
+    var group: Io.Group = .init;
+    defer group.await(io) catch {};
+
+    var next_connection_id: u64 = 1;
+
+    while (!shutdown.load(.acquire)) {
+        const stream = tcp_server.accept(io) catch |err| {
+            if (shutdown.load(.acquire)) break;
+            log.err("h2 server: accept failed: {s}", .{@errorName(err)});
+            continue;
+        };
+
+        const connection_id = next_connection_id;
+        next_connection_id +%= 1;
+        if (next_connection_id == 0) next_connection_id = 1;
+
+        group.concurrent(io, handleAcceptedConnection, .{ Handler, handler, stream, io, connection_id, server_tls_ctx }) catch |err| {
+            log.err("h2 server: failed to spawn connection task: {s}", .{@errorName(err)});
+            stream.close(io);
+        };
+    }
+}
+
+fn handleAcceptedConnection(
+    comptime Handler: type,
+    handler: *Handler,
+    stream: Io.net.Stream,
+    io: Io,
+    connection_id: u64,
+    server_tls_ctx: ?*ssl.SSL_CTX,
+) void {
+    assert(@intFromPtr(handler) != 0);
+    assert(stream.socket.handle >= 0);
+    assert(connection_id > 0);
+
+    _ = set_tcp_no_delay(stream.socket.handle);
+    defer stream.close(io);
+
+    if (server_tls_ctx) |ctx| {
+        var tls_stream = TLSStream.initServer(ctx, @intCast(stream.socket.handle), std.heap.c_allocator) catch |err| {
+            log.warn("h2 server: conn={d} tls handshake failed: {s}", .{ connection_id, @errorName(err) });
+            return;
+        };
+        defer tls_stream.close();
+
+        serveTlsConnection(Handler, handler, &tls_stream, io, connection_id) catch |err| switch (err) {
+            error.ConnectionClosed => {},
+            else => log.warn("h2 server: conn={d} tls driver failed: {s}", .{ connection_id, @errorName(err) }),
+        };
+        return;
+    }
+
+    servePlainConnection(Handler, handler, @intCast(stream.socket.handle), io, connection_id) catch |err| switch (err) {
+        error.ConnectionClosed => {},
+        else => log.warn("h2 server: conn={d} plain driver failed: {s}", .{ connection_id, @errorName(err) }),
+    };
 }
 
 pub const PlainConnectionOptions = struct {

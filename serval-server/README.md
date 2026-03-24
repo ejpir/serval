@@ -12,10 +12,14 @@ The terminated `h2/server.zig` path receives `std.Io` from downstream h2 entry p
 lib/serval-server/
 ├── mod.zig            # Main module exports (Server, MinimalServer)
 ├── README.md          # This file
-├── frontend/          # Protocol dispatch/adaptation helpers
-│   ├── mod.zig        # Frontend module exports
-│   ├── dispatch.zig   # TLS ALPN h2 dispatch policy selection
-│   └── generic_h2.zig # Generic TLS h2 adapter (non-terminated handlers)
+├── frontend/              # Protocol dispatch/adaptation + runtime orchestration helpers
+│   ├── mod.zig            # Frontend module exports
+│   ├── bootstrap.zig      # Shared startup preflight + transport validation
+│   ├── orchestrator.zig   # Frontend-owned TCP/UDP runtime lifecycle orchestration
+│   ├── tcp_runtime.zig    # TCP tunnel runtime mechanics (bounded accept/connect/relay)
+│   ├── udp_runtime.zig    # UDP runtime mechanics (datagrams, sessions, expiry)
+│   ├── dispatch.zig       # TLS ALPN h2 dispatch policy selection
+│   └── generic_h2.zig     # Generic TLS h2 adapter (non-terminated handlers)
 ├── h1/                # HTTP/1.1 implementation
 │   ├── mod.zig        # H1 module exports
 │   ├── server.zig     # Generic Server struct with connection handling
@@ -47,7 +51,7 @@ and upgrade paths when the handler implements explicit HTTP/2 callbacks.
 Native gRPC endpoint serving (service/method handlers owned by serval-server) is
 not implemented yet.
 
-Protocol implementations are isolated in subdirectories (h1/, h2/) with a neutral `frontend/` dispatch layer to keep ALPN/protocol routing decisions outside protocol-specific drivers.
+Protocol implementations are isolated in subdirectories (h1/, h2/) with a neutral `frontend/` layer that owns shared preflight and runtime orchestration, keeping protocol/runtime routing decisions outside protocol-specific drivers.
 
 ACME challenge handling is TLS-ALPN-01 based and is integrated via TLS hook
 providers (`serval-acme/tls_alpn_hook.zig`) instead of a dedicated HTTP
@@ -244,6 +248,32 @@ Message-oriented native session API:
 Canonical bridge writeup:
 - [docs/architecture/h2-bridge.md](/home/nick/repos/serval/docs/architecture/h2-bridge.md)
 
+### Orchestration vs Mechanics Contract
+
+`serval-server` is the orchestration layer. It owns:
+
+- downstream entry/path detection and lifecycle
+- `selectUpstream()` decisions
+- request-class policy (for example gRPC completion requirements)
+- frontend runtime orchestration for optional L4 capabilities (`tcp_transport`, `udp_transport`)
+
+```text
+serval-server (orchestration/policy)
+        │
+        ▼
+serval-proxy.H2StreamBridge (forwarding mechanics)
+        │
+        ▼
+serval-client session/runtime (reusable upstream h2 infra)
+```
+
+`serval-server` does **not** own h2 bridge internals. It consumes the
+`serval-proxy.H2StreamBridge` contract APIs (open/send/cancel/poll/close-action
+mapping) and does not inspect binding-table storage directly.
+
+This contract is a boundary clarification only; it does not change Serval layer
+ownership.
+
 Current support now has five HTTP/2 inbound behaviors:
 - **TLS ALPN `h2` + terminated handler**: when ALPN negotiates `h2` and the handler implements `handleH2Headers` + `handleH2Data`, `Server` dispatches the TLS stream directly into `h2/server.zig` (terminated runtime over TLS)
 - **ALPN rollout policy knobs**: `Config.alpn_mixed_offer_policy` controls mixed-offer ALPN selection (`prefer_http11` vs `prefer_h2`) and `Config.tls_h2_frontend_mode` keeps downstream TLS h2 dispatch explicit (`disabled`, `terminated_only`, `generic`); when ALPN has already negotiated `h2` and no terminated h2 hooks exist, server falls back to generic TLS h2 dispatch to avoid invalid h1 parsing on an h2 connection
@@ -280,6 +310,22 @@ this target organization:
 ```
 
 The mod.zig would dispatch based on negotiated protocol (via ALPN or h2c preface), maintaining the same top-level Server interface.
+
+## TCP/UDP Capability Contract (frontend)
+
+When `Config.tcp_transport` / `Config.udp_transport` are disabled or absent,
+HTTP behavior is unchanged.
+
+When enabled:
+- `frontend/bootstrap.zig` performs shared transport config validation and
+  startup preflight.
+- `frontend/orchestrator.zig` starts/stops transport runtimes under the same
+  shutdown contract as h1/h2 server paths.
+- `frontend/tcp_runtime.zig` handles stream mechanics only (accept/connect/relay/
+  timeout/capacity), consuming shared strategy outputs.
+- `frontend/udp_runtime.zig` handles datagram/session mechanics only
+  (ingress/egress, keying, expiry, bounded sessions), consuming shared strategy
+  outputs.
 
 ## Dependencies
 

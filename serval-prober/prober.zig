@@ -10,15 +10,15 @@ const assert = std.debug.assert;
 const Io = std.Io;
 
 const core = @import("serval-core");
-const log = core.log.scoped(.prober);
 const net = @import("serval-net");
 const health_mod = @import("serval-health");
 const ssl = @import("serval-tls").ssl;
 const serval_client = @import("serval-client");
+const scheduler = @import("scheduler.zig");
+const adapters = @import("adapters.zig");
 
 const Upstream = core.Upstream;
 const HealthState = health_mod.HealthState;
-const UpstreamIndex = core.config.UpstreamIndex;
 const DnsResolver = net.DnsResolver;
 const Client = serval_client.Client;
 const Request = core.types.Request;
@@ -40,13 +40,12 @@ pub const ProberContext = struct {
     allocator: std.mem.Allocator = std.heap.page_allocator,
 };
 
+
 /// Background probe loop - probes unhealthy backends for recovery.
 /// Runs until probe_running is set to false.
 pub fn probeLoop(ctx: ProberContext) void {
     assert(ctx.probe_interval_ms > 0);
     assert(ctx.probe_timeout_ms > 0);
-
-    const interval_duration = std.Io.Duration.fromMilliseconds(@intCast(ctx.probe_interval_ms));
 
     // One-time init at thread start, no allocation in probe loop.
     var io_runtime = Io.Threaded.init(ctx.allocator, .{});
@@ -63,86 +62,25 @@ pub fn probeLoop(ctx: ProberContext) void {
     );
     defer client.deinit();
 
-    while (ctx.probe_running.load(.acquire)) {
-        probeUnhealthyBackends(ctx, &client, io);
-        std.Io.sleep(std.Options.debug_io, interval_duration, .awake) catch {};
-    }
-}
-
-/// Probe all unhealthy backends.
-fn probeUnhealthyBackends(ctx: ProberContext, client: *Client, io: Io) void {
-    assert(ctx.upstreams.len > 0);
-
-    for (ctx.upstreams, 0..) |upstream, i| {
-        const idx: UpstreamIndex = @intCast(i);
-
-        // Healthy backends get passive checks via traffic, only probe unhealthy ones.
-        if (ctx.health.isHealthy(idx)) continue;
-
-        const success = probeBackend(client, upstream, ctx.health_path, io);
-        if (success) {
-            ctx.health.recordSuccess(idx);
-        }
-        // Don't record failure - backend is already unhealthy.
-    }
-}
-
-/// Probe a single backend using serval-client HTTP request.
-/// Returns true if probe succeeds (2xx response).
-fn probeBackend(
-    client: *Client,
-    upstream: Upstream,
-    health_path: []const u8,
-    io: Io,
-) bool {
-    assert(upstream.host.len > 0);
-    assert(health_path.len > 0);
-
-    var request = Request{
-        .method = .GET,
-        .path = health_path,
-        .version = .@"HTTP/1.1",
-        .headers = .{},
+    var adapter_context = adapters.HttpProbeAdapterContext{
+        .client = &client,
+        .health_path = ctx.health_path,
     };
 
-    // Connection: close for one-shot probe.
-    request.headers.put("Host", upstream.host) catch return logHeaderError(upstream);
-    request.headers.put("Connection", "close") catch return logHeaderError(upstream);
-    request.headers.put("User-Agent", "serval-prober/1.0") catch return logHeaderError(upstream);
-
-    var header_buf: [1024]u8 = std.mem.zeroes([1024]u8);
-
-    var result = client.request(upstream, &request, &header_buf, io) catch |err| {
-        log.debug("prober: request failed for {s}:{d}: {s}", .{
-            upstream.host,
-            upstream.port,
-            @errorName(err),
-        });
-        return false;
+    const scheduler_context = scheduler.SchedulerContext{
+        .upstreams = ctx.upstreams,
+        .health = ctx.health,
+        .probe_running = ctx.probe_running,
+        .probe_interval_ms = ctx.probe_interval_ms,
+        .adapter = .{
+            .context = &adapter_context,
+            .probeFn = adapters.httpProbe,
+        },
     };
 
-    result.conn.socket.close();
-
-    const status = result.response.status;
-    const success = status >= 200 and status < 300;
-
-    if (!success) {
-        log.debug("prober: non-2xx status {d} for {s}:{d}{s}", .{
-            status,
-            upstream.host,
-            upstream.port,
-            health_path,
-        });
-    }
-
-    return success;
+    scheduler.runLoopWithIo(scheduler_context, io);
 }
 
-/// Log header setup failure and return false.
-fn logHeaderError(upstream: Upstream) bool {
-    log.debug("prober: failed to add header for {s}:{d}", .{ upstream.host, upstream.port });
-    return false;
-}
 
 test "parseHttpStatus - 2xx success codes" {
     const testStatus = struct {

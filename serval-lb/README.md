@@ -23,8 +23,10 @@ serval-router: client → [Router] → /api/* → pool1 → backend1, backend2
 
 ## Exports
 
-- `LbHandler` - Health-aware round-robin load balancer handler
+- `LbHandler` - Health-aware round-robin load balancer handler (HTTP adapter)
 - `LbConfig` - Configuration for thresholds, probing intervals
+- `RoundRobinStrategy` - Protocol-agnostic strategy core (TCP/UDP/HTTP reuse)
+- `StrategyConfig` - Strategy thresholds shared across protocol adapters
 
 ## Usage
 
@@ -85,6 +87,12 @@ pub const LbConfig = struct {
 
 ## Features
 
+### Shared Strategy Core (HTTP/TCP/UDP)
+
+`strategy_core.zig` owns transport-agnostic upstream selection and health transitions.
+HTTP, TCP, and UDP paths consume this core instead of embedding policy logic in
+transport mechanics.
+
 ### Health-Aware Selection
 
 `selectUpstream()` skips unhealthy backends, cycling through only healthy ones:
@@ -109,8 +117,9 @@ Background thread probes unhealthy backends for recovery (via `serval-prober`):
 
 ```
 serval-lb/
-├── mod.zig       # Module exports
-└── handler.zig   # LbHandler implementation
+├── mod.zig            # Module exports
+├── strategy_core.zig  # Protocol-agnostic round-robin + health strategy core
+└── handler.zig        # HTTP adapter over strategy_core
 ```
 
 ## Implementation Status

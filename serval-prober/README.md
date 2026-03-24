@@ -8,8 +8,11 @@ Active health checking module that runs HTTP/HTTPS GET probes against unhealthy 
 
 ## Exports
 
-- `ProberContext` - Context struct for background prober thread
-- `probeLoop` - Background loop function (run in separate thread)
+- `ProberContext` - Legacy HTTP probe context wrapper
+- `probeLoop` - Legacy wrapper over shared scheduler
+- `ProbeScheduler` - Protocol-agnostic probe scheduler core
+- `ProbeTarget` / `ProbeAdapter` - Shared scheduler contracts
+- `HttpProbeAdapter` / `TcpProbeAdapter` / `UdpProbeAdapter` - Protocol adapters
 
 ## Usage
 
@@ -67,6 +70,15 @@ pub const ProberContext = struct {
 
 ## Design
 
+### Shared Scheduler + Adapter Contract
+
+The prober is split into:
+- a bounded scheduler/lifecycle core (`scheduler.zig`)
+- protocol adapters (`adapters.zig`) for HTTP/TCP/UDP semantics
+
+This keeps probing policy/state transitions transport-agnostic and prevents
+HTTP-specific success criteria from leaking into L4 paths.
+
 ### Passive vs Active Probing
 
 - **Passive**: Handler hooks (e.g., `onLog`) track success/failure from real traffic
@@ -96,8 +108,10 @@ Uses blocking I/O via serval-client. This is intentional:
 
 ```
 serval-prober/
-├── mod.zig     # Module exports
-└── prober.zig  # Prober implementation
+├── mod.zig        # Module exports
+├── scheduler.zig  # Protocol-agnostic probe scheduler/lifecycle core
+├── adapters.zig   # HTTP/TCP/UDP probe adapters
+└── prober.zig     # Backward-compatible wrapper entry points
 ```
 
 ## Dependencies

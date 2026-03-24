@@ -417,6 +417,25 @@ pub const Router = struct {
 // Tests
 // =============================================================================
 
+fn makeRouterLogEntry(status: u16, upstream: Upstream) LogEntry {
+    return .{
+        .timestamp_s = 0,
+        .start_time_ns = 0,
+        .duration_ns = 0,
+        .method = .GET,
+        .path = "/",
+        .request_bytes = 0,
+        .status = status,
+        .response_bytes = 0,
+        .upstream = upstream,
+        .upstream_duration_ns = 0,
+        .error_phase = null,
+        .error_name = null,
+        .connection_reused = false,
+        .keepalive = true,
+    };
+}
+
 test "Router findRoute matches first route" {
     // Setup: Two routes, both could match, first should win
     const routes = [_]Route{
@@ -695,6 +714,51 @@ test "Router selectUpstream delegates to pool LbHandler" {
     try std.testing.expect(static_action == .forward);
     try std.testing.expectEqualStrings("static-1", static_action.forward.host);
     try std.testing.expectEqual(@as(u16, 9001), static_action.forward.port);
+}
+
+test "Router onLog still updates pool health after LB strategy extraction" {
+    const routes = [_]Route{
+        .{
+            .name = "api",
+            .matcher = .{ .path = .{ .prefix = "/api/" } },
+            .pool_idx = 0,
+        },
+    };
+
+    const upstreams = [_]Upstream{
+        .{ .host = "api-1", .port = 8001, .idx = 0 },
+        .{ .host = "api-2", .port = 8002, .idx = 1 },
+    };
+
+    const pool_configs = [_]PoolConfig{
+        .{ .name = "api-pool", .upstreams = &upstreams, .lb_config = .{
+            .enable_probing = false,
+            .unhealthy_threshold = 2,
+            .healthy_threshold = 1,
+        } },
+    };
+
+    var router: Router = undefined;
+    try router.init(&routes, &pool_configs, &.{}, null, null);
+    defer router.deinit();
+
+    var ctx = Context.init();
+    const req = Request{ .path = "/api/users" };
+
+    const first = router.selectUpstream(&ctx, &req);
+    try std.testing.expect(first == .forward);
+
+    // Mark upstream idx=0 unhealthy via router.onLog passthrough.
+    router.onLog(&ctx, makeRouterLogEntry(500, upstreams[0]));
+    router.onLog(&ctx, makeRouterLogEntry(500, upstreams[0]));
+
+    const pool = router.getPool(0).?;
+    try std.testing.expect(!pool.lb_handler.isHealthy(0));
+    try std.testing.expect(pool.lb_handler.isHealthy(1));
+
+    const next = router.selectUpstream(&ctx, &req);
+    try std.testing.expect(next == .forward);
+    try std.testing.expectEqualStrings("api-2", next.forward.host);
 }
 
 test "Router selectUpstream returns 404 when no route matches" {

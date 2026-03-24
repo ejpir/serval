@@ -30,6 +30,8 @@ pub const H2StreamCloseReason = h2.StreamCloseReason;
 pub const H2StreamSummary = h2.StreamSummary;
 pub const H2ResponseWriter = h2.ResponseWriter;
 pub const H2ServerError = h2.ServerError;
+pub const H2RunError = h2.RunError;
+pub const runH2Server = h2.run;
 pub const servePlainH2Connection = h2.servePlainConnection;
 pub const serveTlsH2Connection = h2.serveTlsConnection;
 

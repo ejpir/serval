@@ -10,7 +10,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const Io = std.Io;
-const posix = std.posix;
+const linux = std.os.linux;
 
 const serval_core = @import("serval-core");
 const config = serval_core.config;
@@ -46,6 +46,11 @@ const RelayFailure = error{
     UpstreamError,
 };
 
+const RelayConfig = struct {
+    idle_timeout_ns: ?u64 = null,
+    idle_check_interval_ms: ?i32 = null,
+};
+
 const RelayPhase = enum {
     startup,
     steady_state,
@@ -56,6 +61,7 @@ const RelayShared = struct {
     mutex: Io.Mutex = .init,
     stats: TunnelStats = .{},
     start_ns: u64,
+    last_progress_ns: u64,
     phase: RelayPhase = .startup,
     client_startup_done: bool = false,
     upstream_startup_done: bool = false,
@@ -64,7 +70,7 @@ const RelayShared = struct {
 
     fn init(start_ns: u64) RelayShared {
         assert(start_ns > 0);
-        return .{ .start_ns = start_ns };
+        return .{ .start_ns = start_ns, .last_progress_ns = start_ns };
     }
 
     fn noteProgress(self: *RelayShared, side: Side, bytes: u32, io: Io) void {
@@ -78,6 +84,7 @@ const RelayShared = struct {
             .client => self.stats.client_to_upstream_bytes +|= bytes,
             .upstream => self.stats.upstream_to_client_bytes +|= bytes,
         }
+        self.last_progress_ns = time.monotonicNanos();
     }
 
     fn markClosed(self: *RelayShared, side: Side, io: Io) void {
@@ -128,6 +135,17 @@ const RelayShared = struct {
         return self.phase;
     }
 
+    fn idleTimeoutExceeded(self: *RelayShared, io: Io, idle_timeout_ns: u64) bool {
+        assert(@intFromPtr(self) != 0);
+        assert(idle_timeout_ns > 0);
+
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+
+        const now_ns = time.monotonicNanos();
+        return time.elapsedNanos(self.last_progress_ns, now_ns) >= idle_timeout_ns;
+    }
+
     fn snapshot(self: *RelayShared, io: Io) TunnelStats {
         assert(@intFromPtr(self) != 0);
 
@@ -148,13 +166,9 @@ pub fn relay(
     initial_client_to_upstream: []const u8,
     initial_upstream_to_client: []const u8,
 ) TunnelStats {
-    return relayImpl(io, client_socket, upstream_socket, initial_client_to_upstream, initial_upstream_to_client);
+    return relayImpl(io, client_socket, upstream_socket, initial_client_to_upstream, initial_upstream_to_client, .{});
 }
 
-/// relayWithConfig keeps the previous signature for callers that pass
-/// idle_timeout_ns / poll_timeout_ms.  Those parameters are no longer
-/// used — idle detection now relies on TCP keepalive and Io group
-/// cancellation — but the API stays compatible.
 pub fn relayWithConfig(
     io: Io,
     client_socket: *Socket,
@@ -164,9 +178,13 @@ pub fn relayWithConfig(
     idle_timeout_ns: u64,
     poll_timeout_ms: i32,
 ) TunnelStats {
-    _ = idle_timeout_ns;
-    _ = poll_timeout_ms;
-    return relayImpl(io, client_socket, upstream_socket, initial_client_to_upstream, initial_upstream_to_client);
+    assert(idle_timeout_ns > 0);
+    assert(poll_timeout_ms > 0);
+
+    return relayImpl(io, client_socket, upstream_socket, initial_client_to_upstream, initial_upstream_to_client, .{
+        .idle_timeout_ns = idle_timeout_ns,
+        .idle_check_interval_ms = poll_timeout_ms,
+    });
 }
 
 fn relayImpl(
@@ -175,6 +193,7 @@ fn relayImpl(
     upstream_socket: *Socket,
     initial_client_to_upstream: []const u8,
     initial_upstream_to_client: []const u8,
+    relay_cfg: RelayConfig,
 ) TunnelStats {
     assert(@intFromPtr(client_socket) != 0);
     assert(@intFromPtr(upstream_socket) != 0);
@@ -201,6 +220,16 @@ fn relayImpl(
         shared.finishTermination(.upstream_error, io);
         return shared.snapshot(io);
     };
+
+    if (relay_cfg.idle_timeout_ns) |idle_timeout_ns| {
+        const check_interval_ms = relay_cfg.idle_check_interval_ms orelse 1000;
+        assert(check_interval_ms > 0);
+
+        group.concurrent(io, idleWatchdog, .{ &shared, &group, io, idle_timeout_ns, check_interval_ms }) catch {
+            shared.finishTermination(.upstream_error, io);
+            return shared.snapshot(io);
+        };
+    }
 
     // Foreground: client → upstream.
     // This guarantees initial downstream bytes are forwarded before any
@@ -252,11 +281,22 @@ fn relayDirection(
         try std.Io.checkCancel(io);
 
         const bytes_read = ioReadSome(source, io, &relay_buf, read_side) catch |err| {
-            logTunnelFailure(shared, io, "read_failed", read_side, write_side, err, source, destination);
-            shared.finishTermination(mapFailureToTermination(err), io);
-            return;
+            switch (err) {
+                error.ClientClosed, error.UpstreamClosed => {
+                    halfCloseWrite(destination, write_side);
+                    logTunnelClosure(shared, io, "read_closed", read_side, write_side, source, destination);
+                    shared.markClosed(read_side, io);
+                    return;
+                },
+                else => {
+                    logTunnelFailure(shared, io, "read_failed", read_side, write_side, err, source, destination);
+                    shared.finishTermination(mapFailureToTermination(err), io);
+                    return;
+                },
+            }
         };
         if (bytes_read == 0) {
+            halfCloseWrite(destination, write_side);
             logTunnelClosure(shared, io, "read_eof", read_side, write_side, source, destination);
             shared.markClosed(read_side, io);
             return;
@@ -271,6 +311,30 @@ fn relayDirection(
     }
 }
 
+fn halfCloseWrite(destination: *Socket, write_side: Side) void {
+    assert(@intFromPtr(destination) != 0);
+
+    switch (destination.*) {
+        .plain => |plain| {
+            const rc = linux.shutdown(plain.fd, @intCast(std.posix.SHUT.WR));
+            switch (linux.errno(rc)) {
+                .SUCCESS => {},
+                .INTR => {},
+                else => |err| {
+                    std.log.debug(
+                        "tunnel: half-close failed write_side={s} fd={d} errno={t}",
+                        .{ @tagName(write_side), plain.fd, err },
+                    );
+                },
+            }
+        },
+        .tls => {
+            // TLS half-close is protocol-sensitive (close_notify). For now we
+            // keep TLS behavior unchanged and rely on normal close paths.
+        },
+    }
+}
+
 fn waitForSteadyState(shared: *RelayShared, io: Io) Io.Cancelable!void {
     assert(@intFromPtr(shared) != 0);
 
@@ -282,6 +346,34 @@ fn waitForSteadyState(shared: *RelayShared, io: Io) Io.Cancelable!void {
         switch (phase) {
             .startup => try std.Io.sleep(io, Io.Duration.fromMilliseconds(startup_poll_sleep_ms), .awake),
             .steady_state, .closing => return,
+        }
+    }
+}
+
+fn idleWatchdog(
+    shared: *RelayShared,
+    group: *Io.Group,
+    io: Io,
+    idle_timeout_ns: u64,
+    idle_check_interval_ms: i32,
+) Io.Cancelable!void {
+    assert(@intFromPtr(shared) != 0);
+    assert(@intFromPtr(group) != 0);
+    assert(idle_timeout_ns > 0);
+    assert(idle_check_interval_ms > 0);
+
+    while (true) {
+        try std.Io.checkCancel(io);
+
+        const phase = shared.loadPhase(io);
+        if (phase == .closing) return;
+
+        try std.Io.sleep(io, Io.Duration.fromMilliseconds(@intCast(idle_check_interval_ms)), .awake);
+
+        if (shared.idleTimeoutExceeded(io, idle_timeout_ns)) {
+            shared.finishTermination(.idle_timeout, io);
+            group.cancel(io);
+            return;
         }
     }
 }
@@ -513,6 +605,35 @@ test "relay forwards initial buffered bytes before streaming" {
 
     try std.testing.expectEqual(@as(u64, 10), stats.client_to_upstream_bytes);
     try std.testing.expectEqual(@as(u64, 12), stats.upstream_to_client_bytes);
+}
+
+test "relayWithConfig enforces idle timeout" {
+    var evented: std.Io.Evented = undefined;
+    try evented.init(std.testing.allocator, .{ .thread_limit = 0 });
+    defer evented.deinit();
+
+    const client_pair = try std.posix.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    defer std.posix.close(client_pair[0]);
+    defer std.posix.close(client_pair[1]);
+
+    const upstream_pair = try std.posix.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    defer std.posix.close(upstream_pair[0]);
+    defer std.posix.close(upstream_pair[1]);
+
+    var client_socket = Socket.Plain.init_client(client_pair[0]);
+    var upstream_socket = Socket.Plain.init_client(upstream_pair[0]);
+
+    const stats = relayWithConfig(
+        evented.io(),
+        &client_socket,
+        &upstream_socket,
+        "",
+        "",
+        time.millisToNanos(40),
+        10,
+    );
+
+    try std.testing.expectEqual(Termination.idle_timeout, stats.termination);
 }
 
 test "finishTermination accepts closed-side termination" {

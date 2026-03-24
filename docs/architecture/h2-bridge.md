@@ -48,9 +48,15 @@ HTTP/2 proxy for arbitrary request/response traffic.
 
 This split is intentional:
 
-- `serval-server` decides when a connection enters bridge mode
-- `serval-proxy` owns how streams are forwarded
+- `serval-server` decides when a connection enters bridge mode and applies
+  request-class policy
+- `serval-proxy` owns how streams are forwarded and polled
 - `serval-client` owns reusable upstream session state
+
+`serval-server` must consume the bridge contract (`openDownstreamStream`,
+`sendDownstreamData`, `cancelDownstreamStream`, `pollNextAction`,
+`takeAffectedDownstreamsForConnectionClose`) and mapped receive actions. It
+must not access bridge binding-table internals directly.
 
 ## Bridge Model
 

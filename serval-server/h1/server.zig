@@ -207,6 +207,8 @@ pub fn Server(
         /// Created once at init, shared across all connections.
         /// TigerStyle: Caller owns lifecycle via deinit.
         client_ctx: ?*ssl.SSL_CTX,
+        /// DNS configuration retained for transport runtime orchestration.
+        dns_config: DnsConfig,
 
         /// Protects publish/unpublish of the server TLS manager pointer.
         /// TigerStyle: Explicit synchronization for control-plane activation path.
@@ -298,6 +300,7 @@ pub fn Server(
                 .config = cfg,
                 .forwarder = forwarder_mod.Forwarder(Pool, Tracer).init(pool, tracer, verify_upstream, client_ctx, dns_config),
                 .client_ctx = client_ctx,
+                .dns_config = dns_config,
             };
         }
 
@@ -327,8 +330,23 @@ pub fn Server(
             assert(self.config.port > 0);
             assert(self.config.listen_host.len > 0);
 
-            const addr = Io.net.IpAddress.parse(self.config.listen_host, self.config.port) catch
-                return error.InvalidAddress;
+            const addr = frontend.preflightAndResolveListenAddress(&self.config) catch |err| {
+                log.err("server: frontend preflight failed: {s}", .{@errorName(err)});
+                return err;
+            };
+
+            var runtime_orchestrator: frontend.RuntimeOrchestrator = undefined;
+            runtime_orchestrator.init(
+                shutdown,
+                self.dns_config,
+                self.client_ctx,
+                self.forwarder.verify_upstream_tls,
+            );
+            runtime_orchestrator.start(&self.config) catch |err| {
+                log.err("server: frontend runtime orchestration start failed: {s}", .{@errorName(err)});
+                return err;
+            };
+            defer runtime_orchestrator.stop();
 
             var tcp_server = addr.listen(io, .{
                 .kernel_backlog = self.config.kernel_backlog,
@@ -1193,7 +1211,6 @@ pub fn Server(
             upstream_reader_group: Io.Group = .init,
             upstream_reader_started: bool = false,
             upstream_reader_stop: bool = false,
-            upstream_reader_scan_cursor: u16 = 0,
             pending_resets: [pending_reset_capacity]PendingReset = [_]PendingReset{.{}} ** pending_reset_capacity,
             grpc_completion_policy: GrpcCompletionPolicy = .{},
 
@@ -1595,14 +1612,6 @@ pub fn Server(
                 return supports_h2c_plain or supports_h2_tls;
             }
 
-            fn goawayAffectsActiveTargetStream(upstream_stream_id: u32, goaway: serval_h2.GoAway) bool {
-                assert(upstream_stream_id > 0);
-                assert(goaway.last_stream_id <= 0x7fff_ffff);
-
-                if (goaway.error_code_raw != @intFromEnum(serval_h2.ErrorCode.no_error)) return true;
-                return upstream_stream_id > goaway.last_stream_id;
-            }
-
             fn streamWriterFor(template: *h2_server.ResponseWriter, stream_id: u32) h2_server.ResponseWriter {
                 assert(@intFromPtr(template) != 0);
                 assert(stream_id > 0);
@@ -1666,53 +1675,12 @@ pub fn Server(
                 self.bridge_mutex.lockUncancelable(self.io);
                 defer self.bridge_mutex.unlock(self.io);
 
-                if (self.bridge.activeBindingCount() == 0) {
-                    return error.WouldBlock;
-                }
-
                 const timeout: Io.Timeout = .{ .duration = .{
                     .raw = Io.Duration.fromMilliseconds(upstream_read_timeout_ms),
                     .clock = .awake,
                 } };
 
-                const binding_table = &self.bridge.binding_table;
-                const slot_count: u16 = @intCast(binding_table.slots.len);
-                assert(slot_count > 0);
-
-                var scanned: u16 = 0;
-                while (scanned < slot_count) : (scanned += 1) {
-                    const cursor: u16 = @mod(self.upstream_reader_scan_cursor + scanned, slot_count);
-                    const index: usize = @intCast(cursor);
-                    if (!binding_table.slots[index].used) continue;
-                    const binding = binding_table.slots[index].binding;
-                    self.upstream_reader_scan_cursor = @mod(cursor + 1, slot_count);
-                    // log.debug(
-                    //     "h2 bridge: conn={d} waiting upstream action downstream_stream={d} upstream_stream={d} idx={d} gen={d}",
-                    //     .{
-                    //         self.connection_ctx.connection_id,
-                    //         binding.downstream_stream_id,
-                    //         binding.upstream_stream_id,
-                    //         binding.upstream_index,
-                    //         binding.upstream_session_generation,
-                    //     },
-                    // );
-                    return self.bridge.receiveForDownstream(self.io, timeout, binding.downstream_stream_id) catch |err| switch (err) {
-                        error.BindingNotFound => continue,
-                        error.SessionNotFound => {
-                            _ = self.bridge.binding_table.removeByDownstream(binding.downstream_stream_id) catch |remove_err| switch (remove_err) {
-                                error.BindingNotFound => {},
-                                else => return remove_err,
-                            };
-                            continue;
-                        },
-                        error.WouldBlock,
-                        error.ReadFailed,
-                        => continue,
-                        else => return err,
-                    };
-                }
-
-                return error.WouldBlock;
+                return self.bridge.pollNextAction(self.io, timeout);
             }
 
             fn dispatchUpstreamAction(self: *@This(), action: serval_proxy.h2.bridge.ReceiveAction) void {
@@ -1879,21 +1847,7 @@ pub fn Server(
                     self.bridge_mutex.lockUncancelable(self.io);
                     defer self.bridge_mutex.unlock(self.io);
 
-                    var index: usize = 0;
-                    while (index < self.bridge.binding_table.slots.len) : (index += 1) {
-                        const slot = self.bridge.binding_table.slots[index];
-                        if (!slot.used) continue;
-
-                        const binding = slot.binding;
-                        if (binding.upstream_index != close.upstream_index) continue;
-                        if (binding.upstream_session_generation != close.upstream_session_generation) continue;
-                        if (!goawayAffectsActiveTargetStream(binding.upstream_stream_id, close.goaway)) continue;
-                        if (downstream_count >= downstream_ids.len) break;
-
-                        downstream_ids[downstream_count] = binding.downstream_stream_id;
-                        downstream_count += 1;
-                        _ = self.bridge.binding_table.removeByDownstream(binding.downstream_stream_id) catch continue;
-                    }
+                    downstream_count = self.bridge.takeAffectedDownstreamsForConnectionClose(close, downstream_ids[0..]);
                 }
 
                 const reset_error_code_raw: u32 = if (close.goaway.error_code_raw == @intFromEnum(serval_h2.ErrorCode.no_error))
@@ -3658,4 +3612,10 @@ test "parseContentLengthValue invalid" {
     try std.testing.expectEqual(@as(?u64, null), parseContentLengthValue("abc"));
     try std.testing.expectEqual(@as(?u64, null), parseContentLengthValue("12a34"));
     try std.testing.expectEqual(@as(?u64, null), parseContentLengthValue("18446744073709551616"));
+}
+
+test "h2 bridge adapter avoids proxy binding table internals" {
+    const source = @embedFile("server.zig");
+    const needle = "bridge." ++ "binding_table";
+    try std.testing.expect(std.mem.indexOf(u8, source, needle) == null);
 }

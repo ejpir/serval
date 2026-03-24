@@ -5,6 +5,7 @@
 //! TigerStyle: Units in names, explicit values.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const builtin = @import("builtin");
 const time = @import("time.zig");
 
@@ -290,6 +291,21 @@ pub const DEFAULT_PROBE_TIMEOUT_MS: u32 = 2000;
 
 /// Default path for HTTP health probes.
 pub const DEFAULT_HEALTH_PATH: []const u8 = "/";
+
+/// Default TCP tunnel connect timeout in milliseconds.
+pub const DEFAULT_TCP_CONNECT_TIMEOUT_MS: u32 = 2000;
+
+/// Default TCP tunnel idle timeout in milliseconds.
+pub const DEFAULT_TCP_IDLE_TIMEOUT_MS: u32 = 60_000;
+
+/// Default UDP session idle timeout in milliseconds.
+pub const DEFAULT_UDP_SESSION_IDLE_TIMEOUT_MS: u32 = 30_000;
+
+/// Default maximum concurrent TCP tunnels per listener.
+pub const DEFAULT_TCP_MAX_CONCURRENT_CONNECTIONS: u32 = 10_000;
+
+/// Default maximum active UDP sessions per listener.
+pub const DEFAULT_UDP_MAX_ACTIVE_SESSIONS: u32 = 100_000;
 
 // =============================================================================
 // OpenTelemetry / Tracing Limits
@@ -583,6 +599,74 @@ pub const AlpnMixedOfferPolicy = enum {
     http11_only,
 };
 
+/// TCP upstream transport mode for L4 tunneling.
+pub const TcpTlsMode = enum {
+    /// Raw TCP passthrough to upstream target.
+    passthrough,
+    /// Originate TLS when connecting to upstream target.
+    originate_tls,
+};
+
+/// Active probing mode for TCP targets.
+pub const TcpProbeMode = enum {
+    /// No active probes; rely on passive health signals only.
+    passive_only,
+    /// Active connect probe (and TLS handshake when tls mode requires).
+    connect,
+};
+
+/// Active probing mode for UDP targets.
+pub const UdpProbeMode = enum {
+    /// No active probes; rely on passive health signals only.
+    passive_only,
+    /// Send configured probe payload only.
+    active_send,
+    /// Send payload and require response within timeout.
+    active_send_expect,
+};
+
+/// Session keying mode for UDP mapping state.
+pub const UdpSessionKeyMode = enum {
+    /// Source IP + source port + destination IP + destination port + protocol.
+    five_tuple,
+    /// Source IP + source port + protocol.
+    source_endpoint,
+    /// Source IP + protocol.
+    source_ip,
+};
+
+/// L4 backend target definition used by TCP/UDP transport config.
+pub const L4Target = struct {
+    host: []const u8,
+    port: u16,
+    tls: bool = false,
+};
+
+/// TCP listener/runtime configuration for L4 tunneling.
+pub const TcpTransportConfig = struct {
+    enabled: bool = false,
+    listener_host: []const u8 = "0.0.0.0",
+    listener_port: u16 = 0,
+    upstreams: []const L4Target = &.{},
+    max_concurrent_connections: u32 = DEFAULT_TCP_MAX_CONCURRENT_CONNECTIONS,
+    connect_timeout_ms: u32 = DEFAULT_TCP_CONNECT_TIMEOUT_MS,
+    idle_timeout_ms: u32 = DEFAULT_TCP_IDLE_TIMEOUT_MS,
+    tls_mode: TcpTlsMode = .passthrough,
+    probe_mode: TcpProbeMode = .connect,
+};
+
+/// UDP listener/runtime configuration for L4 tunneling.
+pub const UdpTransportConfig = struct {
+    enabled: bool = false,
+    listener_host: []const u8 = "0.0.0.0",
+    listener_port: u16 = 0,
+    upstreams: []const L4Target = &.{},
+    max_active_sessions: u32 = DEFAULT_UDP_MAX_ACTIVE_SESSIONS,
+    session_idle_timeout_ms: u32 = DEFAULT_UDP_SESSION_IDLE_TIMEOUT_MS,
+    session_key_mode: UdpSessionKeyMode = .five_tuple,
+    probe_mode: UdpProbeMode = .passive_only,
+};
+
 pub const Config = struct {
     /// Host/address to bind the frontend listener to.
     /// Examples:
@@ -626,6 +710,14 @@ pub const Config = struct {
     /// ACME certificate automation configuration.
     /// Null disables automatic issuance/renewal.
     acme: ?AcmeConfig = null,
+
+    /// Optional TCP L4 tunneling configuration.
+    /// Null leaves TCP transport subsystem disabled.
+    tcp_transport: ?TcpTransportConfig = null,
+
+    /// Optional UDP L4 tunneling configuration.
+    /// Null leaves UDP transport subsystem disabled.
+    udp_transport: ?UdpTransportConfig = null,
 };
 
 /// ACME / Let's Encrypt runtime configuration.
@@ -684,6 +776,71 @@ pub const TlsConfig = struct {
     io_timeout_ns: u64 = time.secondsToNanos(30),
 };
 
+pub const TransportConfigError = error{
+    TcpListenerHostEmpty,
+    TcpListenerPortInvalid,
+    TcpTargetSetEmpty,
+    TcpTargetHostEmpty,
+    TcpTargetPortInvalid,
+    TcpMaxConcurrentInvalid,
+    TcpConnectTimeoutInvalid,
+    TcpIdleTimeoutInvalid,
+    UdpListenerHostEmpty,
+    UdpListenerPortInvalid,
+    UdpTargetSetEmpty,
+    UdpTargetHostEmpty,
+    UdpTargetPortInvalid,
+    UdpMaxSessionsInvalid,
+    UdpSessionIdleTimeoutInvalid,
+};
+
+pub fn validateTransportConfig(cfg: *const Config) TransportConfigError!void {
+    assert(@intFromPtr(cfg) != 0);
+
+    if (cfg.tcp_transport) |tcp_cfg| {
+        try validateTcpTransportConfig(&tcp_cfg);
+    }
+
+    if (cfg.udp_transport) |udp_cfg| {
+        try validateUdpTransportConfig(&udp_cfg);
+    }
+}
+
+fn validateTcpTransportConfig(cfg: *const TcpTransportConfig) TransportConfigError!void {
+    assert(@intFromPtr(cfg) != 0);
+
+    if (!cfg.enabled) return;
+
+    if (cfg.listener_host.len == 0) return error.TcpListenerHostEmpty;
+    if (cfg.listener_port == 0) return error.TcpListenerPortInvalid;
+    if (cfg.upstreams.len == 0) return error.TcpTargetSetEmpty;
+    if (cfg.max_concurrent_connections == 0) return error.TcpMaxConcurrentInvalid;
+    if (cfg.connect_timeout_ms == 0) return error.TcpConnectTimeoutInvalid;
+    if (cfg.idle_timeout_ms == 0) return error.TcpIdleTimeoutInvalid;
+
+    for (cfg.upstreams) |upstream| {
+        if (upstream.host.len == 0) return error.TcpTargetHostEmpty;
+        if (upstream.port == 0) return error.TcpTargetPortInvalid;
+    }
+}
+
+fn validateUdpTransportConfig(cfg: *const UdpTransportConfig) TransportConfigError!void {
+    assert(@intFromPtr(cfg) != 0);
+
+    if (!cfg.enabled) return;
+
+    if (cfg.listener_host.len == 0) return error.UdpListenerHostEmpty;
+    if (cfg.listener_port == 0) return error.UdpListenerPortInvalid;
+    if (cfg.upstreams.len == 0) return error.UdpTargetSetEmpty;
+    if (cfg.max_active_sessions == 0) return error.UdpMaxSessionsInvalid;
+    if (cfg.session_idle_timeout_ms == 0) return error.UdpSessionIdleTimeoutInvalid;
+
+    for (cfg.upstreams) |upstream| {
+        if (upstream.host.len == 0) return error.UdpTargetHostEmpty;
+        if (upstream.port == 0) return error.UdpTargetPortInvalid;
+    }
+}
+
 test "Config has sensible defaults" {
     const cfg = Config{};
     try std.testing.expectEqualStrings("0.0.0.0", cfg.listen_host);
@@ -694,6 +851,8 @@ test "Config has sensible defaults" {
     try std.testing.expectEqual(TlsH2FrontendMode.terminated_only, cfg.tls_h2_frontend_mode);
     try std.testing.expectEqual(AlpnMixedOfferPolicy.prefer_http11, cfg.alpn_mixed_offer_policy);
     try std.testing.expect(cfg.acme == null);
+    try std.testing.expect(cfg.tcp_transport == null);
+    try std.testing.expect(cfg.udp_transport == null);
 }
 
 test "AcmeConfig has sensible defaults" {
@@ -702,6 +861,95 @@ test "AcmeConfig has sensible defaults" {
     try std.testing.expectEqual(ACME_DEFAULT_RENEW_BEFORE_NS, cfg.renew_before_ns);
     try std.testing.expectEqual(ACME_DEFAULT_POLL_INTERVAL_MS, cfg.poll_interval_ms);
     try std.testing.expectEqual(@as(usize, 0), cfg.domains.len);
+}
+
+test "validateTransportConfig accepts disabled transport configs" {
+    var cfg = Config{
+        .tcp_transport = .{ .enabled = false },
+        .udp_transport = .{ .enabled = false },
+    };
+
+    try validateTransportConfig(&cfg);
+}
+
+test "validateTransportConfig accepts valid enabled tcp/udp configs" {
+    const tcp_targets = [_]L4Target{
+        .{ .host = "127.0.0.1", .port = 9001 },
+        .{ .host = "127.0.0.1", .port = 9002, .tls = true },
+    };
+
+    const udp_targets = [_]L4Target{
+        .{ .host = "127.0.0.1", .port = 10001 },
+    };
+
+    var cfg = Config{
+        .tcp_transport = .{
+            .enabled = true,
+            .listener_host = "0.0.0.0",
+            .listener_port = 7000,
+            .upstreams = &tcp_targets,
+            .max_concurrent_connections = 1024,
+            .connect_timeout_ms = 2000,
+            .idle_timeout_ms = 30000,
+            .tls_mode = .originate_tls,
+            .probe_mode = .connect,
+        },
+        .udp_transport = .{
+            .enabled = true,
+            .listener_host = "0.0.0.0",
+            .listener_port = 7001,
+            .upstreams = &udp_targets,
+            .max_active_sessions = 4096,
+            .session_idle_timeout_ms = 15000,
+            .session_key_mode = .source_endpoint,
+            .probe_mode = .active_send_expect,
+        },
+    };
+
+    try validateTransportConfig(&cfg);
+}
+
+test "validateTransportConfig rejects invalid enabled tcp config" {
+    var cfg = Config{
+        .tcp_transport = .{
+            .enabled = true,
+            .listener_host = "",
+            .listener_port = 0,
+            .upstreams = &.{},
+            .max_concurrent_connections = 0,
+            .connect_timeout_ms = 0,
+            .idle_timeout_ms = 0,
+        },
+    };
+
+    try std.testing.expectError(error.TcpListenerHostEmpty, validateTransportConfig(&cfg));
+
+    cfg.tcp_transport.?.listener_host = "0.0.0.0";
+    try std.testing.expectError(error.TcpListenerPortInvalid, validateTransportConfig(&cfg));
+
+    cfg.tcp_transport.?.listener_port = 7000;
+    try std.testing.expectError(error.TcpTargetSetEmpty, validateTransportConfig(&cfg));
+}
+
+test "validateTransportConfig rejects invalid enabled udp config" {
+    var cfg = Config{
+        .udp_transport = .{
+            .enabled = true,
+            .listener_host = "",
+            .listener_port = 0,
+            .upstreams = &.{},
+            .max_active_sessions = 0,
+            .session_idle_timeout_ms = 0,
+        },
+    };
+
+    try std.testing.expectError(error.UdpListenerHostEmpty, validateTransportConfig(&cfg));
+
+    cfg.udp_transport.?.listener_host = "0.0.0.0";
+    try std.testing.expectError(error.UdpListenerPortInvalid, validateTransportConfig(&cfg));
+
+    cfg.udp_transport.?.listener_port = 7001;
+    try std.testing.expectError(error.UdpTargetSetEmpty, validateTransportConfig(&cfg));
 }
 
 test "Limits are sensible" {

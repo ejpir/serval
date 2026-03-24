@@ -42,6 +42,33 @@ Top-level exports from [mod.zig](/home/nick/repos/serval/serval-proxy/mod.zig):
 
 ## Main Developer Entry Points
 
+### h2 StreamBridge contract surface
+
+`H2StreamBridge` is the mechanics boundary consumed by `serval-server`.
+
+```text
+serval-server policy/orchestration
+        │ stable mechanics contract
+        ▼
+serval-proxy H2StreamBridge
+        │ reusable sessions/runtime
+        ▼
+serval-client
+```
+
+- `openDownstreamStream(...)` opens/binds a downstream stream to an upstream stream
+- `sendDownstreamData(...)` forwards request DATA for an existing binding
+- `cancelDownstreamStream(...)` maps downstream cancellation/reset upstream
+- `pollNextAction(io, timeout)` provides bounded fair polling across active bindings
+- `takeAffectedDownstreamsForConnectionClose(...)` returns/removes downstream
+  streams that must be reset for a GOAWAY/session-close action
+- `activeBindingCount()` exposes bounded active binding count only (no table
+  internals)
+
+The server/orchestration layer is expected to use only this contract and mapped
+`ReceiveAction` values rather than accessing binding-table storage directly.
+This is a boundary clarification only; module layer ownership is unchanged.
+
 The forwarding surface in [forwarder.zig](/home/nick/repos/serval/serval-proxy/forwarder.zig):
 
 | Function | Purpose |

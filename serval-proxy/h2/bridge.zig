@@ -83,10 +83,19 @@ fn shouldLogIdleWait(since_last_action_ns: u64) bool {
     return phase_ns <= 50 * std.time.ns_per_ms;
 }
 
+fn goawayAffectsActiveTargetStream(upstream_stream_id: u32, goaway: h2.GoAway) bool {
+    assert(upstream_stream_id > 0);
+    assert(goaway.last_stream_id <= 0x7fff_ffff);
+
+    if (goaway.error_code_raw != @intFromEnum(h2.ErrorCode.no_error)) return true;
+    return upstream_stream_id > goaway.last_stream_id;
+}
+
 pub const StreamBridge = struct {
     client: *serval_client.Client,
     sessions: *serval_client.H2UpstreamSessionPool,
     binding_table: bindings.BindingTable = bindings.BindingTable.init(),
+    poll_scan_cursor: u16 = 0,
     debug_connection_id: u64 = 0,
 
     pub fn init(client: *serval_client.Client, sessions: *serval_client.H2UpstreamSessionPool) StreamBridge {
@@ -103,6 +112,7 @@ pub const StreamBridge = struct {
         assert(@intFromPtr(self) != 0);
 
         self.binding_table = bindings.BindingTable.init();
+        self.poll_scan_cursor = 0;
         self.sessions.closeAll();
     }
 
@@ -384,6 +394,87 @@ pub const StreamBridge = struct {
         }
 
         return self.mapReceiveAction(binding.upstream_index, binding.upstream_session_generation, action);
+    }
+
+    pub fn pollNextAction(
+        self: *StreamBridge,
+        io: Io,
+        timeout: Io.Timeout,
+    ) Error!ReceiveAction {
+        assert(@intFromPtr(self) != 0);
+
+        if (self.binding_table.count == 0) return error.WouldBlock;
+
+        const slot_count: u16 = @intCast(self.binding_table.slots.len);
+        assert(slot_count > 0);
+
+        var scanned: u16 = 0;
+        while (scanned < slot_count) : (scanned += 1) {
+            const cursor: u16 = @mod(self.poll_scan_cursor + scanned, slot_count);
+            const index: usize = @intCast(cursor);
+            const slot = self.binding_table.slots[index];
+            if (!slot.used) continue;
+
+            const binding = slot.binding;
+            self.poll_scan_cursor = @mod(cursor + 1, slot_count);
+
+            const action = self.receiveForDownstream(io, timeout, binding.downstream_stream_id) catch |err| switch (err) {
+                error.BindingNotFound => continue,
+                error.SessionNotFound => {
+                    _ = self.binding_table.removeByDownstream(binding.downstream_stream_id) catch |remove_err| switch (remove_err) {
+                        error.BindingNotFound => {},
+                        else => return remove_err,
+                    };
+                    continue;
+                },
+                error.WouldBlock,
+                error.ConnectionClosed,
+                error.ConnectionClosing,
+                error.ReadFailed,
+                error.WriteFailed,
+                => continue,
+                else => return err,
+            };
+
+            if (action == .none) continue;
+            return action;
+        }
+
+        return error.WouldBlock;
+    }
+
+    pub fn takeAffectedDownstreamsForConnectionClose(
+        self: *StreamBridge,
+        close: ConnectionCloseAction,
+        downstream_stream_ids: []u32,
+    ) u16 {
+        assert(@intFromPtr(self) != 0);
+        assert(close.upstream_session_generation > 0);
+        assert(close.goaway.last_stream_id <= 0x7fff_ffff);
+        assert(downstream_stream_ids.len >= self.binding_table.slots.len);
+
+        var downstream_count: u16 = 0;
+        var index: usize = 0;
+        while (index < self.binding_table.slots.len) : (index += 1) {
+            const slot = self.binding_table.slots[index];
+            if (!slot.used) continue;
+
+            const binding = slot.binding;
+            if (binding.upstream_index != close.upstream_index) continue;
+            if (binding.upstream_session_generation != close.upstream_session_generation) continue;
+            if (!goawayAffectsActiveTargetStream(binding.upstream_stream_id, close.goaway)) continue;
+
+            const out_index: usize = @intCast(downstream_count);
+            downstream_stream_ids[out_index] = binding.downstream_stream_id;
+            downstream_count += 1;
+
+            _ = self.binding_table.removeByDownstream(binding.downstream_stream_id) catch |err| switch (err) {
+                error.BindingNotFound => {},
+                else => unreachable,
+            };
+        }
+
+        return downstream_count;
     }
 
     pub fn closeUpstream(self: *StreamBridge, upstream_index: config.UpstreamIndex) void {
@@ -748,4 +839,67 @@ test "StreamBridge clears only matching generation bindings on error connection_
     try std.testing.expect(bridge.binding_table.getByDownstream(13) == null);
     try std.testing.expect(bridge.binding_table.getByDownstream(15) != null);
     try std.testing.expectEqual(@as(u16, 1), bridge.activeBindingCount());
+}
+
+test "StreamBridge takeAffectedDownstreamsForConnectionClose removes only blocked no-error GOAWAY streams" {
+    var dns_resolver: @import("serval-net").DnsResolver = undefined;
+    @import("serval-net").DnsResolver.init(&dns_resolver, .{});
+    var client = serval_client.Client.init(std.testing.allocator, &dns_resolver, null, false);
+    var sessions = serval_client.H2UpstreamSessionPool.init();
+    defer sessions.deinit();
+
+    var bridge = StreamBridge.init(&client, &sessions);
+    defer bridge.deinit();
+
+    const upstream_index: config.UpstreamIndex = 2;
+    const generation: u32 = 4;
+    try bridge.binding_table.put(.{
+        .downstream_stream_id = 31,
+        .upstream_stream_id = 1,
+        .upstream_index = upstream_index,
+        .upstream_session_generation = generation,
+    });
+    try bridge.binding_table.put(.{
+        .downstream_stream_id = 33,
+        .upstream_stream_id = 5,
+        .upstream_index = upstream_index,
+        .upstream_session_generation = generation,
+    });
+
+    var affected: [config.H2_MAX_CONCURRENT_STREAMS]u32 = [_]u32{0} ** config.H2_MAX_CONCURRENT_STREAMS;
+    const affected_count = bridge.takeAffectedDownstreamsForConnectionClose(.{
+        .upstream_index = upstream_index,
+        .upstream_session_generation = generation,
+        .goaway = .{
+            .last_stream_id = 3,
+            .error_code_raw = @intFromEnum(h2.ErrorCode.no_error),
+            .debug_data = "graceful",
+        },
+    }, affected[0..]);
+
+    try std.testing.expectEqual(@as(u16, 1), affected_count);
+    try std.testing.expectEqual(@as(u32, 33), affected[0]);
+    try std.testing.expect(bridge.binding_table.getByDownstream(31) != null);
+    try std.testing.expect(bridge.binding_table.getByDownstream(33) == null);
+}
+
+test "StreamBridge pollNextAction returns WouldBlock when no bindings are active" {
+    var dns_resolver: @import("serval-net").DnsResolver = undefined;
+    @import("serval-net").DnsResolver.init(&dns_resolver, .{});
+    var client = serval_client.Client.init(std.testing.allocator, &dns_resolver, null, false);
+    var sessions = serval_client.H2UpstreamSessionPool.init();
+    defer sessions.deinit();
+
+    var bridge = StreamBridge.init(&client, &sessions);
+    defer bridge.deinit();
+
+    var evented: std.Io.Evented = undefined;
+    try evented.init(std.testing.allocator, .{ .thread_limit = 0 });
+    defer evented.deinit();
+
+    const timeout: Io.Timeout = .{ .duration = .{
+        .raw = Io.Duration.fromMilliseconds(1),
+        .clock = .awake,
+    } };
+    try std.testing.expectError(error.WouldBlock, bridge.pollNextAction(evented.io(), timeout));
 }

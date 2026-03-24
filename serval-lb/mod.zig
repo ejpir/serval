@@ -11,9 +11,14 @@
 //!   defer handler.deinit();
 
 pub const handler = @import("handler.zig");
+pub const strategy_core = @import("strategy_core.zig");
+
 pub const LbHandler = handler.LbHandler;
 pub const LbConfig = handler.LbConfig;
+pub const RoundRobinStrategy = strategy_core.RoundRobinStrategy;
+pub const StrategyConfig = strategy_core.StrategyConfig;
 
 test {
     _ = @import("handler.zig");
+    _ = @import("strategy_core.zig");
 }

@@ -184,6 +184,17 @@ pub const Client = struct {
         upstream: Upstream,
         io: Io,
     ) ClientError!ConnectResult {
+        return self.connectWithTimeout(upstream, io, .none);
+    }
+
+    /// Connect to an upstream server with explicit TCP connect timeout.
+    /// TigerStyle S1: ~2 assertions, S3: bounded operations via Io timeout.
+    pub fn connectWithTimeout(
+        self: *Client,
+        upstream: Upstream,
+        io: Io,
+        connect_timeout: Io.Timeout,
+    ) ClientError!ConnectResult {
         // S1: preconditions
         assert(upstream.host.len > 0); // S1: non-empty host
         assert(upstream.port > 0); // S1: valid port
@@ -205,7 +216,7 @@ pub const Client = struct {
 
         // Step 2: TCP connection (timed)
         const tcp_start_ns = time.monotonicNanos();
-        const fd = tcpConnect(resolve_result.address, io) catch |err| {
+        const fd = tcpConnect(resolve_result.address, io, connect_timeout) catch |err| {
             return mapConnectError(err);
         };
         const tcp_end_ns = time.monotonicNanos();
@@ -392,11 +403,14 @@ fn getLocalPort(fd: i32) u16 {
 
 /// Perform TCP connection using Io async API.
 /// TigerStyle: Bounded via Io cancellation, explicit error return.
-fn tcpConnect(address: Io.net.IpAddress, io: Io) !i32 {
+fn tcpConnect(address: Io.net.IpAddress, io: Io, connect_timeout: Io.Timeout) !i32 {
     // Use IpAddress.connect() to perform async TCP connect
-    // This creates the socket and connects in one step
-    const stream = address.connect(io, .{ .mode = .stream }) catch {
-        return error.ConnectionFailed;
+    // This creates the socket and connects in one step.
+    const stream = address.connect(io, .{
+        .mode = .stream,
+        .timeout = connect_timeout,
+    }) catch |err| {
+        return err;
     };
 
     return stream.socket.handle;
@@ -409,7 +423,7 @@ fn mapConnectError(err: anyerror) ClientError {
         error.ConnectionRefused => ClientError.TcpConnectFailed,
         error.NetworkUnreachable => ClientError.TcpConnectFailed,
         error.ConnectionFailed => ClientError.TcpConnectFailed,
-        error.ConnectionTimedOut => ClientError.TcpConnectTimeout,
+        error.ConnectionTimedOut, error.Timeout => ClientError.TcpConnectTimeout,
         error.ConnectionResetByPeer => ClientError.TcpConnectFailed,
         else => ClientError.TcpConnectFailed,
     };
@@ -545,6 +559,7 @@ test "mapConnectError maps common errors" {
     try std.testing.expectEqual(ClientError.TcpConnectFailed, mapConnectError(error.NetworkUnreachable));
     try std.testing.expectEqual(ClientError.TcpConnectFailed, mapConnectError(error.ConnectionFailed));
     try std.testing.expectEqual(ClientError.TcpConnectTimeout, mapConnectError(error.ConnectionTimedOut));
+    try std.testing.expectEqual(ClientError.TcpConnectTimeout, mapConnectError(error.Timeout));
     try std.testing.expectEqual(ClientError.TcpConnectFailed, mapConnectError(error.ConnectionResetByPeer));
     // Unknown errors map to TcpConnectFailed
     try std.testing.expectEqual(ClientError.TcpConnectFailed, mapConnectError(error.OutOfMemory));

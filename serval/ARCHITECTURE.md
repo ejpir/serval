@@ -402,6 +402,37 @@ upgrade path instead of the normal request/response forwarding path:
 6. If upstream returns a non-`101` response, it is forwarded as plain HTTP and the connection closes
 7. If upstream returns a valid `101 Switching Protocols`, `serval-proxy/tunnel.zig` switches to bidirectional byte relay and the upgraded upstream connection is never returned to the HTTP pool
 
+### Unified Transport-Mechanics Contract (h1 + h2)
+
+Serval uses one explicit contract for transport forwarding mechanics across h1 and
+h2 paths.
+
+```text
+                Strategy / Orchestration (serval-server)
+          (hooks, selectUpstream, lifecycle, policy decisions)
+                                 │
+                                 │  stable mechanics interface
+                                 ▼
+                    Mechanics (serval-proxy / forwarder)
+            h1 request forwarding   +   h2 stream bridging/polling
+                                 │
+                                 ▼
+                  Infrastructure (serval-client/session pool)
+```
+
+Ownership split:
+
+- `serval-server` owns request policy/orchestration (hook lifecycle,
+  `selectUpstream()`, request-class policy like gRPC completion requirements).
+- `serval-proxy` owns forwarding mechanics (h1 forwarding, h2 binding ownership,
+  bounded fair action polling, mapped receive actions, stream reset/close
+  mechanics).
+- `serval-client` owns reusable upstream h2 session/runtime infrastructure
+  (connect/reuse, generation rollover, GOAWAY-aware session lifecycle).
+
+This split is enforced in code: `serval-server` consumes bridge APIs and mapped
+actions, but does not inspect bridge binding-table internals directly.
+
 ### gRPC over HTTP/2 Prior-Knowledge + Upgrade Flow
 
 Canonical bridge writeup:
@@ -459,7 +490,9 @@ session rollover support (one active + one draining session per upstream index)
 and bounded HEADERS+CONTINUATION reassembly plus bounded HPACK
 dynamic-table/Huffman decode in initial parse and runtime paths.
 Routing is still decided from the first request on the connection, and broader
-control-frame propagation remains future work.
+control-frame propagation remains future work. This section documents the
+current bridge scope only and does not claim a fully generic HTTP/2 proxy for
+all traffic classes.
 
 ### Async I/O and Zero-Copy Body Transfer
 

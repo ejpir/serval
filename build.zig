@@ -258,6 +258,9 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Server frontend TCP runtime reuses shared LB strategy core.
+    serval_server_module.addImport("serval-lb", serval_lb_module);
+
     // Router module - depends on core, lb, health, prober, tls, net (Layer 4 - Strategy)
     // Note: Not yet added to umbrella module - will be integrated when feature is complete
     const serval_router_module = b.addModule("serval-router", .{
@@ -737,6 +740,36 @@ pub fn build(b: *std.Build) void {
 
     const integration_test_step = b.step("test-integration", "Run integration tests");
     integration_test_step.dependOn(&run_integration_tests.step);
+
+    const integration_test_udp_runtime = b.addTest(.{
+        .name = "integration_test_udp_runtime",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: udp runtime"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_udp_runtime);
+    const run_integration_test_udp_runtime = b.addRunArtifact(integration_test_udp_runtime);
+
+    const integration_test_udp_runtime_step = b.step(
+        "test-integration-udp-runtime",
+        "Run integration UDP runtime tests",
+    );
+    integration_test_udp_runtime_step.dependOn(&run_integration_test_udp_runtime.step);
+
+    const integration_test_tcp_runtime = b.addTest(.{
+        .name = "integration_test_tcp_runtime",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: tcp runtime"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_tcp_runtime);
+    const run_integration_test_tcp_runtime = b.addRunArtifact(integration_test_tcp_runtime);
+
+    const integration_test_tcp_runtime_step = b.step(
+        "test-integration-tcp-runtime",
+        "Run integration TCP runtime tests",
+    );
+    integration_test_tcp_runtime_step.dependOn(&run_integration_test_tcp_runtime.step);
 
     const acme_pebble_smoke = b.addSystemCommand(&.{
         "bash",

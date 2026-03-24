@@ -12,6 +12,7 @@ const core = @import("serval-core");
 const net = @import("serval-net");
 const health_mod = @import("serval-health");
 const prober = @import("serval-prober");
+const strategy_core = @import("strategy_core.zig");
 const ssl = @import("serval-tls").ssl;
 
 const Context = core.Context;
@@ -21,7 +22,8 @@ const LogEntry = core.LogEntry;
 const config = core.config;
 const DnsResolver = net.DnsResolver;
 
-const HealthState = health_mod.HealthState;
+const StrategyConfig = strategy_core.StrategyConfig;
+const RoundRobinStrategy = strategy_core.RoundRobinStrategy;
 const UpstreamIndex = config.UpstreamIndex;
 const MAX_UPSTREAMS = health_mod.MAX_UPSTREAMS;
 
@@ -49,11 +51,10 @@ pub const LbConfig = struct {
 /// - Active background probing for recovery
 /// - Graceful degradation when all backends unhealthy
 ///
-/// TigerStyle: Embedded HealthState (no pointers), bounded by MAX_UPSTREAMS.
+/// TigerStyle: Embedded protocol-agnostic strategy core, bounded by MAX_UPSTREAMS.
 pub const LbHandler = struct {
     upstreams: []const Upstream,
-    health: HealthState,
-    next_idx: std.atomic.Value(u32),
+    strategy: RoundRobinStrategy,
     probe_running: std.atomic.Value(bool),
     probe_thread: ?std.Thread,
     lb_config: LbConfig,
@@ -85,23 +86,23 @@ pub const LbHandler = struct {
 
         self.* = .{
             .upstreams = upstreams,
-            .health = HealthState.init(
-                @intCast(upstreams.len),
-                lb_config.unhealthy_threshold,
-                lb_config.healthy_threshold,
-            ),
-            .next_idx = std.atomic.Value(u32).init(0),
+            .strategy = undefined,
             .probe_running = std.atomic.Value(bool).init(false),
             .probe_thread = null,
             .lb_config = lb_config,
         };
+
+        self.strategy.init(upstreams, StrategyConfig{
+            .unhealthy_threshold = lb_config.unhealthy_threshold,
+            .healthy_threshold = lb_config.healthy_threshold,
+        });
 
         // Start background prober if enabled
         if (lb_config.enable_probing) {
             self.probe_running.store(true, .release);
             const ctx = prober.ProberContext{
                 .upstreams = upstreams,
-                .health = &self.health,
+                .health = self.strategy.healthPtr(),
                 .probe_running = &self.probe_running,
                 .probe_interval_ms = lb_config.probe_interval_ms,
                 .probe_timeout_ms = lb_config.probe_timeout_ms,
@@ -132,17 +133,7 @@ pub const LbHandler = struct {
         _ = request;
         assert(self.upstreams.len > 0);
 
-        const current = self.next_idx.fetchAdd(1, .monotonic);
-
-        // Try health-aware selection
-        if (self.health.findNthHealthy(current)) |idx| {
-            return self.upstreams[idx];
-        }
-
-        // Fallback: all unhealthy, use simple round-robin (graceful degradation)
-        // Use backend_count from health state - already validated at init
-        const fallback_idx = current % @as(u32, self.health.backend_count);
-        return self.upstreams[fallback_idx];
+        return self.strategy.select();
     }
 
     /// Record request outcome for passive health tracking.
@@ -156,21 +147,21 @@ pub const LbHandler = struct {
         const idx: UpstreamIndex = @intCast(upstream.idx);
 
         if (entry.status >= 500) {
-            self.health.recordFailure(idx);
+            self.strategy.recordFailure(idx);
         } else {
-            self.health.recordSuccess(idx);
+            self.strategy.recordSuccess(idx);
         }
     }
 
     /// Count healthy backends (for observability).
     pub fn countHealthy(self: *const Self) u32 {
-        return self.health.countHealthy();
+        return self.strategy.countHealthy();
     }
 
     /// Check if specific backend is healthy.
     pub fn isHealthy(self: *const Self, idx: UpstreamIndex) bool {
         assert(idx < self.upstreams.len);
-        return self.health.isHealthy(idx);
+        return self.strategy.isHealthy(idx);
     }
 };
 

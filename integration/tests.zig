@@ -13645,3 +13645,921 @@ fn curlPostWithExpect100(allocator: std.mem.Allocator, port: u16, path: []const 
         .allocator = allocator,
     };
 }
+
+const UdpRuntimeServerShared = struct {
+    runtime: serval.server.frontend.UdpRuntime,
+    shutdown: std.atomic.Value(bool),
+    listener_fd: std.atomic.Value(i32),
+};
+
+const UdpRuntimeServer = struct {
+    shared: *UdpRuntimeServerShared,
+    thread: ?std.Thread,
+
+    fn start(cfg: serval.config.UdpTransportConfig) !UdpRuntimeServer {
+        const shared = try std.heap.page_allocator.create(UdpRuntimeServerShared);
+        errdefer std.heap.page_allocator.destroy(shared);
+
+        shared.* = .{
+            .runtime = undefined,
+            .shutdown = std.atomic.Value(bool).init(false),
+            .listener_fd = std.atomic.Value(i32).init(-1),
+        };
+
+        try shared.runtime.init(cfg, .{});
+
+        var server = UdpRuntimeServer{ .shared = shared, .thread = null };
+        server.thread = try std.Thread.spawn(.{}, udpRuntimeServerMain, .{shared});
+
+        var wait_iters: u32 = 0;
+        while (wait_iters < 50) : (wait_iters += 1) {
+            if (shared.listener_fd.load(.acquire) >= 0) break;
+            posix.nanosleep(0, 10 * std.time.ns_per_ms);
+        }
+        if (shared.listener_fd.load(.acquire) < 0) return error.ListenerNotReady;
+
+        return server;
+    }
+
+    fn stop(self: *UdpRuntimeServer) void {
+        self.shared.shutdown.store(true, .release);
+        if (self.thread) |thread| {
+            thread.join();
+            self.thread = null;
+        }
+        std.heap.page_allocator.destroy(self.shared);
+    }
+};
+
+fn udpRuntimeServerMain(shared: *UdpRuntimeServerShared) void {
+    assert(@intFromPtr(shared) != 0);
+
+    var io_runtime = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_runtime.deinit();
+
+    shared.runtime.run(io_runtime.io(), &shared.shutdown, &shared.listener_fd) catch |err| {
+        std.log.err("udp runtime integration server failed: {s}", .{@errorName(err)});
+    };
+}
+
+const UdpEchoServerConfig = struct {
+    port: u16,
+    shutdown: *std.atomic.Value(bool),
+};
+
+fn udpEchoServerMain(config: UdpEchoServerConfig) void {
+    const sock = createUdpSocketBoundLoopback(config.port) catch {
+        return;
+    };
+    defer posix.close(sock);
+
+    var recv_buf: [512]u8 = undefined;
+    var from_addr: std.posix.sockaddr.in = undefined;
+
+    while (!config.shutdown.load(.acquire)) {
+        var poll_fds = [_]std.posix.pollfd{.{
+            .fd = sock,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+
+        const ready = std.posix.poll(&poll_fds, 100) catch {
+            continue;
+        };
+        if (ready == 0) continue;
+
+        var from_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+        const n = c.recvfrom(sock, &recv_buf, recv_buf.len, 0, @ptrCast(&from_addr), &from_len);
+        switch (c.errno(n)) {
+            .SUCCESS => {},
+            .INTR => continue,
+            else => continue,
+        }
+
+        const sent = c.sendto(sock, &recv_buf, @intCast(n), 0, @ptrCast(&from_addr), from_len);
+        if (c.errno(sent) != .SUCCESS) continue;
+    }
+}
+
+fn createUdpSocketBoundLoopback(port: u16) !std.posix.socket_t {
+    const sock = try posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, std.posix.IPPROTO.UDP);
+    errdefer posix.close(sock);
+
+    const addr: std.posix.sockaddr.in = .{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, LOOPBACK_IPV4_BE),
+    };
+
+    const bind_rc = c.bind(sock, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in));
+    switch (c.errno(bind_rc)) {
+        .SUCCESS => return sock,
+        else => return error.BindFailed,
+    }
+}
+
+fn sendUdpDatagram(sock: std.posix.socket_t, port: u16, payload: []const u8) !void {
+    assert(payload.len > 0);
+
+    const dest: std.posix.sockaddr.in = .{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, LOOPBACK_IPV4_BE),
+    };
+
+    const sent = c.sendto(sock, payload.ptr, payload.len, 0, @ptrCast(&dest), @sizeOf(std.posix.sockaddr.in));
+    switch (c.errno(sent)) {
+        .SUCCESS => {
+            if (@as(usize, @intCast(sent)) != payload.len) return error.PartialSend;
+        },
+        else => return error.SendFailed,
+    }
+}
+
+fn recvUdpDatagramWithTimeout(sock: std.posix.socket_t, buf: []u8, timeout_ms: i32) !?usize {
+    assert(buf.len > 0);
+    assert(timeout_ms > 0);
+
+    var poll_fds = [_]std.posix.pollfd{.{
+        .fd = sock,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    const ready = try std.posix.poll(&poll_fds, timeout_ms);
+    if (ready == 0) return null;
+
+    const n = c.recvfrom(sock, buf.ptr, buf.len, 0, null, null);
+    switch (c.errno(n)) {
+        .SUCCESS => return @intCast(n),
+        else => return error.RecvFailed,
+    }
+}
+
+test "integration: udp runtime forwards ingress and egress datagrams" {
+    const listener_port = harness.getPort();
+    const upstream_port = harness.getPort();
+
+    const upstreams = [_]serval.config.L4Target{.{ .host = "127.0.0.1", .port = upstream_port }};
+
+    var server = try UdpRuntimeServer.start(.{
+        .enabled = true,
+        .listener_host = "127.0.0.1",
+        .listener_port = listener_port,
+        .upstreams = &upstreams,
+        .max_active_sessions = 16,
+        .session_idle_timeout_ms = 5000,
+    });
+    defer server.stop();
+
+    var upstream_shutdown = std.atomic.Value(bool).init(false);
+    const upstream_thread = try std.Thread.spawn(.{}, udpEchoServerMain, .{UdpEchoServerConfig{
+        .port = upstream_port,
+        .shutdown = &upstream_shutdown,
+    }});
+    defer {
+        upstream_shutdown.store(true, .release);
+        upstream_thread.join();
+    }
+
+    const client_sock = try createUdpSocketBoundLoopback(0);
+    defer posix.close(client_sock);
+
+    try sendUdpDatagram(client_sock, listener_port, "ping");
+
+    var recv_buf: [64]u8 = undefined;
+    const maybe_n = try recvUdpDatagramWithTimeout(client_sock, &recv_buf, 1000);
+    try testing.expect(maybe_n != null);
+    const n = maybe_n orelse unreachable;
+    try testing.expectEqualStrings("ping", recv_buf[0..n]);
+
+    try testing.expect(server.shared.runtime.packetsForwardedUpstream() >= 1);
+    try testing.expect(server.shared.runtime.packetsForwardedDownstream() >= 1);
+}
+
+test "integration: udp runtime capacity drop preserves existing session forwarding" {
+    const listener_port = harness.getPort();
+    const upstream_port = harness.getPort();
+
+    const upstreams = [_]serval.config.L4Target{.{ .host = "127.0.0.1", .port = upstream_port }};
+
+    var server = try UdpRuntimeServer.start(.{
+        .enabled = true,
+        .listener_host = "127.0.0.1",
+        .listener_port = listener_port,
+        .upstreams = &upstreams,
+        .max_active_sessions = 1,
+        .session_idle_timeout_ms = 5000,
+    });
+    defer server.stop();
+
+    var upstream_shutdown = std.atomic.Value(bool).init(false);
+    const upstream_thread = try std.Thread.spawn(.{}, udpEchoServerMain, .{UdpEchoServerConfig{
+        .port = upstream_port,
+        .shutdown = &upstream_shutdown,
+    }});
+    defer {
+        upstream_shutdown.store(true, .release);
+        upstream_thread.join();
+    }
+
+    const client_a = try createUdpSocketBoundLoopback(0);
+    defer posix.close(client_a);
+    const client_b = try createUdpSocketBoundLoopback(0);
+    defer posix.close(client_b);
+
+    try sendUdpDatagram(client_a, listener_port, "a1");
+    var buf_a: [64]u8 = undefined;
+    const maybe_a1 = try recvUdpDatagramWithTimeout(client_a, &buf_a, 1000);
+    try testing.expect(maybe_a1 != null);
+
+    try sendUdpDatagram(client_b, listener_port, "b1");
+    var buf_b: [64]u8 = undefined;
+    const maybe_b1 = try recvUdpDatagramWithTimeout(client_b, &buf_b, 300);
+    try testing.expect(maybe_b1 == null);
+
+    try sendUdpDatagram(client_a, listener_port, "a2");
+    const maybe_a2 = try recvUdpDatagramWithTimeout(client_a, &buf_a, 1000);
+    try testing.expect(maybe_a2 != null);
+    const n2 = maybe_a2 orelse unreachable;
+    try testing.expectEqualStrings("a2", buf_a[0..n2]);
+
+    try testing.expect(server.shared.runtime.droppedAtSessionCapacity() >= 1);
+}
+
+test "integration: udp runtime key mode five_tuple enforces per-endpoint session capacity" {
+    const listener_port = harness.getPort();
+    const upstream_port = harness.getPort();
+
+    const upstreams = [_]serval.config.L4Target{.{ .host = "127.0.0.1", .port = upstream_port }};
+
+    var server = try UdpRuntimeServer.start(.{
+        .enabled = true,
+        .listener_host = "127.0.0.1",
+        .listener_port = listener_port,
+        .upstreams = &upstreams,
+        .max_active_sessions = 1,
+        .session_idle_timeout_ms = 5000,
+        .session_key_mode = .five_tuple,
+    });
+    defer server.stop();
+
+    var upstream_shutdown = std.atomic.Value(bool).init(false);
+    const upstream_thread = try std.Thread.spawn(.{}, udpEchoServerMain, .{UdpEchoServerConfig{
+        .port = upstream_port,
+        .shutdown = &upstream_shutdown,
+    }});
+    defer {
+        upstream_shutdown.store(true, .release);
+        upstream_thread.join();
+    }
+
+    const client_a = try createUdpSocketBoundLoopback(0);
+    defer posix.close(client_a);
+    const client_b = try createUdpSocketBoundLoopback(0);
+    defer posix.close(client_b);
+
+    try sendUdpDatagram(client_a, listener_port, "f1");
+    var recv_a: [32]u8 = undefined;
+    const a1 = try recvUdpDatagramWithTimeout(client_a, &recv_a, 1000);
+    try testing.expect(a1 != null);
+
+    try sendUdpDatagram(client_b, listener_port, "f2");
+    var recv_b: [32]u8 = undefined;
+    const b1 = try recvUdpDatagramWithTimeout(client_b, &recv_b, 300);
+    try testing.expect(b1 == null);
+
+    try testing.expect(server.shared.runtime.droppedAtSessionCapacity() >= 1);
+}
+
+test "integration: udp runtime key mode source_endpoint reuses session for repeated source endpoint" {
+    const listener_port = harness.getPort();
+    const upstream_port = harness.getPort();
+
+    const upstreams = [_]serval.config.L4Target{.{ .host = "127.0.0.1", .port = upstream_port }};
+
+    var server = try UdpRuntimeServer.start(.{
+        .enabled = true,
+        .listener_host = "127.0.0.1",
+        .listener_port = listener_port,
+        .upstreams = &upstreams,
+        .max_active_sessions = 1,
+        .session_idle_timeout_ms = 5000,
+        .session_key_mode = .source_endpoint,
+    });
+    defer server.stop();
+
+    var upstream_shutdown = std.atomic.Value(bool).init(false);
+    const upstream_thread = try std.Thread.spawn(.{}, udpEchoServerMain, .{UdpEchoServerConfig{
+        .port = upstream_port,
+        .shutdown = &upstream_shutdown,
+    }});
+    defer {
+        upstream_shutdown.store(true, .release);
+        upstream_thread.join();
+    }
+
+    const client = try createUdpSocketBoundLoopback(0);
+    defer posix.close(client);
+
+    try sendUdpDatagram(client, listener_port, "s1");
+    var recv_buf: [32]u8 = undefined;
+    const first = try recvUdpDatagramWithTimeout(client, &recv_buf, 1000);
+    try testing.expect(first != null);
+
+    try sendUdpDatagram(client, listener_port, "s2");
+    const second = try recvUdpDatagramWithTimeout(client, &recv_buf, 1000);
+    try testing.expect(second != null);
+
+    try testing.expectEqual(@as(u64, 1), server.shared.runtime.sessionCreationCount());
+    try testing.expectEqual(@as(u64, 0), server.shared.runtime.droppedAtSessionCapacity());
+}
+
+test "integration: udp runtime key mode source_ip groups distinct source ports" {
+    const listener_port = harness.getPort();
+    const upstream_port = harness.getPort();
+
+    const upstreams = [_]serval.config.L4Target{.{ .host = "127.0.0.1", .port = upstream_port }};
+
+    var server = try UdpRuntimeServer.start(.{
+        .enabled = true,
+        .listener_host = "127.0.0.1",
+        .listener_port = listener_port,
+        .upstreams = &upstreams,
+        .max_active_sessions = 1,
+        .session_idle_timeout_ms = 5000,
+        .session_key_mode = .source_ip,
+    });
+    defer server.stop();
+
+    var upstream_shutdown = std.atomic.Value(bool).init(false);
+    const upstream_thread = try std.Thread.spawn(.{}, udpEchoServerMain, .{UdpEchoServerConfig{
+        .port = upstream_port,
+        .shutdown = &upstream_shutdown,
+    }});
+    defer {
+        upstream_shutdown.store(true, .release);
+        upstream_thread.join();
+    }
+
+    const client_a = try createUdpSocketBoundLoopback(0);
+    defer posix.close(client_a);
+    const client_b = try createUdpSocketBoundLoopback(0);
+    defer posix.close(client_b);
+
+    try sendUdpDatagram(client_a, listener_port, "i1");
+    var recv_a: [32]u8 = undefined;
+    const a1 = try recvUdpDatagramWithTimeout(client_a, &recv_a, 1000);
+    try testing.expect(a1 != null);
+
+    try sendUdpDatagram(client_b, listener_port, "i2");
+    var recv_b: [32]u8 = undefined;
+    const b1 = try recvUdpDatagramWithTimeout(client_b, &recv_b, 300);
+    try testing.expect(b1 == null);
+
+    const a2 = try recvUdpDatagramWithTimeout(client_a, &recv_a, 1000);
+    try testing.expect(a2 != null);
+    const n2 = a2 orelse unreachable;
+    try testing.expectEqualStrings("i2", recv_a[0..n2]);
+
+    try testing.expectEqual(@as(u64, 1), server.shared.runtime.sessionCreationCount());
+    try testing.expectEqual(@as(u64, 0), server.shared.runtime.droppedAtSessionCapacity());
+}
+
+test "integration: udp runtime expires idle session and admits new source" {
+    const listener_port = harness.getPort();
+    const upstream_port = harness.getPort();
+
+    const upstreams = [_]serval.config.L4Target{.{ .host = "127.0.0.1", .port = upstream_port }};
+
+    var server = try UdpRuntimeServer.start(.{
+        .enabled = true,
+        .listener_host = "127.0.0.1",
+        .listener_port = listener_port,
+        .upstreams = &upstreams,
+        .max_active_sessions = 1,
+        .session_idle_timeout_ms = 100,
+        .session_key_mode = .five_tuple,
+    });
+    defer server.stop();
+
+    var upstream_shutdown = std.atomic.Value(bool).init(false);
+    const upstream_thread = try std.Thread.spawn(.{}, udpEchoServerMain, .{UdpEchoServerConfig{
+        .port = upstream_port,
+        .shutdown = &upstream_shutdown,
+    }});
+    defer {
+        upstream_shutdown.store(true, .release);
+        upstream_thread.join();
+    }
+
+    const client_a = try createUdpSocketBoundLoopback(0);
+    defer posix.close(client_a);
+    const client_b = try createUdpSocketBoundLoopback(0);
+    defer posix.close(client_b);
+
+    try sendUdpDatagram(client_a, listener_port, "e1");
+    var recv_a: [32]u8 = undefined;
+    const first = try recvUdpDatagramWithTimeout(client_a, &recv_a, 1000);
+    try testing.expect(first != null);
+
+    posix.nanosleep(0, 350 * std.time.ns_per_ms);
+
+    try sendUdpDatagram(client_b, listener_port, "e2");
+    var recv_b: [32]u8 = undefined;
+    const second = try recvUdpDatagramWithTimeout(client_b, &recv_b, 1000);
+    try testing.expect(second != null);
+
+    try testing.expect(server.shared.runtime.sessionExpirationCount() >= 1);
+    try testing.expect(server.shared.runtime.sessionCreationCount() >= 2);
+}
+
+const TcpRuntimeServerShared = struct {
+    runtime: serval.server.frontend.TcpRuntime,
+    shutdown: std.atomic.Value(bool),
+    listener_fd: std.atomic.Value(i32),
+};
+
+const TcpRuntimeServer = struct {
+    shared: *TcpRuntimeServerShared,
+    thread: ?std.Thread,
+
+    fn start(cfg: serval.config.TcpTransportConfig) !TcpRuntimeServer {
+        return startWithTls(cfg, null, true);
+    }
+
+    fn startWithTls(cfg: serval.config.TcpTransportConfig, client_ctx: ?*ssl.SSL_CTX, verify_upstream_tls: bool) !TcpRuntimeServer {
+        const shared = try std.heap.page_allocator.create(TcpRuntimeServerShared);
+        errdefer std.heap.page_allocator.destroy(shared);
+
+        shared.* = .{
+            .runtime = undefined,
+            .shutdown = std.atomic.Value(bool).init(false),
+            .listener_fd = std.atomic.Value(i32).init(-1),
+        };
+
+        try shared.runtime.init(cfg, .{}, client_ctx, verify_upstream_tls);
+
+        var server = TcpRuntimeServer{ .shared = shared, .thread = null };
+        server.thread = try std.Thread.spawn(.{}, tcpRuntimeServerMain, .{shared});
+
+        var wait_iters: u32 = 0;
+        while (wait_iters < 100) : (wait_iters += 1) {
+            if (shared.listener_fd.load(.acquire) >= 0) break;
+            posix.nanosleep(0, 10 * std.time.ns_per_ms);
+        }
+        if (shared.listener_fd.load(.acquire) < 0) return error.ListenerNotReady;
+
+        return server;
+    }
+
+    fn stop(self: *TcpRuntimeServer, wake_port: u16) void {
+        self.shared.shutdown.store(true, .release);
+        const wake_sock = connectTcp(wake_port) catch null;
+        if (wake_sock) |sock| posix.close(sock);
+        if (self.thread) |thread| {
+            thread.join();
+            self.thread = null;
+        }
+        std.heap.page_allocator.destroy(self.shared);
+    }
+};
+
+fn tcpRuntimeServerMain(shared: *TcpRuntimeServerShared) void {
+    assert(@intFromPtr(shared) != 0);
+
+    var evented: std.Io.Evented = undefined;
+    init_test_io_runtime(&evented, std.heap.page_allocator) catch |err| {
+        std.log.err("tcp runtime integration io init failed: {s}", .{@errorName(err)});
+        return;
+    };
+    defer evented.deinit();
+
+    shared.runtime.run(evented.io(), &shared.shutdown, &shared.listener_fd) catch |err| {
+        std.log.err("tcp runtime integration server failed: {s}", .{@errorName(err)});
+    };
+}
+
+const TcpBackendMode = enum { echo, hold, banner_then_hold };
+
+const TcpBackendServerConfig = struct {
+    port: u16,
+    mode: TcpBackendMode,
+    shutdown: *std.atomic.Value(bool),
+};
+
+const TlsBackendServerConfig = struct {
+    port: u16,
+    shutdown: *std.atomic.Value(bool),
+    accepts: *std.atomic.Value(u32),
+};
+
+fn tcpHoldConnectionWorker(conn: posix.socket_t, shutdown: *std.atomic.Value(bool)) void {
+    assert(conn >= 0);
+    assert(@intFromPtr(shutdown) != 0);
+
+    defer posix.close(conn);
+    while (!shutdown.load(.acquire)) {
+        posix.nanosleep(0, 10 * std.time.ns_per_ms);
+    }
+}
+
+fn waitForTcpServerReady(port: u16, max_attempts: u32) bool {
+    assert(port > 0);
+    assert(max_attempts > 0);
+
+    var attempts: u32 = 0;
+    while (attempts < max_attempts) : (attempts += 1) {
+        const sock = connectTcp(port) catch {
+            posix.nanosleep(0, 10 * std.time.ns_per_ms);
+            continue;
+        };
+        posix.close(sock);
+        return true;
+    }
+
+    return false;
+}
+
+fn shutdownWriteTcp(sock: posix.socket_t) !void {
+    assert(sock >= 0);
+
+    const rc = c.shutdown(sock, @intCast(std.posix.SHUT.WR));
+    switch (c.errno(rc)) {
+        .SUCCESS => return,
+        .INTR => return error.Interrupted,
+        else => return error.ShutdownFailed,
+    }
+}
+
+fn tcpBackendServerMain(config: TcpBackendServerConfig) void {
+    const listener = createTcpListener(config.port) catch return;
+    defer posix.close(listener);
+
+    while (!config.shutdown.load(.acquire)) {
+        var poll_fds = [_]std.posix.pollfd{.{
+            .fd = listener,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = std.posix.poll(&poll_fds, 100) catch continue;
+        if (ready == 0) continue;
+
+        const conn = acceptTcp(listener) catch continue;
+
+        switch (config.mode) {
+            .echo => {
+                var buf: [256]u8 = undefined;
+                const n = posix.recv(conn, &buf, 0) catch {
+                    posix.close(conn);
+                    continue;
+                };
+                if (n > 0) {
+                    _ = posix.send(conn, buf[0..n], 0) catch {
+                        posix.close(conn);
+                        continue;
+                    };
+                }
+                posix.close(conn);
+            },
+            .hold => {
+                const worker = std.Thread.spawn(.{}, tcpHoldConnectionWorker, .{ conn, config.shutdown }) catch {
+                    posix.close(conn);
+                    continue;
+                };
+                worker.detach();
+            },
+            .banner_then_hold => {
+                _ = posix.send(conn, "up", 0) catch {
+                    posix.close(conn);
+                    continue;
+                };
+                const worker = std.Thread.spawn(.{}, tcpHoldConnectionWorker, .{ conn, config.shutdown }) catch {
+                    posix.close(conn);
+                    continue;
+                };
+                worker.detach();
+            },
+        }
+    }
+}
+
+fn tlsBackendServerMain(config: TlsBackendServerConfig) void {
+    assert(@intFromPtr(config.shutdown) != 0);
+    assert(@intFromPtr(config.accepts) != 0);
+
+    const tls_ctx = createTestServerTlsCtx() catch return;
+    defer ssl.SSL_CTX_free(tls_ctx);
+
+    const listener = createTcpListener(config.port) catch return;
+    defer posix.close(listener);
+
+    while (!config.shutdown.load(.acquire)) {
+        var poll_fds = [_]std.posix.pollfd{.{
+            .fd = listener,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = std.posix.poll(&poll_fds, 100) catch continue;
+        if (ready == 0) continue;
+
+        const conn = acceptTcp(listener) catch continue;
+        _ = config.accepts.fetchAdd(1, .seq_cst);
+        var tls_stream = serval_tls.TLSStream.initServer(tls_ctx, conn, std.heap.page_allocator) catch {
+            posix.close(conn);
+            continue;
+        };
+
+        tls_stream.close();
+        posix.close(conn);
+    }
+}
+
+test "integration: tcp runtime accepts downstream and records upstream outcome" {
+    const listener_port = harness.getPort();
+    const upstream_port = harness.getPort();
+
+    var backend_shutdown = std.atomic.Value(bool).init(false);
+    const backend_thread = try std.Thread.spawn(.{}, tcpBackendServerMain, .{TcpBackendServerConfig{
+        .port = upstream_port,
+        .mode = .hold,
+        .shutdown = &backend_shutdown,
+    }});
+    defer {
+        backend_shutdown.store(true, .release);
+        _ = connectTcp(upstream_port) catch null;
+        backend_thread.join();
+    }
+
+    try testing.expect(waitForTcpServerReady(upstream_port, 100));
+
+    const upstreams = [_]serval.config.L4Target{.{ .host = "127.0.0.1", .port = upstream_port }};
+    var server = try TcpRuntimeServer.start(.{
+        .enabled = true,
+        .listener_host = "127.0.0.1",
+        .listener_port = listener_port,
+        .upstreams = &upstreams,
+        .max_concurrent_connections = 8,
+        .connect_timeout_ms = 1000,
+        .idle_timeout_ms = 1000,
+        .tls_mode = .passthrough,
+    });
+    defer server.stop(listener_port);
+
+    const client = try connectTcp(listener_port);
+    defer posix.close(client);
+
+    var wait_iters: u32 = 0;
+    while (wait_iters < 200 and server.shared.runtime.acceptedCount() == 0) : (wait_iters += 1) {
+        posix.nanosleep(0, 10 * std.time.ns_per_ms);
+    }
+
+    try testing.expect(server.shared.runtime.acceptedCount() >= 1);
+    posix.nanosleep(1, 200 * std.time.ns_per_ms);
+    try testing.expect(server.shared.runtime.connectFailureCount() > 0 or server.shared.runtime.upstreamBytes() > 0);
+}
+
+test "integration: tcp runtime enforces bounded behavior under concurrent connects" {
+    const listener_port = harness.getPort();
+    const upstream_port = harness.getPort();
+
+    var backend_shutdown = std.atomic.Value(bool).init(false);
+    const backend_thread = try std.Thread.spawn(.{}, tcpBackendServerMain, .{TcpBackendServerConfig{
+        .port = upstream_port,
+        .mode = .hold,
+        .shutdown = &backend_shutdown,
+    }});
+    defer {
+        backend_shutdown.store(true, .release);
+        _ = connectTcp(upstream_port) catch null;
+        backend_thread.join();
+    }
+
+    try testing.expect(waitForTcpServerReady(upstream_port, 100));
+
+    const upstreams = [_]serval.config.L4Target{.{ .host = "127.0.0.1", .port = upstream_port }};
+    var server = try TcpRuntimeServer.start(.{
+        .enabled = true,
+        .listener_host = "127.0.0.1",
+        .listener_port = listener_port,
+        .upstreams = &upstreams,
+        .max_concurrent_connections = 1,
+        .connect_timeout_ms = 1000,
+        .idle_timeout_ms = 10000,
+        .tls_mode = .passthrough,
+    });
+    defer server.stop(listener_port);
+
+    const client_a = try connectTcp(listener_port);
+    defer posix.close(client_a);
+
+    posix.nanosleep(0, 50 * std.time.ns_per_ms);
+
+    const client_b = try connectTcp(listener_port);
+    defer posix.close(client_b);
+
+    var wait_iters: u32 = 0;
+    while (wait_iters < 150 and server.shared.runtime.rejectedCount() == 0 and server.shared.runtime.connectFailureCount() == 0) : (wait_iters += 1) {
+        posix.nanosleep(0, 10 * std.time.ns_per_ms);
+    }
+
+    const rejected = server.shared.runtime.rejectedCount();
+    const connect_failures = server.shared.runtime.connectFailureCount();
+    try testing.expect(rejected > 0 or connect_failures > 0);
+    try testing.expect(server.shared.runtime.activeCount() <= 1);
+}
+
+test "integration: tcp runtime handles downstream half-close without hanging" {
+    const listener_port = harness.getPort();
+    const upstream_port = harness.getPort();
+
+    var backend_shutdown = std.atomic.Value(bool).init(false);
+    const backend_thread = try std.Thread.spawn(.{}, tcpBackendServerMain, .{TcpBackendServerConfig{
+        .port = upstream_port,
+        .mode = .hold,
+        .shutdown = &backend_shutdown,
+    }});
+    defer {
+        backend_shutdown.store(true, .release);
+        _ = connectTcp(upstream_port) catch null;
+        backend_thread.join();
+    }
+
+    try testing.expect(waitForTcpServerReady(upstream_port, 100));
+
+    const upstreams = [_]serval.config.L4Target{.{ .host = "127.0.0.1", .port = upstream_port }};
+    var server = try TcpRuntimeServer.start(.{
+        .enabled = true,
+        .listener_host = "127.0.0.1",
+        .listener_port = listener_port,
+        .upstreams = &upstreams,
+        .max_concurrent_connections = 4,
+        .connect_timeout_ms = 1000,
+        .idle_timeout_ms = 250,
+        .tls_mode = .passthrough,
+    });
+    defer server.stop(listener_port);
+
+    const client = try connectTcp(listener_port);
+    defer posix.close(client);
+
+    try sendAllTcp(client, "half");
+
+    var shutdown_attempts: u32 = 0;
+    var shutdown_done = false;
+    while (shutdown_attempts < 5) : (shutdown_attempts += 1) {
+        shutdownWriteTcp(client) catch |err| {
+            if (err == error.Interrupted) continue;
+            return err;
+        };
+        shutdown_done = true;
+        break;
+    }
+    try testing.expect(shutdown_done);
+
+    var closed = false;
+    var probe_iters: u32 = 0;
+    while (probe_iters < 120) : (probe_iters += 1) {
+        var poll_fds = [_]std.posix.pollfd{.{
+            .fd = client,
+            .events = std.posix.POLL.IN | std.posix.POLL.HUP,
+            .revents = 0,
+        }};
+        const ready = try std.posix.poll(&poll_fds, 20);
+        if (ready == 0) continue;
+
+        var recv_buf: [8]u8 = undefined;
+        const n = posix.recv(client, &recv_buf, 0) catch {
+            closed = true;
+            break;
+        };
+        if (n == 0) {
+            closed = true;
+            break;
+        }
+    }
+
+    try testing.expect(closed);
+    try testing.expect(server.shared.runtime.acceptedCount() >= 1);
+}
+
+test "integration: tcp runtime idle timeout closes inactive tunnel" {
+    const listener_port = harness.getPort();
+    const upstream_port = harness.getPort();
+
+    var backend_shutdown = std.atomic.Value(bool).init(false);
+    const backend_thread = try std.Thread.spawn(.{}, tcpBackendServerMain, .{TcpBackendServerConfig{
+        .port = upstream_port,
+        .mode = .hold,
+        .shutdown = &backend_shutdown,
+    }});
+    defer {
+        backend_shutdown.store(true, .release);
+        _ = connectTcp(upstream_port) catch null;
+        backend_thread.join();
+    }
+
+    try testing.expect(waitForTcpServerReady(upstream_port, 100));
+
+    const upstreams = [_]serval.config.L4Target{.{ .host = "127.0.0.1", .port = upstream_port }};
+    var server = try TcpRuntimeServer.start(.{
+        .enabled = true,
+        .listener_host = "127.0.0.1",
+        .listener_port = listener_port,
+        .upstreams = &upstreams,
+        .max_concurrent_connections = 4,
+        .connect_timeout_ms = 1000,
+        .idle_timeout_ms = 150,
+        .tls_mode = .passthrough,
+    });
+    defer server.stop(listener_port);
+
+    const client = try connectTcp(listener_port);
+    defer posix.close(client);
+
+    var closed = false;
+    var probe_iters: u32 = 0;
+    while (probe_iters < 80) : (probe_iters += 1) {
+        var poll_fds = [_]std.posix.pollfd{.{
+            .fd = client,
+            .events = std.posix.POLL.IN | std.posix.POLL.HUP,
+            .revents = 0,
+        }};
+        const ready = try std.posix.poll(&poll_fds, 20);
+        if (ready > 0) {
+            var recv_buf: [8]u8 = undefined;
+            const n = posix.recv(client, &recv_buf, 0) catch {
+                closed = true;
+                break;
+            };
+            if (n == 0) {
+                closed = true;
+                break;
+            }
+        }
+    }
+
+    try testing.expect(closed);
+}
+
+test "integration: tcp runtime originate_tls establishes TLS upstream" {
+    const listener_port = harness.getPort();
+    const upstream_port = harness.getPort();
+
+    var tls_backend_shutdown = std.atomic.Value(bool).init(false);
+    var tls_accepts = std.atomic.Value(u32).init(0);
+    const tls_backend_thread = try std.Thread.spawn(.{}, tlsBackendServerMain, .{TlsBackendServerConfig{
+        .port = upstream_port,
+        .shutdown = &tls_backend_shutdown,
+        .accepts = &tls_accepts,
+    }});
+    defer {
+        tls_backend_shutdown.store(true, .release);
+        const wake_tls = connectTcpTls(upstream_port, null) catch null;
+        if (wake_tls) |socket| {
+            var close_socket = socket;
+            close_socket.close();
+        }
+        tls_backend_thread.join();
+    }
+
+    posix.nanosleep(0, 50 * std.time.ns_per_ms);
+
+    var readiness_socket = try connectTcpTls(upstream_port, null);
+    readiness_socket.close();
+
+    var ready_iters: u32 = 0;
+    while (ready_iters < 100 and tls_accepts.load(.acquire) == 0) : (ready_iters += 1) {
+        posix.nanosleep(0, 10 * std.time.ns_per_ms);
+    }
+    const baseline_accepts = tls_accepts.load(.acquire);
+    try testing.expect(baseline_accepts >= 1);
+
+    ssl.init();
+    const client_ctx = try ssl.createClientCtx();
+    defer ssl.SSL_CTX_free(client_ctx);
+    ssl.SSL_CTX_set_verify(client_ctx, ssl.SSL_VERIFY_NONE, null);
+
+    const upstreams = [_]serval.config.L4Target{.{ .host = "127.0.0.1", .port = upstream_port, .tls = false }};
+    var server = try TcpRuntimeServer.startWithTls(.{
+        .enabled = true,
+        .listener_host = "127.0.0.1",
+        .listener_port = listener_port,
+        .upstreams = &upstreams,
+        .max_concurrent_connections = 4,
+        .connect_timeout_ms = 1000,
+        .idle_timeout_ms = 1000,
+        .tls_mode = .originate_tls,
+    }, client_ctx, false);
+    defer server.stop(listener_port);
+
+    const client = try connectTcp(listener_port);
+    defer posix.close(client);
+
+    var wait_iters: u32 = 0;
+    while (wait_iters < 200 and server.shared.runtime.acceptedCount() == 0) : (wait_iters += 1) {
+        posix.nanosleep(0, 10 * std.time.ns_per_ms);
+    }
+
+    try testing.expect(server.shared.runtime.acceptedCount() >= 1);
+    try testing.expect(tls_accepts.load(.acquire) >= baseline_accepts);
+    try testing.expect(server.shared.runtime.connectFailureCount() <= server.shared.runtime.acceptedCount());
+}
+

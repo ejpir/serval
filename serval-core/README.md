@@ -52,6 +52,14 @@ const custom = headers.get("X-Custom");    // ?[]const u8
 - `TlsH2FrontendMode` - TLS frontend h2 dispatch mode (`disabled`, `terminated_only`, `generic`)
 - `AlpnMixedOfferPolicy` - Mixed-offer ALPN selection policy (`prefer_http11`, `prefer_h2`)
 - `AcmeConfig` - ACME certificate automation settings (directory/contact/domains/backoff)
+- `TcpTransportConfig` - TCP L4 tunnel listener/upstream/timeout/limit settings
+- `UdpTransportConfig` - UDP L4 tunnel listener/upstream/session/probe settings
+- `L4Target` - Protocol-agnostic L4 upstream target (host/port/tls)
+- `TcpTlsMode` - TCP upstream mode (`passthrough`, `originate_tls`)
+- `TcpProbeMode` - TCP active probe mode (`passive_only`, `connect`)
+- `UdpProbeMode` - UDP probe mode (`passive_only`, `active_send`, `active_send_expect`)
+- `UdpSessionKeyMode` - UDP session keying (`five_tuple`, `source_endpoint`, `source_ip`)
+- `validateTransportConfig` - Validation entrypoint for optional TCP/UDP transport config
 - `DEBUG_LOGGING` - Comptime flag (true in Debug builds)
 - `MAX_HEADERS` - 64
 - `MAX_HEADER_SIZE_BYTES` - 8192
