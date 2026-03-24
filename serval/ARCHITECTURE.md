@@ -105,7 +105,7 @@ Layer 1 (Protocol):                                                │
   serval-tls ──────────────────────────────────────────────────────┤
                                                                    │
 Layer 2 (Infrastructure):                                          │
-  serval-grpc (depends on core, h2) ───────────────────────────────┤
+  serval-grpc (depends on core) ────────────────────────────────────┤
                                                                    │
   serval-acme (depends on core) ───────────────────────────────────┤
                                                                    │
@@ -153,7 +153,7 @@ Standalone:
 | serval-http | HTTP/1.1 parsing | `Parser` |
 | serval-websocket | RFC 6455 handshake + framing helpers | `validateClientRequest`, `computeAcceptKey`, `parseFrameHeader`, `buildClosePayload` |
 | serval-h2 | Minimal HTTP/2 / h2c protocol helpers | `parseFrameHeader`, `buildFrameHeader`, `parseInitialRequest`, `parseSettingsPayload`, `buildGoAwayFrame`, `StreamTable`, `Window` |
-| serval-grpc | gRPC metadata + envelope helpers | `validateRequest`, `buildMessage`, `parseMessage` |
+| serval-grpc | gRPC metadata + envelope helpers | `validateRequest`, `validateRequestStrict`, `classifyRequest`, `parseGrpcStatus`, `requireGrpcStatus`, `buildMessage`, `parseMessage`, `nextFrame` |
 | serval-acme | ACME certificate automation primitives | `CertState`, `RuntimeConfig`, `Http01Store`, `AcmeDirectory`, `AcmeNewOrderRequest`, `AcmeJwkP256`, `AcmeWireRequest`, `AcmeFlowContext`, `executeAcmeOperation`, `AcmeManager` |
 | serval-pool | Connection reuse (wraps Socket) | `SimplePool`, `NoPool`, `Connection` |
 | serval-client | HTTP/1.1 client for upstream requests + bounded outbound h2 session/runtime primitives | `Client`, `ClientError`, `ResponseHeaders`, `sendRequest`, `readResponseHeaders`, `H2SessionState`, `H2Runtime`, `H2ClientConnection`, `H2UpstreamSessionPool` |

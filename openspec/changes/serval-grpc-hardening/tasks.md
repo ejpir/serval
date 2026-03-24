@@ -28,15 +28,20 @@
 
 ## 5. docs + architecture consistency
 
-- [ ] 5.1 Align `serval/ARCHITECTURE.md` dependency note for `serval-grpc` with actual build imports.
-- [ ] 5.2 Update `serval-grpc/README.md` contracts and error semantics.
-- [ ] 5.3 Verify root `README.md` gRPC behavior text remains accurate.
-- [ ] 5.4 Run and record verification commands (`zig build`, `zig build test`, `zig build test-grpc`).
+- [x] 5.1 Align `serval/ARCHITECTURE.md` dependency note for `serval-grpc` with actual build imports.
+- [x] 5.2 Update `serval-grpc/README.md` contracts and error semantics.
+- [x] 5.3 Verify root `README.md` gRPC behavior text remains accurate.
+- [x] 5.4 Run and record verification commands (`zig build`, `zig build test`, `zig build test-grpc`).
+
+Verification record:
+- `zig build` -> exit 0
+- `zig build test` -> exit 0
+- `zig build test-grpc` -> exit 0
 
 ## 6. PR slicing (recommended)
 
-- [ ] PR1: `grpc-status` semantics + tests + README updates.
-- [ ] PR2: strict metadata validation + grammar tests.
-- [ ] PR3: wire frame scan helpers + fuzz/property tests.
-- [ ] PR4: server/proxy classification integration + integration tests.
-- [ ] PR5: doc/architecture cleanup + full verification pass.
+- [x] PR1: `grpc-status` semantics + tests + README updates.
+- [x] PR2: strict metadata validation + grammar tests.
+- [x] PR3: wire frame scan helpers + fuzz/property tests.
+- [x] PR4: server/proxy classification integration + integration tests.
+- [x] PR5: doc/architecture cleanup + full verification pass.
