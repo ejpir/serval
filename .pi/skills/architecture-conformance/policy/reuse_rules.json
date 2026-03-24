@@ -1,0 +1,101 @@
+{
+  "forbid": [
+    {
+      "id": "dns-must-use-serval-net-resolver",
+      "rule": "Z2",
+      "severity": "CRITICAL",
+      "regex": "\\bstd\\.net\\.getAddressList\\s*\\(",
+      "message": "Use serval-net.DnsResolver instead of std.net.getAddressList.",
+      "recommendation": "Inject/use serval-net.DnsResolver and call resolver APIs.",
+      "allow_paths": ["serval-net/**"]
+    },
+    {
+      "id": "tls-must-use-serval-tls-wrappers",
+      "rule": "Z2",
+      "severity": "CRITICAL",
+      "regex": "\\bc\\.SSL_[A-Za-z0-9_]+\\s*\\(",
+      "message": "Use serval-tls wrappers; avoid direct OpenSSL calls in non-TLS modules.",
+      "recommendation": "Add/extend wrapper in serval-tls and use that API from higher modules.",
+      "allow_paths": ["serval-tls/**"]
+    }
+  ],
+  "prefer": [
+    {
+      "id": "prefer-core-time-over-std-time",
+      "rule": "Z2",
+      "severity": "MAJOR",
+      "regex": "\\bstd\\.time\\.(nanoTimestamp|timestamp|sleep)\\b",
+      "message": "Use serval-core.time wrappers outside serval-core.",
+      "recommendation": "Use core.time.monotonicNanos/realtimeNanos/sleep/elapsedNanos.",
+      "allow_paths": ["serval-core/**"]
+    },
+    {
+      "id": "prefer-core-time-over-io-clock",
+      "mode": "strict",
+      "rule": "Z2",
+      "severity": "MAJOR",
+      "regex": "\\bstd\\.Io\\.Clock\\.",
+      "message": "Use serval-core.time instead of direct std.Io.Clock in non-core modules.",
+      "recommendation": "Call core.time.monotonicNanos/realtimeNanos in consumers.",
+      "allow_paths": ["serval-core/time.zig", "serval-tls/stream.zig"]
+    },
+    {
+      "id": "prefer-core-time-over-posix-nanosleep",
+      "rule": "Z2",
+      "severity": "MAJOR",
+      "regex": "\\b(?:std\\.posix|posix)\\.nanosleep\\b",
+      "message": "Use serval-core.time.sleep instead of direct nanosleep.",
+      "recommendation": "Replace with core.time.sleep(duration_ns).",
+      "allow_paths": ["serval-core/**"]
+    },
+    {
+      "id": "prefer-core-debuglog",
+      "rule": "Z2",
+      "severity": "MAJOR",
+      "regex": "\\bstd\\.log\\.debug\\s*\\(",
+      "message": "Use serval-core.log.debugLog for debug-level logging consistency.",
+      "recommendation": "Import serval-core.log.debugLog and replace std.log.debug.",
+      "allow_paths": ["serval-core/log.zig"]
+    },
+    {
+      "id": "prefer-served-abstractions-over-raw-socket-primitives",
+      "mode": "strict",
+      "rule": "Z2",
+      "severity": "MAJOR",
+      "regex": "\\b(?:std\\.posix|posix)\\.(socket|bind|listen|accept|connect)\\s*\\(",
+      "message": "Prefer serval-socket/serval-client/serval-server abstractions over raw posix socket primitives.",
+      "recommendation": "Route usage through serval-socket (or higher abstraction per module role).",
+      "allow_paths": ["serval-socket/**", "serval-net/**", "serval-tls/**", "**/README.md"]
+    },
+    {
+      "id": "no-std-debug-print-outside-cli",
+      "mode": "strict",
+      "rule": "Z2",
+      "severity": "MAJOR",
+      "regex": "\\bstd\\.debug\\.print\\s*\\(",
+      "message": "Avoid std.debug.print outside CLI/core user-facing output paths.",
+      "recommendation": "Use module logger/hook pipeline or serval-core.log.debugLog as appropriate.",
+      "allow_paths": ["serval-cli/**", "serval-core/**"]
+    }
+  ],
+  "duplicate_api": [
+    {
+      "id": "no-duplicate-core-time-helpers",
+      "rule": "Z2",
+      "severity": "MAJOR",
+      "names": ["monotonicNanos", "realtimeNanos", "elapsedNanos", "sleep"],
+      "message": "Do not redeclare serval-core.time helpers in other modules.",
+      "recommendation": "Import from serval-core.time instead.",
+      "allow_paths": ["serval-core/time.zig", "serval-tls/stream.zig"]
+    },
+    {
+      "id": "no-duplicate-core-log-helper",
+      "rule": "Z2",
+      "severity": "MAJOR",
+      "names": ["debugLog"],
+      "message": "Do not redeclare serval-core.log.debugLog in other modules.",
+      "recommendation": "Import from serval-core.log instead.",
+      "allow_paths": ["serval-core/log.zig"]
+    }
+  ]
+}

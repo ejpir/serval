@@ -72,6 +72,8 @@ pub fn parseHeader(input: []const u8, role: PeerRole) FrameError!Header {
     const first = input[0];
     const second = input[1];
 
+    const header_len = try parseHeaderLen(input, second);
+
     const header = Header{
         .fin = (first & 0x80) != 0,
         .rsv1 = (first & 0x40) != 0,
@@ -80,8 +82,8 @@ pub fn parseHeader(input: []const u8, role: PeerRole) FrameError!Header {
         .opcode = try parseOpcode(@intCast(first & 0x0F)),
         .masked = (second & 0x80) != 0,
         .payload_len = try parsePayloadLen(input, second),
-        .mask_key = try parseMaskKey(input, second),
-        .header_len_bytes = try parseHeaderLen(input, second),
+        .mask_key = try parseMaskKey(input, second, header_len),
+        .header_len_bytes = header_len,
     };
 
     if (header.rsv1 or header.rsv2 or header.rsv3) return error.InvalidReservedBits;
@@ -208,14 +210,13 @@ fn parsePayloadLen(input: []const u8, second: u8) FrameError!u64 {
     };
 }
 
-fn parseMaskKey(input: []const u8, second: u8) FrameError!?[4]u8 {
+fn parseMaskKey(input: []const u8, second: u8, header_len: u8) FrameError!?[4]u8 {
     assert(input.len >= 2);
     assert(input.len <= max_header_size_bytes);
 
     const masked = (second & 0x80) != 0;
     if (!masked) return null;
 
-    const header_len = try parseHeaderLen(input, second);
     assert(header_len >= 6);
     assert(header_len <= max_header_size_bytes);
     const mask_offset = header_len - 4;
@@ -233,6 +234,14 @@ fn parseHeaderLen(input: []const u8, second: u8) FrameError!u8 {
     assert(input.len >= 2);
     assert(input.len <= max_header_size_bytes);
 
+    const total_len = headerLenFromSecondByte(second);
+    assert(total_len >= 2);
+    assert(total_len <= max_header_size_bytes);
+    if (input.len < total_len) return error.IncompleteHeader;
+    return total_len;
+}
+
+fn headerLenFromSecondByte(second: u8) u8 {
     const len_code: u8 = second & 0x7F;
     const masked = (second & 0x80) != 0;
 
@@ -242,10 +251,10 @@ fn parseHeaderLen(input: []const u8, second: u8) FrameError!u8 {
         127 => 10,
         else => unreachable,
     };
+
     const total_len: u8 = base_len + if (masked) @as(u8, 4) else @as(u8, 0);
     assert(total_len >= 2);
     assert(total_len <= max_header_size_bytes);
-    if (input.len < total_len) return error.IncompleteHeader;
     return total_len;
 }
 
@@ -345,6 +354,15 @@ test "parseHeader rejects masked server frame" {
 test "parseHeader rejects incomplete header bytes" {
     const raw = [_]u8{0x81};
     try std.testing.expectError(error.IncompleteHeader, parseHeader(&raw, .client));
+}
+
+test "headerLenFromSecondByte computes bounded sizes" {
+    try std.testing.expectEqual(@as(u8, 2), headerLenFromSecondByte(0x00));
+    try std.testing.expectEqual(@as(u8, 6), headerLenFromSecondByte(0x80));
+    try std.testing.expectEqual(@as(u8, 4), headerLenFromSecondByte(126));
+    try std.testing.expectEqual(@as(u8, 8), headerLenFromSecondByte(0x80 | 126));
+    try std.testing.expectEqual(@as(u8, 10), headerLenFromSecondByte(127));
+    try std.testing.expectEqual(@as(u8, 14), headerLenFromSecondByte(0x80 | 127));
 }
 
 test "parseHeader rejects unsupported opcode" {

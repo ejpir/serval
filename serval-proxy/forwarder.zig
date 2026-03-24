@@ -616,7 +616,8 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             const supports_h2_tls = upstream.http_protocol == .h2 and upstream.tls;
             if (!supports_h2c_plain and !supports_h2_tls) return ForwardError.UnsupportedProtocol;
 
-            serval_grpc.validateRequest(request) catch return ForwardError.UnsupportedProtocol;
+            const request_class = serval_grpc.classifyRequest(request);
+            if (request_class != .grpc) return ForwardError.UnsupportedProtocol;
             _ = serval_h2.looksLikeClientConnectionPreface(initial_client_bytes);
 
             const forward_span = self.tracer.startSpan("forward_grpc_h2", parent_span);
@@ -715,7 +716,9 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             if (upstream.http_protocol != .h2c) return ForwardError.UnsupportedProtocol;
             if (upstream.tls) return ForwardError.UnsupportedProtocol;
             if (body_info.framing == .chunked) return ForwardError.UnsupportedProtocol;
-            serval_grpc.validateRequest(request) catch return ForwardError.UnsupportedProtocol;
+
+            const request_class = serval_grpc.classifyRequest(request);
+            if (request_class != .grpc) return ForwardError.UnsupportedProtocol;
 
             const forward_span = self.tracer.startSpan("forward_grpc_h2c_upgrade", parent_span);
             errdefer self.tracer.endSpan(forward_span, "forward_error");

@@ -125,3 +125,45 @@ test "validateSelection accepts offered protocol" {
 test "validateSelection rejects protocol not offered" {
     try std.testing.expectError(error.ProtocolNotOffered, validateSelection("chat, superchat", "graphql-ws"));
 }
+
+test "validateHeaderValue matrix" {
+    const cases = [_]struct {
+        value: []const u8,
+        expected_error: ?SubprotocolError,
+    }{
+        .{ .value = "chat, superchat", .expected_error = null },
+        .{ .value = "chat", .expected_error = null },
+        .{ .value = "chat, ,jsonrpc", .expected_error = error.EmptyToken },
+        .{ .value = "chat, bad token", .expected_error = error.InvalidToken },
+        .{ .value = " chat", .expected_error = null },
+    };
+
+    var index: usize = 0;
+    while (index < cases.len) : (index += 1) {
+        const result = validateHeaderValue(cases[index].value);
+        if (cases[index].expected_error) |expected_error| {
+            try std.testing.expectError(expected_error, result);
+        } else {
+            try result;
+        }
+    }
+}
+
+test "fuzz isToken and headerOffersProtocol remain bounded" {
+    var prng = std.Random.DefaultPrng.init(0xc149_00d1_11ef_92a4);
+    const random = prng.random();
+
+    var token_buf: [128]u8 = undefined;
+    var header_buf: [512]u8 = undefined;
+
+    var iteration: u32 = 0;
+    while (iteration < 1024) : (iteration += 1) {
+        const token_len = random.uintLessThan(usize, token_buf.len + 1);
+        random.bytes(token_buf[0..token_len]);
+        _ = isToken(token_buf[0..token_len]);
+
+        const header_len = random.uintLessThan(usize, header_buf.len + 1);
+        random.bytes(header_buf[0..header_len]);
+        _ = headerOffersProtocol(header_buf[0..header_len], "chat");
+    }
+}

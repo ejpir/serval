@@ -871,8 +871,8 @@ pub fn GenericTlsH2FrontendHandler(
         }
 
         fn isGrpcRequest(request: *const Request) bool {
-            serval_grpc.validateRequest(request) catch return false;
-            return true;
+            const request_class = serval_grpc.classifyRequest(request);
+            return request_class == .grpc;
         }
 
         fn supportsH2BridgeUpstream(upstream: types.Upstream) bool {

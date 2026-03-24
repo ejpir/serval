@@ -6,8 +6,6 @@
 const std = @import("std");
 const Io = std.Io;
 const assert = std.debug.assert;
-const c = std.c;
-const posix = std.posix;
 
 const core = @import("serval-core");
 const config = core.config;
@@ -31,6 +29,7 @@ const isLastChunk = serval_http.chunked.isLastChunk;
 
 const wire = @import("wire.zig");
 const orchestration = @import("orchestration.zig");
+const test_io = @import("test_io.zig");
 
 const max_host_header_value_bytes = config.ACME_MAX_DOMAIN_NAME_LEN + 6;
 const max_content_length_digits = 20;
@@ -285,13 +284,11 @@ fn readContentLengthBody(
     var iterations: u32 = 0;
 
     while (cursor < content_length and iterations < max_body_iterations) : (iterations += 1) {
-        const bytes_read = socket.read(body_buf[@intCast(cursor)..@intCast(content_length)]) catch |err| {
-            return mapSocketReadError(err);
-        };
-
-        if (bytes_read == 0) return error.BodyConnectionClosed;
-        if (bytes_read > cursor_max) return error.BodyReadFailed;
-        cursor += @intCast(bytes_read);
+        const bytes_read = try readSocketBytes(
+            socket,
+            body_buf[u32ToUsize(cursor)..u32ToUsize(content_length)],
+        );
+        cursor += bytes_read;
     }
 
     if (cursor != content_length) return error.BodyIterationLimitExceeded;
@@ -374,6 +371,44 @@ fn handleChunkHeader(
     state.* = .chunk_data;
 }
 
+fn validateChunkCopyCapacity(body_buf: []u8, out_cursor: u32, chunk_remaining: u64) Error!void {
+    assert(out_cursor <= cursor_max);
+    assert(chunk_remaining <= std.math.maxInt(u64));
+
+    if (body_buf.len > cursor_max) return error.ResponseBodyTooLarge;
+    const body_len: u32 = @intCast(body_buf.len);
+    if (out_cursor > body_len) return error.InvalidChunkedEncoding;
+
+    if (chunk_remaining > cursor_max) return error.ResponseBodyTooLarge;
+    const out_remaining = body_len - out_cursor;
+    if (chunk_remaining > @as(u64, @intCast(out_remaining))) {
+        return error.ResponseBodyTooLarge;
+    }
+}
+
+fn copyPendingChunkData(pending: []u8, body_buf: []u8, ctx: *ChunkParseContext) u32 {
+    assert(@intFromPtr(ctx) != 0);
+    assert(ctx.pending_start <= ctx.pending_end);
+    assert(ctx.chunk_remaining <= cursor_max);
+
+    const pending_available = ctx.pending_end - ctx.pending_start;
+    const chunk_remaining: u32 = @intCast(ctx.chunk_remaining);
+    const to_copy: u32 = @min(pending_available, chunk_remaining);
+
+    const out_start = u32ToUsize(ctx.out_cursor);
+    const pending_start = u32ToUsize(ctx.pending_start);
+    const copy_len = u32ToUsize(to_copy);
+    @memcpy(
+        body_buf[out_start..][0..copy_len],
+        pending[pending_start..][0..copy_len],
+    );
+
+    ctx.out_cursor += to_copy;
+    ctx.pending_start += to_copy;
+    ctx.chunk_remaining -= to_copy;
+    return to_copy;
+}
+
 fn handleChunkData(
     socket: *Socket,
     pending: []u8,
@@ -389,10 +424,7 @@ fn handleChunkData(
         return;
     }
 
-    if (body_buf.len > cursor_max) return error.ResponseBodyTooLarge;
-    const body_len: u32 = @intCast(body_buf.len);
-    const out_remaining = body_len - ctx.out_cursor;
-    if (ctx.chunk_remaining > @as(u64, @intCast(out_remaining))) return error.ResponseBodyTooLarge;
+    try validateChunkCopyCapacity(body_buf, ctx.out_cursor, ctx.chunk_remaining);
 
     const pending_available = ctx.pending_end - ctx.pending_start;
     if (pending_available == 0) {
@@ -400,14 +432,7 @@ fn handleChunkData(
         return;
     }
 
-    if (ctx.chunk_remaining > cursor_max) return error.ResponseBodyTooLarge;
-    const chunk_remaining: u32 = @intCast(ctx.chunk_remaining);
-    const to_copy: u32 = @min(pending_available, chunk_remaining);
-    @memcpy(body_buf[@intCast(ctx.out_cursor)..][0..@intCast(to_copy)], pending[@intCast(ctx.pending_start)..][0..@intCast(to_copy)]);
-
-    ctx.out_cursor += to_copy;
-    ctx.pending_start += to_copy;
-    ctx.chunk_remaining -= to_copy;
+    _ = copyPendingChunkData(pending, body_buf, ctx);
     if (ctx.chunk_remaining == 0) state.* = .chunk_data_crlf;
 }
 
@@ -424,7 +449,7 @@ fn handleChunkDataCrlf(
         try fillPending(socket, pending, &ctx.pending_start, &ctx.pending_end);
     }
 
-    if (pending[@intCast(ctx.pending_start)] != '\r' or pending[@intCast(ctx.pending_start + 1)] != '\n') {
+    if (pending[u32ToUsize(ctx.pending_start)] != '\r' or pending[u32ToUsize(ctx.pending_start + 1)] != '\n') {
         return error.InvalidChunkedEncoding;
     }
 
@@ -441,7 +466,7 @@ fn handleChunkTrailers(
     assert(@intFromPtr(socket) != 0);
     assert(@intFromPtr(ctx) != 0);
 
-    const trailer_slice = pending[@intCast(ctx.pending_start)..@intCast(ctx.pending_end)];
+    const trailer_slice = pending[u32ToUsize(ctx.pending_start)..u32ToUsize(ctx.pending_end)];
     if (trailer_slice.len >= 2 and trailer_slice[0] == '\r' and trailer_slice[1] == '\n') {
         ctx.pending_start += 2;
         state.* = .done;
@@ -478,20 +503,37 @@ fn fillPending(
 
     if (pending_end.* == pending_len and pending_start.* > 0) {
         const kept = pending_end.* - pending_start.*;
-        std.mem.copyForwards(u8, pending[0..@intCast(kept)], pending[@intCast(pending_start.*)..@intCast(pending_end.*)]);
+        std.mem.copyForwards(
+            u8,
+            pending[0..u32ToUsize(kept)],
+            pending[u32ToUsize(pending_start.*)..u32ToUsize(pending_end.*)],
+        );
         pending_start.* = 0;
         pending_end.* = kept;
     }
 
     if (pending_end.* == pending_len) return error.ChunkedTrailerTooLarge;
 
-    const bytes_read = socket.read(pending[@intCast(pending_end.*)..]) catch |err| {
+    const bytes_read = try readSocketBytes(socket, pending[u32ToUsize(pending_end.*)..]);
+    pending_end.* += bytes_read;
+}
+
+fn u32ToUsize(value: u32) usize {
+    assert(value <= cursor_max);
+    assert(@as(u64, value) <= std.math.maxInt(usize));
+    return @intCast(value);
+}
+
+fn readSocketBytes(socket: *Socket, out: []u8) Error!u32 {
+    assert(@intFromPtr(socket) != 0);
+    assert(out.len <= std.math.maxInt(usize));
+
+    const bytes_read = socket.read(out) catch |err| {
         return mapSocketReadError(err);
     };
     if (bytes_read == 0) return error.BodyConnectionClosed;
     if (bytes_read > cursor_max) return error.BodyReadFailed;
-
-    pending_end.* += @intCast(bytes_read);
+    return @intCast(bytes_read);
 }
 
 fn mapSocketReadError(err: SocketError) Error {
@@ -518,11 +560,11 @@ test "formatHostHeaderValue renders host and port" {
 }
 
 test "readContentLengthBody merges preread and socket bytes" {
-    const fds = createTestSocketPair() orelse return;
-    defer closeTestFd(fds[0]);
-    defer closeTestFd(fds[1]);
+    const fds = test_io.create_socket_pair() orelse return;
+    defer test_io.close_fd(fds[0]);
+    defer test_io.close_fd(fds[1]);
 
-    if (!writeTestBytes(fds[1], "de")) return;
+    if (!test_io.write_bytes(fds[1], "de")) return;
 
     var socket = Socket.Plain.init_client(fds[0]);
     var out: [16]u8 = undefined;
@@ -531,9 +573,9 @@ test "readContentLengthBody merges preread and socket bytes" {
 }
 
 test "readChunkedBody decodes pre-read chunked stream" {
-    const fds = createTestSocketPair() orelse return;
-    defer closeTestFd(fds[0]);
-    defer closeTestFd(fds[1]);
+    const fds = test_io.create_socket_pair() orelse return;
+    defer test_io.close_fd(fds[0]);
+    defer test_io.close_fd(fds[1]);
 
     var socket = Socket.Plain.init_client(fds[0]);
     var out: [64]u8 = undefined;
@@ -542,11 +584,11 @@ test "readChunkedBody decodes pre-read chunked stream" {
 }
 
 test "readChunkedBody decodes split pre-read and socket stream" {
-    const fds = createTestSocketPair() orelse return;
-    defer closeTestFd(fds[0]);
-    defer closeTestFd(fds[1]);
+    const fds = test_io.create_socket_pair() orelse return;
+    defer test_io.close_fd(fds[0]);
+    defer test_io.close_fd(fds[1]);
 
-    if (!writeTestBytes(fds[1], "llo\r\n0\r\n\r\n")) return;
+    if (!test_io.write_bytes(fds[1], "llo\r\n0\r\n\r\n")) return;
 
     var socket = Socket.Plain.init_client(fds[0]);
     var out: [64]u8 = undefined;
@@ -555,9 +597,9 @@ test "readChunkedBody decodes split pre-read and socket stream" {
 }
 
 test "readResponseBody rejects pre-read bytes when framing is none" {
-    const fds = createTestSocketPair() orelse return;
-    defer closeTestFd(fds[0]);
-    defer closeTestFd(fds[1]);
+    const fds = test_io.create_socket_pair() orelse return;
+    defer test_io.close_fd(fds[0]);
+    defer test_io.close_fd(fds[1]);
 
     var socket = Socket.Plain.init_client(fds[0]);
     const response = ResponseHeaders{
@@ -574,33 +616,4 @@ test "readResponseBody rejects pre-read bytes when framing is none" {
         error.InvalidResponseBody,
         readResponseBody(&socket, &response, &header_buf, &body_buf),
     );
-}
-
-fn createTestSocketPair() ?[2]i32 {
-    assert(@intFromEnum(posix.AF.UNIX) > 0);
-    assert(@intFromEnum(posix.SOCK.STREAM) > 0);
-    var fds: [2]i32 = undefined;
-    const rc = c.socketpair(
-        @intCast(posix.AF.UNIX),
-        @intCast(posix.SOCK.STREAM),
-        0,
-        &fds,
-    );
-    if (rc != 0) return null;
-    return fds;
-}
-
-fn closeTestFd(fd: i32) void {
-    assert(fd >= 0);
-    assert(fd <= std.math.maxInt(c_int));
-    _ = c.close(fd);
-}
-
-fn writeTestBytes(fd: i32, bytes: []const u8) bool {
-    assert(fd >= 0);
-    assert(bytes.len <= std.math.maxInt(isize));
-    const written = c.write(fd, bytes.ptr, bytes.len);
-    if (written < 0) return false;
-
-    return written == @as(isize, @intCast(bytes.len));
 }

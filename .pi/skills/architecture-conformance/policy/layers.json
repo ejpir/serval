@@ -1,0 +1,24 @@
+{
+  "layers": {
+    "0": ["serval-core"],
+    "1": ["serval-http", "serval-net", "serval-tls", "serval-websocket", "serval-h2"],
+    "2": ["serval-grpc", "serval-acme", "serval-socket", "serval-pool", "serval-client", "serval-health", "serval-prober", "serval-metrics", "serval-waf", "serval-tracing", "serval-otel"],
+    "3": ["serval-proxy"],
+    "4": ["serval-lb", "serval-router", "serval-k8s-gateway"],
+    "5": ["serval-server", "serval", "serval-cli"]
+  },
+  "allowed_sideways": [
+    ["serval-pool", "serval-socket"],
+    ["serval-client", "serval-socket"],
+    ["serval-client", "serval-pool"],
+    ["serval-prober", "serval-client"],
+    ["serval-otel", "serval-tracing"],
+    ["serval-lb", "serval-health"],
+    ["serval-lb", "serval-prober"],
+    ["serval-router", "serval-lb"],
+    ["serval-router", "serval-health"],
+    ["serval-router", "serval-prober"],
+    ["serval", "serval-server"],
+    ["serval", "serval-cli"]
+  ]
+}

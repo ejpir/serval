@@ -179,3 +179,4 @@ if (websocket.looksLikeWebSocketUpgradeRequest(&request)) {
 - Explicit bounded parsing loops
 - Precondition/postcondition assertions
 - Strict separation from transport/session ownership
+- Table-driven grammar checks and bounded fuzz-style parser tests

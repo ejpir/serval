@@ -1116,8 +1116,8 @@ pub fn Server(
                 assert(@intFromPtr(self) != 0);
                 assert(@intFromPtr(request) != 0);
 
-                serval_grpc.validateRequest(request) catch return false;
-                return true;
+                const request_class = serval_grpc.classifyRequest(request);
+                return request_class == .grpc;
             }
 
             fn trackStream(self: *@This(), stream_id: u32) PolicyError!void {
@@ -1582,7 +1582,9 @@ pub fn Server(
             fn mapGrpcStatusValidationError(result: serval_grpc.MetadataError!void) BridgeError!void {
                 result catch |err| switch (err) {
                     error.MissingGrpcStatus => return error.MissingGrpcStatus,
-                    error.InvalidGrpcStatus => return error.InvalidGrpcStatus,
+                    error.InvalidGrpcStatusFormat,
+                    error.InvalidGrpcStatusRange,
+                    => return error.InvalidGrpcStatus,
                     else => unreachable,
                 };
             }
@@ -2355,10 +2357,7 @@ pub fn Server(
             }
             ctx.parse_duration_ns = @intCast(@max(0, realtimeNanos() - parse_start_ns));
 
-            const request_is_grpc = blk: {
-                serval_grpc.validateRequest(&parsed.request) catch break :blk false;
-                break :blk true;
-            };
+            const request_is_grpc = serval_grpc.classifyRequest(&parsed.request) == .grpc;
             if (!request_is_grpc) {
                 log.debug(
                     "server: conn={d} prior-knowledge stream={d} classified as non-gRPC; bridge completion uses generic semantics",
@@ -2935,10 +2934,7 @@ pub fn Server(
                         return;
                     };
 
-                    const upgrade_request_is_grpc = blk_grpc: {
-                        serval_grpc.validateRequest(&parser.request) catch break :blk_grpc false;
-                        break :blk_grpc true;
-                    };
+                    const upgrade_request_is_grpc = serval_grpc.classifyRequest(&parser.request) == .grpc;
                     if (!upgrade_request_is_grpc) {
                         log.debug(
                             "server: conn={d} upgrade stream classified as non-gRPC; bridge completion uses generic semantics",

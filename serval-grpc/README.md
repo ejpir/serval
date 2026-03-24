@@ -32,14 +32,22 @@ Current users:
 | Symbol | Description |
 |--------|-------------|
 | `MessagePrefix` | Parsed 5-byte gRPC message envelope |
+| `FrameView` | Parsed framed-message view (prefix + payload + frame size) |
 | `WireError` | Message-envelope parse/build errors |
 | `parsePrefix(raw)` | Parse 5-byte prefix only |
+| `frameLengthBytes(raw)` | Parse prefix and return full frame length (`prefix + payload`) |
+| `parseFrame(raw)` | Parse and validate one complete framed message |
+| `nextFrame(raw, cursor_bytes)` | Iterate framed messages in a contiguous byte slice |
 | `buildMessage(out, compressed, payload)` | Build prefix + payload buffer |
 | `parseMessage(raw)` | Validate and slice a full framed message |
 | `MetadataError` | Request/trailer validation errors |
+| `RequestClass` | Request classification enum: `grpc`, `non_grpc`, `invalid_grpc_like` |
 | `isGrpcContentType(value)` | Match `application/grpc`, `application/grpc+...`, and `application/grpc;...` |
-| `validateRequest(request)` | Enforce gRPC request metadata requirements |
-| `requireGrpcStatus(headers)` | Enforce numeric `grpc-status` presence |
+| `validateRequest(request)` | Compatibility request validation (`te` case-insensitive, permissive media suffix/params) |
+| `validateRequestStrict(request)` | Strict request validation (exact `te: trailers`, strict media suffix/parameter grammar) |
+| `classifyRequest(request)` | Classify as `grpc`, `non_grpc`, or `invalid_grpc_like` |
+| `parseGrpcStatus(headers)` | Parse and validate canonical numeric `grpc-status` (`0..16`) |
+| `requireGrpcStatus(headers)` | Enforce valid canonical `grpc-status` presence |
 
 ## File Layout
 
@@ -57,12 +65,25 @@ Current users:
 
 - method must be `POST`
 - request path must be non-empty
-- `content-type` must be a gRPC content-type
-- `te` must be exactly `trailers`
+- `content-type` must be a gRPC content-type (`application/grpc`, `+suffix`, or `;params`)
+- `te` must case-insensitively equal `trailers`
 - missing/invalid metadata returns explicit typed errors (`Missing*` / `Invalid*`)
 
-This is intentionally minimal and transport-safe. It does not try to interpret
-protobuf payloads or application-level RPC semantics.
+`validateRequestStrict()` applies the same baseline checks with stricter grammar:
+
+- `te` must be exactly lowercase `trailers`
+- `content-type` rejects ASCII whitespace
+- `application/grpc+...` requires non-empty HTTP token suffix
+- `application/grpc;...` requires one or more `key=value` token parameters
+
+This keeps compatibility mode available while allowing hardened deployments to
+enforce stricter metadata normalization and parsing.
+
+`classifyRequest()` centralizes stream/request class detection for higher layers:
+
+- `grpc`: valid gRPC request metadata
+- `non_grpc`: no gRPC metadata signals present
+- `invalid_grpc_like`: gRPC-signaling metadata present but invalid
 
 ### Response / trailer validation
 
@@ -70,6 +91,10 @@ protobuf payloads or application-level RPC semantics.
 
 - `grpc-status` must be present
 - `grpc-status` must be numeric
+- `grpc-status` must be within canonical gRPC status-code range (`0..16`)
+
+`parseGrpcStatus()` returns the parsed status code as `u8` for call sites that need
+explicit status inspection while preserving fail-closed validation.
 
 This is used by stream-aware h2 proxying to fail closed when an upstream claims
 to be gRPC but does not produce valid gRPC terminal metadata.
@@ -83,6 +108,14 @@ to be gRPC but does not produce valid gRPC terminal metadata.
 
 Length is bounded by `serval-core.config.GRPC_MAX_MESSAGE_SIZE_BYTES`.
 Short frames (`len < 5`) fail with `NeedMoreData` instead of asserting.
+
+In addition to prefix/message helpers, it now provides bounded scanning helpers for
+streaming buffers:
+
+- `frameLengthBytes(raw)` for fast frame-length checks
+- `parseFrame(raw)` for one validated frame view
+- `nextFrame(raw, &cursor)` for incremental multi-frame scans with explicit
+  `NeedMoreData` on truncation
 
 ## Example
 

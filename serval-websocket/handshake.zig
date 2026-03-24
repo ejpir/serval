@@ -369,3 +369,111 @@ test "validateServerResponse rejects wrong accept key" {
     const result = validateServerResponse(101, headers, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
     try std.testing.expectError(error.InvalidAcceptHeader, result);
 }
+
+test "validateClientRequest matrix" {
+    const cases = [_]struct {
+        method: types.Method,
+        connection: []const u8,
+        upgrade: []const u8,
+        key: []const u8,
+        version: []const u8,
+        body_framing: BodyFraming,
+        expected_error: ?HandshakeError,
+    }{
+        .{
+            .method = .GET,
+            .connection = "Upgrade",
+            .upgrade = "websocket",
+            .key = "dGhlIHNhbXBsZSBub25jZQ==",
+            .version = "13",
+            .body_framing = .none,
+            .expected_error = null,
+        },
+        .{
+            .method = .POST,
+            .connection = "Upgrade",
+            .upgrade = "websocket",
+            .key = "dGhlIHNhbXBsZSBub25jZQ==",
+            .version = "13",
+            .body_framing = .none,
+            .expected_error = error.InvalidMethod,
+        },
+        .{
+            .method = .GET,
+            .connection = "keep-alive",
+            .upgrade = "websocket",
+            .key = "dGhlIHNhbXBsZSBub25jZQ==",
+            .version = "13",
+            .body_framing = .none,
+            .expected_error = error.MissingConnectionHeader,
+        },
+        .{
+            .method = .GET,
+            .connection = "Upgrade",
+            .upgrade = "websocket",
+            .key = "invalid",
+            .version = "13",
+            .body_framing = .none,
+            .expected_error = error.InvalidWebSocketKey,
+        },
+        .{
+            .method = .GET,
+            .connection = "Upgrade",
+            .upgrade = "websocket",
+            .key = "dGhlIHNhbXBsZSBub25jZQ==",
+            .version = "12",
+            .body_framing = .none,
+            .expected_error = error.UnsupportedWebSocketVersion,
+        },
+        .{
+            .method = .GET,
+            .connection = "Upgrade",
+            .upgrade = "websocket",
+            .key = "dGhlIHNhbXBsZSBub25jZQ==",
+            .version = "13",
+            .body_framing = .{ .content_length = 1 },
+            .expected_error = error.UnexpectedMessageBody,
+        },
+    };
+
+    var index: usize = 0;
+    while (index < cases.len) : (index += 1) {
+        var request = Request{
+            .method = cases[index].method,
+            .path = "/chat",
+            .version = .@"HTTP/1.1",
+            .headers = .{},
+        };
+        try request.headers.put("Host", "server.example.com");
+        try request.headers.put("Upgrade", cases[index].upgrade);
+        try request.headers.put("Connection", cases[index].connection);
+        try request.headers.put("Sec-WebSocket-Key", cases[index].key);
+        try request.headers.put("Sec-WebSocket-Version", cases[index].version);
+
+        const result = validateClientRequest(&request, cases[index].body_framing);
+        if (cases[index].expected_error) |expected_error| {
+            try std.testing.expectError(expected_error, result);
+        } else {
+            try result;
+        }
+    }
+}
+
+test "fuzz headerHasToken and getHeaderValue remain bounded" {
+    var prng = std.Random.DefaultPrng.init(0x53a9_6b11_9112_44d1);
+    const random = prng.random();
+
+    var value_buf: [256]u8 = undefined;
+    var headers_buf: [1024]u8 = undefined;
+
+    var iteration: u32 = 0;
+    while (iteration < 512) : (iteration += 1) {
+        const value_len = random.uintLessThan(usize, value_buf.len + 1);
+        random.bytes(value_buf[0..value_len]);
+        _ = headerHasToken(value_buf[0..value_len], "upgrade");
+
+        const body_len = random.uintLessThan(usize, 64) + 1;
+        random.bytes(headers_buf[0..body_len]);
+        _ = getHeaderValue(headers_buf[0..body_len], "Connection");
+    }
+}

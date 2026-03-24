@@ -2049,6 +2049,55 @@ fn buildSimpleH2PostRequest(
     return out[0..pos];
 }
 
+fn buildSimpleH2PostStreamFrames(
+    path: []const u8,
+    authority: []const u8,
+    scheme: []const u8,
+    body: []const u8,
+    stream_id: u32,
+    out: []u8,
+) ![]const u8 {
+    assert(path.len > 0);
+    assert(authority.len > 0);
+    assert(scheme.len > 0);
+    assert(stream_id > 0);
+
+    var content_length_buf: [20]u8 = undefined;
+    const content_length = try std.fmt.bufPrint(&content_length_buf, "{d}", .{body.len});
+
+    var header_block_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const header_block = try buildH2HeaderBlock(&.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = path },
+        .{ .name = ":scheme", .value = scheme },
+        .{ .name = ":authority", .value = authority },
+        .{ .name = "content-type", .value = "text/plain" },
+        .{ .name = "content-length", .value = content_length },
+    }, &header_block_buf);
+
+    var pos: usize = 0;
+
+    const headers_frame = try appendH2Frame(
+        out[pos..],
+        .headers,
+        serval_h2.flags_end_headers,
+        stream_id,
+        header_block,
+    );
+    pos += headers_frame.len;
+
+    const data_frame = try appendH2Frame(
+        out[pos..],
+        .data,
+        serval_h2.flags_end_stream,
+        stream_id,
+        body,
+    );
+    pos += data_frame.len;
+
+    return out[0..pos];
+}
+
 fn buildSimpleH2PostRequestWithoutContentLength(
     path: []const u8,
     authority: []const u8,
@@ -4350,6 +4399,214 @@ fn grpcH2MultiBackendMain(config: GrpcH2MultiBackendConfig) !void {
 
 fn startGrpcH2MultiBackend(config: GrpcH2MultiBackendConfig) !std.Thread {
     const thread = try std.Thread.spawn(.{}, grpcH2MultiBackendMain, .{config});
+    posix.nanosleep(0, H2_SERVER_STARTUP_DELAY_MS * std.time.ns_per_ms);
+    return thread;
+}
+
+const MixedGrpcGenericBackendConfig = struct {
+    port: u16,
+    grpc_path: []const u8,
+    grpc_response: []const u8,
+    generic_path: []const u8,
+};
+
+const ParsedRequestClass = struct {
+    stream_id: u32,
+    path: []const u8,
+    request_class: serval_grpc.RequestClass,
+    consumed_bytes: u32,
+};
+
+fn parseSingleRequestClass(input: []const u8) !ParsedRequestClass {
+    assert(input.len > 0);
+
+    var cursor: usize = 0;
+    var iterations: u32 = 0;
+    var stream_id: u32 = 0;
+    var request = serval.Request{};
+    var saw_headers = false;
+
+    while (cursor < input.len and iterations < H2_MAX_FRAME_READS) : (iterations += 1) {
+        if (input.len - cursor < serval_h2.frame_header_size_bytes) return error.NeedMoreData;
+
+        const header = try serval_h2.parseFrameHeader(input[cursor..]);
+        const payload_start = cursor + serval_h2.frame_header_size_bytes;
+        const payload_end = payload_start + header.length;
+        if (payload_end > input.len) return error.NeedMoreData;
+        const payload = input[payload_start..payload_end];
+
+        switch (header.frame_type) {
+            .settings => {
+                if ((header.flags & serval_h2.flags_ack) == 0) return error.InvalidFrame;
+            },
+            .window_update => {},
+            .headers => {
+                if (saw_headers) return error.InvalidFrame;
+                if ((header.flags & serval_h2.flags_end_headers) == 0) return error.InvalidFrame;
+                if (header.stream_id == 0) return error.InvalidFrame;
+
+                stream_id = header.stream_id;
+                var fields_buf: [H2_MAX_HEADER_FIELDS]serval_h2.HeaderField = undefined;
+                const fields = try decodeH2Fields(payload, &fields_buf);
+                for (fields) |field| {
+                    if (std.mem.eql(u8, field.name, ":method")) {
+                        if (std.mem.eql(u8, field.value, "POST")) {
+                            request.method = .POST;
+                        } else if (std.mem.eql(u8, field.value, "GET")) {
+                            request.method = .GET;
+                        }
+                    } else if (std.mem.eql(u8, field.name, ":path")) {
+                        request.path = field.value;
+                    } else if (std.mem.eql(u8, field.name, ":authority")) {
+                        try request.headers.put("host", field.value);
+                    } else {
+                        try request.headers.put(field.name, field.value);
+                    }
+                }
+                if (request.path.len == 0) return error.MissingPath;
+                saw_headers = true;
+
+                if ((header.flags & serval_h2.flags_end_stream) != 0) {
+                    return .{
+                        .stream_id = stream_id,
+                        .path = request.path,
+                        .request_class = serval_grpc.classifyRequest(&request),
+                        .consumed_bytes = @intCast(payload_end),
+                    };
+                }
+            },
+            .data => {
+                if (!saw_headers) {
+                    if (header.stream_id == 1) {
+                        cursor = payload_end;
+                        continue;
+                    }
+                    return error.InvalidFrame;
+                }
+                if (header.stream_id != stream_id) return error.InvalidFrame;
+                if ((header.flags & serval_h2.flags_end_stream) == 0) {
+                    cursor = payload_end;
+                    continue;
+                }
+
+                return .{
+                    .stream_id = stream_id,
+                    .path = request.path,
+                    .request_class = serval_grpc.classifyRequest(&request),
+                    .consumed_bytes = @intCast(payload_end),
+                };
+            },
+            else => return error.InvalidFrame,
+        }
+
+        cursor = payload_end;
+    }
+
+    return error.NeedMoreData;
+}
+
+fn sendGenericHeadersOnlyResponse(conn: posix.socket_t, stream_id: u32) !void {
+    assert(stream_id > 0);
+
+    var send_buf: [256]u8 = undefined;
+    var pos: usize = 0;
+
+    var response_headers_buf: [128]u8 = undefined;
+    const response_headers = try buildH2HeaderBlock(&.{
+        .{ .name = ":status", .value = "204" },
+        .{ .name = "content-type", .value = "text/plain" },
+    }, &response_headers_buf);
+
+    const headers_frame = try appendH2Frame(
+        send_buf[pos..],
+        .headers,
+        serval_h2.flags_end_headers | serval_h2.flags_end_stream,
+        stream_id,
+        response_headers,
+    );
+    pos += headers_frame.len;
+
+    try sendAllTcp(conn, send_buf[0..pos]);
+}
+
+fn mixedGrpcGenericBackendMain(config: MixedGrpcGenericBackendConfig) !void {
+    const listener = try createTcpListener(config.port);
+    defer posix.close(listener);
+
+    const conn = try acceptTcp(listener);
+    defer posix.close(conn);
+
+    var request_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var total: usize = 0;
+    var parsed: serval_h2.InitialRequest = undefined;
+    var request_storage_buf: [serval_h2.request_stable_storage_size_bytes]u8 = undefined;
+
+    while (true) {
+        const n = try posix.recv(conn, request_buf[total..], 0);
+        if (n == 0) return error.ConnectionClosed;
+        total += n;
+        parsed = serval_h2.parseInitialRequest(request_buf[0..total], &request_storage_buf) catch |err| switch (err) {
+            error.NeedMoreData => continue,
+            else => return err,
+        };
+        break;
+    }
+
+    var settings_buf: [2 * serval_h2.frame_header_size_bytes]u8 = undefined;
+    var settings_pos: usize = 0;
+    const settings = try appendH2Frame(settings_buf[settings_pos..], .settings, 0, 0, &[_]u8{});
+    settings_pos += settings.len;
+    const settings_ack = try appendH2Frame(settings_buf[settings_pos..], .settings, serval_h2.flags_ack, 0, &[_]u8{});
+    settings_pos += settings_ack.len;
+    try sendAllTcp(conn, settings_buf[0..settings_pos]);
+
+    const first_class = serval_grpc.classifyRequest(&parsed.request);
+    if (first_class == .grpc) {
+        try testing.expectEqualStrings(config.grpc_path, parsed.request.path);
+        try sendGrpcUnaryResponse(conn, parsed.stream_id, config.grpc_response);
+    } else {
+        try testing.expectEqualStrings(config.generic_path, parsed.request.path);
+        try sendGenericHeadersOnlyResponse(conn, parsed.stream_id);
+    }
+
+    var second_request_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var second_total: usize = 0;
+
+    const consumed_bytes: usize = @intCast(parsed.consumed_bytes);
+    assert(consumed_bytes <= total);
+    if (total > consumed_bytes) {
+        const carried_len = total - consumed_bytes;
+        assert(carried_len <= second_request_buf.len);
+        @memcpy(second_request_buf[0..carried_len], request_buf[consumed_bytes..total]);
+        second_total = carried_len;
+    }
+
+    while (true) {
+        if (second_total > 0) {
+            const second = parseSingleRequestClass(second_request_buf[0..second_total]) catch |err| switch (err) {
+                error.NeedMoreData => null,
+                else => return err,
+            };
+            if (second) |req| {
+                if (req.request_class == .grpc) {
+                    try testing.expectEqualStrings(config.grpc_path, req.path);
+                    try sendGrpcUnaryResponse(conn, req.stream_id, config.grpc_response);
+                } else {
+                    try testing.expectEqualStrings(config.generic_path, req.path);
+                    try sendGenericHeadersOnlyResponse(conn, req.stream_id);
+                }
+                return;
+            }
+        }
+
+        const n = try posix.recv(conn, second_request_buf[second_total..], 0);
+        if (n == 0) return error.ConnectionClosed;
+        second_total += n;
+    }
+}
+
+fn startMixedGrpcGenericBackend(config: MixedGrpcGenericBackendConfig) !std.Thread {
+    const thread = try std.Thread.spawn(.{}, mixedGrpcGenericBackendMain, .{config});
     posix.nanosleep(0, H2_SERVER_STARTUP_DELAY_MS * std.time.ns_per_ms);
     return thread;
 }
@@ -10369,6 +10626,53 @@ fn waitForGrpcUnaryResponseOnStream(
     try testing.expect(saw_trailers);
 }
 
+const HeadersOnlyExpectation = struct {
+    stream_id: u32,
+    expected_status: []const u8,
+};
+
+fn waitForHeadersOnlyResponseOnStream(
+    sock: posix.socket_t,
+    initial: *[]const u8,
+    frame_buf: []u8,
+    expectation: HeadersOnlyExpectation,
+) !void {
+    assert(frame_buf.len >= H2_TEST_BUFFER_SIZE_BYTES);
+    assert(expectation.stream_id > 0);
+
+    var iterations: u32 = 0;
+    while (iterations < H2_MAX_FRAME_READS * 3) : (iterations += 1) {
+        const frame_view = try readH2Frame(sock, initial.*, frame_buf);
+        initial.* = frame_view.remaining;
+
+        switch (frame_view.header.frame_type) {
+            .settings => {
+                if ((frame_view.header.flags & serval_h2.flags_ack) == 0) {
+                    try sendH2SettingsAck(sock);
+                }
+            },
+            .headers => {
+                if (frame_view.header.stream_id != expectation.stream_id) continue;
+                try testing.expect((frame_view.header.flags & serval_h2.flags_end_stream) != 0);
+
+                var fields_buf: [H2_MAX_HEADER_FIELDS]serval_h2.HeaderField = undefined;
+                const fields = try decodeH2Fields(frame_view.payload, &fields_buf);
+                const status = findH2FieldValue(fields, ":status") orelse return error.MissingStatus;
+                try testing.expectEqualStrings(expectation.expected_status, status);
+                try testing.expect(findH2FieldValue(fields, "grpc-status") == null);
+                return;
+            },
+            .rst_stream => {
+                if (frame_view.header.stream_id != expectation.stream_id) continue;
+                return error.UnexpectedReset;
+            },
+            else => {},
+        }
+    }
+
+    return error.ReadTimeout;
+}
+
 fn waitForRstOnStream(
     sock: posix.socket_t,
     initial: *[]const u8,
@@ -10842,6 +11146,71 @@ test "integration: grpc h2c mixed goaway and non-grpc trailer reset loop preserv
 
 test "integration: grpc h2c mixed goaway and non-grpc trailer reset soak loop" {
     try run_mixed_goaway_and_nongrpc_trailer_cycles(20);
+}
+
+test "integration: grpc h2c mixed grpc and non-grpc streams share one downstream connection" {
+    const backend_port = harness.getPort();
+    const proxy_port = harness.getPort();
+
+    const backend_thread = try startMixedGrpcGenericBackend(.{
+        .port = backend_port,
+        .grpc_path = "/grpc.test.Echo/MixedGrpcStream",
+        .grpc_response = "mixed-grpc-reply",
+        .generic_path = "/h2-mixed-nongrpc-stream",
+    });
+    defer backend_thread.join();
+
+    var proxy = try GrpcH2ProxyServer.start(proxy_port, .{
+        .host = "127.0.0.1",
+        .port = backend_port,
+        .idx = 0,
+        .http_protocol = .h2c,
+    });
+    defer proxy.stop();
+
+    const sock = try connectTcp(proxy_port);
+    defer posix.close(sock);
+
+    var authority_buf: [32]u8 = undefined;
+    const authority = try std.fmt.bufPrint(&authority_buf, "127.0.0.1:{d}", .{proxy_port});
+
+    var grpc_request_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const grpc_request = try buildGrpcH2Request(
+        "/grpc.test.Echo/MixedGrpcStream",
+        authority,
+        "mixed-grpc-ping",
+        &grpc_request_buf,
+    );
+    try sendAllTcp(sock, grpc_request);
+
+    var nongrpc_request_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const nongrpc_request = try buildSimpleH2PostStreamFrames(
+        "/h2-mixed-nongrpc-stream",
+        authority,
+        "http",
+        "mixed-http-body",
+        3,
+        &nongrpc_request_buf,
+    );
+    try sendAllTcp(sock, nongrpc_request);
+
+    var frame_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var payload_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var initial: []const u8 = &[_]u8{};
+
+    try waitForGrpcUnaryResponseOnStream(
+        sock,
+        &initial,
+        &frame_buf,
+        &payload_buf,
+        1,
+        "mixed-grpc-reply",
+    );
+
+    try waitForHeadersOnlyResponseOnStream(sock, &initial, &frame_buf, .{
+        .stream_id = 3,
+        .expected_status = "204",
+    });
 }
 
 test "integration: grpc h2c missing grpc-status trailer maps to downstream reset" {

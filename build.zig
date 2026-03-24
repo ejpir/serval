@@ -1334,6 +1334,21 @@ pub fn build(b: *std.Build) void {
     );
     integration_test_h2c_mixed_goaway_nongrpc_soak_step.dependOn(&run_integration_test_h2c_mixed_goaway_nongrpc_soak.step);
 
+    const integration_test_h2c_mixed_grpc_nongrpc_same_conn = b.addTest(.{
+        .name = "integration_test_h2c_mixed_grpc_nongrpc_same_conn",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: grpc h2c mixed grpc and non-grpc streams share one downstream connection"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_h2c_mixed_grpc_nongrpc_same_conn);
+    const run_integration_test_h2c_mixed_grpc_nongrpc_same_conn = b.addRunArtifact(integration_test_h2c_mixed_grpc_nongrpc_same_conn);
+
+    const integration_test_h2c_mixed_grpc_nongrpc_same_conn_step = b.step(
+        "test-integration-h2c-mixed-grpc-nongrpc-same-conn",
+        "Run integration test (h2c mixed gRPC + non-gRPC streams on one downstream connection)",
+    );
+    integration_test_h2c_mixed_grpc_nongrpc_same_conn_step.dependOn(&run_integration_test_h2c_mixed_grpc_nongrpc_same_conn.step);
+
     const integration_test_h2_generic_completeness_fast_step = b.step(
         "test-integration-h2-generic-completeness-fast",
         "Run focused HTTP/2 generic parity checks (non-gRPC semantics across ALPN + h2c prior-knowledge + h2c upgrade)",
@@ -1355,6 +1370,7 @@ pub fn build(b: *std.Build) void {
     );
     integration_test_h2_mixed_hardening_fast_step.dependOn(&run_integration_test_h2c_mixed_goaway_nongrpc.step);
     integration_test_h2_mixed_hardening_fast_step.dependOn(&run_integration_test_h2c_mixed_goaway_nongrpc_soak.step);
+    integration_test_h2_mixed_hardening_fast_step.dependOn(&run_integration_test_h2c_mixed_grpc_nongrpc_same_conn.step);
     integration_test_h2_mixed_hardening_fast_step.dependOn(&run_integration_test_h2c_cancel_goaway_overlap.step);
     integration_test_h2_mixed_hardening_fast_step.dependOn(&run_integration_test_h2c_cancel_goaway_overlap_soak.step);
     integration_test_h2_mixed_hardening_fast_step.dependOn(&run_integration_test_h2c_reset_isolation.step);
@@ -1648,6 +1664,7 @@ pub fn build(b: *std.Build) void {
     run_integration_test_h2c_upgrade_generic_headers_only.step.dependOn(&build_echo_backend.step);
     run_integration_test_h2c_mixed_goaway_nongrpc.step.dependOn(&build_echo_backend.step);
     run_integration_test_h2c_mixed_goaway_nongrpc_soak.step.dependOn(&build_echo_backend.step);
+    run_integration_test_h2c_mixed_grpc_nongrpc_same_conn.step.dependOn(&build_echo_backend.step);
     run_integration_test_2.step.dependOn(&build_lb_example.step);
     run_integration_test_77.step.dependOn(&build_lb_example.step);
     run_integration_test_78.step.dependOn(&build_lb_example.step);

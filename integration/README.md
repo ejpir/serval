@@ -251,6 +251,7 @@ These are for testing only. Use `--insecure-skip-verify` with self-signed certif
 | `grpc h2c upgrade request is proxied end-to-end` | HTTP/1.1 `Upgrade: h2c` request is bootstrapped into stream-aware forwarding after `101` |
 | `grpc h2c upgrade server streaming relays multiple DATA frames` | Upgraded h2c path preserves multi-message gRPC server-streaming responses |
 | `grpc h2c multiplexes two unary streams on one connection` | One proxied h2c connection carries multiple gRPC streams end-to-end |
+| `grpc h2c mixed grpc and non-grpc streams share one downstream connection` | Mixed stream classes on one downstream h2c connection preserve request-class-aware completion: gRPC stream requires grpc-status, non-gRPC stream succeeds without grpc-status |
 | `grpc h2c stream churn handles many unary streams on one connection` | Stress case validates many unary stream lifecycles on one proxied h2c connection |
 | `grpc h2c stream churn near concurrent-stream bound` | Higher fan-out stress case drives stream lifecycle behavior close to configured concurrent-stream limits |
 | `grpc h2c upgrade multiplexes two unary streams on one connection` | `Upgrade: h2c` sessions preserve multi-stream gRPC behavior after `101` |
