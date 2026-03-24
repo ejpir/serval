@@ -428,6 +428,50 @@ pub fn main(process_init: std.process.Init) !void {
     }
     std.debug.print("\n", .{});
 
+    // Optional L4 transport demo configuration.
+    // Keeping this false preserves existing HTTP-only example behavior.
+    const enable_l4_transports = false;
+    const tcp_targets = [_]serval.config.L4Target{.{
+        .host = upstreams[0].host,
+        .port = upstreams[0].port,
+        .tls = upstreams[0].tls,
+    }};
+    const udp_targets = [_]serval.config.L4Target{.{
+        .host = upstreams[0].host,
+        .port = upstreams[0].port,
+        .tls = false,
+    }};
+
+    var server_cfg = serval.Config{
+        .port = args.port,
+        .tls = tls_config,
+    };
+
+    if (enable_l4_transports) {
+        server_cfg.tcp_transport = .{
+            .enabled = true,
+            .listener_host = "127.0.0.1",
+            .listener_port = args.port + 100,
+            .upstreams = &tcp_targets,
+            .max_concurrent_connections = 1024,
+            .connect_timeout_ms = 2000,
+            .idle_timeout_ms = 60000,
+            .tls_mode = .passthrough,
+            .probe_mode = .connect,
+        };
+
+        server_cfg.udp_transport = .{
+            .enabled = true,
+            .listener_host = "127.0.0.1",
+            .listener_port = args.port + 101,
+            .upstreams = &udp_targets,
+            .max_active_sessions = 4096,
+            .session_idle_timeout_ms = 30000,
+            .session_key_mode = .five_tuple,
+            .probe_mode = .passive_only,
+        };
+    }
+
     // Run server
     if (args.extra.trace) {
         // OpenTelemetry tracing enabled
@@ -467,10 +511,7 @@ pub fn main(process_init: std.process.Init) !void {
         // Pass probe_ctx as client_ctx for upstream TLS connections.
         // Same SSL context is used for probing and forwarding.
         // DnsConfig{} uses default TTL (60s) and timeout (5s) values
-        var server = OtelServerType.init(&handler, &pool, &metrics, tracer, .{
-            .port = args.port,
-            .tls = tls_config,
-        }, probe_ctx, DnsConfig{});
+        var server = OtelServerType.init(&handler, &pool, &metrics, tracer, server_cfg, probe_ctx, DnsConfig{});
 
         server.run(io, &shutdown, null) catch |err| {
             std.debug.print("Server error: {}\n", .{err});
@@ -489,10 +530,7 @@ pub fn main(process_init: std.process.Init) !void {
         // Pass probe_ctx as client_ctx for upstream TLS connections.
         // Same SSL context is used for probing and forwarding.
         // DnsConfig{} uses default TTL (60s) and timeout (5s) values
-        var server = NoopServerType.init(&handler, &pool, &metrics, &tracer, .{
-            .port = args.port,
-            .tls = tls_config,
-        }, probe_ctx, DnsConfig{});
+        var server = NoopServerType.init(&handler, &pool, &metrics, &tracer, server_cfg, probe_ctx, DnsConfig{});
 
         server.run(io, &shutdown, null) catch |err| {
             std.debug.print("Server error: {}\n", .{err});
