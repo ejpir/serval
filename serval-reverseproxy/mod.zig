@@ -16,7 +16,6 @@ pub const equivalence = @import("equivalence.zig");
 pub const runtime = @import("runtime.zig");
 pub const integration = @import("integration.zig");
 pub const orchestrator = @import("orchestrator.zig");
-pub const provider_adapter = @import("provider_adapter.zig");
 
 pub const CanonicalIr = ir.CanonicalIr;
 pub const ValidationStage = ir.ValidationStage;
@@ -70,7 +69,6 @@ pub const RuntimeLoadOptions = runtime.LoadOptions;
 pub const RuntimeRunOptions = runtime.RunOptions;
 pub const Runtime = runtime.Runtime;
 pub const load = runtime.load;
-pub const RuntimeProviderAdapter = provider_adapter.RuntimeProviderAdapter;
 
 pub const FailurePolicy = ir.FailurePolicy;
 pub const RuntimeBudget = ir.RuntimeBudget;
@@ -96,5 +94,4 @@ test {
     _ = runtime;
     _ = integration;
     _ = orchestrator;
-    _ = provider_adapter;
 }
