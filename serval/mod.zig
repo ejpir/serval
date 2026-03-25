@@ -231,6 +231,24 @@ pub const ForwardError = proxy.ForwardError;
 pub const ForwardResult = proxy.ForwardResult;
 
 // =============================================================================
+// Reverse Proxy Orchestrator (from serval-reverseproxy)
+// =============================================================================
+
+pub const reverseproxy = @import("serval-reverseproxy");
+pub const ReverseProxyCanonicalIr = reverseproxy.CanonicalIr;
+pub const ReverseProxyRuntimeSnapshot = reverseproxy.RuntimeSnapshot;
+pub const ReverseProxyOrchestrator = reverseproxy.Orchestrator;
+
+// =============================================================================
+// Filter SDK (from serval-filter-sdk)
+// =============================================================================
+
+pub const filter_sdk = @import("serval-filter-sdk");
+pub const FilterContext = filter_sdk.FilterContext;
+pub const FilterDecision = filter_sdk.Decision;
+pub const verifyFilter = filter_sdk.verifyFilter;
+
+// =============================================================================
 // Metrics (from serval-metrics)
 // =============================================================================
 
@@ -312,6 +330,8 @@ test {
     _ = @import("serval-acme");
     _ = @import("serval-pool");
     _ = @import("serval-proxy");
+    _ = @import("serval-reverseproxy");
+    _ = @import("serval-filter-sdk");
     _ = @import("serval-metrics");
     _ = @import("serval-tracing");
     _ = @import("serval-otel");

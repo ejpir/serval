@@ -5663,6 +5663,709 @@ test "integration: netbird route matrix enforces grpc h2c only for service paths
     try expectWebSocketEchoThroughNetbirdProxy(proxy_port, "/relay", "ws-relay-echo");
 }
 
+fn writeReverseproxyDslFile(
+    allocator: std.mem.Allocator,
+    proxy_port: u16,
+    tag: []const u8,
+    dsl_content: []const u8,
+) ![]u8 {
+    std.debug.assert(tag.len > 0);
+    std.debug.assert(dsl_content.len > 0);
+
+    const path = try std.fmt.allocPrint(allocator, "integration/tmp_reverseproxy_{d}_{s}.dsl", .{ proxy_port, tag });
+    errdefer allocator.free(path);
+
+    try std.Io.Dir.cwd().writeFile(std.Options.debug_io, .{ .sub_path = path, .data = dsl_content });
+    return path;
+}
+
+fn cleanupTempDslFile(path: []const u8) void {
+    std.Io.Dir.cwd().deleteFile(std.Options.debug_io, path) catch |err| {
+        if (err != error.FileNotFound) {
+            std.debug.print("warn: failed to delete temp DSL file '{s}': {s}\n", .{ path, @errorName(err) });
+        }
+    };
+}
+
+fn writeReverseproxyDslConfig(
+    allocator: std.mem.Allocator,
+    proxy_port: u16,
+    backend_port: u16,
+    route_prefix: []const u8,
+) ![]u8 {
+    std.debug.assert(route_prefix.len > 0);
+
+    var host_buf: [48]u8 = undefined;
+    const host = try std.fmt.bufPrint(&host_buf, "127.0.0.1:{d}", .{proxy_port});
+
+    const content = try std.fmt.allocPrint(
+        allocator,
+        \\listener l1 0.0.0.0:{d}
+        \\pool pool-a upstream=http://127.0.0.1:{d}
+        \\plugin plugin-a fail_policy=fail_closed
+        \\chain chain-a plugin=plugin-a
+        \\route route-a listener=l1 host={s} path={s} pool=pool-a chain=chain-a
+    ,
+        .{ proxy_port, backend_port, host, route_prefix },
+    );
+    defer allocator.free(content);
+
+    return writeReverseproxyDslFile(allocator, proxy_port, "single", content);
+}
+
+test "integration: reverseproxy runtime binary loads dsl config and forwards matched route" {
+    const allocator = testing.allocator;
+    const backend_port = harness.getPort();
+    const proxy_port = harness.getPort();
+
+    var pm = harness.ProcessManager.init(allocator);
+    defer pm.deinit();
+
+    try pm.startEchoBackend(backend_port, "rp-runtime-backend", .{});
+
+    const dsl_path = try writeReverseproxyDslConfig(allocator, proxy_port, backend_port, "/api");
+    defer allocator.free(dsl_path);
+    defer cleanupTempDslFile(dsl_path);
+
+    try pm.startReverseproxyRuntime(proxy_port, .{
+        .config_file = dsl_path,
+    });
+
+    var client = harness.TestClient.init(allocator);
+    defer client.deinit();
+
+    const response = try client.get(proxy_port, "/api/test");
+    defer response.deinit();
+
+    try testing.expectEqual(@as(u16, 200), response.status);
+    try testing.expect(response.backend_id != null);
+    try testing.expectEqualStrings("rp-runtime-backend", response.backend_id.?);
+}
+
+test "integration: reverseproxy runtime binary returns 404 for unmatched route" {
+    const allocator = testing.allocator;
+    const backend_port = harness.getPort();
+    const proxy_port = harness.getPort();
+
+    var pm = harness.ProcessManager.init(allocator);
+    defer pm.deinit();
+
+    try pm.startEchoBackend(backend_port, "rp-runtime-backend-404", .{});
+
+    const dsl_path = try writeReverseproxyDslConfig(allocator, proxy_port, backend_port, "/api");
+    defer allocator.free(dsl_path);
+    defer cleanupTempDslFile(dsl_path);
+
+    try pm.startReverseproxyRuntime(proxy_port, .{
+        .config_file = dsl_path,
+    });
+
+    var client = harness.TestClient.init(allocator);
+    defer client.deinit();
+
+    const response = try client.get(proxy_port, "/nope");
+    defer response.deinit();
+
+    try testing.expectEqual(@as(u16, 404), response.status);
+    try testing.expect(std.mem.indexOf(u8, response.body, "Not Found") != null);
+}
+
+test "integration: reverseproxy runtime binary requires host match" {
+    const allocator = testing.allocator;
+    const backend_port = harness.getPort();
+    const proxy_port = harness.getPort();
+
+    var pm = harness.ProcessManager.init(allocator);
+    defer pm.deinit();
+
+    try pm.startEchoBackend(backend_port, "rp-runtime-host", .{});
+
+    const content = try std.fmt.allocPrint(
+        allocator,
+        \\listener l1 0.0.0.0:{d}
+        \\pool pool-a upstream=http://127.0.0.1:{d}
+        \\plugin plugin-a fail_policy=fail_closed
+        \\chain chain-a plugin=plugin-a
+        \\route route-a listener=l1 host=example.com path=/api pool=pool-a chain=chain-a
+    ,
+        .{ proxy_port, backend_port },
+    );
+    defer allocator.free(content);
+
+    const dsl_path = try writeReverseproxyDslFile(allocator, proxy_port, "host-mismatch", content);
+    defer allocator.free(dsl_path);
+    defer cleanupTempDslFile(dsl_path);
+
+    try pm.startReverseproxyRuntime(proxy_port, .{
+        .config_file = dsl_path,
+    });
+
+    var client = harness.TestClient.init(allocator);
+    defer client.deinit();
+
+    const response = try client.get(proxy_port, "/api/test");
+    defer response.deinit();
+
+    try testing.expectEqual(@as(u16, 404), response.status);
+    try testing.expect(std.mem.indexOf(u8, response.body, "Not Found") != null);
+}
+
+test "integration: reverseproxy runtime binary uses first-match route semantics" {
+    const allocator = testing.allocator;
+    const backend_api_port = harness.getPort();
+    const backend_admin_port = harness.getPort();
+    const proxy_port = harness.getPort();
+
+    var pm = harness.ProcessManager.init(allocator);
+    defer pm.deinit();
+
+    try pm.startEchoBackend(backend_api_port, "rp-runtime-api", .{});
+    try pm.startEchoBackend(backend_admin_port, "rp-runtime-admin", .{});
+
+    var host_buf: [48]u8 = undefined;
+    const host = std.fmt.bufPrint(&host_buf, "127.0.0.1:{d}", .{proxy_port}) catch unreachable;
+
+    const content = try std.fmt.allocPrint(
+        allocator,
+        \\listener l1 0.0.0.0:{d}
+        \\pool pool-api upstream=http://127.0.0.1:{d}
+        \\pool pool-admin upstream=http://127.0.0.1:{d}
+        \\plugin plugin-a fail_policy=fail_closed
+        \\chain chain-api plugin=plugin-a
+        \\chain chain-admin plugin=plugin-a
+        \\route route-api listener=l1 host={s} path=/api pool=pool-api chain=chain-api
+        \\route route-admin listener=l1 host={s} path=/api/admin pool=pool-admin chain=chain-admin
+    ,
+        .{ proxy_port, backend_api_port, backend_admin_port, host, host },
+    );
+    defer allocator.free(content);
+
+    const dsl_path = try writeReverseproxyDslFile(allocator, proxy_port, "longest-prefix", content);
+    defer allocator.free(dsl_path);
+    defer cleanupTempDslFile(dsl_path);
+
+    try pm.startReverseproxyRuntime(proxy_port, .{
+        .config_file = dsl_path,
+    });
+
+    var client = harness.TestClient.init(allocator);
+    defer client.deinit();
+
+    const response = try client.get(proxy_port, "/api/admin/users");
+    defer response.deinit();
+
+    try testing.expectEqual(@as(u16, 200), response.status);
+    try testing.expect(response.backend_id != null);
+    try testing.expectEqualStrings("rp-runtime-api", response.backend_id.?);
+}
+
+test "integration: reverseproxy runtime binary routes different prefixes to distinct pools" {
+    const allocator = testing.allocator;
+    const backend_api_port = harness.getPort();
+    const backend_static_port = harness.getPort();
+    const proxy_port = harness.getPort();
+
+    var pm = harness.ProcessManager.init(allocator);
+    defer pm.deinit();
+
+    try pm.startEchoBackend(backend_api_port, "rp-runtime-api-split", .{});
+    try pm.startEchoBackend(backend_static_port, "rp-runtime-static-split", .{});
+
+    var host_buf: [48]u8 = undefined;
+    const host = std.fmt.bufPrint(&host_buf, "127.0.0.1:{d}", .{proxy_port}) catch unreachable;
+
+    const content = try std.fmt.allocPrint(
+        allocator,
+        \\listener l1 0.0.0.0:{d}
+        \\pool pool-api upstream=http://127.0.0.1:{d}
+        \\pool pool-static upstream=http://127.0.0.1:{d}
+        \\plugin plugin-a fail_policy=fail_closed
+        \\chain chain-api plugin=plugin-a
+        \\chain chain-static plugin=plugin-a
+        \\route route-api listener=l1 host={s} path=/api pool=pool-api chain=chain-api
+        \\route route-static listener=l1 host={s} path=/static pool=pool-static chain=chain-static
+    ,
+        .{ proxy_port, backend_api_port, backend_static_port, host, host },
+    );
+    defer allocator.free(content);
+
+    const dsl_path = try writeReverseproxyDslFile(allocator, proxy_port, "split-prefix", content);
+    defer allocator.free(dsl_path);
+    defer cleanupTempDslFile(dsl_path);
+
+    try pm.startReverseproxyRuntime(proxy_port, .{
+        .config_file = dsl_path,
+    });
+
+    var client = harness.TestClient.init(allocator);
+    defer client.deinit();
+
+    const api_response = try client.get(proxy_port, "/api/v1/accounts");
+    defer api_response.deinit();
+    try testing.expectEqual(@as(u16, 200), api_response.status);
+    try testing.expect(api_response.backend_id != null);
+    try testing.expectEqualStrings("rp-runtime-api-split", api_response.backend_id.?);
+
+    const static_response = try client.get(proxy_port, "/static/app.js");
+    defer static_response.deinit();
+    try testing.expectEqual(@as(u16, 200), static_response.status);
+    try testing.expect(static_response.backend_id != null);
+    try testing.expectEqualStrings("rp-runtime-static-split", static_response.backend_id.?);
+}
+
+test "integration: reverseproxy runtime admission rejects missing pool upstream spec" {
+    const allocator = testing.allocator;
+    const proxy_port = harness.getPort();
+
+    var pm = harness.ProcessManager.init(allocator);
+    defer pm.deinit();
+
+    var host_buf: [48]u8 = undefined;
+    const host = std.fmt.bufPrint(&host_buf, "127.0.0.1:{d}", .{proxy_port}) catch unreachable;
+
+    const content = try std.fmt.allocPrint(
+        allocator,
+        \\listener l1 0.0.0.0:{d}
+        \\pool pool-a
+        \\plugin plugin-a fail_policy=fail_closed
+        \\chain chain-a plugin=plugin-a
+        \\route route-a listener=l1 host={s} path=/api pool=pool-a chain=chain-a
+    ,
+        .{ proxy_port, host },
+    );
+    defer allocator.free(content);
+
+    const dsl_path = try writeReverseproxyDslFile(allocator, proxy_port, "missing-pool-upstream", content);
+    defer allocator.free(dsl_path);
+    defer cleanupTempDslFile(dsl_path);
+
+    try pm.startReverseproxyRuntimeExpectFailure(proxy_port, .{
+        .config_file = dsl_path,
+    });
+}
+
+test "integration: reverseproxy runtime binary returns 502 when upstream is unavailable" {
+    const allocator = testing.allocator;
+    const unreachable_port = harness.getPort();
+    const proxy_port = harness.getPort();
+
+    var pm = harness.ProcessManager.init(allocator);
+    defer pm.deinit();
+
+    const dsl_path = try writeReverseproxyDslConfig(allocator, proxy_port, unreachable_port, "/api");
+    defer allocator.free(dsl_path);
+    defer cleanupTempDslFile(dsl_path);
+
+    try pm.startReverseproxyRuntime(proxy_port, .{
+        .config_file = dsl_path,
+    });
+
+    var client = harness.TestClient.init(allocator);
+    defer client.deinit();
+
+    const response = try client.get(proxy_port, "/api/test");
+    defer response.deinit();
+
+    try testing.expectEqual(@as(u16, 502), response.status);
+}
+
+test "integration: reverseproxy runtime binary admission rejects duplicate route ids" {
+    const allocator = testing.allocator;
+    const backend_port = harness.getPort();
+    const proxy_port = harness.getPort();
+
+    var pm = harness.ProcessManager.init(allocator);
+    defer pm.deinit();
+
+    try pm.startEchoBackend(backend_port, "rp-runtime-admission-dup", .{});
+
+    var host_buf: [48]u8 = undefined;
+    const host = std.fmt.bufPrint(&host_buf, "127.0.0.1:{d}", .{proxy_port}) catch unreachable;
+
+    const content = try std.fmt.allocPrint(
+        allocator,
+        \\listener l1 0.0.0.0:{d}
+        \\pool pool-a upstream=http://127.0.0.1:1
+        \\plugin plugin-a fail_policy=fail_closed
+        \\chain chain-a plugin=plugin-a
+        \\route route-a listener=l1 host={s} path=/api pool=pool-a chain=chain-a
+        \\route route-a listener=l1 host={s} path=/admin pool=pool-a chain=chain-a
+    ,
+        .{ proxy_port, host, host },
+    );
+    defer allocator.free(content);
+
+    const dsl_path = try writeReverseproxyDslFile(allocator, proxy_port, "admission-dup", content);
+    defer allocator.free(dsl_path);
+    defer cleanupTempDslFile(dsl_path);
+
+    try pm.startReverseproxyRuntimeExpectFailure(proxy_port, .{
+        .config_file = dsl_path,
+    });
+}
+
+test "integration: reverseproxy runtime binary admission rejects unsupported DSL constructs" {
+    const allocator = testing.allocator;
+    const backend_port = harness.getPort();
+    const proxy_port = harness.getPort();
+
+    var pm = harness.ProcessManager.init(allocator);
+    defer pm.deinit();
+
+    try pm.startEchoBackend(backend_port, "rp-runtime-admission-unsupported", .{});
+
+    const content =
+        \\listener l1 0.0.0.0:19000
+        \\pool pool-a
+        \\plugin plugin-a fail_policy=fail_closed
+        \\function dynamic-route-builder
+    ;
+
+    const dsl_path = try writeReverseproxyDslFile(allocator, proxy_port, "admission-unsupported", content);
+    defer allocator.free(dsl_path);
+    defer cleanupTempDslFile(dsl_path);
+
+    try pm.startReverseproxyRuntimeExpectFailure(proxy_port, .{
+        .config_file = dsl_path,
+    });
+}
+
+test "integration: reverseproxy orchestrator rollback to last-known-good on guard breach" {
+    const reverseproxy = serval.reverseproxy;
+
+    const budget = reverseproxy.RuntimeBudget{
+        .max_state_bytes = 1024,
+        .max_output_bytes = 1024 * 1024,
+        .max_expansion_ratio_milli = 2000,
+        .max_cpu_micros_per_chunk = 1000,
+    };
+
+    const entries = [_]reverseproxy.ChainEntry{.{
+        .plugin_id = "plugin-a",
+        .failure_policy = .fail_closed,
+        .budget = budget,
+        .priority = 1,
+        .before = &.{},
+        .after = &.{},
+    }};
+
+    const candidate = reverseproxy.CanonicalIr{
+        .listeners = &[_]reverseproxy.Listener{.{ .id = "l", .bind = "0.0.0.0:443" }},
+        .pools = &[_]reverseproxy.Pool{.{ .id = "pool-a" }},
+        .routes = &[_]reverseproxy.Route{.{
+            .id = "route-a",
+            .listener_id = "l",
+            .host = "example.com",
+            .path_prefix = "/",
+            .pool_id = "pool-a",
+            .chain_id = "chain-a",
+            .disable_plugin_ids = &.{},
+            .add_plugin_ids = &.{},
+            .waivers = &.{},
+        }},
+        .plugins = &[_]reverseproxy.PluginCatalogEntry{.{
+            .id = "plugin-a",
+            .version = "1",
+            .enabled = true,
+            .mandatory = false,
+            .disable_requires_waiver = false,
+        }},
+        .chains = &[_]reverseproxy.ChainPlan{.{ .id = "chain-a", .entries = entries[0..] }},
+        .global_plugin_ids = &.{},
+    };
+
+    var orchestrator = reverseproxy.Orchestrator.init(1_000_000);
+    var snapshot_v1 = reverseproxy.RuntimeSnapshot.fromCanonicalIr(&candidate, 1, 10);
+    try orchestrator.admitAndActivate(&candidate, &snapshot_v1, 20);
+
+    var snapshot_v2 = reverseproxy.RuntimeSnapshot.fromCanonicalIr(&candidate, 2, 30);
+    try orchestrator.admitAndActivate(&candidate, &snapshot_v2, 40);
+
+    var monitor = reverseproxy.GuardWindowMonitor.init(
+        &orchestrator,
+        .{ .guard_window_ns = 1000, .max_error_rate_milli = 10, .max_fail_closed_count = 1 },
+        2,
+        40,
+    );
+
+    const decision = monitor.evaluate(.{ .request_count = 100, .error_count = 60, .fail_closed_count = 0 }, 50);
+    try testing.expectEqual(reverseproxy.GuardDecision.auto_rollback, decision);
+    try testing.expectEqual(@as(u64, 1), orchestrator.getActiveSnapshot().?.generation_id);
+}
+
+test "integration: reverseproxy orchestrator enters safe mode when rollback unavailable" {
+    const reverseproxy = serval.reverseproxy;
+
+    var orchestrator = reverseproxy.Orchestrator.init(1_000_000);
+    var monitor = reverseproxy.GuardWindowMonitor.init(
+        &orchestrator,
+        .{ .guard_window_ns = 1000, .max_error_rate_milli = 10, .max_fail_closed_count = 1 },
+        1,
+        10,
+    );
+
+    const decision = monitor.evaluate(.{ .request_count = 10, .error_count = 10, .fail_closed_count = 0 }, 11);
+    try testing.expectEqual(reverseproxy.GuardDecision.safe_mode, decision);
+    try testing.expectEqual(reverseproxy.ApplyStage.safe_mode, orchestrator.getStage());
+}
+
+test "integration: reverseproxy runtime admission rejects unknown pool reference" {
+    const allocator = testing.allocator;
+    const proxy_port = harness.getPort();
+
+    var pm = harness.ProcessManager.init(allocator);
+    defer pm.deinit();
+
+    var host_buf: [48]u8 = undefined;
+    const host = std.fmt.bufPrint(&host_buf, "127.0.0.1:{d}", .{proxy_port}) catch unreachable;
+
+    const content = try std.fmt.allocPrint(
+        allocator,
+        \\listener l1 0.0.0.0:{d}
+        \\pool pool-a upstream=http://127.0.0.1:1
+        \\plugin plugin-a fail_policy=fail_closed
+        \\chain chain-a plugin=plugin-a
+        \\route route-a listener=l1 host={s} path=/api pool=missing chain=chain-a
+    ,
+        .{ proxy_port, host },
+    );
+    defer allocator.free(content);
+
+    const dsl_path = try writeReverseproxyDslFile(allocator, proxy_port, "admission-missing-pool", content);
+    defer allocator.free(dsl_path);
+    defer cleanupTempDslFile(dsl_path);
+
+    try pm.startReverseproxyRuntimeExpectFailure(proxy_port, .{
+        .config_file = dsl_path,
+    });
+}
+
+test "integration: reverseproxy runtime admission rejects unknown chain reference" {
+    const allocator = testing.allocator;
+    const proxy_port = harness.getPort();
+
+    var pm = harness.ProcessManager.init(allocator);
+    defer pm.deinit();
+
+    var host_buf: [48]u8 = undefined;
+    const host = std.fmt.bufPrint(&host_buf, "127.0.0.1:{d}", .{proxy_port}) catch unreachable;
+
+    const content = try std.fmt.allocPrint(
+        allocator,
+        \\listener l1 0.0.0.0:{d}
+        \\pool pool-a upstream=http://127.0.0.1:1
+        \\plugin plugin-a fail_policy=fail_closed
+        \\chain chain-a plugin=plugin-a
+        \\route route-a listener=l1 host={s} path=/api pool=pool-a chain=missing
+    ,
+        .{ proxy_port, host },
+    );
+    defer allocator.free(content);
+
+    const dsl_path = try writeReverseproxyDslFile(allocator, proxy_port, "admission-missing-chain", content);
+    defer allocator.free(dsl_path);
+    defer cleanupTempDslFile(dsl_path);
+
+    try pm.startReverseproxyRuntimeExpectFailure(proxy_port, .{
+        .config_file = dsl_path,
+    });
+}
+
+test "integration: reverseproxy runtime admission rejects unknown plugin reference" {
+    const allocator = testing.allocator;
+    const proxy_port = harness.getPort();
+
+    var pm = harness.ProcessManager.init(allocator);
+    defer pm.deinit();
+
+    var host_buf: [48]u8 = undefined;
+    const host = std.fmt.bufPrint(&host_buf, "127.0.0.1:{d}", .{proxy_port}) catch unreachable;
+
+    const content = try std.fmt.allocPrint(
+        allocator,
+        \\listener l1 0.0.0.0:{d}
+        \\pool pool-a upstream=http://127.0.0.1:1
+        \\plugin plugin-a fail_policy=fail_closed
+        \\chain chain-a plugin=missing-plugin
+        \\route route-a listener=l1 host={s} path=/api pool=pool-a chain=chain-a
+    ,
+        .{ proxy_port, host },
+    );
+    defer allocator.free(content);
+
+    const dsl_path = try writeReverseproxyDslFile(allocator, proxy_port, "admission-missing-plugin", content);
+    defer allocator.free(dsl_path);
+    defer cleanupTempDslFile(dsl_path);
+
+    try pm.startReverseproxyRuntimeExpectFailure(proxy_port, .{
+        .config_file = dsl_path,
+    });
+}
+
+test "integration: reverseproxy runtime admission rejects duplicate chain ids" {
+    const allocator = testing.allocator;
+    const proxy_port = harness.getPort();
+
+    var pm = harness.ProcessManager.init(allocator);
+    defer pm.deinit();
+
+    var host_buf: [48]u8 = undefined;
+    const host = std.fmt.bufPrint(&host_buf, "127.0.0.1:{d}", .{proxy_port}) catch unreachable;
+
+    const content = try std.fmt.allocPrint(
+        allocator,
+        \\listener l1 0.0.0.0:{d}
+        \\pool pool-a upstream=http://127.0.0.1:1
+        \\plugin plugin-a fail_policy=fail_closed
+        \\chain chain-a plugin=plugin-a
+        \\chain chain-a plugin=plugin-a
+        \\route route-a listener=l1 host={s} path=/api pool=pool-a chain=chain-a
+    ,
+        .{ proxy_port, host },
+    );
+    defer allocator.free(content);
+
+    const dsl_path = try writeReverseproxyDslFile(allocator, proxy_port, "admission-duplicate-chain", content);
+    defer allocator.free(dsl_path);
+    defer cleanupTempDslFile(dsl_path);
+
+    try pm.startReverseproxyRuntimeExpectFailure(proxy_port, .{
+        .config_file = dsl_path,
+    });
+}
+
+test "integration: reverseproxy runtime tie-break is deterministic (first route wins)" {
+    const allocator = testing.allocator;
+    const backend_first_port = harness.getPort();
+    const backend_second_port = harness.getPort();
+    const proxy_port = harness.getPort();
+
+    var pm = harness.ProcessManager.init(allocator);
+    defer pm.deinit();
+
+    try pm.startEchoBackend(backend_first_port, "rp-runtime-first", .{});
+    try pm.startEchoBackend(backend_second_port, "rp-runtime-second", .{});
+
+    var host_buf: [48]u8 = undefined;
+    const host = std.fmt.bufPrint(&host_buf, "127.0.0.1:{d}", .{proxy_port}) catch unreachable;
+
+    const content = try std.fmt.allocPrint(
+        allocator,
+        \\listener l1 0.0.0.0:{d}
+        \\pool pool-first upstream=http://127.0.0.1:{d}
+        \\pool pool-second upstream=http://127.0.0.1:{d}
+        \\plugin plugin-a fail_policy=fail_closed
+        \\chain chain-first plugin=plugin-a
+        \\chain chain-second plugin=plugin-a
+        \\route route-first listener=l1 host={s} path=/api pool=pool-first chain=chain-first
+        \\route route-second listener=l1 host={s} path=/api pool=pool-second chain=chain-second
+    ,
+        .{ proxy_port, backend_first_port, backend_second_port, host, host },
+    );
+    defer allocator.free(content);
+
+    const dsl_path = try writeReverseproxyDslFile(allocator, proxy_port, "tie-break-equal-prefix", content);
+    defer allocator.free(dsl_path);
+    defer cleanupTempDslFile(dsl_path);
+
+    try pm.startReverseproxyRuntime(proxy_port, .{
+        .config_file = dsl_path,
+    });
+
+    var client = harness.TestClient.init(allocator);
+    defer client.deinit();
+
+    var request_index: u32 = 0;
+    while (request_index < 5) : (request_index += 1) {
+        const response = try client.get(proxy_port, "/api/tie-break");
+        defer response.deinit();
+        try testing.expectEqual(@as(u16, 200), response.status);
+        try testing.expect(response.backend_id != null);
+        try testing.expectEqualStrings("rp-runtime-first", response.backend_id.?);
+    }
+}
+
+test "integration: netbird subprocess serves local health endpoint" {
+    const allocator = testing.allocator;
+    const backend_port = harness.getPort();
+    const proxy_port = harness.getPort();
+
+    var pm = harness.ProcessManager.init(allocator);
+    defer pm.deinit();
+
+    try pm.startEchoBackend(backend_port, "rp-health-backend", .{});
+
+    var http_addr_buf: [ADDR_BUF_LEN]u8 = undefined;
+    var h2c_addr_buf: [ADDR_BUF_LEN + 4]u8 = undefined;
+    const http_addr = std.fmt.bufPrint(&http_addr_buf, "http://127.0.0.1:{d}", .{backend_port}) catch unreachable;
+    const h2c_addr = std.fmt.bufPrint(&h2c_addr_buf, "h2c://127.0.0.1:{d}", .{backend_port}) catch unreachable;
+
+    try pm.startNetbirdProxy(proxy_port, .{
+        .cert_path = harness.TEST_CERT_PATH,
+        .key_path = harness.TEST_KEY_PATH,
+        .management_http = http_addr,
+        .dashboard_http = http_addr,
+        .relay_http = http_addr,
+        .signal_http = http_addr,
+        .signal_grpc = h2c_addr,
+        .management_grpc = h2c_addr,
+        .zitadel_http = h2c_addr,
+    });
+
+    const response = try curlHttps(allocator, proxy_port, "/healthz");
+    defer response.deinit();
+
+    try testing.expectEqual(@as(u16, 200), response.status);
+    try testing.expectEqualStrings("ok\n", response.body);
+    try testing.expect(response.backend_id == null);
+}
+
+test "integration: netbird subprocess routes api to management upstream" {
+    const allocator = testing.allocator;
+    const management_port = harness.getPort();
+    const dashboard_port = harness.getPort();
+    const proxy_port = harness.getPort();
+
+    var pm = harness.ProcessManager.init(allocator);
+    defer pm.deinit();
+
+    try pm.startEchoBackend(management_port, "rp-management", .{});
+    try pm.startEchoBackend(dashboard_port, "rp-dashboard", .{});
+
+    var management_http_addr_buf: [ADDR_BUF_LEN]u8 = undefined;
+    var dashboard_http_addr_buf: [ADDR_BUF_LEN]u8 = undefined;
+    var management_h2c_addr_buf: [ADDR_BUF_LEN + 4]u8 = undefined;
+    var dashboard_h2c_addr_buf: [ADDR_BUF_LEN + 4]u8 = undefined;
+    const management_http = std.fmt.bufPrint(&management_http_addr_buf, "http://127.0.0.1:{d}", .{management_port}) catch unreachable;
+    const dashboard_http = std.fmt.bufPrint(&dashboard_http_addr_buf, "http://127.0.0.1:{d}", .{dashboard_port}) catch unreachable;
+    const management_h2c = std.fmt.bufPrint(&management_h2c_addr_buf, "h2c://127.0.0.1:{d}", .{management_port}) catch unreachable;
+    const dashboard_h2c = std.fmt.bufPrint(&dashboard_h2c_addr_buf, "h2c://127.0.0.1:{d}", .{dashboard_port}) catch unreachable;
+
+    try pm.startNetbirdProxy(proxy_port, .{
+        .cert_path = harness.TEST_CERT_PATH,
+        .key_path = harness.TEST_KEY_PATH,
+        .management_http = management_http,
+        .dashboard_http = dashboard_http,
+        .relay_http = dashboard_http,
+        .signal_http = dashboard_http,
+        .signal_grpc = management_h2c,
+        .management_grpc = management_h2c,
+        .zitadel_http = dashboard_h2c,
+    });
+
+    const api_response = try curlHttps(allocator, proxy_port, "/api/accounts");
+    defer api_response.deinit();
+    try testing.expectEqual(@as(u16, 200), api_response.status);
+    try testing.expect(api_response.backend_id != null);
+    try testing.expectEqualStrings("rp-management", api_response.backend_id.?);
+
+    const catch_all_response = try curlHttps(allocator, proxy_port, "/dashboard");
+    defer catch_all_response.deinit();
+    try testing.expectEqual(@as(u16, 200), catch_all_response.status);
+    try testing.expect(catch_all_response.backend_id != null);
+    try testing.expectEqualStrings("rp-dashboard", catch_all_response.backend_id.?);
+}
+
 test "integration: terminated h2 server acks settings and ping and serves unary grpc" {
     const server_port = harness.getPort();
 
@@ -14562,4 +15265,3 @@ test "integration: tcp runtime originate_tls establishes TLS upstream" {
     try testing.expect(tls_accepts.load(.acquire) >= baseline_accepts);
     try testing.expect(server.shared.runtime.connectFailureCount() <= server.shared.runtime.acceptedCount());
 }
-

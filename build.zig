@@ -213,6 +213,22 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Reverse-proxy orchestrator runtime module - canonical IR + generation lifecycle
+    const serval_reverseproxy_module = b.addModule("serval-reverseproxy", .{
+        .root_source_file = b.path("serval-reverseproxy/mod.zig"),
+        .imports = &.{
+            .{ .name = "serval-core", .module = serval_core_module },
+        },
+    });
+
+    // Filter SDK module - restricted surface for user-authored filters.
+    const serval_filter_sdk_module = b.addModule("serval-filter-sdk", .{
+        .root_source_file = b.path("serval-filter-sdk/mod.zig"),
+        .imports = &.{
+            .{ .name = "serval-core", .module = serval_core_module },
+        },
+    });
+
     // Server module - composes core, net, socket, http, websocket, h2, grpc, pool, proxy, client, metrics, tracing, tls
     const serval_server_module = b.addModule("serval-server", .{
         .root_source_file = b.path("serval-server/mod.zig"),
@@ -233,6 +249,13 @@ pub fn build(b: *std.Build) void {
             .{ .name = "serval-acme", .module = serval_acme_module },
         },
     });
+
+    // Reverseproxy runtime depends on server runtime composition modules.
+    serval_reverseproxy_module.addImport("serval-net", serval_net_module);
+    serval_reverseproxy_module.addImport("serval-pool", serval_pool_module);
+    serval_reverseproxy_module.addImport("serval-metrics", serval_metrics_module);
+    serval_reverseproxy_module.addImport("serval-tracing", serval_tracing_module);
+    serval_reverseproxy_module.addImport("serval-server", serval_server_module);
 
     // Prober module - depends on core, net, health, tls, client
     const serval_prober_module = b.addModule("serval-prober", .{
@@ -275,6 +298,9 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Reverseproxy runtime uses router strategy as the routing engine.
+    serval_reverseproxy_module.addImport("serval-router", serval_router_module);
+
     // Gateway module - depends on router, core, server, net, tls, client, pool (Layer 5 - Orchestration)
     const serval_gateway_module = b.addModule("serval-k8s-gateway", .{
         .root_source_file = b.path("serval-k8s-gateway/mod.zig"),
@@ -303,6 +329,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "serval-acme", .module = serval_acme_module },
             .{ .name = "serval-pool", .module = serval_pool_module },
             .{ .name = "serval-proxy", .module = serval_proxy_module },
+            .{ .name = "serval-reverseproxy", .module = serval_reverseproxy_module },
+            .{ .name = "serval-filter-sdk", .module = serval_filter_sdk_module },
             .{ .name = "serval-metrics", .module = serval_metrics_module },
             .{ .name = "serval-tracing", .module = serval_tracing_module },
             .{ .name = "serval-otel", .module = serval_otel_module },
@@ -336,6 +364,8 @@ pub fn build(b: *std.Build) void {
     serval_tests_mod.addImport("serval-acme", serval_acme_module);
     serval_tests_mod.addImport("serval-pool", serval_pool_module);
     serval_tests_mod.addImport("serval-proxy", serval_proxy_module);
+    serval_tests_mod.addImport("serval-reverseproxy", serval_reverseproxy_module);
+    serval_tests_mod.addImport("serval-filter-sdk", serval_filter_sdk_module);
     serval_tests_mod.addImport("serval-metrics", serval_metrics_module);
     serval_tests_mod.addImport("serval-tracing", serval_tracing_module);
     serval_tests_mod.addImport("serval-otel", serval_otel_module);
@@ -639,6 +669,45 @@ pub fn build(b: *std.Build) void {
     const proxy_test_step = b.step("test-proxy", "Run serval-proxy h2 primitive tests");
     proxy_test_step.dependOn(&run_proxy_h2_tests.step);
 
+    // Reverseproxy module tests (IR/admission/orchestration + DSL equivalence)
+    const reverseproxy_tests_mod = b.createModule(.{
+        .root_source_file = b.path("serval-reverseproxy/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    reverseproxy_tests_mod.addImport("serval-core", serval_core_module);
+    reverseproxy_tests_mod.addImport("serval-filter-sdk", serval_filter_sdk_module);
+    reverseproxy_tests_mod.addImport("serval-net", serval_net_module);
+    reverseproxy_tests_mod.addImport("serval-pool", serval_pool_module);
+    reverseproxy_tests_mod.addImport("serval-metrics", serval_metrics_module);
+    reverseproxy_tests_mod.addImport("serval-tracing", serval_tracing_module);
+    reverseproxy_tests_mod.addImport("serval-server", serval_server_module);
+    reverseproxy_tests_mod.addImport("serval-router", serval_router_module);
+    const reverseproxy_tests = b.addTest(.{
+        .name = "reverseproxy_tests",
+        .root_module = reverseproxy_tests_mod,
+    });
+    force_llvm_lld(reverseproxy_tests);
+    const run_reverseproxy_tests = b.addRunArtifact(reverseproxy_tests);
+
+    const reverseproxy_test_step = b.step("test-reverseproxy", "Run serval-reverseproxy library tests");
+    reverseproxy_test_step.dependOn(&run_reverseproxy_tests.step);
+
+    const reverseproxy_integration_tests = b.addTest(.{
+        .name = "reverseproxy_integration_tests",
+        .root_module = reverseproxy_tests_mod,
+        .filters = &.{"integration: reverseproxy"},
+    });
+    force_llvm_lld(reverseproxy_integration_tests);
+    const run_reverseproxy_integration_tests = b.addRunArtifact(reverseproxy_integration_tests);
+
+    const reverseproxy_integration_test_step = b.step(
+        "test-reverseproxy-integration",
+        "Run serval-reverseproxy cross-component integration tests",
+    );
+    reverseproxy_integration_test_step.dependOn(&run_reverseproxy_integration_tests.step);
+
     // Server module tests
     const server_tests_mod = b.createModule(.{
         .root_source_file = b.path("serval-server/mod.zig"),
@@ -770,6 +839,36 @@ pub fn build(b: *std.Build) void {
         "Run integration TCP runtime tests",
     );
     integration_test_tcp_runtime_step.dependOn(&run_integration_test_tcp_runtime.step);
+
+    const integration_test_reverseproxy = b.addTest(.{
+        .name = "integration_test_reverseproxy",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: reverseproxy"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_reverseproxy);
+    const run_integration_test_reverseproxy = b.addRunArtifact(integration_test_reverseproxy);
+
+    const integration_test_reverseproxy_step = b.step(
+        "test-integration-reverseproxy",
+        "Run integration reverseproxy tests",
+    );
+    integration_test_reverseproxy_step.dependOn(&run_integration_test_reverseproxy.step);
+
+    const integration_test_netbird = b.addTest(.{
+        .name = "integration_test_netbird",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: netbird"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_netbird);
+    const run_integration_test_netbird = b.addRunArtifact(integration_test_netbird);
+
+    const integration_test_netbird_step = b.step(
+        "test-integration-netbird",
+        "Run integration netbird tests",
+    );
+    integration_test_netbird_step.dependOn(&run_integration_test_netbird.step);
 
     const acme_pebble_smoke = b.addSystemCommand(&.{
         "bash",
@@ -1541,6 +1640,58 @@ pub fn build(b: *std.Build) void {
     const run_router_example_step = b.step("run-router-example", "Run router example");
     run_router_example_step.dependOn(&run_router_example.step);
 
+    // Reverseproxy runtime example (DSL + orchestrator runtime provider)
+    const reverseproxy_runtime_mod = b.createModule(.{
+        .root_source_file = b.path("examples/reverseproxy_runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    reverseproxy_runtime_mod.linkSystemLibrary("ssl", .{});
+    reverseproxy_runtime_mod.linkSystemLibrary("crypto", .{});
+    reverseproxy_runtime_mod.addImport("serval", serval_module);
+    reverseproxy_runtime_mod.addImport("serval-cli", serval_cli_module);
+    reverseproxy_runtime_mod.addImport("serval-net", serval_net_module);
+    const reverseproxy_runtime = b.addExecutable(.{
+        .name = "reverseproxy_runtime",
+        .root_module = reverseproxy_runtime_mod,
+    });
+    force_llvm_lld(reverseproxy_runtime);
+    const build_reverseproxy_runtime = b.addInstallArtifact(reverseproxy_runtime, .{});
+    const run_reverseproxy_runtime = b.addRunArtifact(reverseproxy_runtime);
+
+    if (b.args) |args| {
+        run_reverseproxy_runtime.addArgs(args);
+    }
+
+    const build_reverseproxy_runtime_step = b.step("build-reverseproxy-runtime", "Build reverseproxy runtime example");
+    build_reverseproxy_runtime_step.dependOn(&build_reverseproxy_runtime.step);
+
+    const reverseproxy_runtime_tests_mod = b.createModule(.{
+        .root_source_file = b.path("examples/reverseproxy_runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    reverseproxy_runtime_tests_mod.linkSystemLibrary("ssl", .{});
+    reverseproxy_runtime_tests_mod.linkSystemLibrary("crypto", .{});
+    reverseproxy_runtime_tests_mod.addImport("serval", serval_module);
+    reverseproxy_runtime_tests_mod.addImport("serval-cli", serval_cli_module);
+    reverseproxy_runtime_tests_mod.addImport("serval-net", serval_net_module);
+    const reverseproxy_runtime_tests = b.addTest(.{
+        .name = "reverseproxy_runtime_tests",
+        .root_module = reverseproxy_runtime_tests_mod,
+    });
+    force_llvm_lld(reverseproxy_runtime_tests);
+    const run_reverseproxy_runtime_tests = b.addRunArtifact(reverseproxy_runtime_tests);
+
+    const reverseproxy_runtime_test_step = b.step("test-reverseproxy-runtime", "Run reverseproxy runtime example tests");
+    reverseproxy_runtime_test_step.dependOn(&run_reverseproxy_runtime_tests.step);
+    test_step.dependOn(&run_reverseproxy_runtime_tests.step);
+
+    const run_reverseproxy_runtime_step = b.step("run-reverseproxy-runtime", "Run reverseproxy runtime example");
+    run_reverseproxy_runtime_step.dependOn(&run_reverseproxy_runtime.step);
+
     // NetBird reverse-proxy example
     // Note: Links SSL libraries since serval depends on serval-server which depends on serval-tls
     const netbird_proxy_mod = b.createModule(.{
@@ -1659,9 +1810,11 @@ pub fn build(b: *std.Build) void {
     const build_echo_backend = b.addInstallArtifact(echo_backend, .{});
     const run_echo_backend = b.addRunArtifact(echo_backend);
 
-    // Ensure echo_backend is rebuilt before integration tests run.
-    // The test harness spawns ./zig-out/bin/echo_backend directly.
+    // Ensure subprocess binaries are rebuilt before integration tests run.
+    // The harness spawns ./zig-out/bin/echo_backend and ./zig-out/bin/netbird_proxy directly.
     run_integration_tests.step.dependOn(&build_echo_backend.step);
+    run_integration_tests.step.dependOn(&build_netbird_proxy.step);
+    run_integration_tests.step.dependOn(&build_reverseproxy_runtime.step);
     run_integration_test_2.step.dependOn(&build_echo_backend.step);
     run_integration_test_32.step.dependOn(&build_echo_backend.step);
     run_integration_test_34.step.dependOn(&build_echo_backend.step);
@@ -1698,6 +1851,10 @@ pub fn build(b: *std.Build) void {
     run_integration_test_h2c_mixed_goaway_nongrpc.step.dependOn(&build_echo_backend.step);
     run_integration_test_h2c_mixed_goaway_nongrpc_soak.step.dependOn(&build_echo_backend.step);
     run_integration_test_h2c_mixed_grpc_nongrpc_same_conn.step.dependOn(&build_echo_backend.step);
+    run_integration_test_reverseproxy.step.dependOn(&build_echo_backend.step);
+    run_integration_test_reverseproxy.step.dependOn(&build_reverseproxy_runtime.step);
+    run_integration_test_netbird.step.dependOn(&build_echo_backend.step);
+    run_integration_test_netbird.step.dependOn(&build_netbird_proxy.step);
     run_integration_test_2.step.dependOn(&build_lb_example.step);
     run_integration_test_77.step.dependOn(&build_lb_example.step);
     run_integration_test_78.step.dependOn(&build_lb_example.step);
@@ -1832,6 +1989,7 @@ pub fn build(b: *std.Build) void {
     // Default step - build all examples
     b.default_step.dependOn(&build_lb_example.step);
     b.default_step.dependOn(&build_router_example.step);
+    b.default_step.dependOn(&build_reverseproxy_runtime.step);
     b.default_step.dependOn(&build_netbird_proxy.step);
     b.default_step.dependOn(&build_gateway_example.step);
     b.default_step.dependOn(&build_echo_backend.step);

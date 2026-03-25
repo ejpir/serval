@@ -32,6 +32,7 @@ const serval_h2 = @import("serval-h2");
 const serval_grpc = @import("serval-grpc");
 const websocket_server = @import("../websocket/mod.zig");
 const frontend = @import("../frontend/mod.zig");
+const RuntimeProvider = frontend.RuntimeProvider;
 const h2_server = @import("../h2/server.zig");
 const h2_runtime = @import("../h2/runtime.zig");
 const serval_proxy = @import("serval-proxy");
@@ -209,6 +210,9 @@ pub fn Server(
         client_ctx: ?*ssl.SSL_CTX,
         /// DNS configuration retained for transport runtime orchestration.
         dns_config: DnsConfig,
+        /// Optional external runtime-provider adapter.
+        /// Enables generation-aware orchestration without hard coupling.
+        runtime_provider: ?RuntimeProvider,
 
         /// Protects publish/unpublish of the server TLS manager pointer.
         /// TigerStyle: Explicit synchronization for control-plane activation path.
@@ -301,7 +305,24 @@ pub fn Server(
                 .forwarder = forwarder_mod.Forwarder(Pool, Tracer).init(pool, tracer, verify_upstream, client_ctx, dns_config),
                 .client_ctx = client_ctx,
                 .dns_config = dns_config,
+                .runtime_provider = null,
             };
+        }
+
+        /// Configure optional runtime provider adapter.
+        /// Keeps server standalone while allowing external orchestration integration.
+        pub fn setRuntimeProvider(self: *Self, runtime_provider: ?RuntimeProvider) void {
+            assert(@intFromPtr(self) != 0);
+            if (runtime_provider) |provider| {
+                const generation = provider.activeGeneration();
+                if (generation) |value| assert(value > 0);
+            }
+            self.runtime_provider = runtime_provider;
+        }
+
+        pub fn getRuntimeProvider(self: *const Self) ?RuntimeProvider {
+            assert(@intFromPtr(self) != 0);
+            return self.runtime_provider;
         }
 
         /// Clean up server resources.
@@ -329,6 +350,10 @@ pub fn Server(
         ) !void {
             assert(self.config.port > 0);
             assert(self.config.listen_host.len > 0);
+            if (self.runtime_provider) |provider| {
+                const generation = provider.activeGeneration();
+                if (generation) |value| assert(value > 0);
+            }
 
             const addr = frontend.preflightAndResolveListenAddress(&self.config) catch |err| {
                 log.err("server: frontend preflight failed: {s}", .{@errorName(err)});
@@ -425,6 +450,7 @@ pub fn Server(
                     self.tracer,
                     self.config,
                     tls_ctx_manager,
+                    self.runtime_provider,
                     io,
                     stream,
                 }) catch |err| {
@@ -2418,6 +2444,7 @@ pub fn Server(
             tracer: *Tracer,
             cfg: Config,
             tls_ctx_manager: ?*ReloadableServerCtx,
+            runtime_provider: ?RuntimeProvider,
             io: Io,
             stream: Io.net.Stream,
         ) void {
@@ -2427,6 +2454,14 @@ pub fn Server(
             assert(@intFromPtr(metrics) != 0);
             assert(@intFromPtr(tracer) != 0);
             assert(cfg.max_requests_per_connection > 0);
+
+            if (runtime_provider) |provider| {
+                const generation = provider.activeGeneration();
+                if (generation) |value| {
+                    assert(value > 0);
+                    log.debug("server: runtime_provider active_generation={d}", .{value});
+                }
+            }
 
             // Setup: TCP_NODELAY, connection ID, metrics
             _ = set_tcp_no_delay(stream.socket.handle);
@@ -3069,6 +3104,20 @@ pub fn Server(
                     }
                 }
 
+                if (runtime_provider) |provider| {
+                    if (provider.lookupRoute(&parser.request)) |route_snapshot| {
+                        log.debug(
+                            "server: runtime_provider matched generation={d} route={s} pool={s} chain={s}",
+                            .{
+                                route_snapshot.generation_id,
+                                route_snapshot.route_id,
+                                route_snapshot.pool_id,
+                                route_snapshot.chain_id,
+                            },
+                        );
+                    }
+                }
+
                 // Select upstream and forward (or reject if handler returns action)
                 const action_result = handler.selectUpstream(&ctx, &parser.request);
 
@@ -3592,6 +3641,52 @@ test "MinimalServer compiles" {
     // TigerStyle: null client_ctx for tests without TLS upstreams.
     // DnsConfig{} uses default TTL and timeout values.
     _ = MinimalServer(TestHandler).init(&handler, &pool, &metrics, &tracer, .{}, null, DnsConfig{});
+}
+
+test "Server runtime provider is optional and defaults to null" {
+    var handler = TestHandler{};
+    var pool = pool_mod.SimplePool.init();
+    var metrics = metrics_mod.NoopMetrics{};
+    var tracer = tracing_mod.NoopTracer{};
+
+    var server = Server(TestHandler, pool_mod.SimplePool, metrics_mod.NoopMetrics, tracing_mod.NoopTracer)
+        .init(&handler, &pool, &metrics, &tracer, .{}, null, DnsConfig{});
+
+    try std.testing.expect(server.getRuntimeProvider() == null);
+}
+
+test "Server accepts runtime provider adapter without reverseproxy hard dependency" {
+    const FakeProvider = struct {
+        pub fn activeGeneration(self: *const @This()) ?u64 {
+            _ = self;
+            return 7;
+        }
+
+        pub fn lookupRoute(self: *const @This(), request: *const Request) ?frontend.RouteSnapshot {
+            _ = self;
+            _ = request;
+            return .{
+                .generation_id = 7,
+                .route_id = "route-a",
+                .pool_id = "pool-a",
+                .chain_id = "chain-a",
+            };
+        }
+    };
+
+    var handler = TestHandler{};
+    var pool = pool_mod.SimplePool.init();
+    var metrics = metrics_mod.NoopMetrics{};
+    var tracer = tracing_mod.NoopTracer{};
+
+    var server = Server(TestHandler, pool_mod.SimplePool, metrics_mod.NoopMetrics, tracing_mod.NoopTracer)
+        .init(&handler, &pool, &metrics, &tracer, .{}, null, DnsConfig{});
+
+    var fake_provider = FakeProvider{};
+    server.setRuntimeProvider(frontend.fromRuntimeProvider(&fake_provider));
+
+    const configured = server.getRuntimeProvider() orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(?u64, 7), configured.activeGeneration());
 }
 
 test "parseContentLengthValue valid" {

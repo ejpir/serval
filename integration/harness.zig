@@ -398,6 +398,38 @@ pub const LoadBalancerConfig = struct {
     debug: bool = false,
 };
 
+/// Configuration for NetBird reverse-proxy example process.
+pub const NetbirdProxyConfig = struct {
+    /// TLS certificate path for HTTPS listener.
+    cert_path: []const u8,
+    /// TLS private key path for HTTPS listener.
+    key_path: []const u8,
+    /// HTTP upstream for /api/* and management HTTP routes.
+    management_http: []const u8,
+    /// HTTP upstream for non-management catch-all routes.
+    dashboard_http: []const u8,
+    /// HTTP upstream for relay routes.
+    relay_http: []const u8,
+    /// HTTP upstream for websocket proxy routes.
+    signal_http: []const u8,
+    /// h2c upstream for signal gRPC routes.
+    signal_grpc: []const u8,
+    /// h2c upstream for management gRPC routes.
+    management_grpc: []const u8,
+    /// h2c upstream for zitadel routes.
+    zitadel_http: []const u8,
+    /// Enable debug logging.
+    debug: bool = false,
+};
+
+/// Configuration for reverseproxy runtime binary process.
+pub const ReverseproxyRuntimeConfig = struct {
+    /// Path to DSL config file.
+    config_file: []const u8,
+    /// Enable debug logging.
+    debug: bool = false,
+};
+
 pub const ProcessManager = struct {
     allocator: std.mem.Allocator,
     processes: std.ArrayList(Process),
@@ -678,6 +710,183 @@ pub const ProcessManager = struct {
         // Wait for health checks (backends need to be marked healthy)
         // TigerStyle C1: Named constant with unit suffix
         posix.nanosleep(HEALTH_SETTLE_DELAY_S, 0);
+    }
+
+    /// Start reverseproxy runtime example with DSL + pool mappings.
+    pub fn startReverseproxyRuntime(
+        self: *ProcessManager,
+        port: u16,
+        config: ReverseproxyRuntimeConfig,
+    ) !void {
+        assert(port > 0);
+        assert(config.config_file.len > 0);
+
+        var args: std.ArrayList([]const u8) = .empty;
+        defer args.deinit(self.allocator);
+
+        var allocated_strings: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (allocated_strings.items) |s| self.allocator.free(s);
+            allocated_strings.deinit(self.allocator);
+        }
+
+        try args.append(self.allocator, "./zig-out/bin/reverseproxy_runtime");
+        try args.append(self.allocator, "--port");
+
+        var port_buf: [PORT_BUF_LEN]u8 = undefined;
+        const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch unreachable;
+        const port_dup = try self.allocator.dupe(u8, port_str);
+        try allocated_strings.append(self.allocator, port_dup);
+        try args.append(self.allocator, port_dup);
+
+        try args.append(self.allocator, "--config-file");
+        try args.append(self.allocator, config.config_file);
+
+        if (config.debug) {
+            try args.append(self.allocator, "--debug");
+        }
+
+        const pid = try spawnProcess(self.allocator, args.items);
+        errdefer {
+            posix.kill(pid, posix.SIG.KILL) catch |err| {
+                if (err != error.ProcessNotFound) {
+                    std.log.warn("errdefer kill({d}) failed: {s}", .{ pid, @errorName(err) });
+                }
+            };
+            _ = posix.waitpid(pid, 0);
+        }
+
+        try self.processes.append(self.allocator, .{
+            .pid = pid,
+            .name = try self.allocator.dupe(u8, "reverseproxy_runtime"),
+            .allocator = self.allocator,
+        });
+
+        try waitForPort(port, SERVER_READY_TIMEOUT_MS);
+        posix.nanosleep(0, READY_POLL_INTERVAL_MS * std.time.ns_per_ms);
+    }
+
+    /// Start reverseproxy runtime and require startup failure (admission/config rejection).
+    pub fn startReverseproxyRuntimeExpectFailure(
+        self: *ProcessManager,
+        port: u16,
+        config: ReverseproxyRuntimeConfig,
+    ) !void {
+        assert(port > 0);
+        assert(config.config_file.len > 0);
+
+        var args: std.ArrayList([]const u8) = .empty;
+        defer args.deinit(self.allocator);
+
+        var allocated_strings: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (allocated_strings.items) |s| self.allocator.free(s);
+            allocated_strings.deinit(self.allocator);
+        }
+
+        try args.append(self.allocator, "./zig-out/bin/reverseproxy_runtime");
+        try args.append(self.allocator, "--port");
+
+        var port_buf: [PORT_BUF_LEN]u8 = undefined;
+        const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch unreachable;
+        const port_dup = try self.allocator.dupe(u8, port_str);
+        try allocated_strings.append(self.allocator, port_dup);
+        try args.append(self.allocator, port_dup);
+
+        try args.append(self.allocator, "--config-file");
+        try args.append(self.allocator, config.config_file);
+
+        if (config.debug) {
+            try args.append(self.allocator, "--debug");
+        }
+
+        const pid = try spawnProcess(self.allocator, args.items);
+        const wait_result = posix.waitpid(pid, 0);
+        const exited_normally = (wait_result.status & 0x7f) == 0;
+        const exit_code = (wait_result.status >> 8) & 0xff;
+
+        if (!exited_normally or exit_code == 0) {
+            return error.ExpectedProcessFailure;
+        }
+    }
+
+    /// Start NetBird reverse-proxy example with explicit upstream mapping.
+    pub fn startNetbirdProxy(
+        self: *ProcessManager,
+        port: u16,
+        config: NetbirdProxyConfig,
+    ) !void {
+        assert(port > 0);
+        assert(config.cert_path.len > 0);
+        assert(config.key_path.len > 0);
+        assert(config.management_http.len > 0);
+        assert(config.dashboard_http.len > 0);
+        assert(config.relay_http.len > 0);
+        assert(config.signal_http.len > 0);
+        assert(config.signal_grpc.len > 0);
+        assert(config.management_grpc.len > 0);
+        assert(config.zitadel_http.len > 0);
+
+        var args: std.ArrayList([]const u8) = .empty;
+        defer args.deinit(self.allocator);
+
+        var allocated_strings: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (allocated_strings.items) |s| self.allocator.free(s);
+            allocated_strings.deinit(self.allocator);
+        }
+
+        try args.append(self.allocator, "./zig-out/bin/netbird_proxy");
+        try args.append(self.allocator, "--port");
+
+        var port_buf: [PORT_BUF_LEN]u8 = undefined;
+        const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch unreachable;
+        const port_dup = try self.allocator.dupe(u8, port_str);
+        try allocated_strings.append(self.allocator, port_dup);
+        try args.append(self.allocator, port_dup);
+
+        try args.append(self.allocator, "--cert");
+        try args.append(self.allocator, config.cert_path);
+        try args.append(self.allocator, "--key");
+        try args.append(self.allocator, config.key_path);
+
+        try args.append(self.allocator, "--management-http");
+        try args.append(self.allocator, config.management_http);
+        try args.append(self.allocator, "--dashboard-http");
+        try args.append(self.allocator, config.dashboard_http);
+        try args.append(self.allocator, "--relay-http");
+        try args.append(self.allocator, config.relay_http);
+        try args.append(self.allocator, "--signal-http");
+        try args.append(self.allocator, config.signal_http);
+        try args.append(self.allocator, "--signal-grpc");
+        try args.append(self.allocator, config.signal_grpc);
+        try args.append(self.allocator, "--management-grpc");
+        try args.append(self.allocator, config.management_grpc);
+        try args.append(self.allocator, "--zitadel-http");
+        try args.append(self.allocator, config.zitadel_http);
+
+        if (config.debug) {
+            try args.append(self.allocator, "--debug");
+        }
+
+        const pid = try spawnProcess(self.allocator, args.items);
+        errdefer {
+            posix.kill(pid, posix.SIG.KILL) catch |err| {
+                if (err != error.ProcessNotFound) {
+                    std.log.warn("errdefer kill({d}) failed: {s}", .{ pid, @errorName(err) });
+                }
+            };
+            _ = posix.waitpid(pid, 0);
+        }
+
+        try self.processes.append(self.allocator, .{
+            .pid = pid,
+            .name = try self.allocator.dupe(u8, "netbird_proxy"),
+            .allocator = self.allocator,
+        });
+
+        try waitForPort(port, SERVER_READY_TIMEOUT_MS);
+        posix.nanosleep(0, READY_POLL_INTERVAL_MS * std.time.ns_per_ms);
     }
 
     pub fn stopAll(self: *ProcessManager) void {

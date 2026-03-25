@@ -101,6 +101,8 @@ exe.root_module.addImport("serval-lb", serval.module("serval-lb"));
 | `serval-tls` | TLS termination/origination with kTLS offload |
 | `serval-pool` | Connection pooling |
 | `serval-proxy` | Upstream forwarding |
+| `serval-reverseproxy` | Reverse-proxy canonical IR + generation lifecycle orchestrator |
+| `serval-filter-sdk` | Restricted SDK surface for user-authored filters |
 | `serval-server` | HTTP/1.1 server |
 | `serval-lb` | Load balancer handler (round-robin) |
 | `serval-router` | Content-based routing (host/path matching, path rewriting) |
@@ -168,6 +170,7 @@ pub fn handleWebSocket(self: *@This(), ctx: *serval.Context, req: *const serval.
 zig build                       # Build all examples
 zig build run-lb-example        # Run load balancer
 zig build run-router-example    # Run content-based router
+zig build run-reverseproxy-runtime # Run reverseproxy runtime (DSL-driven)
 zig build run-netbird-proxy     # Run NetBird reverse-proxy example
 zig build run-llm-example       # Run LLM streaming example
 zig build run-echo-backend      # Run echo backend
@@ -287,6 +290,21 @@ curl http://localhost:8080/other        # -> api-backend (default), path unchang
 The router strips path prefixes before forwarding:
 - `/api/users` → api-pool receives `/users`
 - `/static/image.png` → static-pool receives `/image.png`
+
+### Reverseproxy Runtime (DSL Config File)
+
+A checked-in starter config is available at `examples/reverseproxy/basic.dsl`.
+
+```bash
+# Terminal 1: Start backend
+zig build run-echo-backend -- --port 8001 --id rp-backend
+
+# Terminal 2: Start reverseproxy runtime with DSL config
+zig build run-reverseproxy-runtime -- --config-file examples/reverseproxy/basic.dsl
+
+# Terminal 3: Test
+curl http://127.0.0.1:8080/
+```
 
 ### NetBird Reverse Proxy (Self-Signed TLS Supported)
 

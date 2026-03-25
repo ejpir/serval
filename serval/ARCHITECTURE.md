@@ -38,6 +38,8 @@ serval (umbrella - re-exports all modules)
 ├── serval-health   # Backend health tracking (atomic bitmap, thresholds)
 ├── serval-prober   # Background health probing
 ├── serval-proxy    # Upstream forwarding (h1/ + initial h2 stream-bridge primitives)
+├── serval-reverseproxy # Reverse-proxy canonical IR + generation lifecycle orchestrator
+├── serval-filter-sdk # Restricted filter author SDK boundary
 ├── serval-metrics  # Request metrics (real-time + Prometheus)
 ├── serval-tracing  # Distributed tracing interface
 ├── serval-otel     # OpenTelemetry implementation
@@ -132,6 +134,7 @@ Layer 3 (Mechanics):                                       │       │
        ↑                                                   │       │
        │                                                   │       │
 Layer 5 (Orchestration):                                   │       │
+  serval-reverseproxy (IR + generation lifecycle) ─────────┤       │
   serval-server ───────────────────────────────────────────┤       │
                                                            │       │
                                                       serval (composes all)
@@ -160,6 +163,8 @@ Standalone:
 | serval-health | Backend health tracking | `HealthState`, `UpstreamIndex`, `MAX_UPSTREAMS` |
 | serval-prober | Background health probing (HTTP/HTTPS) | `ProberContext`, `probeLoop` |
 | serval-proxy | Request forwarding + initial stream-aware h2 bridge primitives | `Forwarder`, `ForwardResult`, `BodyInfo`, `Protocol`, `H2StreamBridge` |
+| serval-reverseproxy | Reverse-proxy runtime orchestration (canonical IR + generation lifecycle) | `CanonicalIr`, `validateCanonicalIr`, `RuntimeSnapshot`, `Orchestrator` |
+| serval-filter-sdk | Restricted filter author SDK boundary | `FilterContext`, `HeaderSliceView`, `ChunkView`, `EmitWriter`, `Decision`, `verifyFilter` |
 | serval-metrics | Observability | `NoopMetrics`, `PrometheusMetrics`, `RealTimeMetrics` |
 | serval-waf | Scanner-focused request blocking | `Config`, `ScannerRule`, `Decision`, `ShieldedHandler` |
 | serval-tracing | Distributed tracing interface | `NoopTracer`, `SpanHandle` |
