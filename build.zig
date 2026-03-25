@@ -251,6 +251,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // Reverseproxy runtime depends on server runtime composition modules.
+    serval_reverseproxy_module.addImport("serval-filter-sdk", serval_filter_sdk_module);
     serval_reverseproxy_module.addImport("serval-net", serval_net_module);
     serval_reverseproxy_module.addImport("serval-pool", serval_pool_module);
     serval_reverseproxy_module.addImport("serval-metrics", serval_metrics_module);

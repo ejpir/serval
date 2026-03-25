@@ -28,6 +28,72 @@ pub const HeaderSliceView = struct {
     }
 };
 
+pub const HeaderWriteError = error{
+    TooManyHeaders,
+};
+
+pub const HeaderWriteView = struct {
+    storage: []core.Header,
+    count: *u32,
+
+    pub fn init(storage: []core.Header, count: *u32) HeaderWriteView {
+        assert(@intFromPtr(count) != 0);
+        assert(count.* <= storage.len);
+        return .{ .storage = storage, .count = count };
+    }
+
+    pub fn len(self: HeaderWriteView) usize {
+        return self.count.*;
+    }
+
+    pub fn get(self: HeaderWriteView, idx: usize) ?HeaderView {
+        if (idx >= self.count.*) return null;
+        const h = self.storage[idx];
+        return .{ .name = h.name, .value = h.value };
+    }
+
+    pub fn asReadOnly(self: HeaderWriteView) HeaderSliceView {
+        return .{ .headers = self.storage[0..self.count.*] };
+    }
+
+    pub fn upsert(self: *HeaderWriteView, name: []const u8, value: []const u8) HeaderWriteError!void {
+        assert(@intFromPtr(self) != 0);
+        assert(name.len > 0);
+
+        var index: usize = 0;
+        while (index < self.count.*) : (index += 1) {
+            if (std.ascii.eqlIgnoreCase(self.storage[index].name, name)) {
+                self.storage[index].value = value;
+                return;
+            }
+        }
+
+        if (self.count.* >= self.storage.len) return error.TooManyHeaders;
+        const write_index: usize = @intCast(self.count.*);
+        self.storage[write_index] = .{ .name = name, .value = value };
+        self.count.* += 1;
+    }
+
+    pub fn remove(self: *HeaderWriteView, name: []const u8) bool {
+        assert(@intFromPtr(self) != 0);
+        assert(name.len > 0);
+
+        var index: usize = 0;
+        while (index < self.count.*) : (index += 1) {
+            if (!std.ascii.eqlIgnoreCase(self.storage[index].name, name)) continue;
+
+            var shift: usize = index;
+            while (shift + 1 < self.count.*) : (shift += 1) {
+                self.storage[shift] = self.storage[shift + 1];
+            }
+            self.count.* -= 1;
+            return true;
+        }
+
+        return false;
+    }
+};
+
 pub const ChunkView = struct {
     bytes: []const u8,
     is_last: bool,

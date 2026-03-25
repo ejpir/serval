@@ -7,6 +7,7 @@ const sdk = @import("serval-filter-sdk");
 const ir = @import("ir.zig");
 const dsl = @import("dsl.zig");
 const policy = @import("policy.zig");
+const filter_runtime = @import("filter_runtime.zig");
 const request_stream = @import("stream_request.zig");
 const response_stream = @import("stream_response.zig");
 const orchestrator_mod = @import("orchestrator.zig");
@@ -179,6 +180,146 @@ test "integration: reverseproxy dsl admission plus policy and streaming lifecycl
     try testing.expectEqual(@as(u32, 1), request_obs.request_headers_calls);
     try testing.expectEqual(@as(u32, 2), request_obs.request_chunk_calls);
     try testing.expectEqual(@as(u32, 1), response_obs.response_chunk_calls);
+}
+
+test "integration: reverseproxy loads custom filter and executes all hooks" {
+    const source =
+        \\listener l1 0.0.0.0:443
+        \\pool pool-1
+        \\plugin plugin-1 fail_policy=fail_closed
+        \\chain chain-1 plugin=plugin-1
+        \\route route-1 listener=l1 host=example.com path=/ pool=pool-1 chain=chain-1
+    ;
+
+    const LoadedFilter = struct {
+        req_headers: u32 = 0,
+        req_chunks: u32 = 0,
+        req_end: u32 = 0,
+        res_headers: u32 = 0,
+        res_chunks: u32 = 0,
+        res_end: u32 = 0,
+
+        pub fn onRequestHeaders(self: *@This(), ctx: *sdk.FilterContext, headers: sdk.HeaderSliceView) sdk.Decision {
+            _ = headers;
+            self.req_headers += 1;
+            ctx.incrementCounter("req_headers", 1);
+            return .continue_filtering;
+        }
+
+        pub fn onRequestChunk(self: *@This(), ctx: *sdk.FilterContext, chunk: sdk.ChunkView, emit: *sdk.EmitWriter) sdk.Decision {
+            _ = ctx;
+            self.req_chunks += 1;
+            emit.emit(chunk.bytes) catch return .{ .reject = .{ .status = 500, .reason = "request emit" } };
+            return .continue_filtering;
+        }
+
+        pub fn onRequestEnd(self: *@This(), ctx: *sdk.FilterContext, emit: *sdk.EmitWriter) sdk.Decision {
+            _ = ctx;
+            _ = emit;
+            self.req_end += 1;
+            return .continue_filtering;
+        }
+
+        pub fn onResponseHeaders(self: *@This(), ctx: *sdk.FilterContext, headers: sdk.HeaderSliceView) sdk.Decision {
+            _ = headers;
+            self.res_headers += 1;
+            ctx.setTag("phase", "response");
+            return .continue_filtering;
+        }
+
+        pub fn onResponseChunk(self: *@This(), ctx: *sdk.FilterContext, chunk: sdk.ChunkView, emit: *sdk.EmitWriter) sdk.Decision {
+            _ = ctx;
+            self.res_chunks += 1;
+            emit.emit(chunk.bytes) catch return .{ .reject = .{ .status = 500, .reason = "response emit" } };
+            return .continue_filtering;
+        }
+
+        pub fn onResponseEnd(self: *@This(), ctx: *sdk.FilterContext, emit: *sdk.EmitWriter) sdk.Decision {
+            _ = ctx;
+            _ = emit;
+            self.res_end += 1;
+            return .continue_filtering;
+        }
+    };
+
+    const Observe = struct {
+        tags: u32 = 0,
+        counters: u32 = 0,
+
+        fn setTag(ctx: *anyopaque, key: []const u8, value: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = key;
+            _ = value;
+            self.tags += 1;
+        }
+
+        fn incrCounter(ctx: *anyopaque, key: []const u8, delta: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = key;
+            _ = delta;
+            self.counters += 1;
+        }
+    };
+
+    const parsed = try dsl.parse(source);
+    const candidate = parsed.toCanonicalIr();
+
+    var registry = filter_runtime.FilterRegistry.init();
+    var loaded = LoadedFilter{};
+    try registry.registerTyped("plugin-1", &loaded, LoadedFilter);
+
+    var observe = Observe{};
+    var filter_ctx = sdk.FilterContext{
+        .route_id = "route-1",
+        .chain_id = "chain-1",
+        .plugin_id = "",
+        .request_id = 11,
+        .stream_id = 1,
+        .set_tag_fn = Observe.setTag,
+        .incr_counter_fn = Observe.incrCounter,
+        .observe_ctx = &observe,
+    };
+
+    var request_header_storage: [core.config.MAX_HEADERS]core.Header = undefined;
+    var response_header_storage: [core.config.MAX_HEADERS]core.Header = undefined;
+    var request_header_count: u32 = 0;
+    var response_header_count: u32 = 0;
+    var request_headers = sdk.HeaderWriteView.init(request_header_storage[0..], &request_header_count);
+    var response_headers = sdk.HeaderWriteView.init(response_header_storage[0..], &response_header_count);
+
+    var sink = CountingSink{};
+    var emit = sdk.EmitWriter.init(&sink, CountingSink.write, 64);
+    var hooks_obs = filter_runtime.HookObservation.init();
+
+    const decision = try registry.executeRouteHooks(
+        &candidate,
+        "route-1",
+        &filter_ctx,
+        &request_headers,
+        &response_headers,
+        &[_][]const u8{ "abc", "def" },
+        &[_][]const u8{"ghi"},
+        &emit,
+        .{ .ctx = &sink, .wait_writable_fn = AlwaysWritable.wait, .max_wait_attempts = 2, .wait_timeout_ns = 1 },
+        &hooks_obs,
+    );
+    switch (decision) {
+        .continue_filtering => {},
+        .reject, .bypass_plugin => return error.TestExpectedEqual,
+    }
+
+    try testing.expectEqual(@as(u32, 1), loaded.req_headers);
+    try testing.expectEqual(@as(u32, 2), loaded.req_chunks);
+    try testing.expectEqual(@as(u32, 1), loaded.req_end);
+    try testing.expectEqual(@as(u32, 1), loaded.res_headers);
+    try testing.expectEqual(@as(u32, 1), loaded.res_chunks);
+    try testing.expectEqual(@as(u32, 1), loaded.res_end);
+    try testing.expectEqual(@as(u64, 9), sink.bytes);
+    try testing.expectEqual(@as(u32, 1), observe.tags);
+    try testing.expectEqual(@as(u32, 1), observe.counters);
+    try testing.expectEqual(@as(u32, 1), hooks_obs.request_headers_calls);
+    try testing.expectEqual(@as(u32, 2), hooks_obs.request_chunk_calls);
+    try testing.expectEqual(@as(u32, 1), hooks_obs.response_chunk_calls);
 }
 
 test "integration: reverseproxy guard-window rollback plus failure semantics" {

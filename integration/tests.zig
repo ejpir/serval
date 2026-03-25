@@ -28,6 +28,7 @@ const serval_net = @import("serval-net");
 const serval_tls = @import("serval-tls");
 const posix = @import("posix_compat.zig");
 const harness = @import("harness.zig");
+const custom_filter = @import("filters/custom_filter.zig");
 
 const ssl = serval_tls.ssl;
 
@@ -6107,6 +6108,167 @@ test "integration: reverseproxy orchestrator enters safe mode when rollback unav
     const decision = monitor.evaluate(.{ .request_count = 10, .error_count = 10, .fail_closed_count = 0 }, 11);
     try testing.expectEqual(reverseproxy.GuardDecision.safe_mode, decision);
     try testing.expectEqual(reverseproxy.ApplyStage.safe_mode, orchestrator.getStage());
+}
+
+test "integration: reverseproxy loads custom filter and validates hook lifecycle" {
+    const reverseproxy = serval.reverseproxy;
+    const sdk = serval.filter_sdk;
+
+    const LoadedFilter = custom_filter.HookLifecycleFilter;
+    const Observe = custom_filter.Observer;
+
+    const Sink = struct {
+        bytes: u64 = 0,
+
+        fn write(ctx: *anyopaque, out: []const u8) sdk.EmitError!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.bytes += out.len;
+        }
+    };
+
+    const source =
+        \\listener l1 0.0.0.0:443
+        \\pool p1
+        \\plugin plugin-1 fail_policy=fail_closed
+        \\chain c1 plugin=plugin-1
+        \\route r1 listener=l1 host=example.com path=/ pool=p1 chain=c1
+    ;
+
+    const parsed = try reverseproxy.parseDsl(source);
+    var candidate = parsed.toCanonicalIr();
+
+    var diagnostics: [reverseproxy.ir.MAX_VALIDATION_DIAGNOSTICS]reverseproxy.ValidationDiagnostic = undefined;
+    var diagnostics_count: u32 = 0;
+    try reverseproxy.validateCanonicalIr(&candidate, &diagnostics, &diagnostics_count);
+    try testing.expectEqual(@as(u32, 0), diagnostics_count);
+
+    var registry = reverseproxy.FilterRegistry.init();
+    var loaded = LoadedFilter{};
+    try registry.registerTyped("plugin-1", &loaded, LoadedFilter);
+
+    var observe = Observe{};
+    var filter_ctx = sdk.FilterContext{
+        .route_id = "r1",
+        .chain_id = "c1",
+        .plugin_id = "",
+        .request_id = 1,
+        .stream_id = 1,
+        .set_tag_fn = Observe.setTag,
+        .incr_counter_fn = Observe.incrCounter,
+        .observe_ctx = &observe,
+    };
+
+    var request_header_storage: [serval.config.MAX_HEADERS]serval.Header = undefined;
+    var response_header_storage: [serval.config.MAX_HEADERS]serval.Header = undefined;
+    var request_header_count: u32 = 0;
+    var response_header_count: u32 = 0;
+    var request_headers = sdk.HeaderWriteView.init(request_header_storage[0..], &request_header_count);
+    var response_headers = sdk.HeaderWriteView.init(response_header_storage[0..], &response_header_count);
+
+    var sink = Sink{};
+    var emit = sdk.EmitWriter.init(&sink, Sink.write, 64);
+    var hooks = reverseproxy.HookObservation.init();
+
+    const decision = try registry.executeRouteHooks(
+        &candidate,
+        "r1",
+        &filter_ctx,
+        &request_headers,
+        &response_headers,
+        &[_][]const u8{ "ab", "cd" },
+        &[_][]const u8{"ef"},
+        &emit,
+        .{ .ctx = &sink, .wait_writable_fn = custom_filter.AlwaysWritable.wait, .max_wait_attempts = 2, .wait_timeout_ns = 1 },
+        &hooks,
+    );
+
+    switch (decision) {
+        .continue_filtering => {},
+        .reject, .bypass_plugin => return error.TestExpectedEqual,
+    }
+
+    try testing.expectEqual(@as(u32, 1), loaded.request_headers);
+    try testing.expectEqual(@as(u32, 2), loaded.request_chunks);
+    try testing.expectEqual(@as(u32, 1), loaded.request_end);
+    try testing.expectEqual(@as(u32, 1), loaded.response_headers);
+    try testing.expectEqual(@as(u32, 1), loaded.response_chunks);
+    try testing.expectEqual(@as(u32, 1), loaded.response_end);
+    try testing.expectEqual(@as(u64, 6), sink.bytes);
+    try testing.expectEqual(@as(u32, 1), observe.tags);
+    try testing.expectEqual(@as(u32, 1), observe.counters);
+    try testing.expectEqual(@as(u32, 1), hooks.request_headers_calls);
+    try testing.expectEqual(@as(u32, 2), hooks.request_chunk_calls);
+    try testing.expectEqual(@as(u32, 1), hooks.response_chunk_calls);
+}
+
+test "integration: reverseproxy custom filter transforms request and response bodies" {
+    const reverseproxy = serval.reverseproxy;
+    const sdk = serval.filter_sdk;
+
+    const source =
+        \\listener l1 0.0.0.0:443
+        \\pool p1
+        \\plugin plugin-1 fail_policy=fail_closed
+        \\chain c1 plugin=plugin-1
+        \\route r1 listener=l1 host=example.com path=/ pool=p1 chain=c1
+    ;
+
+    const parsed = try reverseproxy.parseDsl(source);
+    var candidate = parsed.toCanonicalIr();
+
+    var diagnostics: [reverseproxy.ir.MAX_VALIDATION_DIAGNOSTICS]reverseproxy.ValidationDiagnostic = undefined;
+    var diagnostics_count: u32 = 0;
+    try reverseproxy.validateCanonicalIr(&candidate, &diagnostics, &diagnostics_count);
+    try testing.expectEqual(@as(u32, 0), diagnostics_count);
+
+    var registry = reverseproxy.FilterRegistry.init();
+    var filter = custom_filter.BodyTransformFilter{};
+    try registry.registerTyped("plugin-1", &filter, custom_filter.BodyTransformFilter);
+
+    var filter_ctx = sdk.FilterContext{
+        .route_id = "r1",
+        .chain_id = "c1",
+        .plugin_id = "",
+        .request_id = 2,
+        .stream_id = 9,
+    };
+
+    var request_header_storage: [serval.config.MAX_HEADERS]serval.Header = undefined;
+    var response_header_storage: [serval.config.MAX_HEADERS]serval.Header = undefined;
+    var request_header_count: u32 = 0;
+    var response_header_count: u32 = 0;
+    var request_headers = sdk.HeaderWriteView.init(request_header_storage[0..], &request_header_count);
+    var response_headers = sdk.HeaderWriteView.init(response_header_storage[0..], &response_header_count);
+
+    var sink = custom_filter.CaptureSink{};
+    var emit = sdk.EmitWriter.init(&sink, custom_filter.CaptureSink.write, 128);
+    var hooks = reverseproxy.HookObservation.init();
+
+    const decision = try registry.executeRouteHooks(
+        &candidate,
+        "r1",
+        &filter_ctx,
+        &request_headers,
+        &response_headers,
+        &[_][]const u8{"ab"},
+        &[_][]const u8{"cd"},
+        &emit,
+        .{ .ctx = &sink, .wait_writable_fn = custom_filter.AlwaysWritable.wait, .max_wait_attempts = 2, .wait_timeout_ns = 1 },
+        &hooks,
+    );
+
+    switch (decision) {
+        .continue_filtering => {},
+        .reject, .bypass_plugin => return error.TestExpectedEqual,
+    }
+
+    try testing.expectEqualStrings("REQ:ab;RES:cd;", sink.bytes());
+    try testing.expectEqual(@as(usize, 1), request_headers.len());
+    try testing.expectEqual(@as(usize, 1), response_headers.len());
+    try testing.expectEqualStrings("x-request-filter", request_headers.get(0).?.name);
+    try testing.expectEqualStrings("enabled", request_headers.get(0).?.value);
+    try testing.expectEqualStrings("x-response-filter", response_headers.get(0).?.name);
+    try testing.expectEqualStrings("enabled", response_headers.get(0).?.value);
 }
 
 test "integration: reverseproxy runtime admission rejects unknown pool reference" {

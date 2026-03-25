@@ -4,7 +4,7 @@
 
 It intentionally exposes only:
 - `FilterContext`
-- header/chunk views
+- header/chunk views (`HeaderSliceView`, `HeaderWriteView`)
 - bounded `EmitWriter`
 - `Decision`
 - `verifyFilter` compile-time contract checks
@@ -41,3 +41,20 @@ const MyFilter = struct {
 
 comptime sdk.verifyFilter(MyFilter);
 ```
+
+## Writable Header Hooks
+
+Filters may implement writable header hooks:
+- `onRequestHeadersWrite(self, ctx, headers: sdk.HeaderWriteView)`
+- `onResponseHeadersWrite(self, ctx, headers: sdk.HeaderWriteView)`
+
+`HeaderWriteView` supports bounded mutation:
+- `upsert(name, value)` (insert or replace, bounded by fixed header capacity)
+- `remove(name)`
+- `asReadOnly()` for read-only projection
+
+Limits and behavior:
+- No allocation (fixed storage, bounded by core header limits)
+- `upsert` returns `error.TooManyHeaders` when capacity is exhausted
+- Header names must be non-empty
+- Existing read-only hooks (`onRequestHeaders`, `onResponseHeaders`) remain supported
