@@ -1,0 +1,416 @@
+verify • Findings
+
+  1. High: h1 short-circuit responses reuse keep-alive connections without draining the request body. In the onRequest direct/reject branches serval-server/h1/server.zig:2744, serval-server/h1/server.zig:2753,
+     serval-server/h1/server.zig:2766, and the action-style reject branch serval-server/h1/server.zig:3088, serval-server/h1/server.zig:3128, the code advances buffer_offset using getBodyLength() serval-server/h1/
+     reader.zig:68 and then continues the connection. getBodyLength() only understands Content-Length, so chunked bodies become 0, and partially unread fixed-length bodies are not drained either. That is a request-
+     desynchronization bug and a ship blocker.
+  2. High: terminated h2 TLS reads do not actually honor the documented timeout/backpressure model. The module README says the path uses H2_SERVER_IDLE_TIMEOUT_NS and splits WantRead vs WantWrite serval-server/
+     README.md:7, but the implementation treats both as a plain retry serval-server/h2/server.zig:2348 and then waits only for readability with no timeout at all serval-server/h2/server.zig:2361. That means quiet or
+     write-blocked TLS h2 connections can hang indefinitely and the code/documentation contract is false.
+  3. High: any handler with onRequest causes a 128 MiB heap allocation per live connection. The configured size is serval-core/config.zig:81, and the allocation happens at connection setup in serval-server/h1/
+     server.zig:2593. Under concurrency this is an easy memory-DoS vector and not acceptable for enterprise-ready server code.
+  4. Medium: allocator discipline is still weak in hot paths. The h1 h2-bridge allocates a session pool per bridge request serval-server/h1/server.zig:1900, the h2 upgrade path does the same serval-server/h1/
+     server.zig:1997, generic h2 does per-request/per-connection client setup on page_allocator serval-server/frontend/generic_h2.zig:394, serval-server/frontend/generic_h2.zig:486, serval-server/frontend/
+     generic_h2.zig:1093, and the TCP runtime also constructs clients on page_allocator per accepted connection serval-server/frontend/tcp_runtime.zig:236. That conflicts with the repo’s stated hot-path allocation
+     discipline and will hurt latency stability under load.
+  5. Medium: the TLS reload control path can crash the process on contention. lockTlsReloadControlMutex() spins and then calls @panic serval-server/h1/server.zig:96, serval-server/h1/server.zig:105, and it is used by
+     public management operations like serval-server/h1/server.zig:227 and serval-server/h1/server.zig:246. Enterprise control-plane operations need explicit failure semantics, not whole-process termination.
+  6. Medium: the h2 request-body tracker has a silent state-corruption fallback. When the tracker table is full, getOrInsertRequestBodyTracker() overwrites an existing slot by modulo serval-server/h2/runtime.zig:519,
+     serval-server/h2/runtime.zig:531. Even if current invariants usually prevent it, this is the wrong failure mode for protocol accounting; it should fail closed.
+  7. Low: the main h1 connection routine is far beyond the TigerStyle maintainability bar. The request loop starts at serval-server/h1/server.zig:2420 and mixes TLS handshake, ALPN dispatch, h1 parsing, websocket
+     handling, h2c upgrades, tracing, metrics, and forwarding in one surface. The tests in that file only start at serval-server/h1/server.zig:3532 and mostly cover reload plumbing and helper functions, not the risky
+     request-loop branches above. That is a reviewability and regression-risk problem.
+
+---
+
+Base directory for this skill: /home/nick/.claude/plugins/cache/superpowers-marketplace/superpowers/4.0.3/skills/receiving-code-review
+
+# Code Review Reception
+
+## Overview
+
+Code review requires technical evaluation, not emotional performance.
+
+**Core principle:** Verify before implementing. Ask before assuming. Technical correctness over social comfort.
+
+## The Response Pattern
+
+```
+WHEN receiving code review feedback:
+
+1. READ: Complete feedback without reacting
+2. UNDERSTAND: Restate requirement in own words (or ask)
+3. VERIFY: Check against codebase reality
+4. EVALUATE: Technically sound for THIS codebase?
+5. RESPOND: Technical acknowledgment or reasoned pushback
+6. IMPLEMENT: One item at a time, test each
+```
+
+## Forbidden Responses
+
+**NEVER:**
+- "You're absolutely right!" (explicit CLAUDE.md violation)
+- "Great point!" / "Excellent feedback!" (performative)
+- "Let me implement that now" (before verification)
+
+**INSTEAD:**
+- Restate the technical requirement
+- Ask clarifying questions
+- Push back with technical reasoning if wrong
+- Just start working (actions > words)
+
+## Handling Unclear Feedback
+
+```
+IF any item is unclear:
+  STOP - do not implement anything yet
+  ASK for clarification on unclear items
+
+WHY: Items may be related. Partial understanding = wrong implementation.
+```
+
+**Example:**
+```
+your human partner: "Fix 1-6"
+You understand 1,2,3,6. Unclear on 4,5.
+
+❌ WRONG: Implement 1,2,3,6 now, ask about 4,5 later
+✅ RIGHT: "I understand items 1,2,3,6. Need clarification on 4 and 5 before proceeding."
+```
+
+## Source-Specific Handling
+
+### From your human partner
+- **Trusted** - implement after understanding
+- **Still ask** if scope unclear
+- **No performative agreement**
+- **Skip to action** or technical acknowledgment
+
+### From External Reviewers
+```
+BEFORE implementing:
+  1. Check: Technically correct for THIS codebase?
+  2. Check: Breaks existing functionality?
+  3. Check: Reason for current implementation?
+  4. Check: Works on all platforms/versions?
+  5. Check: Does reviewer understand full context?
+
+IF suggestion seems wrong:
+  Push back with technical reasoning
+
+IF can't easily verify:
+  Say so: "I can't verify this without [X]. Should I [investigate/ask/proceed]?"
+
+IF conflicts with your human partner's prior decisions:
+  Stop and discuss with your human partner first
+```
+
+**your human partner's rule:** "External feedback - be skeptical, but check carefully"
+
+## YAGNI Check for "Professional" Features
+
+```
+IF reviewer suggests "implementing properly":
+  grep codebase for actual usage
+
+  IF unused: "This endpoint isn't called. Remove it (YAGNI)?"
+  IF used: Then implement properly
+```
+
+**your human partner's rule:** "You and reviewer both report to me. If we don't need this feature, don't add it."
+
+## Implementation Order
+
+```
+FOR multi-item feedback:
+  1. Clarify anything unclear FIRST
+  2. Then implement in this order:
+     - Blocking issues (breaks, security)
+     - Simple fixes (typos, imports)
+     - Complex fixes (refactoring, logic)
+  3. Test each fix individually
+  4. Verify no regressions
+```
+
+## When To Push Back
+
+Push back when:
+- Suggestion breaks existing functionality
+- Reviewer lacks full context
+- Violates YAGNI (unused feature)
+- Technically incorrect for this stack
+- Legacy/compatibility reasons exist
+- Conflicts with your human partner's architectural decisions
+
+**How to push back:**
+- Use technical reasoning, not defensiveness
+- Ask specific questions
+- Reference working tests/code
+- Involve your human partner if architectural
+
+**Signal if uncomfortable pushing back out loud:** "Strange things are afoot at the Circle K"
+
+## Acknowledging Correct Feedback
+
+When feedback IS correct:
+```
+✅ "Fixed. [Brief description of what changed]"
+✅ "Good catch - [specific issue]. Fixed in [location]."
+✅ [Just fix it and show in the code]
+
+❌ "You're absolutely right!"
+❌ "Great point!"
+❌ "Thanks for catching that!"
+❌ "Thanks for [anything]"
+❌ ANY gratitude expression
+```
+
+**Why no thanks:** Actions speak. Just fix it. The code itself shows you heard the feedback.
+
+**If you catch yourself about to write "Thanks":** DELETE IT. State the fix instead.
+
+## Gracefully Correcting Your Pushback
+
+If you pushed back and were wrong:
+```
+✅ "You were right - I checked [X] and it does [Y]. Implementing now."
+✅ "Verified this and you're correct. My initial understanding was wrong because [reason]. Fixing."
+
+❌ Long apology
+❌ Defending why you pushed back
+❌ Over-explaining
+```
+
+State the correction factually and move on.
+
+## Common Mistakes
+
+| Mistake | Fix |
+|---------|-----|
+| Performative agreement | State requirement or just act |
+| Blind implementation | Verify against codebase first |
+| Batch without testing | One at a time, test each |
+| Assuming reviewer is right | Check if breaks things |
+| Avoiding pushback | Technical correctness > comfort |
+| Partial implementation | Clarify all items first |
+| Can't verify, proceed anyway | State limitation, ask for direction |
+
+## Real Examples
+
+**Performative Agreement (Bad):**
+```
+Reviewer: "Remove legacy code"
+❌ "You're absolutely right! Let me remove that..."
+```
+
+**Technical Verification (Good):**
+```
+Reviewer: "Remove legacy code"
+✅ "Checking... build target is 10.15+, this API needs 13+. Need legacy for backward compat. Current impl has wrong bundle ID - fix it or drop pre-13 support?"
+```
+
+**YAGNI (Good):**
+```
+Reviewer: "Implement proper metrics tracking with database, date filters, CSV export"
+✅ "Grepped codebase - nothing calls this endpoint. Remove it (YAGNI)? Or is there usage I'm missing?"
+```
+
+**Unclear Item (Good):**
+```
+your human partner: "Fix items 1-6"
+You understand 1,2,3,6. Unclear on 4,5.
+✅ "Understand 1,2,3,6. Need clarification on 4 and 5 before implementing."
+```
+
+## GitHub Thread Replies
+
+When replying to inline review comments on GitHub, reply in the comment thread (`gh api repos/{owner}/{repo}/pulls/{pr}/comments/{id}/replies`), not as a top-level PR comment.
+
+## The Bottom Line
+
+**External feedback = suggestions to evaluate, not orders to follow.**
+
+Verify. Question. Then implement.
+
+No performative agreement. Technical rigor always.
+
+---
+
+how wou;d you fix them
+
+---
+
+Base directory for this skill: /home/nick/.claude/plugins/cache/superpowers-marketplace/superpowers/4.0.3/skills/writing-plans
+
+# Writing Plans
+
+## Overview
+
+Write comprehensive implementation plans assuming the engineer has zero context for our codebase and questionable taste. Document everything they need to know: which files to touch for each task, code, testing, docs they might need to check, how to test it. Give them the whole plan as bite-sized tasks. DRY. YAGNI. TDD. Frequent commits.
+
+Assume they are a skilled developer, but know almost nothing about our toolset or problem domain. Assume they don't know good test design very well.
+
+**Announce at start:** "I'm using the writing-plans skill to create the implementation plan."
+
+**Context:** This should be run in a dedicated worktree (created by brainstorming skill).
+
+**Save plans to:** `docs/plans/YYYY-MM-DD-<feature-name>.md`
+
+## Bite-Sized Task Granularity
+
+**Each step is one action (2-5 minutes):**
+- "Write the failing test" - step
+- "Run it to make sure it fails" - step
+- "Implement the minimal code to make the test pass" - step
+- "Run the tests and make sure they pass" - step
+- "Commit" - step
+
+## Plan Document Header
+
+**Every plan MUST start with this header:**
+
+```markdown
+# [Feature Name] Implementation Plan
+
+> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+
+**Goal:** [One sentence describing what this builds]
+
+**Architecture:** [2-3 sentences about approach]
+
+**Tech Stack:** [Key technologies/libraries]
+
+---
+```
+
+## Task Structure
+
+```markdown
+### Task N: [Component Name]
+
+**Files:**
+- Create: `exact/path/to/file.py`
+- Modify: `exact/path/to/existing.py:123-145`
+- Test: `tests/exact/path/to/test.py`
+
+**Step 1: Write the failing test**
+
+```python
+def test_specific_behavior():
+    result = function(input)
+    assert result == expected
+```
+
+**Step 2: Run test to verify it fails**
+
+Run: `pytest tests/path/test.py::test_name -v`
+Expected: FAIL with "function not defined"
+
+**Step 3: Write minimal implementation**
+
+```python
+def function(input):
+    return expected
+```
+
+**Step 4: Run test to verify it passes**
+
+Run: `pytest tests/path/test.py::test_name -v`
+Expected: PASS
+
+**Step 5: Commit**
+
+```bash
+git add tests/path/test.py src/path/file.py
+git commit -m "feat: add specific feature"
+```
+```
+
+## Remember
+- Exact file paths always
+- Complete code in plan (not "add validation")
+- Exact commands with expected output
+- Reference relevant skills with @ syntax
+- DRY, YAGNI, TDD, frequent commits
+
+## Execution Handoff
+
+After saving the plan, offer execution choice:
+
+**"Plan complete and saved to `docs/plans/<filename>.md`. Two execution options:**
+
+**1. Subagent-Driven (this session)** - I dispatch fresh subagent per task, review between tasks, fast iteration
+
+**2. Parallel Session (separate)** - Open new session with executing-plans, batch execution with checkpoints
+
+**Which approach?"**
+
+**If Subagent-Driven chosen:**
+- **REQUIRED SUB-SKILL:** Use superpowers:subagent-driven-development
+- Stay in this session
+- Fresh subagent per task + code review
+
+**If Parallel Session chosen:**
+- Guide them to open new session in worktree
+- **REQUIRED SUB-SKILL:** New session uses superpowers:executing-plans
+
+---
+
+<task-notification>
+<task-id>b007tv66z</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>REDACTED.output</output-file>
+<status>killed</status>
+<summary>Background command "grep -rn "H2_SERVER_IDLE_TIMEOUT_NS" /home/nick/repos/serval/" was stopped</summary>
+</task-notification>
+Read the output file to retrieve the result: REDACTED.output
+
+---
+
+│ 7. Monolithic loop        │ Low      │ Not addressed — structural refactor, no correctness impact. Separate effort.                                                  │?
+
+---
+
+yes
+
+---
+
+this plan
+
+---
+
+• Findings
+
+  1. High: Task 7 reintroduces the Task 1 bug by removing the ability for action-style rejects to close the connection. The proposed resolveUpstreamAction() returns ?types.Upstream and the call site uses orelse
+     continue docs/plans/2026-03-26-verification-findings-fixes.md:641, docs/plans/2026-03-26-verification-findings-fixes.md:672. After Task 1, reject handling needs three outcomes: continue, close, or fall
+     through. ?Upstream only gives two. As written, the refactor would force reject back into continue, which is exactly the desync hazard Task 1 is trying to eliminate.
+  2. High: Task 1’s proposed fix is broader than the stated problem and would regress legitimate handlers that already consume the body. The plan says “close the connection after any short-circuit response where the
+     request has an unconsumed body,” but the actual condition is just parser.body_framing != .none docs/plans/2026-03-26-verification-findings-fixes.md:55, docs/plans/2026-03-26-verification-findings-fixes.md:85.
+     Context already exposes body-reading APIs serval-core/context.zig:351, serval-core/context.zig:371, and BodyReader tracks consumption state serval-core/context.zig:60, serval-core/context.zig:63. Closing on all
+     framed requests would unnecessarily kill keep-alive even when the handler fully read the body first.
+  3. Medium: Task 2 does not actually resolve the WantWrite half of finding 2. The task says to differentiate WantRead vs WantWrite docs/plans/2026-03-26-verification-findings-fixes.md:153, but the proposed code
+     still handles WantWrite as a blind continue with no writable wait docs/plans/2026-03-26-verification-findings-fixes.md:202. That fixes the infinite-read-timeout issue, but it does not fix the readiness-model
+     mismatch the task claims to address.
+  4. Medium: Task 1’s test plan does not test the bug, only the helper. The proposed test just proves getBodyLength() returns 0 for chunked docs/plans/2026-03-26-verification-findings-fixes.md:22, which is already
+     true today and not the behavioral failure. The actual regression test needs to exercise a keep-alive connection where a short-circuit response leaves unread body bytes on the socket. As written, the plan can go
+     green without protecting the vulnerability.
+  5. Medium: Task 3 is too speculative for a production plan. It changes a shared config contract from 128 MiB to 64 KiB docs/plans/2026-03-26-verification-findings-fixes.md:264, then defers impact analysis to
+     “judgment call at implementation time” docs/plans/2026-03-26-verification-findings-fixes.md:274. For enterprise code, that needs an explicit caller inventory or a fail-closed migration path first. Otherwise this
+     risks trading a DoS vector for silent behavior breakage.
+  6. Low: a few code snippets are not execution-ready. The new chunked-body test uses headers.set(...) docs/plans/2026-03-26-verification-findings-fixes.md:31, while existing HeaderMap usage in this module uses
+     put(...) serval-server/h1/connection.zig:82. That is minor, but this file presents itself as an executable task plan, so the snippets need to compile as written.
+
+---
+
+• Findings
+
+  1. Medium: Task 4 still assumes all lock callers can “propagate naturally,” but two of them currently return void. The plan says the callers at lines 236, 249, 262, 272 can just catch return
+     error.TlsReloadLockContention docs/plans/2026-03-26-verification-findings-fixes.md:395. That works for reloadServerTlsFromPemFiles() and activeServerTlsGeneration(), but not for publishTlsCtxManager() and
+     unpublishTlsCtxManager() in serval-server/h1/server.zig:258 and serval-server/h1/server.zig:269, which currently return void. The plan needs to say whether those APIs become fallible or handle contention
+     internally.
+  2. Medium: Task 5’s sample overflow test will not compile as written. It uses var runtime: Runtime = .{}; docs/plans/2026-03-26-verification-findings-fixes.md:430, but Runtime has a required state field with no
+     default serval-server/h2/runtime.zig:83. That test needs to initialize via try Runtime.init() or test through a public API that constructs a valid runtime.
+  3. Low: Task 1 still says “Write a regression test for the desync scenario,” but the listed tests are only helper tests for isBodyConsumed() docs/plans/2026-03-26-verification-findings-fixes.md:126. Those are
+     useful, but they do not exercise the actual connection-reuse failure mode. The plan should either rename that section to “unit tests for body-consumption logic” or add a real keep-alive desync regression test.
+
+  Assessment
