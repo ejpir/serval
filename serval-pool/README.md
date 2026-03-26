@@ -117,7 +117,7 @@ Call `drain()` during server shutdown to close all pooled connections cleanly.
 ## Observability
 
 ### Checked-Out Tracking
-The pool tracks connections currently in use (checked out) to detect hung or leaked connections:
+The pool tracks pooled connections currently in use (checked out). This does not include fresh miss-path connections that were never acquired from the pool:
 
 ```zig
 const stats = pool.getStats();
@@ -148,7 +148,7 @@ pub const PoolStats = struct {
 ```
 
 ### Use Cases
-- **Leak detection**: `total_checked_out` grows unbounded if connections are never released
+- **Leak detection**: `total_checked_out` grows if borrowed pooled connections are not released
 - **Capacity monitoring**: Compare `checked_out` against limits to detect saturation
 - **Hangs debugging**: Identify which upstream has connections that are never returned
 

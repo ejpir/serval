@@ -15,7 +15,6 @@ const UpstreamIndex = config.UpstreamIndex;
 // debug
 const serval_core = @import("serval-core");
 const log = serval_core.log.scoped(.pool);
-const debugLog = serval_core.debugLog;
 
 const serval_socket = @import("serval-socket");
 const Socket = serval_socket.Socket;
@@ -82,6 +81,9 @@ pub const Connection = struct {
     /// Sentinel to detect double-release. Set to magic value when in pool.
     /// TigerStyle: Defense in depth against use-after-release bugs.
     pool_sentinel: u32 = IN_USE_SENTINEL,
+    /// True when this checkout came from pool.acquire() rather than fresh connect.
+    /// Used to keep checked_out_counts semantics precise.
+    from_pool: bool = false,
 
     const IN_POOL_SENTINEL: u32 = 0xDEAD_BEEF;
     const IN_USE_SENTINEL: u32 = 0xCAFE_BABE;
@@ -182,7 +184,8 @@ pub const SimplePool = struct {
         [_][MAX_CONNS_PER_UPSTREAM]?Connection{[_]?Connection{null} ** MAX_CONNS_PER_UPSTREAM} ** MAX_UPSTREAMS,
     counts: [MAX_UPSTREAMS]u8 = [_]u8{0} ** MAX_UPSTREAMS,
 
-    /// Count of connections currently checked out (in use) per upstream.
+    /// Count of pooled connections currently checked out per upstream.
+    /// Excludes fresh miss-path connections that were never acquired from pool.
     /// TigerStyle: Explicit tracking for observability and leak detection.
     checked_out_counts: [MAX_UPSTREAMS]u8 = [_]u8{0} ** MAX_UPSTREAMS,
 
@@ -261,6 +264,8 @@ pub const SimplePool = struct {
                     // Connection is valid - mark as in-use before returning
                     var valid_conn = c;
                     valid_conn.pool_sentinel = Connection.IN_USE_SENTINEL;
+                    valid_conn.from_pool = true;
+                    assert(self.checked_out_counts[idx] < std.math.maxInt(u8));
                     self.checked_out_counts[idx] += 1;
                     result = valid_conn;
                     break;
@@ -275,6 +280,22 @@ pub const SimplePool = struct {
                 var c = conn.*;
                 c.close();
                 self.emitMetric(upstream_idx, .acquire_evicted);
+            }
+        }
+
+        // Perform non-blocking liveness check outside lock and before hit/miss metric emit.
+        if (result) |conn| {
+            if (conn.isUnusable()) {
+                var unusable_conn = conn;
+                unusable_conn.close();
+
+                self.mutex.lockUncancelable(std.Options.debug_io);
+                assert(self.checked_out_counts[idx] > 0);
+                self.checked_out_counts[idx] -= 1;
+                self.mutex.unlock(std.Options.debug_io);
+
+                self.emitMetric(upstream_idx, .acquire_evicted);
+                result = null;
             }
         }
 
@@ -309,8 +330,9 @@ pub const SimplePool = struct {
             self.mutex.lockUncancelable(std.Options.debug_io);
             defer self.mutex.unlock(std.Options.debug_io);
 
-            // Always decrement checked_out count
-            if (self.checked_out_counts[idx] > 0) {
+            // Only decrement for connections that were checked out from this pool.
+            if (conn.from_pool) {
+                assert(self.checked_out_counts[idx] > 0);
                 self.checked_out_counts[idx] -= 1;
             }
 
@@ -318,6 +340,7 @@ pub const SimplePool = struct {
                 // Update timestamp and sentinel for pool storage
                 c.last_used_ns = time.monotonicNanos();
                 c.pool_sentinel = Connection.IN_POOL_SENTINEL;
+                c.from_pool = false;
 
                 if (self.counts[idx] < MAX_CONNS_PER_UPSTREAM) {
                     // Store in pool
@@ -380,7 +403,7 @@ pub const SimplePool = struct {
     pub const PoolStats = struct {
         /// Connections available in pool per upstream.
         available: [MAX_UPSTREAMS]u8,
-        /// Connections currently checked out per upstream.
+        /// Pooled connections currently checked out per upstream.
         checked_out: [MAX_UPSTREAMS]u8,
         /// Total available across all upstreams.
         total_available: u32,
@@ -414,6 +437,29 @@ pub const SimplePool = struct {
 // Tests
 // =============================================================================
 
+const TestSocketPair = struct {
+    conn: Connection,
+    peer_fd: std.posix.fd_t,
+};
+
+fn testConnection(created_ns: u64, last_used_ns: u64, pool_sentinel: u32, from_pool: bool) !TestSocketPair {
+    const fds = try std.posix.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    return .{
+        .conn = .{
+            .socket = Socket.Plain.init_client(fds[0]),
+            .created_ns = created_ns,
+            .last_used_ns = last_used_ns,
+            .pool_sentinel = pool_sentinel,
+            .from_pool = from_pool,
+        },
+        .peer_fd = fds[1],
+    };
+}
+
+fn closePeerFd(fd: std.posix.fd_t) void {
+    if (fd >= 0) std.posix.close(fd);
+}
+
 test "NoPool always returns null" {
     var pool = NoPool{};
     try std.testing.expectEqual(@as(?Connection, null), pool.acquire(0));
@@ -431,17 +477,9 @@ test "SimplePool stores and retrieves connections" {
     // Initially empty
     try std.testing.expectEqual(@as(u8, 0), pool.counts[0]);
 
-    // Directly store a connection (simulating release with healthy=true)
-    // We use undefined socket since we only test pool counting, not I/O
-    // Set timestamps to now so connection is not considered stale
-    // Set sentinel to IN_POOL_SENTINEL as if it were properly released
-    const test_conn: Connection = .{
-        .socket = undefined,
-        .created_ns = now_ns,
-        .last_used_ns = now_ns,
-        .pool_sentinel = Connection.IN_POOL_SENTINEL,
-    };
-    pool.connections[0][0] = test_conn;
+    var pair = try testConnection(now_ns, now_ns, Connection.IN_POOL_SENTINEL, false);
+    defer closePeerFd(pair.peer_fd);
+    pool.connections[0][0] = pair.conn;
     pool.counts[0] = 1;
     try std.testing.expectEqual(@as(u8, 1), pool.counts[0]);
 
@@ -449,8 +487,11 @@ test "SimplePool stores and retrieves connections" {
     const conn = pool.acquire(0);
     try std.testing.expect(conn != null);
     try std.testing.expectEqual(@as(u8, 0), pool.counts[0]);
+    var acquired = conn.?;
+    defer acquired.close();
     // Verify sentinel changed to IN_USE after acquire
-    try std.testing.expectEqual(Connection.IN_USE_SENTINEL, conn.?.pool_sentinel);
+    try std.testing.expectEqual(Connection.IN_USE_SENTINEL, acquired.pool_sentinel);
+    try std.testing.expect(acquired.from_pool);
 }
 
 test "SimplePool respects max connections per upstream" {
@@ -548,27 +589,27 @@ test "SimplePool getStats returns correct counts" {
 test "SimplePool checked_out_counts tracks acquire and release" {
     var pool = SimplePool.init();
     const now_ns = time.monotonicNanos();
+    defer pool.drain();
 
     // Initially no checked out connections
     try std.testing.expectEqual(@as(u8, 0), pool.checked_out_counts[0]);
 
-    // Add a connection to the pool
-    pool.connections[0][0] = .{
-        .socket = undefined,
-        .created_ns = now_ns,
-        .last_used_ns = now_ns,
-        .pool_sentinel = Connection.IN_POOL_SENTINEL,
-    };
+    var pair = try testConnection(now_ns, now_ns, Connection.IN_POOL_SENTINEL, false);
+    defer closePeerFd(pair.peer_fd);
+    pool.connections[0][0] = pair.conn;
     pool.counts[0] = 1;
 
     // Acquire increments checked_out_counts
-    const conn = pool.acquire(0);
-    try std.testing.expect(conn != null);
+    const conn_opt = pool.acquire(0);
+    try std.testing.expect(conn_opt != null);
+    const conn = conn_opt.?;
     try std.testing.expectEqual(@as(u8, 1), pool.checked_out_counts[0]);
     try std.testing.expectEqual(@as(u8, 0), pool.counts[0]);
+    try std.testing.expect(conn.from_pool);
 
-    // Note: Cannot test release() decrementing because it requires actual I/O
-    // for closing connections. The logic is verified by code inspection.
+    pool.release(0, conn, true);
+    try std.testing.expectEqual(@as(u8, 0), pool.checked_out_counts[0]);
+    try std.testing.expectEqual(@as(u8, 1), pool.counts[0]);
 }
 
 // =============================================================================
@@ -599,22 +640,21 @@ test "Invariant: acquired connections have valid timestamps" {
     var pool = SimplePool.init();
     const now_ns = time.monotonicNanos();
 
-    // Store a properly initialized connection
-    pool.connections[0][0] = .{
-        .socket = undefined,
-        .created_ns = now_ns - 1000,
-        .last_used_ns = now_ns,
-        .pool_sentinel = Connection.IN_POOL_SENTINEL,
-    };
+    var pair = try testConnection(now_ns - 1000, now_ns, Connection.IN_POOL_SENTINEL, false);
+    defer closePeerFd(pair.peer_fd);
+    pool.connections[0][0] = pair.conn;
     pool.counts[0] = 1;
 
     const result = pool.acquire(0);
     try std.testing.expect(result != null);
+    var acquired = result.?;
+    defer acquired.close();
 
     // INVARIANT: All acquired connections MUST have valid timestamps
-    try std.testing.expect(result.?.created_ns > 0);
-    try std.testing.expect(result.?.last_used_ns > 0);
-    try std.testing.expect(result.?.last_used_ns >= result.?.created_ns);
+    try std.testing.expect(acquired.created_ns > 0);
+    try std.testing.expect(acquired.last_used_ns > 0);
+    try std.testing.expect(acquired.last_used_ns >= acquired.created_ns);
+    try std.testing.expect(acquired.from_pool);
 }
 
 test "Pool evicts connections exceeding max age (5 minutes)" {
@@ -663,34 +703,35 @@ test "Pool retains fresh, recently-used connections" {
     var pool = SimplePool.init();
     const now_ns = time.monotonicNanos();
 
-    const fresh_conn: Connection = .{
-        .socket = undefined,
-        .created_ns = now_ns - (30 * time.ns_per_s), // 30s old
-        .last_used_ns = now_ns - (5 * time.ns_per_s), // Used 5s ago
-        .pool_sentinel = Connection.IN_POOL_SENTINEL,
-    };
-
-    pool.connections[0][0] = fresh_conn;
+    var pair = try testConnection(
+        now_ns - (30 * time.ns_per_s),
+        now_ns - (5 * time.ns_per_s),
+        Connection.IN_POOL_SENTINEL,
+        false,
+    );
+    defer closePeerFd(pair.peer_fd);
+    pool.connections[0][0] = pair.conn;
     pool.counts[0] = 1;
 
     // Should successfully acquire (not evicted)
     const result = pool.acquire(0);
     try std.testing.expect(result != null);
     try std.testing.expectEqual(@as(u8, 0), pool.counts[0]); // Removed from pool
-    try std.testing.expectEqual(Connection.IN_USE_SENTINEL, result.?.pool_sentinel);
+    var acquired = result.?;
+    defer acquired.close();
+    try std.testing.expectEqual(Connection.IN_USE_SENTINEL, acquired.pool_sentinel);
+    try std.testing.expect(acquired.from_pool);
 }
 
 test "Full lifecycle: acquire → release → acquire reuses connection" {
     var pool = SimplePool.init();
     const now_ns = time.monotonicNanos();
+    defer pool.drain();
 
     // Simulate first request: create connection and release to pool
-    const new_conn: Connection = .{
-        .socket = undefined,
-        .created_ns = now_ns,
-        .last_used_ns = now_ns,
-        .pool_sentinel = Connection.IN_USE_SENTINEL,
-    };
+    var pair = try testConnection(now_ns, now_ns, Connection.IN_USE_SENTINEL, false);
+    defer closePeerFd(pair.peer_fd);
+    const new_conn = pair.conn;
 
     pool.release(0, new_conn, true);
     try std.testing.expectEqual(@as(u8, 1), pool.counts[0]);
@@ -701,9 +742,13 @@ test "Full lifecycle: acquire → release → acquire reuses connection" {
     try std.testing.expectEqual(@as(u8, 0), pool.counts[0]);
 
     // Verify timestamps are preserved
-    try std.testing.expectEqual(now_ns, reused_conn.?.created_ns);
-    try std.testing.expect(reused_conn.?.last_used_ns >= reused_conn.?.created_ns);
-    try std.testing.expectEqual(Connection.IN_USE_SENTINEL, reused_conn.?.pool_sentinel);
+    const acquired = reused_conn.?;
+    try std.testing.expectEqual(now_ns, acquired.created_ns);
+    try std.testing.expect(acquired.last_used_ns >= acquired.created_ns);
+    try std.testing.expectEqual(Connection.IN_USE_SENTINEL, acquired.pool_sentinel);
+    try std.testing.expect(acquired.from_pool);
+    pool.release(0, acquired, true);
+    try std.testing.expectEqual(@as(u8, 0), pool.checked_out_counts[0]);
 }
 
 // =============================================================================
@@ -716,12 +761,9 @@ test "CRITICAL: Release unhealthy connection does NOT pool it" {
     var pool = SimplePool.init();
     const now_ns = time.monotonicNanos();
 
-    const unhealthy_conn: Connection = .{
-        .socket = undefined,
-        .created_ns = now_ns,
-        .last_used_ns = now_ns,
-        .pool_sentinel = Connection.IN_USE_SENTINEL,
-    };
+    var pair = try testConnection(now_ns, now_ns, Connection.IN_USE_SENTINEL, false);
+    defer closePeerFd(pair.peer_fd);
+    const unhealthy_conn = pair.conn;
 
     // Release as unhealthy (healthy=false)
     pool.release(0, unhealthy_conn, false);
@@ -740,15 +782,16 @@ test "CRITICAL: Pool full drops healthy connection (bounded buffer)" {
     var pool = SimplePool.init();
     const now_ns = time.monotonicNanos();
 
+    var peer_fds: [SimplePool.MAX_CONNS_PER_UPSTREAM + 1]std.posix.fd_t = [_]std.posix.fd_t{-1} ** (SimplePool.MAX_CONNS_PER_UPSTREAM + 1);
+    defer {
+        for (peer_fds) |fd| closePeerFd(fd);
+    }
+
     // Fill pool to MAX_CONNS_PER_UPSTREAM
     for (0..SimplePool.MAX_CONNS_PER_UPSTREAM) |i| {
-        const conn: Connection = .{
-            .socket = undefined,
-            .created_ns = now_ns,
-            .last_used_ns = now_ns,
-            .pool_sentinel = Connection.IN_USE_SENTINEL,
-        };
-        pool.release(0, conn, true);
+        var pair = try testConnection(now_ns, now_ns, Connection.IN_USE_SENTINEL, false);
+        peer_fds[i] = pair.peer_fd;
+        pool.release(0, pair.conn, true);
         try std.testing.expectEqual(@as(u8, @intCast(i + 1)), pool.counts[0]);
     }
 
@@ -756,13 +799,9 @@ test "CRITICAL: Pool full drops healthy connection (bounded buffer)" {
     try std.testing.expectEqual(SimplePool.MAX_CONNS_PER_UPSTREAM, pool.counts[0]);
 
     // Release one more healthy connection - should be dropped (closed)
-    const overflow_conn: Connection = .{
-        .socket = undefined,
-        .created_ns = now_ns,
-        .last_used_ns = now_ns,
-        .pool_sentinel = Connection.IN_USE_SENTINEL,
-    };
-    pool.release(0, overflow_conn, true);
+    var overflow_pair = try testConnection(now_ns, now_ns, Connection.IN_USE_SENTINEL, false);
+    peer_fds[SimplePool.MAX_CONNS_PER_UPSTREAM] = overflow_pair.peer_fd;
+    pool.release(0, overflow_pair.conn, true);
 
     // Pool should still be at max (overflow connection was closed)
     try std.testing.expectEqual(SimplePool.MAX_CONNS_PER_UPSTREAM, pool.counts[0]);
@@ -775,22 +814,14 @@ test "CRITICAL: Multiple upstreams are isolated" {
     const now_ns = time.monotonicNanos();
 
     // Release connection to upstream 0
-    const conn_upstream_0: Connection = .{
-        .socket = undefined,
-        .created_ns = now_ns,
-        .last_used_ns = now_ns,
-        .pool_sentinel = Connection.IN_USE_SENTINEL,
-    };
-    pool.release(0, conn_upstream_0, true);
+    var pair_0 = try testConnection(now_ns, now_ns, Connection.IN_USE_SENTINEL, false);
+    defer closePeerFd(pair_0.peer_fd);
+    pool.release(0, pair_0.conn, true);
 
     // Release connection to upstream 1
-    const conn_upstream_1: Connection = .{
-        .socket = undefined,
-        .created_ns = now_ns,
-        .last_used_ns = now_ns,
-        .pool_sentinel = Connection.IN_USE_SENTINEL,
-    };
-    pool.release(1, conn_upstream_1, true);
+    var pair_1 = try testConnection(now_ns, now_ns, Connection.IN_USE_SENTINEL, false);
+    defer closePeerFd(pair_1.peer_fd);
+    pool.release(1, pair_1.conn, true);
 
     // Verify counts
     try std.testing.expectEqual(@as(u8, 1), pool.counts[0]);
@@ -799,12 +830,16 @@ test "CRITICAL: Multiple upstreams are isolated" {
     // Acquire from upstream 0 - should get upstream 0's connection
     const result_0 = pool.acquire(0);
     try std.testing.expect(result_0 != null);
+    var acquired_0 = result_0.?;
+    defer acquired_0.close();
     try std.testing.expectEqual(@as(u8, 0), pool.counts[0]); // upstream 0 now empty
     try std.testing.expectEqual(@as(u8, 1), pool.counts[1]); // upstream 1 unchanged
 
     // Acquire from upstream 1 - should get upstream 1's connection
     const result_1 = pool.acquire(1);
     try std.testing.expect(result_1 != null);
+    var acquired_1 = result_1.?;
+    defer acquired_1.close();
     try std.testing.expectEqual(@as(u8, 0), pool.counts[0]); // upstream 0 still empty
     try std.testing.expectEqual(@as(u8, 0), pool.counts[1]); // upstream 1 now empty
 }
@@ -816,36 +851,26 @@ test "CRITICAL: LIFO order preserves cache locality" {
     const now_ns = time.monotonicNanos();
 
     // Release 3 connections with different timestamps
-    const old_conn: Connection = .{
-        .socket = undefined,
-        .created_ns = now_ns - 1000,
-        .last_used_ns = now_ns - 1000,
-        .pool_sentinel = Connection.IN_USE_SENTINEL,
-    };
-    pool.release(0, old_conn, true);
+    var pair_old = try testConnection(now_ns - 1000, now_ns - 1000, Connection.IN_USE_SENTINEL, false);
+    defer closePeerFd(pair_old.peer_fd);
+    pool.release(0, pair_old.conn, true);
 
-    const mid_conn: Connection = .{
-        .socket = undefined,
-        .created_ns = now_ns - 500,
-        .last_used_ns = now_ns - 500,
-        .pool_sentinel = Connection.IN_USE_SENTINEL,
-    };
-    pool.release(0, mid_conn, true);
+    var pair_mid = try testConnection(now_ns - 500, now_ns - 500, Connection.IN_USE_SENTINEL, false);
+    defer closePeerFd(pair_mid.peer_fd);
+    pool.release(0, pair_mid.conn, true);
 
-    const recent_conn: Connection = .{
-        .socket = undefined,
-        .created_ns = now_ns - 100,
-        .last_used_ns = now_ns - 100,
-        .pool_sentinel = Connection.IN_USE_SENTINEL,
-    };
-    pool.release(0, recent_conn, true);
+    var pair_recent = try testConnection(now_ns - 100, now_ns - 100, Connection.IN_USE_SENTINEL, false);
+    defer closePeerFd(pair_recent.peer_fd);
+    pool.release(0, pair_recent.conn, true);
 
     try std.testing.expectEqual(@as(u8, 3), pool.counts[0]);
 
     // Acquire should return MOST RECENT (LIFO)
     const result = pool.acquire(0);
     try std.testing.expect(result != null);
-    try std.testing.expectEqual(now_ns - 100, result.?.last_used_ns);
+    var acquired = result.?;
+    defer acquired.close();
+    try std.testing.expectEqual(now_ns - 100, acquired.last_used_ns);
 }
 
 test "CRITICAL: Drain closes all pooled connections" {
@@ -854,15 +879,16 @@ test "CRITICAL: Drain closes all pooled connections" {
     var pool = SimplePool.init();
     const now_ns = time.monotonicNanos();
 
+    var peer_fds = [_]std.posix.fd_t{-1} ** 3;
+    defer {
+        for (peer_fds) |fd| closePeerFd(fd);
+    }
+
     // Add connections to multiple upstreams
     for (0..3) |upstream_idx| {
-        const conn: Connection = .{
-            .socket = undefined,
-            .created_ns = now_ns,
-            .last_used_ns = now_ns,
-            .pool_sentinel = Connection.IN_USE_SENTINEL,
-        };
-        pool.release(@intCast(upstream_idx), conn, true);
+        var pair = try testConnection(now_ns, now_ns, Connection.IN_USE_SENTINEL, false);
+        peer_fds[upstream_idx] = pair.peer_fd;
+        pool.release(@intCast(upstream_idx), pair.conn, true);
     }
 
     try std.testing.expectEqual(@as(u8, 1), pool.counts[0]);
@@ -917,29 +943,20 @@ test "CRITICAL: Metrics callback receives correct events" {
     try std.testing.expectEqual(@as(u32, 1), TestMetrics.acquire_misses);
 
     // Release healthy connection - should emit release_stored
-    const conn: Connection = .{
-        .socket = undefined,
-        .created_ns = now_ns,
-        .last_used_ns = now_ns,
-        .pool_sentinel = Connection.IN_USE_SENTINEL,
-    };
-    pool.release(0, conn, true);
+    var pair = try testConnection(now_ns, now_ns, Connection.IN_USE_SENTINEL, false);
+    defer closePeerFd(pair.peer_fd);
+    pool.release(0, pair.conn, true);
     try std.testing.expectEqual(@as(u32, 1), TestMetrics.release_stored);
     try std.testing.expectEqual(@as(u32, 0), TestMetrics.release_closed);
 
     // Acquire from pool - should emit acquire_hit
-    _ = pool.acquire(0);
+    const acquired_opt = pool.acquire(0);
+    try std.testing.expect(acquired_opt != null);
     try std.testing.expectEqual(@as(u32, 1), TestMetrics.acquire_hits);
     try std.testing.expectEqual(@as(u32, 1), TestMetrics.acquire_misses); // Unchanged
 
     // Release unhealthy connection - should emit release_closed
-    const unhealthy: Connection = .{
-        .socket = undefined,
-        .created_ns = now_ns,
-        .last_used_ns = now_ns,
-        .pool_sentinel = Connection.IN_USE_SENTINEL,
-    };
-    pool.release(0, unhealthy, false);
+    pool.release(0, acquired_opt.?, false);
     try std.testing.expectEqual(@as(u32, 1), TestMetrics.release_stored); // Unchanged
     try std.testing.expectEqual(@as(u32, 1), TestMetrics.release_closed);
 }
@@ -951,12 +968,9 @@ test "CRITICAL: Boundary - connection at exactly max age threshold" {
     const max_age_ns = 5 * 60 * time.ns_per_s;
 
     // Connection at EXACTLY max age (not over)
-    const boundary_conn: Connection = .{
-        .socket = undefined,
-        .created_ns = now_ns - max_age_ns,
-        .last_used_ns = now_ns,
-        .pool_sentinel = Connection.IN_POOL_SENTINEL,
-    };
+    var pair = try testConnection(now_ns - max_age_ns, now_ns, Connection.IN_POOL_SENTINEL, false);
+    defer closePeerFd(pair.peer_fd);
+    const boundary_conn = pair.conn;
 
     pool.connections[0][0] = boundary_conn;
     pool.counts[0] = 1;
@@ -967,6 +981,8 @@ test "CRITICAL: Boundary - connection at exactly max age threshold" {
     // Current implementation: if (age_ns > MAX_CONNECTION_AGE_NS)
     // So exactly-at-threshold should NOT be evicted
     try std.testing.expect(result != null);
+    var acquired = result.?;
+    defer acquired.close();
 }
 
 test "CRITICAL: Boundary - connection at exactly idle timeout threshold" {
@@ -976,12 +992,9 @@ test "CRITICAL: Boundary - connection at exactly idle timeout threshold" {
     const idle_timeout_ns = 60 * time.ns_per_s;
 
     // Connection at EXACTLY idle timeout (not over)
-    const boundary_conn: Connection = .{
-        .socket = undefined,
-        .created_ns = now_ns - 1000,
-        .last_used_ns = now_ns - idle_timeout_ns,
-        .pool_sentinel = Connection.IN_POOL_SENTINEL,
-    };
+    var pair = try testConnection(now_ns - 1000, now_ns - idle_timeout_ns, Connection.IN_POOL_SENTINEL, false);
+    defer closePeerFd(pair.peer_fd);
+    const boundary_conn = pair.conn;
 
     pool.connections[0][0] = boundary_conn;
     pool.counts[0] = 1;
@@ -989,6 +1002,8 @@ test "CRITICAL: Boundary - connection at exactly idle timeout threshold" {
     // Should NOT be evicted (idle > TIMEOUT, not >=)
     const result = pool.acquire(0);
     try std.testing.expect(result != null);
+    var acquired = result.?;
+    defer acquired.close();
 }
 
 test "CRITICAL: checked_out_counts prevents pool accounting bugs" {
@@ -996,14 +1011,11 @@ test "CRITICAL: checked_out_counts prevents pool accounting bugs" {
     // Bug here = connection leak detection fails
     var pool = SimplePool.init();
     const now_ns = time.monotonicNanos();
+    defer pool.drain();
 
-    const conn: Connection = .{
-        .socket = undefined,
-        .created_ns = now_ns,
-        .last_used_ns = now_ns,
-        .pool_sentinel = Connection.IN_USE_SENTINEL,
-    };
-    pool.release(0, conn, true);
+    var pair = try testConnection(now_ns, now_ns, Connection.IN_USE_SENTINEL, false);
+    defer closePeerFd(pair.peer_fd);
+    pool.release(0, pair.conn, true);
 
     try std.testing.expectEqual(@as(u8, 0), pool.checked_out_counts[0]);
     try std.testing.expectEqual(@as(u8, 1), pool.counts[0]);
@@ -1034,17 +1046,18 @@ test "CRITICAL: Concurrent acquire/release is thread-safe" {
     // Bug here = data races, crashes, corrupted counts
     var pool = SimplePool.init();
     const now_ns = time.monotonicNanos();
+    defer pool.drain();
 
     // Pre-populate pool with connections
     const NUM_INITIAL_CONNECTIONS = 8;
-    for (0..NUM_INITIAL_CONNECTIONS) |_| {
-        const conn: Connection = .{
-            .socket = undefined,
-            .created_ns = now_ns,
-            .last_used_ns = now_ns,
-            .pool_sentinel = Connection.IN_USE_SENTINEL,
-        };
-        pool.release(0, conn, true);
+    var peer_fds: [NUM_INITIAL_CONNECTIONS]std.posix.fd_t = [_]std.posix.fd_t{-1} ** NUM_INITIAL_CONNECTIONS;
+    defer {
+        for (peer_fds) |fd| closePeerFd(fd);
+    }
+    for (0..NUM_INITIAL_CONNECTIONS) |i| {
+        var pair = try testConnection(now_ns, now_ns, Connection.IN_USE_SENTINEL, false);
+        peer_fds[i] = pair.peer_fd;
+        pool.release(0, pair.conn, true);
     }
 
     try std.testing.expectEqual(@as(u8, NUM_INITIAL_CONNECTIONS), pool.counts[0]);
@@ -1101,37 +1114,43 @@ test "CRITICAL: Race on pool full condition does not overflow" {
     // Bug here = buffer overflow past MAX_CONNS_PER_UPSTREAM
     var pool = SimplePool.init();
     const now_ns = time.monotonicNanos();
+    defer pool.drain();
 
     // Fill pool to MAX - 1
     const INITIAL = SimplePool.MAX_CONNS_PER_UPSTREAM - 1;
-    for (0..INITIAL) |_| {
-        const conn: Connection = .{
-            .socket = undefined,
-            .created_ns = now_ns,
-            .last_used_ns = now_ns,
-            .pool_sentinel = Connection.IN_USE_SENTINEL,
-        };
-        pool.release(0, conn, true);
+    var initial_peer_fds: [INITIAL]std.posix.fd_t = [_]std.posix.fd_t{-1} ** INITIAL;
+    defer {
+        for (initial_peer_fds) |fd| closePeerFd(fd);
+    }
+    for (0..INITIAL) |i| {
+        var pair = try testConnection(now_ns, now_ns, Connection.IN_USE_SENTINEL, false);
+        initial_peer_fds[i] = pair.peer_fd;
+        pool.release(0, pair.conn, true);
     }
 
     // Multiple threads try to release simultaneously
     // Only one should succeed, rest should close (not crash)
     const ReleaseWorker = struct {
-        fn run(p: *SimplePool, timestamp: u64) void {
-            const conn: Connection = .{
-                .socket = undefined,
-                .created_ns = timestamp,
-                .last_used_ns = timestamp,
-                .pool_sentinel = Connection.IN_USE_SENTINEL,
-            };
+        fn run(p: *SimplePool, conn: Connection) void {
             p.release(0, conn, true);
         }
     };
 
     const NUM_THREADS = 4;
+    var thread_peer_fds: [NUM_THREADS]std.posix.fd_t = [_]std.posix.fd_t{-1} ** NUM_THREADS;
+    defer {
+        for (thread_peer_fds) |fd| closePeerFd(fd);
+    }
+    var thread_conns: [NUM_THREADS]Connection = undefined;
+    for (0..NUM_THREADS) |i| {
+        var pair = try testConnection(now_ns, now_ns, Connection.IN_USE_SENTINEL, false);
+        thread_peer_fds[i] = pair.peer_fd;
+        thread_conns[i] = pair.conn;
+    }
+
     var threads: [NUM_THREADS]std.Thread = undefined;
-    for (&threads) |*thread| {
-        thread.* = try std.Thread.spawn(.{}, ReleaseWorker.run, .{ &pool, now_ns });
+    for (&threads, 0..) |*thread, i| {
+        thread.* = try std.Thread.spawn(.{}, ReleaseWorker.run, .{ &pool, thread_conns[i] });
     }
 
     for (threads) |thread| {
@@ -1153,12 +1172,9 @@ test "CRITICAL: Sentinel lifecycle prevents use-after-release" {
     const now_ns = time.monotonicNanos();
 
     // New connection starts with IN_USE_SENTINEL
-    var conn: Connection = .{
-        .socket = undefined,
-        .created_ns = now_ns,
-        .last_used_ns = now_ns,
-        .pool_sentinel = Connection.IN_USE_SENTINEL,
-    };
+    var pair = try testConnection(now_ns, now_ns, Connection.IN_USE_SENTINEL, false);
+    defer closePeerFd(pair.peer_fd);
+    var conn: Connection = pair.conn;
     try std.testing.expectEqual(Connection.IN_USE_SENTINEL, conn.pool_sentinel);
 
     // Release to pool (changes sentinel to IN_POOL_SENTINEL internally)
@@ -1201,16 +1217,15 @@ test "Sentinel: Pool acquire changes IN_POOL → IN_USE" {
     const now_ns = time.monotonicNanos();
 
     // Manually insert connection with IN_POOL_SENTINEL
-    pool.connections[0][0] = .{
-        .socket = undefined,
-        .created_ns = now_ns,
-        .last_used_ns = now_ns,
-        .pool_sentinel = Connection.IN_POOL_SENTINEL,
-    };
+    var pair = try testConnection(now_ns, now_ns, Connection.IN_POOL_SENTINEL, false);
+    defer closePeerFd(pair.peer_fd);
+    pool.connections[0][0] = pair.conn;
     pool.counts[0] = 1;
 
     // Acquire should change sentinel to IN_USE
     const conn = pool.acquire(0);
     try std.testing.expect(conn != null);
-    try std.testing.expectEqual(Connection.IN_USE_SENTINEL, conn.?.pool_sentinel);
+    var acquired = conn.?;
+    defer acquired.close();
+    try std.testing.expectEqual(Connection.IN_USE_SENTINEL, acquired.pool_sentinel);
 }
