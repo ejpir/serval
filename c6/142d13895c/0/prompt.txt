@@ -1,0 +1,410 @@
+• Findings
+
+  1. High: request-body streaming failures are downgraded to debug logs, and the upstream connection is still returned to the pool as healthy. In serval-proxy/
+     forwarder.zig:1073, body_group.await() failure is ignored, and in serval-proxy/forwarder.zig:1076 a failed streamRequestBody() is only logged. The same path then
+     unconditionally does release(..., true) at serval-proxy/forwarder.zig:1086. That means a client disconnect, partial upload, or upstream write failure can leave a poisoned
+     h1 connection in the pool for the next request. This is a correctness and pool-hygiene bug, not just observability debt. It violates S2, S4, C4, and C5.
+  2. High: h1 response forwarding does not support EOF-delimited bodies and can silently truncate responses. In serval-proxy/h1/response.zig:204, the body path only handles
+     chunked or Content-Length; serval-proxy/h1/response.zig:225 explicitly leaves connection-close semantics unsupported. For an upstream that legitimately sends a close-
+     delimited response, the proxy forwards headers, drops any unread/pre-read body bytes, and returns success. Combined with the healthy pool release in serval-proxy/
+     forwarder.zig:1086, this is not enterprise-safe for heterogeneous upstreams. It violates C1, C4, and C5.
+  3. Medium: ConnectConfig.timeout_ns is dead API. The config advertises an explicit timeout at serval-proxy/connect.zig:43, and connectUpstream() asserts it is non-zero at
+     serval-proxy/connect.zig:124, but the actual call site uses client.connect(...) at serval-proxy/connect.zig:139, which hardwires .none timeout in serval-client/
+     client.zig:182. The real timeout-aware path exists at serval-client/client.zig:192 and is not used. This is an operability bug: operators can think they configured a hard
+     connect bound when they did not. It violates S7 and C3.
+  4. Medium: the highest-risk proxy paths are barely tested. The critical behavior lives in serval-proxy/forwarder.zig:602, serval-proxy/forwarder.zig:699, and serval-proxy/
+     forwarder.zig:928, but the file’s tests start at serval-proxy/forwarder.zig:1098 and only cover init/constants. The only serval-proxy integration test I found is
+     integration/tests.zig:6889, and that is h2 stream-bridge coverage, not the main h1 forwarder/pool/retry paths. For enterprise code, missing tests around stale pooled
+     sockets, concurrent upload/download failure, EOF-delimited upstreams, and timeout enforcement are a release blocker.
+  5. Low: the module is drifting from its own TigerStyle/Serval rules. Production catch {} remains in serval-proxy/tunnel.zig:220 and serval-proxy/tunnel.zig:229, which
+     collapses scheduler/setup failures into a generic upstream error. serval-proxy/h2/bridge.zig:77 uses std.time directly instead of serval-core.time. These are smaller than
+     the correctness issues above, but they matter if the goal is TigerBeetle-style discipline and debuggability.
+
+---
+
+Base directory for this skill: /home/nick/.claude/plugins/cache/superpowers-marketplace/superpowers/4.0.3/skills/receiving-code-review
+
+# Code Review Reception
+
+## Overview
+
+Code review requires technical evaluation, not emotional performance.
+
+**Core principle:** Verify before implementing. Ask before assuming. Technical correctness over social comfort.
+
+## The Response Pattern
+
+```
+WHEN receiving code review feedback:
+
+1. READ: Complete feedback without reacting
+2. UNDERSTAND: Restate requirement in own words (or ask)
+3. VERIFY: Check against codebase reality
+4. EVALUATE: Technically sound for THIS codebase?
+5. RESPOND: Technical acknowledgment or reasoned pushback
+6. IMPLEMENT: One item at a time, test each
+```
+
+## Forbidden Responses
+
+**NEVER:**
+- "You're absolutely right!" (explicit CLAUDE.md violation)
+- "Great point!" / "Excellent feedback!" (performative)
+- "Let me implement that now" (before verification)
+
+**INSTEAD:**
+- Restate the technical requirement
+- Ask clarifying questions
+- Push back with technical reasoning if wrong
+- Just start working (actions > words)
+
+## Handling Unclear Feedback
+
+```
+IF any item is unclear:
+  STOP - do not implement anything yet
+  ASK for clarification on unclear items
+
+WHY: Items may be related. Partial understanding = wrong implementation.
+```
+
+**Example:**
+```
+your human partner: "Fix 1-6"
+You understand 1,2,3,6. Unclear on 4,5.
+
+❌ WRONG: Implement 1,2,3,6 now, ask about 4,5 later
+✅ RIGHT: "I understand items 1,2,3,6. Need clarification on 4 and 5 before proceeding."
+```
+
+## Source-Specific Handling
+
+### From your human partner
+- **Trusted** - implement after understanding
+- **Still ask** if scope unclear
+- **No performative agreement**
+- **Skip to action** or technical acknowledgment
+
+### From External Reviewers
+```
+BEFORE implementing:
+  1. Check: Technically correct for THIS codebase?
+  2. Check: Breaks existing functionality?
+  3. Check: Reason for current implementation?
+  4. Check: Works on all platforms/versions?
+  5. Check: Does reviewer understand full context?
+
+IF suggestion seems wrong:
+  Push back with technical reasoning
+
+IF can't easily verify:
+  Say so: "I can't verify this without [X]. Should I [investigate/ask/proceed]?"
+
+IF conflicts with your human partner's prior decisions:
+  Stop and discuss with your human partner first
+```
+
+**your human partner's rule:** "External feedback - be skeptical, but check carefully"
+
+## YAGNI Check for "Professional" Features
+
+```
+IF reviewer suggests "implementing properly":
+  grep codebase for actual usage
+
+  IF unused: "This endpoint isn't called. Remove it (YAGNI)?"
+  IF used: Then implement properly
+```
+
+**your human partner's rule:** "You and reviewer both report to me. If we don't need this feature, don't add it."
+
+## Implementation Order
+
+```
+FOR multi-item feedback:
+  1. Clarify anything unclear FIRST
+  2. Then implement in this order:
+     - Blocking issues (breaks, security)
+     - Simple fixes (typos, imports)
+     - Complex fixes (refactoring, logic)
+  3. Test each fix individually
+  4. Verify no regressions
+```
+
+## When To Push Back
+
+Push back when:
+- Suggestion breaks existing functionality
+- Reviewer lacks full context
+- Violates YAGNI (unused feature)
+- Technically incorrect for this stack
+- Legacy/compatibility reasons exist
+- Conflicts with your human partner's architectural decisions
+
+**How to push back:**
+- Use technical reasoning, not defensiveness
+- Ask specific questions
+- Reference working tests/code
+- Involve your human partner if architectural
+
+**Signal if uncomfortable pushing back out loud:** "Strange things are afoot at the Circle K"
+
+## Acknowledging Correct Feedback
+
+When feedback IS correct:
+```
+✅ "Fixed. [Brief description of what changed]"
+✅ "Good catch - [specific issue]. Fixed in [location]."
+✅ [Just fix it and show in the code]
+
+❌ "You're absolutely right!"
+❌ "Great point!"
+❌ "Thanks for catching that!"
+❌ "Thanks for [anything]"
+❌ ANY gratitude expression
+```
+
+**Why no thanks:** Actions speak. Just fix it. The code itself shows you heard the feedback.
+
+**If you catch yourself about to write "Thanks":** DELETE IT. State the fix instead.
+
+## Gracefully Correcting Your Pushback
+
+If you pushed back and were wrong:
+```
+✅ "You were right - I checked [X] and it does [Y]. Implementing now."
+✅ "Verified this and you're correct. My initial understanding was wrong because [reason]. Fixing."
+
+❌ Long apology
+❌ Defending why you pushed back
+❌ Over-explaining
+```
+
+State the correction factually and move on.
+
+## Common Mistakes
+
+| Mistake | Fix |
+|---------|-----|
+| Performative agreement | State requirement or just act |
+| Blind implementation | Verify against codebase first |
+| Batch without testing | One at a time, test each |
+| Assuming reviewer is right | Check if breaks things |
+| Avoiding pushback | Technical correctness > comfort |
+| Partial implementation | Clarify all items first |
+| Can't verify, proceed anyway | State limitation, ask for direction |
+
+## Real Examples
+
+**Performative Agreement (Bad):**
+```
+Reviewer: "Remove legacy code"
+❌ "You're absolutely right! Let me remove that..."
+```
+
+**Technical Verification (Good):**
+```
+Reviewer: "Remove legacy code"
+✅ "Checking... build target is 10.15+, this API needs 13+. Need legacy for backward compat. Current impl has wrong bundle ID - fix it or drop pre-13 support?"
+```
+
+**YAGNI (Good):**
+```
+Reviewer: "Implement proper metrics tracking with database, date filters, CSV export"
+✅ "Grepped codebase - nothing calls this endpoint. Remove it (YAGNI)? Or is there usage I'm missing?"
+```
+
+**Unclear Item (Good):**
+```
+your human partner: "Fix items 1-6"
+You understand 1,2,3,6. Unclear on 4,5.
+✅ "Understand 1,2,3,6. Need clarification on 4 and 5 before implementing."
+```
+
+## GitHub Thread Replies
+
+When replying to inline review comments on GitHub, reply in the comment thread (`gh api repos/{owner}/{repo}/pulls/{pr}/comments/{id}/replies`), not as a top-level PR comment.
+
+## The Bottom Line
+
+**External feedback = suggestions to evaluate, not orders to follow.**
+
+Verify. Question. Then implement.
+
+No performative agreement. Technical rigor always.
+
+---
+
+Base directory for this skill: /home/nick/.claude/plugins/cache/superpowers-marketplace/superpowers/4.0.3/skills/writing-plans
+
+# Writing Plans
+
+## Overview
+
+Write comprehensive implementation plans assuming the engineer has zero context for our codebase and questionable taste. Document everything they need to know: which files to touch for each task, code, testing, docs they might need to check, how to test it. Give them the whole plan as bite-sized tasks. DRY. YAGNI. TDD. Frequent commits.
+
+Assume they are a skilled developer, but know almost nothing about our toolset or problem domain. Assume they don't know good test design very well.
+
+**Announce at start:** "I'm using the writing-plans skill to create the implementation plan."
+
+**Context:** This should be run in a dedicated worktree (created by brainstorming skill).
+
+**Save plans to:** `docs/plans/YYYY-MM-DD-<feature-name>.md`
+
+## Bite-Sized Task Granularity
+
+**Each step is one action (2-5 minutes):**
+- "Write the failing test" - step
+- "Run it to make sure it fails" - step
+- "Implement the minimal code to make the test pass" - step
+- "Run the tests and make sure they pass" - step
+- "Commit" - step
+
+## Plan Document Header
+
+**Every plan MUST start with this header:**
+
+```markdown
+# [Feature Name] Implementation Plan
+
+> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+
+**Goal:** [One sentence describing what this builds]
+
+**Architecture:** [2-3 sentences about approach]
+
+**Tech Stack:** [Key technologies/libraries]
+
+---
+```
+
+## Task Structure
+
+```markdown
+### Task N: [Component Name]
+
+**Files:**
+- Create: `exact/path/to/file.py`
+- Modify: `exact/path/to/existing.py:123-145`
+- Test: `tests/exact/path/to/test.py`
+
+**Step 1: Write the failing test**
+
+```python
+def test_specific_behavior():
+    result = function(input)
+    assert result == expected
+```
+
+**Step 2: Run test to verify it fails**
+
+Run: `pytest tests/path/test.py::test_name -v`
+Expected: FAIL with "function not defined"
+
+**Step 3: Write minimal implementation**
+
+```python
+def function(input):
+    return expected
+```
+
+**Step 4: Run test to verify it passes**
+
+Run: `pytest tests/path/test.py::test_name -v`
+Expected: PASS
+
+**Step 5: Commit**
+
+```bash
+git add tests/path/test.py src/path/file.py
+git commit -m "feat: add specific feature"
+```
+```
+
+## Remember
+- Exact file paths always
+- Complete code in plan (not "add validation")
+- Exact commands with expected output
+- Reference relevant skills with @ syntax
+- DRY, YAGNI, TDD, frequent commits
+
+## Execution Handoff
+
+After saving the plan, offer execution choice:
+
+**"Plan complete and saved to `docs/plans/<filename>.md`. Two execution options:**
+
+**1. Subagent-Driven (this session)** - I dispatch fresh subagent per task, review between tasks, fast iteration
+
+**2. Parallel Session (separate)** - Open new session with executing-plans, batch execution with checkpoints
+
+**Which approach?"**
+
+**If Subagent-Driven chosen:**
+- **REQUIRED SUB-SKILL:** Use superpowers:subagent-driven-development
+- Stay in this session
+- Fresh subagent per task + code review
+
+**If Parallel Session chosen:**
+- Guide them to open new session in worktree
+- **REQUIRED SUB-SKILL:** New session uses superpowers:executing-plans
+
+---
+
+• Findings
+
+  1. High: Task 2 does not actually fix the close-delimited truncation bug. In the plan, docs/plans/2026-03-26-proxy-findings-fixes.md:93 proposes returning InvalidResponse only
+     when pre_read_body.len > 0, then otherwise “assuming no body.” But the current proxy bug in serval-proxy/h1/response.zig:204 is broader: any body-bearing response with
+     neither Content-Length nor chunked is unsafe because the proxy never reads until EOF. If pre_read_body.len == 0, the proposed change still returns success and silently
+     drops the later body. This plan needs one of two real fixes:
+      - reject all body-bearing close-delimited responses unless the code can positively know the request was HEAD, or
+      - implement explicit read-until-EOF forwarding and force connection close/no pooling.
+  2. High: the validation steps are not testing the code being changed. The plan repeatedly says to run zig build test-proxy at docs/plans/2026-03-26-proxy-findings-fixes.md:70,
+     docs/plans/2026-03-26-proxy-findings-fixes.md:126, docs/plans/2026-03-26-proxy-findings-fixes.md:190, and docs/plans/2026-03-26-proxy-findings-fixes.md:286. But that step
+     only runs h2 primitive tests from build.zig:652 through build.zig:673. It does not cover forwarder.zig, connect.zig, h1/response.zig, or tunnel.zig. For enterprise-ready
+     code, this plan needs new regression tests for each fix, not just zig build test.
+  3. Medium: Task 2 needs a slightly tighter contract than “status != 204 and status != 304.” Without request-method context, serval-proxy/h1/response.zig:118 cannot distinguish
+     HEAD from a normal GET, so the plan’s “HEAD response or empty” assumption is not defensible. The safer plan is to thread an explicit “response body allowed” flag into
+     forwardResponse() or reject ambiguous unframed responses fail-closed.
+  4. Medium: Task 3 is directionally correct, but the plan still lacks a proof that timeout wiring is honored. The dead API problem is real in serval-proxy/connect.zig:115 and
+     serval-client/client.zig:182, so the code change is fine, but the plan should add a focused timeout regression test instead of relying on compilation and broad suite pass.
+
+---
+
+• Findings
+
+  1. Medium: Task 2’s regression tests still do not prove the real behavior change. The plan now correctly fails close-delimited non-HEAD responses closed, but the proposed
+     tests in docs/plans/2026-03-26-proxy-findings-fixes.md:226 only validate parsing predicates (parseStatusCode, parseContentLength, isChunkedResponse). They do not exercise
+     serval-proxy/h1/response.zig:118 returning InvalidResponse for the unframed 200 case, nor the HEAD pass-through branch. For this bug class, I would want at least one
+     socket-backed/unit harness test that calls forwardResponse(..., is_head_request) directly and asserts:
+      - non-HEAD + unframed 200 => ForwardError.InvalidResponse
+      - HEAD + unframed 200 => success
+  2. Low: Task 3’s test is weaker than the code change it is meant to protect. The timeout conversion test in docs/plans/2026-03-26-proxy-findings-fixes.md:340 only proves that
+     an Io.Timeout value can be constructed, not that serval-proxy/connect.zig:115 actually uses client.connectWithTimeout() instead of client.connect(). It is not wrong, but it
+     is a low-signal regression test. If you keep it, I would treat it as a compile-time guard, not as sufficient verification of the operator-facing timeout contract.
+
+---
+
+● Now I'll rewrite the Task 2 test section and Task 3 test label. The key insight: forwardResponse's header-receive and header-send paths use socket.read()/socket.write() directly (Io is
+  discarded), so socketpair-backed tests work without an async runtime.
+
+why is it not using Io, we should right?
+
+---
+
+i think we need to fix it properly with fibers
+
+---
+
+• Findings
+
+  1. High: Task 1’s new pool test is invalid as written and will likely assert before it verifies anything useful. The plan constructs a fake connection with fd = -1 at docs/
+     plans/2026-03-26-proxy-findings-fixes.md:94 and then calls pool.release(..., false) at docs/plans/2026-03-26-proxy-findings-fixes.md:100. But unhealthy release closes the
+     connection in serval-pool/pool.zig:333, so this test is feeding release() an invalid socket on the close path. You already have real coverage for unhealthy release at
+     serval-pool/pool.zig:1185. This plan should either reuse that existing pattern or add a forwarder-level regression, not a synthetic fd = -1 case.
+  2. Medium: Task 2’s sendBuffer replacement regresses TigerStyle by removing the explicit bounded-write guard. The proposed loop at docs/plans/2026-03-26-proxy-findings-
+     fixes.md:301 writes until completion with no iteration cap, while the current shared helper has MAX_WRITE_ITERATIONS at serval-client/request.zig:39 and enforces it in
+     serval-client/request.zig:170. The fiber-safe rewrite is the right direction, but it needs the same explicit bound or it weakens S3.
+  3. Low: Task 3’s new socket-backed test helper swallows write failures, which weakens the regression tests. The helper at docs/plans/2026-03-26-proxy-findings-fixes.md:459
+     does posix.write(... ) catch return;, so a broken test setup can silently short-circuit instead of failing loudly. For verification code at this level, that should be try/
+     error-returning, not silent return.
