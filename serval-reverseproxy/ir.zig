@@ -33,9 +33,45 @@ pub const RuntimeBudget = struct {
     }
 };
 
+pub const TlsProvider = enum(u8) {
+    static,
+    selfsigned,
+    acme,
+};
+
+pub const StaticTlsConfig = struct {
+    cert_path: []const u8,
+    key_path: []const u8,
+};
+
+pub const SelfSignedTlsConfig = struct {
+    state_dir_path: []const u8,
+    domain: []const u8,
+    rotate_on_boot: bool = false,
+};
+
+pub const AcmeTlsConfig = struct {
+    directory_url: []const u8,
+    contact_email: []const u8,
+    state_dir_path: []const u8,
+    domain: []const u8,
+    renew_before_ns: u64 = config.ACME_DEFAULT_RENEW_BEFORE_NS,
+    poll_interval_ms: u32 = config.ACME_DEFAULT_POLL_INTERVAL_MS,
+    fail_backoff_min_ms: u32 = config.ACME_DEFAULT_FAIL_BACKOFF_MIN_MS,
+    fail_backoff_max_ms: u32 = config.ACME_DEFAULT_FAIL_BACKOFF_MAX_MS,
+};
+
+pub const ListenerTls = struct {
+    provider: TlsProvider,
+    static: ?StaticTlsConfig = null,
+    selfsigned: ?SelfSignedTlsConfig = null,
+    acme: ?AcmeTlsConfig = null,
+};
+
 pub const Listener = struct {
     id: []const u8,
     bind: []const u8,
+    tls: ?ListenerTls = null,
 };
 
 pub const Pool = struct {
@@ -135,6 +171,7 @@ pub const ValidationReason = enum(u8) {
     missing_order_dependency,
     cyclic_order_constraints,
     duplicate_order_plugin_id,
+    invalid_listener_tls_config,
     too_many_diagnostics,
 };
 
@@ -174,6 +211,7 @@ pub const ValidationError = error{
     MissingOrderDependency,
     CyclicOrderConstraints,
     DuplicateOrderPluginId,
+    InvalidListenerTlsConfig,
     TooManyDiagnostics,
 };
 
@@ -237,6 +275,7 @@ fn validateStructure(
     }
 
     try validateUniqueIds(candidate, diagnostics, diagnostics_count);
+    try validateListeners(candidate, diagnostics, diagnostics_count);
     try validateRoutePolicyStructure(candidate, diagnostics, diagnostics_count);
     try validateGlobalPolicyStructure(candidate, diagnostics, diagnostics_count);
     try validateChains(candidate, diagnostics, diagnostics_count);
@@ -376,6 +415,92 @@ fn validateUniqueIds(
     }
 
     assert(diagnostics_count.* <= MAX_VALIDATION_DIAGNOSTICS);
+}
+
+fn validateListeners(
+    candidate: *const CanonicalIr,
+    diagnostics: *[MAX_VALIDATION_DIAGNOSTICS]ValidationDiagnostic,
+    diagnostics_count: *u32,
+) ValidationError!void {
+    assert(@intFromPtr(candidate) != 0);
+    assert(diagnostics_count.* <= MAX_VALIDATION_DIAGNOSTICS);
+
+    var listener_index: usize = 0;
+    while (listener_index < candidate.listeners.len) : (listener_index += 1) {
+        const listener = candidate.listeners[listener_index];
+        if (listener.tls == null) continue;
+
+        const tls_cfg = listener.tls.?;
+        switch (tls_cfg.provider) {
+            .static => {
+                const static_cfg = tls_cfg.static orelse {
+                    try appendDiagnostic(diagnostics, diagnostics_count, .{
+                        .stage = .structure,
+                        .object_kind = .listener,
+                        .object_id = listener.id,
+                        .reason = .invalid_listener_tls_config,
+                    });
+                    return error.InvalidListenerTlsConfig;
+                };
+                if (static_cfg.cert_path.len == 0 or static_cfg.key_path.len == 0) {
+                    try appendDiagnostic(diagnostics, diagnostics_count, .{
+                        .stage = .structure,
+                        .object_kind = .listener,
+                        .object_id = listener.id,
+                        .reason = .invalid_listener_tls_config,
+                    });
+                    return error.InvalidListenerTlsConfig;
+                }
+            },
+            .selfsigned => {
+                const selfsigned_cfg = tls_cfg.selfsigned orelse {
+                    try appendDiagnostic(diagnostics, diagnostics_count, .{
+                        .stage = .structure,
+                        .object_kind = .listener,
+                        .object_id = listener.id,
+                        .reason = .invalid_listener_tls_config,
+                    });
+                    return error.InvalidListenerTlsConfig;
+                };
+                if (selfsigned_cfg.state_dir_path.len == 0 or selfsigned_cfg.domain.len == 0) {
+                    try appendDiagnostic(diagnostics, diagnostics_count, .{
+                        .stage = .structure,
+                        .object_kind = .listener,
+                        .object_id = listener.id,
+                        .reason = .invalid_listener_tls_config,
+                    });
+                    return error.InvalidListenerTlsConfig;
+                }
+            },
+            .acme => {
+                const acme_cfg = tls_cfg.acme orelse {
+                    try appendDiagnostic(diagnostics, diagnostics_count, .{
+                        .stage = .structure,
+                        .object_kind = .listener,
+                        .object_id = listener.id,
+                        .reason = .invalid_listener_tls_config,
+                    });
+                    return error.InvalidListenerTlsConfig;
+                };
+                if (acme_cfg.directory_url.len == 0 or
+                    acme_cfg.contact_email.len == 0 or
+                    acme_cfg.state_dir_path.len == 0 or
+                    acme_cfg.domain.len == 0 or
+                    acme_cfg.poll_interval_ms == 0 or
+                    acme_cfg.fail_backoff_min_ms == 0 or
+                    acme_cfg.fail_backoff_min_ms > acme_cfg.fail_backoff_max_ms)
+                {
+                    try appendDiagnostic(diagnostics, diagnostics_count, .{
+                        .stage = .structure,
+                        .object_kind = .listener,
+                        .object_id = listener.id,
+                        .reason = .invalid_listener_tls_config,
+                    });
+                    return error.InvalidListenerTlsConfig;
+                }
+            },
+        }
+    }
 }
 
 fn validateGlobalPolicyStructure(
@@ -973,4 +1098,51 @@ test "validation rejects waiver target when plugin does not require waiver" {
     try std.testing.expectError(error.InvalidRouteWaiverTarget, validateCanonicalIr(&candidate, &diagnostics, &diagnostics_count));
     try std.testing.expectEqual(@as(u32, 1), diagnostics_count);
     try std.testing.expectEqual(ValidationReason.invalid_route_waiver_target, diagnostics[0].reason);
+}
+
+test "validation rejects static tls listener with missing cert path" {
+    const budget = RuntimeBudget{
+        .max_state_bytes = 1024,
+        .max_output_bytes = 1024 * 1024,
+        .max_expansion_ratio_milli = 2000,
+        .max_cpu_micros_per_chunk = 1000,
+    };
+    const chain_entries = [_]ChainEntry{.{
+        .plugin_id = "plugin-a",
+        .failure_policy = .fail_closed,
+        .budget = budget,
+        .priority = 1,
+        .before = &.{},
+        .after = &.{},
+    }};
+
+    const candidate = CanonicalIr{
+        .listeners = &[_]Listener{.{
+            .id = "listener-a",
+            .bind = "0.0.0.0:443",
+            .tls = .{ .provider = .static, .static = .{ .cert_path = "", .key_path = "/tmp/key.pem" } },
+        }},
+        .pools = &[_]Pool{.{ .id = "pool-a" }},
+        .routes = &[_]Route{.{
+            .id = "route-a",
+            .listener_id = "listener-a",
+            .host = "example.com",
+            .path_prefix = "/",
+            .pool_id = "pool-a",
+            .chain_id = "chain-a",
+            .disable_plugin_ids = &.{},
+            .add_plugin_ids = &.{},
+            .waivers = &.{},
+        }},
+        .plugins = &[_]PluginCatalogEntry{.{ .id = "plugin-a", .version = "1", .enabled = true, .mandatory = false, .disable_requires_waiver = false }},
+        .chains = &[_]ChainPlan{.{ .id = "chain-a", .entries = chain_entries[0..] }},
+        .global_plugin_ids = &.{},
+    };
+
+    var diagnostics: [MAX_VALIDATION_DIAGNOSTICS]ValidationDiagnostic = undefined;
+    var diagnostics_count: u32 = 0;
+
+    try std.testing.expectError(error.InvalidListenerTlsConfig, validateCanonicalIr(&candidate, &diagnostics, &diagnostics_count));
+    try std.testing.expectEqual(@as(u32, 1), diagnostics_count);
+    try std.testing.expectEqual(ValidationReason.invalid_listener_tls_config, diagnostics[0].reason);
 }

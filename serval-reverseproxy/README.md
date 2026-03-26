@@ -7,6 +7,7 @@ Scope in this slice:
 - Deterministic IR validation diagnostics (stage + object + reason)
 - Deterministic chain ordering and composition (`ordering.zig`, `composition.zig`)
 - Header-phase policy execution contract (`policy.zig`)
+- Runtime-loaded filter binding/dispatch (`filter_runtime.zig`)
 - Request streaming execution with bounded backpressure (`stream_request.zig`)
 - Response streaming execution + framing planner (`stream_response.zig`)
 - Failure classification + protocol-correct terminal actions (`failure.zig`)
@@ -36,10 +37,48 @@ try runtime.run(.{ .port = 8080 }); // optional override; omit to use DSL listen
 
 Starter DSL config:
 - `examples/reverseproxy/basic.dsl`
+- TLS providers example: `examples/reverseproxy/tls_providers.dsl`
 
 Route/listener binding:
 - Routes may declare `listener=<listener-id>` for explicit listener scoping.
 - If omitted, runtime defaults route binding to the first declared listener.
+
+Core DSL object roles:
+- `listener`: inbound bind target (IP:port) for receiving traffic.
+- `pool`: upstream target set (in this slice, one upstream spec per pool).
+- `plugin`: a policy/filter capability with fail policy and metadata.
+- `chain`: ordered policy execution pipeline referencing one or more plugins.
+- `route`: request matcher (listener/host/path) that selects pool + chain.
+
+`chain` in practice:
+- A chain is the policy pipeline attached to a route.
+- Route matching decides *where* to send traffic (`pool`), and chain decides *what policy logic* runs for that traffic (`plugin` entries).
+
+Runtime component selection (binary mode):
+- `config.component.pool=simple|none`
+- `config.component.metrics=noop|prometheus`
+- `config.component.tracing=noop|otel`
+- when tracing is `otel`, set `config.component.tracing.otel.endpoint=<http(s)://collector:4318/v1/traces>`
+- optional OTEL metadata keys:
+  - `config.component.tracing.otel.service_name`
+  - `config.component.tracing.otel.service_version`
+  - `config.component.tracing.otel.scope_name`
+  - `config.component.tracing.otel.scope_version`
+
+Alternate statement form is also supported:
+- `component pool simple`
+- `component metrics prometheus`
+- `component tracing noop`
+
+TLS listener providers:
+- `tls.provider=static` with `tls.static.cert_path` + `tls.static.key_path`
+- `tls.provider=selfsigned` with `tls.selfsigned.state_dir` + `tls.selfsigned.domain`
+- `tls.provider=acme` with `tls.acme.directory_url`, `tls.acme.contact_email`, `tls.acme.state_dir`, `tls.acme.domain`
+
+ACME provider bootstrap behavior:
+- If no ACME-issued certificate exists in `<state_dir>/cert/current/`, reverseproxy first generates a listener-scoped self-signed bootstrap certificate.
+- Reverseproxy starts TLS using that bootstrap certificate.
+- ACME renewer then requests and hot-activates a CA-issued certificate via `reloadServerTlsFromPemFiles()`.
 
 Key exports:
 - `load`

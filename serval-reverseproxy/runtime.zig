@@ -4,14 +4,13 @@ const std = @import("std");
 const assert = std.debug.assert;
 const core = @import("serval-core");
 const server_mod = @import("serval-server");
-const pool_mod = @import("serval-pool");
-const metrics_mod = @import("serval-metrics");
-const tracing_mod = @import("serval-tracing");
 const net = @import("serval-net");
 const router_mod = @import("serval-router");
 const dsl = @import("dsl.zig");
 const ir = @import("ir.zig");
 const orchestrator = @import("orchestrator.zig");
+const certs = @import("certs/mod.zig");
+const components = @import("components.zig");
 
 const DnsConfig = net.DnsConfig;
 
@@ -84,16 +83,97 @@ pub const Runtime = struct {
 
         var handler = ProxyHandler{ .router = &router, .default_upstream = self.pool_upstream_storage[0] };
 
-        var pool = pool_mod.SimplePool.init();
-        var metrics = metrics_mod.NoopMetrics{};
-        var tracer = tracing_mod.NoopTracer{};
+        const active_listener = try findListenerById(&candidate, active_listener_id);
+
+        var maybe_static_provider: ?certs.StaticProvider = null;
+        var maybe_selfsigned_provider: ?certs.SelfSignedProvider = null;
+        var maybe_acme_provider: ?certs.AcmeProvider = null;
+
+        var server_tls_config: ?core.config.TlsConfig = null;
+        if (active_listener.tls) |tls_cfg| {
+            switch (tls_cfg.provider) {
+                .static => {
+                    maybe_static_provider = try certs.StaticProvider.init(tls_cfg.static orelse return error.InvalidListenerTls);
+                    const initial = maybe_static_provider.?.loadInitial();
+                    server_tls_config = .{ .cert_path = initial.cert_path, .key_path = initial.key_path };
+                },
+                .selfsigned => {
+                    maybe_selfsigned_provider = try certs.SelfSignedProvider.init(tls_cfg.selfsigned orelse return error.InvalidListenerTls, active_listener.id);
+                    const initial = try maybe_selfsigned_provider.?.loadInitial(self.io_threaded.io());
+                    server_tls_config = .{ .cert_path = initial.cert_path, .key_path = initial.key_path };
+                },
+                .acme => {
+                    maybe_acme_provider = try certs.AcmeProvider.init(tls_cfg.acme orelse return error.InvalidListenerTls, active_listener.id);
+                    const initial = try maybe_acme_provider.?.loadInitial(self.io_threaded.io());
+                    server_tls_config = .{ .cert_path = initial.cert_path, .key_path = initial.key_path };
+                },
+            }
+        }
+
+        defer if (maybe_static_provider) |*static_provider| static_provider.deinit();
+        defer if (maybe_selfsigned_provider) |*selfsigned_provider| selfsigned_provider.deinit();
+        defer if (maybe_acme_provider) |*acme_provider| acme_provider.deinit();
+
+        var runtime_pool = components.RuntimePool.init(self.parsed_dsl.component_pool_kind);
+        var runtime_metrics = components.RuntimeMetrics.init(self.parsed_dsl.component_metrics_kind);
+        var runtime_tracer = try components.RuntimeTracer.init(self.parsed_dsl.component_tracer_kind, .{
+            .endpoint = self.parsed_dsl.component_tracing_otel_endpoint,
+            .service_name = self.parsed_dsl.component_tracing_otel_service_name,
+            .service_version = self.parsed_dsl.component_tracing_otel_service_version,
+            .scope_name = self.parsed_dsl.component_tracing_otel_scope_name,
+            .scope_version = self.parsed_dsl.component_tracing_otel_scope_version,
+        });
+        defer runtime_tracer.deinit();
         var shutdown = std.atomic.Value(bool).init(false);
 
-        const ServerType = server_mod.Server(ProxyHandler, pool_mod.SimplePool, metrics_mod.NoopMetrics, tracing_mod.NoopTracer);
-        var server = ServerType.init(&handler, &pool, &metrics, &tracer, .{
+        const ServerType = server_mod.Server(ProxyHandler, components.RuntimePool, components.RuntimeMetrics, components.RuntimeTracer);
+        var server = ServerType.init(&handler, &runtime_pool, &runtime_metrics, &runtime_tracer, .{
             .port = listen_port,
-            .tls = null,
+            .tls = server_tls_config,
         }, null, DnsConfig{});
+
+        const ReloadCtx = struct {
+            server: *ServerType,
+
+            fn activate(ctx_raw: *anyopaque, cert_path: []const u8, key_path: []const u8) certs.ActivationResult {
+                const ctx: *@This() = @ptrCast(@alignCast(ctx_raw));
+                _ = ctx.server.reloadServerTlsFromPemFiles(cert_path, key_path) catch |err| {
+                    std.log.err("reverseproxy-acme: tls reload failed err={s}", .{@errorName(err)});
+                    return .transient_failure;
+                };
+                return .success;
+            }
+        };
+
+        const AcmeRunCtx = struct {
+            provider: *certs.AcmeProvider,
+            shutdown: *std.atomic.Value(bool),
+            activate_ctx: *anyopaque,
+            activate_fn: certs.ActivateFn,
+
+            fn run(ctx: *@This()) void {
+                ctx.provider.run(ctx.shutdown, ctx.activate_ctx, ctx.activate_fn) catch |err| {
+                    if (ctx.shutdown.load(.acquire)) return;
+                    std.log.err("reverseproxy-acme: provider exited err={s}", .{@errorName(err)});
+                };
+            }
+        };
+
+        var maybe_reload_ctx: ?ReloadCtx = null;
+        var maybe_acme_run_ctx: ?AcmeRunCtx = null;
+        var maybe_acme_thread: ?std.Thread = null;
+        defer if (maybe_acme_thread) |thread| thread.join();
+
+        if (maybe_acme_provider) |*acme_provider| {
+            maybe_reload_ctx = .{ .server = &server };
+            maybe_acme_run_ctx = .{
+                .provider = acme_provider,
+                .shutdown = &shutdown,
+                .activate_ctx = @ptrCast(&maybe_reload_ctx.?),
+                .activate_fn = ReloadCtx.activate,
+            };
+            maybe_acme_thread = try std.Thread.spawn(.{}, AcmeRunCtx.run, .{&maybe_acme_run_ctx.?});
+        }
 
         std.debug.print("reverseproxy runtime listening on :{d}\n", .{listen_port});
         try server.run(self.io_threaded.io(), &shutdown, null);
@@ -223,6 +303,18 @@ fn buildRouterArtifacts(
 
     route_count.* = selected_route_count;
     pool_count.* = @intCast(candidate.pools.len);
+}
+
+fn findListenerById(candidate: *const ir.CanonicalIr, listener_id: []const u8) !*const ir.Listener {
+    assert(@intFromPtr(candidate) != 0);
+    assert(listener_id.len > 0);
+
+    var listener_index: usize = 0;
+    while (listener_index < candidate.listeners.len) : (listener_index += 1) {
+        if (std.mem.eql(u8, candidate.listeners[listener_index].id, listener_id)) return &candidate.listeners[listener_index];
+    }
+
+    return error.MissingListener;
 }
 
 fn findPoolIndex(pools: []const ir.Pool, pool_id: []const u8) !u8 {

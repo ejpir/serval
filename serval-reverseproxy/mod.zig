@@ -16,6 +16,8 @@ pub const equivalence = @import("equivalence.zig");
 pub const runtime = @import("runtime.zig");
 pub const integration = @import("integration.zig");
 pub const orchestrator = @import("orchestrator.zig");
+pub const certs = @import("certs/mod.zig");
+pub const components = @import("components.zig");
 
 pub const CanonicalIr = ir.CanonicalIr;
 pub const ValidationStage = ir.ValidationStage;
@@ -70,8 +72,26 @@ pub const RuntimeRunOptions = runtime.RunOptions;
 pub const Runtime = runtime.Runtime;
 pub const load = runtime.load;
 
+pub const ComponentPoolKind = components.PoolKind;
+pub const ComponentMetricsKind = components.MetricsKind;
+pub const ComponentTracerKind = components.TracerKind;
+pub const RuntimePool = components.RuntimePool;
+pub const RuntimeMetrics = components.RuntimeMetrics;
+pub const RuntimeTracer = components.RuntimeTracer;
+
+pub const CertActivationResult = certs.ActivationResult;
+pub const CertMaterial = certs.CertMaterial;
+pub const StaticCertProvider = certs.StaticProvider;
+pub const SelfSignedCertProvider = certs.SelfSignedProvider;
+pub const AcmeCertProvider = certs.AcmeProvider;
+
 pub const FailurePolicy = ir.FailurePolicy;
 pub const RuntimeBudget = ir.RuntimeBudget;
+pub const TlsProvider = ir.TlsProvider;
+pub const ListenerTls = ir.ListenerTls;
+pub const StaticTlsConfig = ir.StaticTlsConfig;
+pub const SelfSignedTlsConfig = ir.SelfSignedTlsConfig;
+pub const AcmeTlsConfig = ir.AcmeTlsConfig;
 pub const Listener = ir.Listener;
 pub const Pool = ir.Pool;
 pub const Route = ir.Route;
@@ -94,4 +114,6 @@ test {
     _ = runtime;
     _ = integration;
     _ = orchestrator;
+    _ = certs;
+    _ = components;
 }

@@ -257,6 +257,8 @@ pub fn build(b: *std.Build) void {
     serval_reverseproxy_module.addImport("serval-metrics", serval_metrics_module);
     serval_reverseproxy_module.addImport("serval-tracing", serval_tracing_module);
     serval_reverseproxy_module.addImport("serval-server", serval_server_module);
+    serval_reverseproxy_module.addImport("serval-acme", serval_acme_module);
+    serval_reverseproxy_module.addImport("serval-otel", serval_otel_module);
 
     // Prober module - depends on core, net, health, tls, client
     const serval_prober_module = b.addModule("serval-prober", .{
@@ -685,6 +687,10 @@ pub fn build(b: *std.Build) void {
     reverseproxy_tests_mod.addImport("serval-tracing", serval_tracing_module);
     reverseproxy_tests_mod.addImport("serval-server", serval_server_module);
     reverseproxy_tests_mod.addImport("serval-router", serval_router_module);
+    reverseproxy_tests_mod.addImport("serval-acme", serval_acme_module);
+    reverseproxy_tests_mod.addImport("serval-otel", serval_otel_module);
+    reverseproxy_tests_mod.linkSystemLibrary("ssl", .{});
+    reverseproxy_tests_mod.linkSystemLibrary("crypto", .{});
     const reverseproxy_tests = b.addTest(.{
         .name = "reverseproxy_tests",
         .root_module = reverseproxy_tests_mod,
