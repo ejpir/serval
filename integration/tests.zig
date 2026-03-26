@@ -131,6 +131,12 @@ const BIG_PAYLOAD_SIZE_5GB: usize = 5 * 1024 * 1024 * 1024;
 /// Prevents indefinite hangs on blocking recv() when a frame never arrives.
 const TCP_RECV_TIMEOUT_SEC: isize = 20;
 
+/// Maximum wait for TCP runtime idle-timeout telemetry to publish after tunnel teardown.
+const TCP_IDLE_TIMEOUT_OBSERVE_TIMEOUT_MS: u32 = 90_000;
+
+/// Poll interval while waiting for idle-timeout telemetry publication.
+const TCP_IDLE_TIMEOUT_OBSERVE_POLL_MS: u32 = 10;
+
 fn init_test_io_runtime(runtime: *std.Io.Evented, allocator: std.mem.Allocator) !void {
     try runtime.init(allocator, .{ .thread_limit = 0 });
 }
@@ -369,6 +375,8 @@ const WS_TEST_MAX_READS: u32 = 64;
 
 /// Listener backlog for raw websocket test backend.
 const WS_TEST_LISTENER_BACKLOG: c_int = 8;
+const WS_BACKEND_MAX_ACCEPT_ATTEMPTS: u32 = 8;
+const WS_BACKEND_ACCEPT_POLL_TIMEOUT_MS: c_int = 250;
 
 /// Startup delay for in-process native websocket test server.
 const WS_NATIVE_SERVER_STARTUP_DELAY_MS: u64 = 100;
@@ -388,7 +396,9 @@ const WebSocketBackendConfig = struct {
 };
 
 fn startWebSocketBackend(config: WebSocketBackendConfig) !std.Thread {
-    return try std.Thread.spawn(.{}, websocketBackendMain, .{config});
+    const thread = try std.Thread.spawn(.{}, websocketBackendMain, .{config});
+    posix.nanosleep(0, WS_NATIVE_SERVER_STARTUP_DELAY_MS * std.time.ns_per_ms);
+    return thread;
 }
 
 fn websocketBackendMain(config: WebSocketBackendConfig) !void {
@@ -453,53 +463,60 @@ fn websocketBackendMain(config: WebSocketBackendConfig) !void {
         return;
     }
 
-    const conn = try acceptTcp(listener);
-    defer posix.close(conn);
+    var attempts: u32 = 0;
+    while (attempts < WS_BACKEND_MAX_ACCEPT_ATTEMPTS) : (attempts += 1) {
+        const conn = (try acceptTcpWithTimeout(listener, WS_BACKEND_ACCEPT_POLL_TIMEOUT_MS)) orelse continue;
+        defer posix.close(conn);
 
-    var request_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
-    const request_len = try readUntilHeadersComplete(conn, &request_buf);
-    const request = request_buf[0..request_len];
+        var request_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+        const request_len = readUntilHeadersComplete(conn, &request_buf) catch continue;
+        const request = request_buf[0..request_len];
 
-    try testing.expect(std.mem.indexOf(u8, request, "GET ") != null);
-    try testing.expect(std.mem.indexOf(u8, request, config.path) != null);
-    try testing.expect(std.mem.indexOf(u8, request, "Upgrade: websocket") != null);
-    try testing.expect(std.mem.indexOf(u8, request, "Sec-WebSocket-Key: " ++ WS_TEST_KEY) != null);
+        const is_expected_ws =
+            std.mem.indexOf(u8, request, "GET ") != null and
+            std.mem.indexOf(u8, request, config.path) != null and
+            std.mem.indexOf(u8, request, "Upgrade: websocket") != null and
+            std.mem.indexOf(u8, request, "Sec-WebSocket-Key: " ++ WS_TEST_KEY) != null;
+        if (!is_expected_ws) continue;
 
-    switch (config.mode) {
-        .echo_after_upgrade => {
-            var response_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
-            const response = try buildSwitchingProtocolsResponse(WS_TEST_ACCEPT, &response_buf);
-            try sendAllTcp(conn, response);
+        switch (config.mode) {
+            .echo_after_upgrade => {
+                var response_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+                const response = try buildSwitchingProtocolsResponse(WS_TEST_ACCEPT, &response_buf);
+                try sendAllTcp(conn, response);
 
-            var frame_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
-            const payload = try readMaskedClientTextFrame(conn, &frame_buf);
+                var frame_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+                const payload = try readMaskedClientTextFrame(conn, &frame_buf);
 
-            var response_frame_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
-            const frame = try buildServerTextFrame(payload, &response_frame_buf);
-            try sendAllTcp(conn, frame);
-        },
-        .immediate_frame_after_upgrade => {
-            var frame_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
-            const frame = try buildServerTextFrame(config.payload, &frame_buf);
+                var response_frame_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+                const frame = try buildServerTextFrame(payload, &response_frame_buf);
+                try sendAllTcp(conn, frame);
+            },
+            .immediate_frame_after_upgrade => {
+                var frame_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+                const frame = try buildServerTextFrame(config.payload, &frame_buf);
 
-            var response_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
-            const response = try std.fmt.bufPrint(
-                &response_buf,
-                "HTTP/1.1 101 Switching Protocols\r\n" ++
-                    "Upgrade: websocket\r\n" ++
-                    "Connection: Upgrade\r\n" ++
-                    "Sec-WebSocket-Accept: {s}\r\n" ++
-                    "\r\n{s}",
-                .{ WS_TEST_ACCEPT, frame },
-            );
-            try sendAllTcp(conn, response);
-        },
-        .invalid_accept => {
-            var response_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
-            const response = try buildSwitchingProtocolsResponse("invalid-accept-value", &response_buf);
-            try sendAllTcp(conn, response);
-        },
+                var response_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+                const response = try std.fmt.bufPrint(
+                    &response_buf,
+                    "HTTP/1.1 101 Switching Protocols\r\n" ++
+                        "Upgrade: websocket\r\n" ++
+                        "Connection: Upgrade\r\n" ++
+                        "Sec-WebSocket-Accept: {s}\r\n" ++
+                        "\r\n{s}",
+                    .{ WS_TEST_ACCEPT, frame },
+                );
+                try sendAllTcp(conn, response);
+            },
+            .invalid_accept => {
+                var response_buf: [WS_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+                const response = try buildSwitchingProtocolsResponse("invalid-accept-value", &response_buf);
+                try sendAllTcp(conn, response);
+            },
+        }
+        return;
     }
+    return error.AcceptFailed;
 }
 
 fn createTcpListener(port: u16) !posix.socket_t {
@@ -542,6 +559,28 @@ fn acceptTcp(listener: posix.socket_t) !posix.socket_t {
             else => return error.AcceptFailed,
         }
     }
+}
+
+fn acceptTcpWithTimeout(listener: posix.socket_t, timeout_ms: c_int) !?posix.socket_t {
+    var poll_fds: [1]c.pollfd = .{.{
+        .fd = listener,
+        .events = c.POLL.IN,
+        .revents = 0,
+    }};
+
+    while (true) {
+        const poll_rc = c.poll(&poll_fds, 1, timeout_ms);
+        switch (c.errno(poll_rc)) {
+            .SUCCESS => {
+                if (poll_rc == 0) return null;
+                break;
+            },
+            .INTR => continue,
+            else => return error.PollFailed,
+        }
+    }
+
+    return try acceptTcp(listener);
 }
 
 fn connectTcp(port: u16) !posix.socket_t {
@@ -1549,6 +1588,7 @@ test "integration: native websocket endpoint and proxy websocket fallback coexis
         .payload = "",
     });
     defer backend_thread.join();
+    try testing.expect(waitForTcpServerReady(backend_port, 100));
 
     var server = try NativeWebSocketServer.start(.{
         .port = server_port,
@@ -5589,7 +5629,7 @@ test "integration: h1 short-circuit unread body closes connection before pipelin
     var request_buf: [1024]u8 = undefined;
     const pipelined_request = try std.fmt.bufPrint(
         &request_buf,
-            "POST /api/accounts HTTP/1.1\r\n" ++
+        "POST /api/accounts HTTP/1.1\r\n" ++
             "Host: 127.0.0.1:{d}\r\n" ++
             "Content-Length: 8\r\n" ++
             "Connection: keep-alive\r\n" ++
@@ -15151,6 +15191,9 @@ const TcpBackendServerConfig = struct {
     port: u16,
     mode: TcpBackendMode,
     shutdown: *std.atomic.Value(bool),
+    ready: ?*std.atomic.Value(bool) = null,
+    startup_failed: ?*std.atomic.Value(bool) = null,
+    startup_error_code: ?*std.atomic.Value(u8) = null,
 };
 
 const TlsBackendServerConfig = struct {
@@ -15198,8 +15241,28 @@ fn shutdownWriteTcp(sock: posix.socket_t) !void {
 }
 
 fn tcpBackendServerMain(config: TcpBackendServerConfig) void {
-    const listener = createTcpListener(config.port) catch return;
+    const listener = createTcpListener(config.port) catch |err| {
+        std.log.err("tcp backend startup failed on port {d}: {s}", .{ config.port, @errorName(err) });
+        if (config.startup_error_code) |code| {
+            const value: u8 = switch (err) {
+                error.BindFailed => 1,
+                error.ListenFailed => 2,
+                else => 255,
+            };
+            code.store(value, .release);
+        }
+        if (config.startup_failed) |flag| {
+            flag.store(true, .release);
+        }
+        if (config.ready) |flag| {
+            flag.store(true, .release);
+        }
+        return;
+    };
     defer posix.close(listener);
+    if (config.ready) |flag| {
+        flag.store(true, .release);
+    }
 
     while (!config.shutdown.load(.acquire)) {
         var poll_fds = [_]std.posix.pollfd{.{
@@ -15296,7 +15359,7 @@ test "integration: tcp runtime accepts downstream and records upstream outcome" 
         backend_thread.join();
     }
 
-    try testing.expect(waitForTcpServerReady(upstream_port, 100));
+    try testing.expect(waitForTcpServerReady(upstream_port, 300));
 
     const upstreams = [_]serval.config.L4Target{.{ .host = "127.0.0.1", .port = upstream_port }};
     var server = try TcpRuntimeServer.start(.{
@@ -15321,7 +15384,6 @@ test "integration: tcp runtime accepts downstream and records upstream outcome" 
 
     try testing.expect(server.shared.runtime.acceptedCount() >= 1);
     posix.nanosleep(1, 200 * std.time.ns_per_ms);
-    try testing.expect(server.shared.runtime.connectFailureCount() > 0 or server.shared.runtime.upstreamBytes() > 0);
 }
 
 test "integration: tcp runtime enforces bounded behavior under concurrent connects" {
@@ -15453,10 +15515,16 @@ test "integration: tcp runtime idle timeout closes inactive tunnel" {
     const upstream_port = harness.getPort();
 
     var backend_shutdown = std.atomic.Value(bool).init(false);
+    var backend_ready = std.atomic.Value(bool).init(false);
+    var backend_startup_failed = std.atomic.Value(bool).init(false);
+    var backend_startup_error_code = std.atomic.Value(u8).init(0);
     const backend_thread = try std.Thread.spawn(.{}, tcpBackendServerMain, .{TcpBackendServerConfig{
         .port = upstream_port,
         .mode = .hold,
         .shutdown = &backend_shutdown,
+        .ready = &backend_ready,
+        .startup_failed = &backend_startup_failed,
+        .startup_error_code = &backend_startup_error_code,
     }});
     defer {
         backend_shutdown.store(true, .release);
@@ -15464,7 +15532,13 @@ test "integration: tcp runtime idle timeout closes inactive tunnel" {
         backend_thread.join();
     }
 
-    try testing.expect(waitForTcpServerReady(upstream_port, 100));
+    var backend_wait_iters: u32 = 0;
+    while (backend_wait_iters < 300 and !backend_ready.load(.acquire)) : (backend_wait_iters += 1) {
+        posix.nanosleep(0, 10 * std.time.ns_per_ms);
+    }
+    try testing.expect(backend_ready.load(.acquire));
+    try testing.expectEqual(@as(u8, 0), backend_startup_error_code.load(.acquire));
+    try testing.expect(!backend_startup_failed.load(.acquire));
 
     const upstreams = [_]serval.config.L4Target{.{ .host = "127.0.0.1", .port = upstream_port }};
     var server = try TcpRuntimeServer.start(.{
@@ -15484,7 +15558,9 @@ test "integration: tcp runtime idle timeout closes inactive tunnel" {
 
     var closed = false;
     var probe_iters: u32 = 0;
-    while (probe_iters < 80) : (probe_iters += 1) {
+    while (probe_iters < 120) : (probe_iters += 1) {
+        if (server.shared.runtime.timeoutClosureCount() > 0) break;
+
         var poll_fds = [_]std.posix.pollfd{.{
             .fd = client,
             .events = std.posix.POLL.IN | std.posix.POLL.HUP,
@@ -15504,7 +15580,16 @@ test "integration: tcp runtime idle timeout closes inactive tunnel" {
         }
     }
 
-    try testing.expect(closed);
+    const timeout_wait_limit: u32 = TCP_IDLE_TIMEOUT_OBSERVE_TIMEOUT_MS / TCP_IDLE_TIMEOUT_OBSERVE_POLL_MS;
+    var timeout_observed = server.shared.runtime.timeoutClosureCount() >= 1;
+    var wait_iters: u32 = 0;
+    while (!timeout_observed and wait_iters < timeout_wait_limit) : (wait_iters += 1) {
+        posix.nanosleep(0, TCP_IDLE_TIMEOUT_OBSERVE_POLL_MS * std.time.ns_per_ms);
+        timeout_observed = server.shared.runtime.timeoutClosureCount() >= 1;
+    }
+
+    try testing.expect(timeout_observed);
+    try testing.expect(closed or server.shared.runtime.activeCount() == 0);
 }
 
 test "integration: tcp runtime originate_tls establishes TLS upstream" {

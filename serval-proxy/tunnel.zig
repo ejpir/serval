@@ -202,7 +202,8 @@ fn relayImpl(
     const start_ns = time.monotonicNanos();
     var shared = RelayShared.init(start_ns);
     var group: Io.Group = .init;
-    defer group.cancel(io);
+    var cancel_requested = std.atomic.Value(bool).init(false);
+    defer if (!cancel_requested.swap(true, .acq_rel)) group.cancel(io);
 
     // Run both directions with the same relay state machine. One side is
     // attached as a concurrent fiber; the other runs on the current fiber.
@@ -217,7 +218,8 @@ fn relayImpl(
         initial_upstream_to_client,
         Side.upstream,
         Side.client,
-    }) catch {
+    }) catch |err| {
+        debugLog("tunnel: relay fiber spawn failed err={s}", .{@errorName(err)});
         shared.finishTermination(.upstream_error, io);
         return shared.snapshot(io);
     };
@@ -226,7 +228,12 @@ fn relayImpl(
         const check_interval_ms = relay_cfg.idle_check_interval_ms orelse 1000;
         assert(check_interval_ms > 0);
 
-        group.concurrent(io, idleWatchdog, .{ &shared, &group, io, idle_timeout_ns, check_interval_ms }) catch {
+        group.concurrent(
+            io,
+            idleWatchdog,
+            .{ &shared, &group, &cancel_requested, io, idle_timeout_ns, check_interval_ms, client_socket, upstream_socket },
+        ) catch |err| {
+            debugLog("tunnel: idle watchdog spawn failed err={s}", .{@errorName(err)});
             shared.finishTermination(.upstream_error, io);
             return shared.snapshot(io);
         };
@@ -354,12 +361,18 @@ fn waitForSteadyState(shared: *RelayShared, io: Io) Io.Cancelable!void {
 fn idleWatchdog(
     shared: *RelayShared,
     group: *Io.Group,
+    cancel_requested: *std.atomic.Value(bool),
     io: Io,
     idle_timeout_ns: u64,
     idle_check_interval_ms: i32,
+    client_socket: *Socket,
+    upstream_socket: *Socket,
 ) Io.Cancelable!void {
     assert(@intFromPtr(shared) != 0);
     assert(@intFromPtr(group) != 0);
+    assert(@intFromPtr(cancel_requested) != 0);
+    assert(@intFromPtr(client_socket) != 0);
+    assert(@intFromPtr(upstream_socket) != 0);
     assert(idle_timeout_ns > 0);
     assert(idle_check_interval_ms > 0);
 
@@ -373,9 +386,33 @@ fn idleWatchdog(
 
         if (shared.idleTimeoutExceeded(io, idle_timeout_ns)) {
             shared.finishTermination(.idle_timeout, io);
-            group.cancel(io);
+            forceAbortSocketIo(client_socket);
+            forceAbortSocketIo(upstream_socket);
+            if (!cancel_requested.swap(true, .acq_rel)) {
+                group.cancel(io);
+            }
             return;
         }
+    }
+}
+
+fn forceAbortSocketIo(socket: *Socket) void {
+    assert(@intFromPtr(socket) != 0);
+
+    switch (socket.*) {
+        .plain => |plain| {
+            const rc = linux.shutdown(plain.fd, @intCast(std.posix.SHUT.RDWR));
+            switch (linux.errno(rc)) {
+                .SUCCESS => {},
+                .INTR => {},
+                else => |err| {
+                    debugLog("tunnel: force-abort shutdown failed fd={d} errno={t}", .{ plain.fd, err });
+                },
+            }
+        },
+        .tls => {
+            // TLS sockets are not force-shutdown here; they rely on normal cancellation paths.
+        },
     }
 }
 

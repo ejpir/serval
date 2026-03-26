@@ -39,7 +39,6 @@ const serval_socket = @import("serval-socket");
 const Socket = serval_socket.Socket;
 
 const serval_client = @import("serval-client");
-const readHeaderBytes = serval_client.readHeaderBytes;
 const ResponseError = serval_client.ResponseError;
 const HeaderBytesResult = serval_client.HeaderBytesResult;
 
@@ -122,6 +121,7 @@ pub fn forwardResponse(
     upstream_socket: *Socket,
     client_socket: *Socket,
     is_pooled: bool,
+    is_head_request: bool,
 ) ForwardError!ForwardResult {
     _ = client_stream; // Unused - client_socket provides the Socket
     // Precondition: socket file descriptors must be valid (non-negative).
@@ -221,10 +221,12 @@ pub fn forwardResponse(
             // instead of raw splice+poll, avoiding deadlock with concurrent body streaming.
             total_body_bytes += try forwardBody(upstream_socket, client_socket, remaining, io);
         }
+    } else if (is_head_request or status == 204 or status == 304) {
+        debugLog("recv: no body expected (head={} status={d})", .{ is_head_request, status });
+    } else {
+        debugLog("recv: close-delimited response rejected status={d} pre_read={d}", .{ status, pre_read_body.len });
+        return ForwardError.InvalidResponse;
     }
-    // else: No body (e.g., 204, 304) or connection-close semantics.
-    // Connection-close without Content-Length or chunked is unsupported
-    // for now (would require read-until-EOF which complicates pooling).
 
     const recv_end_ns = time.monotonicNanos();
     const recv_duration_ns = time.elapsedNanos(recv_start_ns, recv_end_ns);
@@ -249,25 +251,7 @@ pub fn receiveHeaders(
     buffer: *[config.MAX_HEADER_SIZE_BYTES]u8,
     is_pooled: bool,
 ) ForwardError!HeadersResult {
-    _ = io; // Unused - Socket handles I/O internally
-    // Precondition: socket fd must be valid.
-    assert(conn.get_fd() >= 0);
-    // Precondition: buffer is provided (not null via pointer).
-    assert(buffer.len == config.MAX_HEADER_SIZE_BYTES);
-
-    // Delegate to serval-client for header reading.
-    // TigerStyle: Reuse code from serval-client, handle error mapping locally.
-    const result = readHeaderBytes(&conn.socket, buffer) catch |err| {
-        return mapResponseErrorToForwardError(err, is_pooled);
-    };
-
-    // S2: Postcondition - header_end is within total_bytes
-    assert(result.header_end <= result.total_bytes);
-
-    return .{
-        .header_len = @intCast(result.total_bytes),
-        .header_end = @intCast(result.header_end),
-    };
+    return receiveHeadersWithPreread(conn, io, buffer, is_pooled, 0);
 }
 
 /// Receive HTTP response headers with pre-existing data in buffer.
@@ -281,7 +265,6 @@ fn receiveHeadersWithPreread(
     is_pooled: bool,
     pre_read_bytes: usize,
 ) ForwardError!HeadersResult {
-    _ = io; // Unused - Socket handles I/O internally
     // Precondition: socket fd must be valid.
     assert(conn.get_fd() >= 0);
     // Precondition: buffer is provided (not null via pointer).
@@ -290,7 +273,7 @@ fn receiveHeadersWithPreread(
     assert(pre_read_bytes <= config.MAX_HEADER_SIZE_BYTES);
 
     // Read header bytes with initial offset for pre-read data
-    const result = readHeaderBytesWithPreread(&conn.socket, buffer, pre_read_bytes) catch |err| {
+    const result = readHeaderBytesWithPreread(&conn.socket, buffer, pre_read_bytes, io) catch |err| {
         return mapResponseErrorToForwardError(err, is_pooled);
     };
 
@@ -315,6 +298,7 @@ fn readHeaderBytesWithPreread(
     socket: *Socket,
     header_buf: *[config.MAX_HEADER_SIZE_BYTES]u8,
     pre_read_bytes: usize,
+    io: Io,
 ) ResponseError!HeaderBytesResult {
     // S1: Preconditions
     assert(header_buf.len > 0);
@@ -344,11 +328,9 @@ fn readHeaderBytesWithPreread(
             return error.ResponseHeadersTooLarge;
         }
 
-        // Read more data
+        // Read more data (fiber-safe for plain sockets).
         const remaining_buf = header_buf[total_read..];
-        const bytes_read = socket.read(remaining_buf) catch |err| {
-            return mapSocketErrorLocal(err);
-        };
+        const bytes_read = try readFiberSafe(socket, remaining_buf, io);
 
         if (bytes_read == 0) {
             // Connection closed before complete headers
@@ -363,6 +345,23 @@ fn readHeaderBytesWithPreread(
 
     // S3: Bounded loop exhausted - should not happen with correct limits
     return error.ResponseHeadersTooLarge;
+}
+
+/// Fiber-safe socket read. Plain sockets use io.vtable.netRead; TLS uses
+/// blocking socket.read() because TLS handshakes cannot be yielded mid-flight.
+fn readFiberSafe(socket: *Socket, buf: []u8, io: Io) ResponseError!usize {
+    assert(buf.len > 0);
+    return switch (socket.*) {
+        .plain => |plain| {
+            var read_bufs: [1][]u8 = .{buf};
+            return io.vtable.netRead(io.userdata, plain.fd, &read_bufs) catch {
+                return error.RecvFailed;
+            };
+        },
+        .tls => socket.read(buf) catch |err| {
+            return mapSocketErrorLocal(err);
+        },
+    };
 }
 
 /// Import SocketError from serval-socket.
@@ -403,6 +402,7 @@ fn mapResponseErrorToForwardError(err: ResponseError, is_pooled: bool) ForwardEr
 // =============================================================================
 
 const testing = std.testing;
+const posix = std.posix;
 
 // -----------------------------------------------------------------------------
 // HeadersResult Tests
@@ -881,6 +881,93 @@ test "ForwardResult: status code range" {
         .connection_reused = false,
     };
     try testing.expectEqual(@as(u16, 599), result_599.status);
+}
+
+fn writeAllToFd(fd: i32, data: []const u8) !void {
+    var written: usize = 0;
+    while (written < data.len) {
+        written += try posix.write(fd, data[written..]);
+    }
+}
+
+test "forwardResponse: non-HEAD unframed 200 returns InvalidResponse" {
+    var evented: std.Io.Evented = undefined;
+    try evented.init(std.testing.allocator, .{ .thread_limit = 0 });
+    defer evented.deinit();
+    const io = evented.io();
+
+    const upstream_pair = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(upstream_pair[0]);
+    defer posix.close(upstream_pair[1]);
+
+    const client_pair = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(client_pair[0]);
+    defer posix.close(client_pair[1]);
+
+    const response_data = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
+    try writeAllToFd(upstream_pair[1], response_data);
+
+    var upstream_socket: Socket = .{ .plain = .{ .fd = upstream_pair[0] } };
+    var upstream_conn = Connection{ .socket = upstream_socket };
+    var client_socket: Socket = .{ .plain = .{ .fd = client_pair[1] } };
+    const client_stream: Io.net.Stream = undefined;
+
+    const result = forwardResponse(io, &upstream_conn, client_stream, &upstream_socket, &client_socket, false, false);
+    try testing.expectError(ForwardError.InvalidResponse, result);
+}
+
+test "forwardResponse: HEAD unframed 200 succeeds with zero body" {
+    var evented: std.Io.Evented = undefined;
+    try evented.init(std.testing.allocator, .{ .thread_limit = 0 });
+    defer evented.deinit();
+    const io = evented.io();
+
+    const upstream_pair = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(upstream_pair[0]);
+    defer posix.close(upstream_pair[1]);
+
+    const client_pair = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(client_pair[0]);
+    defer posix.close(client_pair[1]);
+
+    const response_data = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
+    try writeAllToFd(upstream_pair[1], response_data);
+
+    var upstream_socket: Socket = .{ .plain = .{ .fd = upstream_pair[0] } };
+    var upstream_conn = Connection{ .socket = upstream_socket };
+    var client_socket: Socket = .{ .plain = .{ .fd = client_pair[1] } };
+    const client_stream: Io.net.Stream = undefined;
+
+    const result = try forwardResponse(io, &upstream_conn, client_stream, &upstream_socket, &client_socket, false, true);
+    try testing.expectEqual(@as(u16, 200), result.status);
+    const header_len = std.mem.indexOf(u8, response_data, "\r\n\r\n").? + 4;
+    try testing.expectEqual(@as(u64, header_len), result.response_bytes);
+}
+
+test "forwardResponse: 204 without framing succeeds (no body by spec)" {
+    var evented: std.Io.Evented = undefined;
+    try evented.init(std.testing.allocator, .{ .thread_limit = 0 });
+    defer evented.deinit();
+    const io = evented.io();
+
+    const upstream_pair = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(upstream_pair[0]);
+    defer posix.close(upstream_pair[1]);
+
+    const client_pair = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(client_pair[0]);
+    defer posix.close(client_pair[1]);
+
+    const response_data = "HTTP/1.1 204 No Content\r\n\r\n";
+    try writeAllToFd(upstream_pair[1], response_data);
+
+    var upstream_socket: Socket = .{ .plain = .{ .fd = upstream_pair[0] } };
+    var upstream_conn = Connection{ .socket = upstream_socket };
+    var client_socket: Socket = .{ .plain = .{ .fd = client_pair[1] } };
+    const client_stream: Io.net.Stream = undefined;
+
+    const result = try forwardResponse(io, &upstream_conn, client_stream, &upstream_socket, &client_socket, false, false);
+    try testing.expectEqual(@as(u16, 204), result.status);
 }
 
 // -----------------------------------------------------------------------------

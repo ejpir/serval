@@ -63,21 +63,37 @@ pub const buildRequestBuffer = client_request.buildRequestBuffer;
 // Proxy-specific Request Sending (adapts Connection to Socket)
 // =============================================================================
 
-/// Send buffer to connection using Socket abstraction.
-/// Handles both TLS and plaintext transparently.
-/// TigerStyle: Explicit io parameter for async I/O (unused - Socket handles I/O).
+/// Send buffer to connection using fiber-safe I/O for plain sockets.
+/// TLS falls back to blocking writes because handshake/state transitions
+/// cannot safely yield mid-operation.
 pub fn sendBuffer(conn: *Connection, io: Io, data: []const u8) ForwardError!void {
-    _ = io; // Unused - Socket handles I/O internally
     assert(data.len > 0); // S1: precondition - data must not be empty
 
-    // Delegate to serval-client's sendBuffer, mapping errors
-    client_request.sendBufferToSocket(&conn.socket, data) catch |err| {
-        return switch (err) {
-            client_request.ClientError.SendFailed => ForwardError.SendFailed,
-            client_request.ClientError.SendTimeout => ForwardError.SendFailed,
-            client_request.ClientError.BufferTooSmall => ForwardError.SendFailed,
-        };
-    };
+    switch (conn.socket) {
+        .plain => |plain| {
+            var sent: usize = 0;
+            var iterations: u32 = 0;
+            while (sent < data.len and iterations < client_request.MAX_WRITE_ITERATIONS) : (iterations += 1) {
+                const pending = data[sent..];
+                const write_slices = [_][]const u8{pending};
+                const n = io.vtable.netWrite(io.userdata, plain.fd, &.{}, &write_slices, 1) catch {
+                    return ForwardError.SendFailed;
+                };
+                if (n == 0) return ForwardError.SendFailed;
+                sent += n;
+            }
+            if (sent < data.len) return ForwardError.SendFailed;
+        },
+        .tls => {
+            client_request.sendBufferToSocket(&conn.socket, data) catch |err| {
+                return switch (err) {
+                    client_request.ClientError.SendFailed => ForwardError.SendFailed,
+                    client_request.ClientError.SendTimeout => ForwardError.SendFailed,
+                    client_request.ClientError.BufferTooSmall => ForwardError.SendFailed,
+                };
+            };
+        },
+    }
 }
 
 /// Send request body to connection (TLS or plaintext).

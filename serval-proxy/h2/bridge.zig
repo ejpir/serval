@@ -77,10 +77,10 @@ pub const ReceiveAction = union(enum) {
 fn shouldLogIdleWait(since_last_action_ns: u64) bool {
     // Reduce WouldBlock log flood while preserving periodic visibility.
     // Log aggressively during first 250ms, then roughly once per second.
-    if (since_last_action_ns <= 250 * std.time.ns_per_ms) return true;
-    const second_ns: u64 = std.time.ns_per_s;
+    if (since_last_action_ns <= 250 * time.ns_per_ms) return true;
+    const second_ns: u64 = time.ns_per_s;
     const phase_ns = since_last_action_ns % second_ns;
-    return phase_ns <= 50 * std.time.ns_per_ms;
+    return phase_ns <= 50 * time.ns_per_ms;
 }
 
 fn goawayAffectsActiveTargetStream(upstream_stream_id: u32, goaway: h2.GoAway) bool {

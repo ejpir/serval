@@ -113,7 +113,13 @@ fn socket_compat(domain: u32, sock_type: u32, protocol: u32) anyerror!socket_t {
         switch (c.errno(rc)) {
             .SUCCESS => return @intCast(rc),
             .INTR => continue,
-            else => return error.SocketFailed,
+            else => |errno_value| {
+                std.log.err(
+                    "posix_compat.socket_compat failed: domain={d} type={d} proto={d} errno={s}",
+                    .{ domain, sock_type, protocol, @tagName(errno_value) },
+                );
+                return error.SocketFailed;
+            },
         }
     }
 }

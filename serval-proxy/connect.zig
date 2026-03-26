@@ -135,8 +135,12 @@ pub fn connectUpstream(
         cfg.verify_upstream_tls,
     );
 
-    // Connect using serval-client
-    const client_result = client.connect(upstream.*, io) catch |err| {
+    // Connect using serval-client with configured timeout.
+    const connect_timeout: Io.Timeout = .{ .duration = .{
+        .raw = Io.Duration.fromNanoseconds(@intCast(cfg.timeout_ns)),
+        .clock = .awake,
+    } };
+    const client_result = client.connectWithTimeout(upstream.*, io, connect_timeout) catch |err| {
         debugLog("connect: FAILED err={s}", .{@errorName(err)});
         return mapClientError(err);
     };
@@ -257,6 +261,20 @@ test "ConnectConfig: timeout_ns uses nanoseconds" {
     };
 
     try testing.expectEqual(@as(u64, 30_000_000_000), config.timeout_ns);
+}
+
+test "ConnectConfig: timeout_ns converts to non-none Io.Timeout (compile-time guard)" {
+    const cfg = ConnectConfig{
+        .timeout_ns = 5_000_000_000,
+        .verify_upstream_tls = false,
+    };
+    assert(cfg.timeout_ns > 0);
+
+    const timeout: Io.Timeout = .{ .duration = .{
+        .raw = Io.Duration.fromNanoseconds(@intCast(cfg.timeout_ns)),
+        .clock = .awake,
+    } };
+    try testing.expect(timeout != .none);
 }
 
 // =============================================================================

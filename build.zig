@@ -1179,6 +1179,51 @@ pub fn build(b: *std.Build) void {
     );
     integration_test_2_step.dependOn(&run_integration_test_2.step);
 
+    const integration_test_16 = b.addTest(.{
+        .name = "integration_test_16",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: native websocket endpoint and proxy websocket fallback coexist"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_16);
+    const run_integration_test_16 = b.addRunArtifact(integration_test_16);
+
+    const integration_test_16_step = b.step(
+        "test-integration-16",
+        "Run integration test 16 (native websocket endpoint and proxy websocket fallback coexist)",
+    );
+    integration_test_16_step.dependOn(&run_integration_test_16.step);
+
+    const integration_test_136 = b.addTest(.{
+        .name = "integration_test_136",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: tcp runtime accepts downstream and records upstream outcome"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_136);
+    const run_integration_test_136 = b.addRunArtifact(integration_test_136);
+
+    const integration_test_136_step = b.step(
+        "test-integration-136",
+        "Run integration test 136 (tcp runtime accepts downstream and records upstream outcome)",
+    );
+    integration_test_136_step.dependOn(&run_integration_test_136.step);
+
+    const integration_test_139 = b.addTest(.{
+        .name = "integration_test_139",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: tcp runtime idle timeout closes inactive tunnel"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_139);
+    const run_integration_test_139 = b.addRunArtifact(integration_test_139);
+
+    const integration_test_139_step = b.step(
+        "test-integration-139",
+        "Run integration test 139 (tcp runtime idle timeout closes inactive tunnel)",
+    );
+    integration_test_139_step.dependOn(&run_integration_test_139.step);
+
     const integration_debug_port_step = b.step(
         "test-integration-debug-port",
         "Run the two port-sensitive integration tests (echo backend 200 + lb forwards single backend)",

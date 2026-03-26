@@ -175,7 +175,7 @@ pub const Runtime = struct {
 
     pub fn timeoutClosureCount(self: *const Self) u64 {
         assert(@intFromPtr(self) != 0);
-        return self.timeout_closures.load(.acquire);
+        return self.timeout_closures.load(.seq_cst);
     }
 
     pub fn upstreamBytes(self: *const Self) u64 {
@@ -269,7 +269,7 @@ fn handleAcceptedConnection(runtime: *Runtime, stream: Io.net.Stream, io: Io) vo
     _ = runtime.upstream_bytes.fetchAdd(tunnel_stats.client_to_upstream_bytes, .monotonic);
     _ = runtime.downstream_bytes.fetchAdd(tunnel_stats.upstream_to_client_bytes, .monotonic);
     if (tunnel_stats.termination == .idle_timeout) {
-        const timeout_count = runtime.timeout_closures.fetchAdd(1, .monotonic) + 1;
+        const timeout_count = runtime.timeout_closures.fetchAdd(1, .seq_cst) + 1;
         if (shouldLogSampled(timeout_count, timeout_closure_log_sample_interval)) {
             log.warn(
                 "event=tcp_tunnel_idle_timeout count={d} upstream_idx={d}",

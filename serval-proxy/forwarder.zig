@@ -1051,7 +1051,8 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             // Runs concurrently with body streaming when has_body is true.
             const recv_span = self.tracer.startSpan("recv_response", forward_span);
             debugLog("recv: awaiting response headers", .{});
-            var result = forwardResponse(io, &mutable_conn, client_stream, &mutable_conn.socket, &client_socket, is_pooled) catch |err| {
+            const is_head = request.method == .HEAD;
+            var result = forwardResponse(io, &mutable_conn, client_stream, &mutable_conn.socket, &client_socket, is_pooled, is_head) catch |err| {
                 self.tracer.endSpan(recv_span, @errorName(err));
                 return err;
             };
@@ -1070,20 +1071,25 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             // Wait for body streaming to finish before releasing the connection.
             // Must happen before pool.release so the background task no longer
             // holds references to mutable_conn.
+            var body_stream_ok = true;
             body_group.await(io) catch |err| {
                 debugLog("send: body group await failed err={s}", .{@errorName(err)});
+                body_stream_ok = false;
             };
             if (has_body) {
                 _ = body_ctx.result catch |err| {
                     debugLog("send: body stream error={s}", .{@errorName(err)});
+                    body_stream_ok = false;
                 };
             }
 
+            // Mark unhealthy when body streaming fails to avoid pooling a
+            // potentially poisoned keep-alive connection.
             // RFC 9112 recommends checking upstream's Connection: close header and not
             // pooling if present. Current implementation relies on StaleConnection retry
             // (Pingora-style). Consider adding explicit header check if retry overhead
             // becomes measurable.
-            self.pool.release(upstream.idx, mutable_conn, true);
+            self.pool.release(upstream.idx, mutable_conn, body_stream_ok);
 
             debugLog("forward: complete status={d} pooled={}", .{ result.status, is_pooled });
             return result;

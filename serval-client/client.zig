@@ -410,6 +410,18 @@ fn tcpConnect(address: Io.net.IpAddress, io: Io, connect_timeout: Io.Timeout) !i
         .mode = .stream,
         .timeout = connect_timeout,
     }) catch |err| {
+        if (err == error.OptionUnsupported and connect_timeout != .none) {
+            // Some IO backends (notably uring today) do not yet support
+            // connect-time timeout options. Fall back to backend-default connect
+            // semantics so callers can still establish connections.
+            const fallback = address.connect(io, .{
+                .mode = .stream,
+                .timeout = .none,
+            }) catch |fallback_err| {
+                return fallback_err;
+            };
+            return fallback.socket.handle;
+        }
         return err;
     };
 
