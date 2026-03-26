@@ -319,7 +319,9 @@ pub const RouterClient = struct {
 
                 // Sleep with exponential backoff
                 const backoff_ns = backoff_ms * time.ns_per_ms;
-                std.Io.sleep(std.Options.debug_io, .fromNanoseconds(@intCast(backoff_ns)), .awake) catch {};
+                std.Io.sleep(std.Options.debug_io, .fromNanoseconds(@intCast(backoff_ns)), .awake) catch |sleep_err| {
+                    log.warn("router client retry sleep failed: {s}", .{@errorName(sleep_err)});
+                };
 
                 // Increase backoff (capped at MAX_BACKOFF_MS)
                 backoff_ms = @min(backoff_ms * 2, MAX_BACKOFF_MS);

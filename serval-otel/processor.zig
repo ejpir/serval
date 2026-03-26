@@ -307,8 +307,8 @@ pub const ConsoleExporter = struct {
         for (spans) |*span| {
             var trace_buf: [32]u8 = undefined;
             var span_buf: [16]u8 = undefined;
-            std.debug.print(
-                "[SPAN] {s} trace={s} span={s} duration_us={}\n",
+            std.log.info(
+                "[SPAN] {s} trace={s} span={s} duration_us={}",
                 .{
                     span.getName(),
                     span.span_context.trace_id.toHex(&trace_buf),

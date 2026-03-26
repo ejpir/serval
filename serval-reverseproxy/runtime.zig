@@ -175,7 +175,7 @@ pub const Runtime = struct {
             maybe_acme_thread = try std.Thread.spawn(.{}, AcmeRunCtx.run, .{&maybe_acme_run_ctx.?});
         }
 
-        std.debug.print("reverseproxy runtime listening on :{d}\n", .{listen_port});
+        std.log.info("reverseproxy runtime listening on :{d}", .{listen_port});
         try server.run(self.io_threaded.io(), &shutdown, null);
     }
 };
@@ -325,8 +325,11 @@ fn findPoolIndex(pools: []const ir.Pool, pool_id: []const u8) !u8 {
     return error.MissingPoolReference;
 }
 
-fn normalizeHostForRouter(host: []const u8) []const u8 {
+fn normalizeHostForRouter(host: []const u8) ?[]const u8 {
     assert(host.len > 0);
+
+    if (std.mem.eql(u8, host, "*")) return null;
+
     const colon_index = std.mem.indexOfScalar(u8, host, ':') orelse return host;
     if (colon_index == 0) return host;
     return host[0..colon_index];
@@ -403,7 +406,7 @@ test "load parses config and derives listener/pool upstreams" {
     defer {
         std.Io.Dir.cwd().deleteFile(std.Options.debug_io, path) catch |err| {
             if (err != error.FileNotFound) {
-                std.debug.print("warn: cleanup failed for {s}: {s}\n", .{ path, @errorName(err) });
+                std.log.warn("cleanup failed for {s}: {s}", .{ path, @errorName(err) });
             }
         };
     }
@@ -413,4 +416,38 @@ test "load parses config and derives listener/pool upstreams" {
 
     try std.testing.expectEqual(@as(u32, 1), runtime.pool_count);
     try std.testing.expectEqual(@as(u16, 18001), runtime.pool_upstream_storage[0].port);
+}
+
+test "load netbird dsl replacement routes and protocols" {
+    var runtime = try load(.{ .config_file = "examples/reverseproxy/netbird.dsl" });
+    defer runtime.deinit();
+
+    try std.testing.expectEqual(@as(u32, 7), runtime.pool_count);
+    try std.testing.expectEqual(@as(u32, 26), runtime.route_count);
+
+    const signal_grpc_idx = findPoolIndexForRoute(&runtime, "signal-grpc");
+    const management_grpc_idx = findPoolIndexForRoute(&runtime, "management-grpc");
+    const signal_http_idx = findPoolIndexForRoute(&runtime, "signal-http");
+    const dashboard_idx = findPoolIndexForRoute(&runtime, "dashboard-catchall");
+
+    try std.testing.expectEqual(core.HttpProtocol.h2c, runtime.pool_upstream_storage[signal_grpc_idx].http_protocol);
+    try std.testing.expectEqual(core.HttpProtocol.h2c, runtime.pool_upstream_storage[management_grpc_idx].http_protocol);
+    try std.testing.expectEqual(core.HttpProtocol.h1, runtime.pool_upstream_storage[signal_http_idx].http_protocol);
+    try std.testing.expectEqual(core.HttpProtocol.h1, runtime.pool_upstream_storage[dashboard_idx].http_protocol);
+
+    try std.testing.expect(runtime.route_storage[0].matcher.host == null);
+}
+
+fn findPoolIndexForRoute(runtime: *const Runtime, route_name: []const u8) u8 {
+    assert(route_name.len > 0);
+    assert(runtime.route_count <= runtime.route_storage.len);
+
+    var route_index: u32 = 0;
+    while (route_index < runtime.route_count) : (route_index += 1) {
+        const idx: usize = @intCast(route_index);
+        if (!std.mem.eql(u8, runtime.route_storage[idx].name, route_name)) continue;
+        return runtime.route_storage[idx].pool_idx;
+    }
+
+    unreachable;
 }

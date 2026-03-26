@@ -149,10 +149,18 @@ fn forwardBodySplice(upstream_fd: i32, client_fd: i32, length_bytes: u64) Forwar
     var pipe_read_flags = getFdFlags(pipe_fds[0]) catch return ForwardError.SpliceFailed;
     var pipe_write_flags = getFdFlags(pipe_fds[1]) catch return ForwardError.SpliceFailed;
     defer {
-        setFdFlags(upstream_fd, upstream_flags) catch {};
-        setFdFlags(client_fd, client_flags) catch {};
-        setFdFlags(pipe_fds[0], pipe_read_flags) catch {};
-        setFdFlags(pipe_fds[1], pipe_write_flags) catch {};
+        setFdFlags(upstream_fd, upstream_flags) catch |err| {
+            std.log.warn("splice restore flags failed fd={d} err={s}", .{ upstream_fd, @errorName(err) });
+        };
+        setFdFlags(client_fd, client_flags) catch |err| {
+            std.log.warn("splice restore flags failed fd={d} err={s}", .{ client_fd, @errorName(err) });
+        };
+        setFdFlags(pipe_fds[0], pipe_read_flags) catch |err| {
+            std.log.warn("splice restore flags failed fd={d} err={s}", .{ pipe_fds[0], @errorName(err) });
+        };
+        setFdFlags(pipe_fds[1], pipe_write_flags) catch |err| {
+            std.log.warn("splice restore flags failed fd={d} err={s}", .{ pipe_fds[1], @errorName(err) });
+        };
     }
 
     setFdNonBlocking(upstream_fd, &upstream_flags) catch return ForwardError.SpliceFailed;

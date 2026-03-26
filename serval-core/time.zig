@@ -61,7 +61,9 @@ pub fn sleep(duration_ns: u64) void {
         std.Options.debug_io,
         .fromNanoseconds(@intCast(duration_ns)),
         .awake,
-    ) catch {};
+    ) catch |err| {
+        std.log.warn("time.sleep failed: {s}", .{@errorName(err)});
+    };
 }
 
 // =============================================================================

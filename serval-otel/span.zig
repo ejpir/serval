@@ -389,7 +389,9 @@ test "Span disabled is no-op" {
     span.setIntAttribute("key", 42);
     try std.testing.expectEqual(@as(u8, 0), span.attribute_count);
 
-    span.addEvent("event") catch {};
+    span.addEvent("event") catch |err| {
+        std.log.warn("span disabled addEvent failed unexpectedly: {s}", .{@errorName(err)});
+    };
     try std.testing.expectEqual(@as(u8, 0), span.event_count);
 
     span.setOk();

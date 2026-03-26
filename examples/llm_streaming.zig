@@ -228,7 +228,9 @@ const LlmHandler = struct {
 
         // Simulate thinking delay between tokens
         if (self.token_idx > 0) {
-            std.Io.sleep(std.Options.debug_io, .fromNanoseconds(@intCast(TOKEN_DELAY_NS)), .awake) catch {};
+            std.Io.sleep(std.Options.debug_io, .fromNanoseconds(@intCast(TOKEN_DELAY_NS)), .awake) catch |err| {
+                std.log.warn("llm streaming token delay sleep failed: {s}", .{@errorName(err)});
+            };
         }
 
         // Get current token

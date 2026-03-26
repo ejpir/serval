@@ -177,7 +177,9 @@ pub const StatsDisplay = struct {
 
         while (self.running.load(.acquire) and iteration < max_iterations) : (iteration += 1) {
             self.drawHeader();
-            std.Io.sleep(std.Options.debug_io, .fromSeconds(1), .awake) catch {};
+            std.Io.sleep(std.Options.debug_io, .fromSeconds(1), .awake) catch |err| {
+                std.log.warn("stats display sleep failed: {s}", .{@errorName(err)});
+            };
         }
     }
 

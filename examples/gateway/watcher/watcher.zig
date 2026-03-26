@@ -996,7 +996,9 @@ pub const Watcher = struct {
 
         // Sleep for current backoff duration.
         const backoff_ns: u64 = @as(u64, current_ms) * std.time.ns_per_ms;
-        std.Io.sleep(std.Options.debug_io, .fromNanoseconds(@intCast(backoff_ns)), .awake) catch {};
+        std.Io.sleep(std.Options.debug_io, .fromNanoseconds(@intCast(backoff_ns)), .awake) catch |err| {
+            log.warn("watcher backoff sleep failed: {s}", .{@errorName(err)});
+        };
 
         // Increase backoff for next attempt (capped at MAX_BACKOFF_MS).
         const new_backoff = current_ms * BACKOFF_MULTIPLIER;

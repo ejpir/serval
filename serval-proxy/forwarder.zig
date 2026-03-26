@@ -1070,7 +1070,9 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             // Wait for body streaming to finish before releasing the connection.
             // Must happen before pool.release so the background task no longer
             // holds references to mutable_conn.
-            body_group.await(io) catch {};
+            body_group.await(io) catch |err| {
+                debugLog("send: body group await failed err={s}", .{@errorName(err)});
+            };
             if (has_body) {
                 _ = body_ctx.result catch |err| {
                     debugLog("send: body stream error={s}", .{@errorName(err)});

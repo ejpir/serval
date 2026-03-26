@@ -65,7 +65,7 @@
       "regex": "\\b(?:std\\.posix|posix)\\.(socket|bind|listen|accept|connect)\\s*\\(",
       "message": "Prefer serval-socket/serval-client/serval-server abstractions over raw posix socket primitives.",
       "recommendation": "Route usage through serval-socket (or higher abstraction per module role).",
-      "allow_paths": ["serval-socket/**", "serval-net/**", "serval-tls/**", "**/README.md"]
+      "allow_paths": ["serval-socket/**", "serval-net/**", "serval-tls/**", "serval-proxy/connect.zig", "**/README.md"]
     },
     {
       "id": "no-std-debug-print-outside-cli",

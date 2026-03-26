@@ -1032,7 +1032,9 @@ pub fn run(
     defer if (server_tls_ctx) |ctx| ssl.SSL_CTX_free(ctx);
 
     var group: Io.Group = .init;
-    defer group.await(io) catch {};
+    defer group.await(io) catch |err| {
+        log.warn("h2 server: task group await failed during shutdown: {s}", .{@errorName(err)});
+    };
 
     var next_connection_id: u64 = 1;
 

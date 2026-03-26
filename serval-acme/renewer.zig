@@ -172,7 +172,7 @@ pub const Renewer = struct {
             null,
             self.hook_provider,
         ) catch |err| {
-            std.debug.print("error: ACME issuance failed: {s}\n", .{@errorName(err)});
+            std.log.err("ACME issuance failed: {s}", .{@errorName(err)});
             return switch (err) {
                 error.InvalidRuntimeConfig => .fatal_failure,
                 else => .transient_failure,
@@ -181,7 +181,7 @@ pub const Renewer = struct {
 
         return switch (self.activate_fn(self.activate_ctx, persisted.cert_path, persisted.key_path)) {
             .success => blk: {
-                std.debug.print("ACME issuance succeeded; activated cert={s} key={s}\n", .{ persisted.cert_path, persisted.key_path });
+                std.log.info("ACME issuance succeeded; activated cert={s} key={s}", .{ persisted.cert_path, persisted.key_path });
                 break :blk .success;
             },
             .transient_failure => .transient_failure,

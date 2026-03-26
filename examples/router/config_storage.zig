@@ -282,7 +282,9 @@ pub fn swapRouter(
     // TigerStyle: Bounded wait with explicit timeout from config.
     // TigerStyle: Grace period in milliseconds converted to seconds + nanoseconds
     const grace_ns: u64 = config.CONFIG_SWAP_GRACE_MS * time.ns_per_ms;
-    std.Io.sleep(std.Options.debug_io, .fromNanoseconds(@intCast(grace_ns)), .awake) catch {};
+    std.Io.sleep(std.Options.debug_io, .fromNanoseconds(@intCast(grace_ns)), .awake) catch |err| {
+        std.log.warn("router config grace sleep failed: {s}", .{@errorName(err)});
+    };
 
     // S2: Postcondition - current_router points to newly initialized slot
     const final_router = current_router.load(.acquire);

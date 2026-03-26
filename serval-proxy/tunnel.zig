@@ -15,6 +15,7 @@ const linux = std.os.linux;
 const serval_core = @import("serval-core");
 const config = serval_core.config;
 const time = serval_core.time;
+const debugLog = serval_core.debugLog;
 
 const serval_socket = @import("serval-socket");
 const Socket = serval_socket.Socket;
@@ -321,7 +322,7 @@ fn halfCloseWrite(destination: *Socket, write_side: Side) void {
                 .SUCCESS => {},
                 .INTR => {},
                 else => |err| {
-                    std.log.debug(
+                    debugLog(
                         "tunnel: half-close failed write_side={s} fd={d} errno={t}",
                         .{ @tagName(write_side), plain.fd, err },
                     );
@@ -507,7 +508,7 @@ fn logTunnelClosure(
     destination: *const Socket,
 ) void {
     const stats = shared.snapshot(io);
-    std.log.debug(
+    debugLog(
         "tunnel: {s} read_side={s} write_side={s} source_fd={d} destination_fd={d} client_to_upstream_bytes={d} upstream_to_client_bytes={d} duration_ns={d} termination={s}",
         .{
             event,

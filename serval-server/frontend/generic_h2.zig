@@ -753,7 +753,9 @@ pub fn GenericTlsH2FrontendHandler(
             defer connection_mutex.?.unlock(self.io);
 
             var stream_writer = streamWriterFor(writer_template.?, stream_id);
-            _ = stream_writer.sendData(&[_]u8{}, true) catch {};
+            _ = stream_writer.sendData(&[_]u8{}, true) catch |err| {
+                log.warn("generic h2 websocket stream close frame failed stream={d} err={s}", .{ stream_id, @errorName(err) });
+            };
         }
 
         fn trackWebSocketStream(self: *Self, stream_id: u32, conn: Connection) Error!void {

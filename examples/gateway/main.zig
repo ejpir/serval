@@ -389,7 +389,9 @@ fn waitForShutdown(ctrl: *Controller) void {
 
     while (iteration < max_iterations) : (iteration += 1) {
         if (ctrl.isShutdown()) break;
-        std.Io.sleep(std.Options.debug_io, .fromNanoseconds(@intCast(sleep_interval_ns)), .awake) catch {};
+        std.Io.sleep(std.Options.debug_io, .fromNanoseconds(@intCast(sleep_interval_ns)), .awake) catch |err| {
+            log.warn("gateway shutdown loop sleep failed: {s}", .{@errorName(err)});
+        };
     }
 }
 
@@ -471,7 +473,9 @@ fn runEndpointSyncLoop(allocator: std.mem.Allocator, ctrl: *Controller) void {
         if (ctrl.isShutdown()) break;
 
         // Sleep first to allow initial config to be pushed
-        std.Io.sleep(std.Options.debug_io, .fromNanoseconds(@intCast(sync_interval_ns)), .awake) catch {};
+        std.Io.sleep(std.Options.debug_io, .fromNanoseconds(@intCast(sync_interval_ns)), .awake) catch |err| {
+            log.warn("gateway endpoint sync sleep failed: {s}", .{@errorName(err)});
+        };
 
         if (ctrl.isShutdown()) break;
 

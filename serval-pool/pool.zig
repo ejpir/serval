@@ -1057,13 +1057,17 @@ test "CRITICAL: Concurrent acquire/release is thread-safe" {
                 // Try to acquire
                 if (p.acquire(0)) |conn| {
                     // Simulate some work
-                    std.Thread.yield() catch {};
+                    std.Thread.yield() catch |err| {
+                        std.log.warn("pool test worker yield failed: {s}", .{@errorName(err)});
+                    };
 
                     // Release back to pool
                     p.release(0, conn, true);
                 } else {
                     // Pool was empty, yield and retry
-                    std.Thread.yield() catch {};
+                    std.Thread.yield() catch |err| {
+                        std.log.warn("pool test worker retry yield failed: {s}", .{@errorName(err)});
+                    };
                 }
             }
         }

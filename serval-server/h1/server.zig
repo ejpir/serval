@@ -3028,7 +3028,7 @@ pub fn Server(
                                 handler.handleWebSocket(&ctx, &parser.request, &ws_session) catch |err| {
                                     websocket_error_name = @errorName(err);
                                     if (ws_session.state() == .open) {
-                                        ws_session.close(serval_websocket.close_internal_error, "") catch |close_err| {
+                                        ws_session.close(serval_websocket.close.internal_error, "") catch |close_err| {
                                             if (websocket_error_name == null) websocket_error_name = @errorName(close_err);
                                         };
                                     }

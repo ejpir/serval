@@ -41,7 +41,6 @@ pub const close_invalid_frame_payload_data = close.invalid_frame_payload_data;
 pub const close_policy_violation = close.policy_violation;
 pub const close_message_too_big = close.message_too_big;
 pub const close_mandatory_extension = close.mandatory_extension;
-pub const close_internal_error = close.internal_error;
 pub const close_service_restart = close.service_restart;
 pub const close_try_again_later = close.try_again_later;
 pub const close_bad_gateway = close.bad_gateway;

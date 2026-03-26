@@ -72,6 +72,13 @@ pub fn ShieldedHandler(comptime Inner: type) type {
             return .continue_request;
         }
 
+        pub fn onRequestBody(self: *Self, ctx: *Context, chunk: []const u8, is_last: bool) BodyAction {
+            if (comptime @hasDecl(Inner, "onRequestBody")) {
+                return self.inner.onRequestBody(ctx, chunk, is_last);
+            }
+            return .continue_body;
+        }
+
         pub fn selectUpstream(self: *Self, ctx: *Context, request: *const Request) @typeInfo(@TypeOf(Inner.selectUpstream)).@"fn".return_type.? {
             return self.inner.selectUpstream(ctx, request);
         }
