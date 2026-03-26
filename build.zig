@@ -1862,6 +1862,7 @@ pub fn build(b: *std.Build) void {
     run_integration_test_reverseproxy.step.dependOn(&build_reverseproxy_runtime.step);
     run_integration_test_netbird.step.dependOn(&build_echo_backend.step);
     run_integration_test_netbird.step.dependOn(&build_netbird_proxy.step);
+    run_integration_test_netbird.step.dependOn(&build_reverseproxy_runtime.step);
     run_integration_test_2.step.dependOn(&build_lb_example.step);
     run_integration_test_77.step.dependOn(&build_lb_example.step);
     run_integration_test_78.step.dependOn(&build_lb_example.step);

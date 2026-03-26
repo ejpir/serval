@@ -306,34 +306,23 @@ zig build run-reverseproxy-runtime -- --config-file examples/reverseproxy/basic.
 curl http://127.0.0.1:8080/
 ```
 
-### NetBird Reverse Proxy (Self-Signed TLS Supported)
+### NetBird Reverse Proxy (DSL Runtime)
 
-A production-oriented NetBird route matrix example is available as `netbird_proxy`.
+A production route matrix for NetBird is available as `examples/reverseproxy/netbird.dsl`.
 
 ```bash
-# 1) Prepare self-signed frontend cert/key (example)
-openssl req -x509 -newkey rsa:4096 -sha256 -days 365 \
-  -nodes -keyout /etc/serval/netbird-selfsigned.key \
-  -out /etc/serval/netbird-selfsigned.crt \
-  -subj "/CN=netbird.local"
+# Copy and edit config for your backend topology
+cp examples/reverseproxy/netbird.dsl /etc/serval/netbird.dsl
 
-# 2) Copy and edit config for your backend topology
-cp deploy/examples/netbird/serval-netbird.conf.example /etc/serval/netbird.conf
-
-# 3) Run Serval NetBird proxy
-zig build run-netbird-proxy -- --config /etc/serval/netbird.conf
+# Run Serval reverseproxy runtime
+zig build run-reverseproxy-runtime -- --config-file /etc/serval/netbird.dsl
 ```
 
-OpenWrt deployment guide (ARM/procd/fw4): `deploy/examples/netbird/openwrt/README.md`.
-
-Route contract enforced by the binary:
+Route contract in the DSL:
 - gRPC service paths (`/signalexchange.SignalExchange/*`, `/management.ManagementService/*`) route to h2 upstreams (`h2c://` or `h2://`).
 - Zitadel paths (`/admin/v1/*`, `/auth/v1/*`, `/management/v1/*`, `/system/v1/*`, `/assets/v1/*`, `/ui/*`, `/oidc/v1/*`, `/saml/v2/*`, `/oauth/v2/*`, `/openapi/*`, `/debug/*`, `/device*`, `/.well-known/openid-configuration`, `/zitadel.*`) route to h2 upstreams (`h2c://` or `h2://`).
 - WebSocket/API/relay/dashboard paths route to HTTP/1.1 upstreams (`http://` or `https://`).
-- Obvious scanner traffic is rejected before upstream selection using the default `serval-waf` scanner rules.
-- NetBird WAF behavior is configurable in `netbird.conf` via `waf_block_threshold`, `waf_enforcement_mode`, and `waf_failure_mode`.
-- Mixed protocol backends on the same host:port must be configured as explicit separate entries (example: `management_grpc` + `management_http`).
-- Frontend ALPN policy is configurable in the NetBird config template via `alpn_mixed_offer_policy` and `tls_h2_frontend_mode`.
+- Mixed protocol backends on the same host:port must be configured as explicit separate entries (example: `management-grpc` + `management-http`).
 
 ### serval-router and serval-k8s-gateway
 

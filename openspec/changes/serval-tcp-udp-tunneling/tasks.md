@@ -45,6 +45,6 @@
 
 - [x] 7.1 Add TCP telemetry: accepted connections, active tunnels, directional bytes, connect failures, timeout closures, capacity rejections.
 - [x] 7.2 Add UDP telemetry: packets received/forwarded/dropped, active sessions, session create/expire counts, upstream forwarding/probe errors.
-- [ ] 7.3 Add structured logs for tunnel establishment, forwarding failures, and bounded-resource rejection/drop events (with sampling for endpoint-heavy detail).
+- [x] 7.3 Add structured logs for tunnel establishment, forwarding failures, and bounded-resource rejection/drop events (with sampling for endpoint-heavy detail).
 - [x] 7.4 Add unit/integration tests for config validation, strategy/prober extraction regression, TCP/UDP happy paths, failures, and overload behavior.
 - [x] 7.5 Update module docs/READMEs and architecture references for shared strategy/prober cores plus new `serval-tcp`/`serval-udp` capability contracts.

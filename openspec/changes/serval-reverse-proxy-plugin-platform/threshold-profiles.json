@@ -1,0 +1,110 @@
+{
+  "version": 1,
+  "profiles": {
+    "canary": {
+      "guard_window_seconds": 300,
+      "evaluation_windows_seconds": [30, 60],
+      "traffic_floor_rpm": 200,
+      "rollback_triggers": {
+        "http_5xx_rate": {
+          "relative_multiplier_gt": 2.0,
+          "absolute_percent_gt": 1.5,
+          "duration_seconds": 60,
+          "require_both": true
+        },
+        "chain_abort_rate": {
+          "percent_gt": 0.2,
+          "duration_seconds": 30
+        },
+        "fail_closed_rate": {
+          "percent_gt": 0.5,
+          "duration_seconds": 30
+        },
+        "backpressure_timeouts": {
+          "count_gte_per_min": 5
+        },
+        "expansion_budget_violations": {
+          "count_gte_per_min": 10
+        },
+        "cpu_budget_violations": {
+          "count_gte_per_min": 20
+        },
+        "latency_p99_regression": {
+          "relative_percent_increase_gt": 35,
+          "duration_seconds": 300
+        },
+        "h2_reset_anomaly": {
+          "relative_multiplier_gt": 2.0,
+          "absolute_percent_streams_gt": 0.5,
+          "require_both": true
+        }
+      }
+    },
+    "production": {
+      "guard_window_seconds": 600,
+      "evaluation_windows_seconds": [30, 60],
+      "traffic_floor_rpm": 200,
+      "rollback_triggers": {
+        "http_5xx_rate": {
+          "relative_multiplier_gt": 1.5,
+          "absolute_percent_gt": 1.0,
+          "duration_seconds": 60,
+          "require_both": true
+        },
+        "chain_abort_rate": {
+          "percent_gt": 0.1,
+          "duration_seconds": 30
+        },
+        "fail_closed_rate": {
+          "percent_gt": 0.25,
+          "duration_seconds": 30
+        },
+        "backpressure_timeouts": {
+          "count_gte_per_min": 2
+        },
+        "expansion_budget_violations": {
+          "count_gte_per_min": 3
+        },
+        "cpu_budget_violations": {
+          "count_gte_per_min": 5
+        },
+        "latency_p99_regression": {
+          "relative_percent_increase_gt": 20,
+          "duration_seconds": 300
+        },
+        "h2_reset_anomaly": {
+          "relative_multiplier_gt": 1.5,
+          "absolute_percent_streams_gt": 0.3,
+          "require_both": true
+        }
+      }
+    }
+  },
+  "immediate_hard_stop_triggers": [
+    "runtime_invariant_violation",
+    "runtime_panic_or_critical_internal_fault",
+    "listener_health_below_serving_threshold_post_activation",
+    "mandatory_baseline_security_chain_missing_post_activation"
+  ],
+  "safe_mode": {
+    "enter_if": {
+      "single_rollback_attempt_failed": true,
+      "or_consecutive_rollback_attempts_failed_within_seconds": {
+        "count": 2,
+        "window_seconds": 120
+      }
+    },
+    "actions": [
+      "freeze_new_applies",
+      "disable_optional_plugin_chains_where_policy_allows",
+      "preserve_mandatory_baseline_security_controls",
+      "emit_critical_diagnostics",
+      "page_on_call"
+    ]
+  },
+  "baseline": {
+    "window_seconds": 1800,
+    "aggregation": "median",
+    "exclude_rollout_windows": true
+  }
+}

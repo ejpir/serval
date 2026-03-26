@@ -271,6 +271,7 @@ These are for testing only. Use `--insecure-skip-verify` with self-signed certif
 | `serval-client h2 upstream session pool reuses connected session` | `serval-client/h2/upstream_pool` acquires+handshakes a fresh upstream h2c session, then reuses the same socket/session for another unary stream |
 | `serval-proxy h2 stream bridge binds downstream to upstream streams` | `serval-proxy/h2/bridge` maps downstream stream ids to reused upstream h2 streams while preserving unary gRPC response headers/data/trailers |
 | `netbird route matrix enforces grpc h2c only for service paths` | End-to-end NetBird-style path/protocol split on one backend host:port: gRPC paths use `.h2c` upstream entries, WebSocket/API/OAuth/OIDC/UI/`.well-known`/catch-all use `.h1` |
+| `netbird reverseproxy runtime dsl enforces grpc h2c split` | End-to-end coverage that the `reverseproxy_runtime` binary enforces NetBird DSL path split: gRPC service paths to h2c pools, HTTP/WebSocket paths to h1 pool, with `host=*` wildcard matching |
 
 ### NetBird Route Contract (locked)
 

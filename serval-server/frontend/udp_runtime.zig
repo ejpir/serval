@@ -27,6 +27,10 @@ const StrategyConfig = serval_lb.StrategyConfig;
 const session_read_timeout_ms: u32 = 100;
 const session_datagram_buffer_bytes: u32 = 2048;
 const max_sessions_expired_per_sweep: u32 = 256;
+const session_capacity_log_sample_interval: u64 = 64;
+const datagram_drop_log_sample_interval: u64 = 64;
+const forwarding_error_log_sample_interval: u64 = 32;
+const session_create_log_sample_interval: u64 = 128;
 
 const SessionKey = struct {
     mode: UdpSessionKeyMode,
@@ -188,9 +192,15 @@ pub const Runtime = struct {
             _ = self.packets_received.fetchAdd(1, .monotonic);
 
             if (message.flags.trunc) {
-                _ = self.drop_ingress_truncated.fetchAdd(1, .monotonic);
-                _ = self.packets_dropped.fetchAdd(1, .monotonic);
-                log.warn("udp runtime: dropped truncated ingress datagram", .{});
+                const truncated_count = self.drop_ingress_truncated.fetchAdd(1, .monotonic) + 1;
+                const dropped_count = self.packets_dropped.fetchAdd(1, .monotonic) + 1;
+                if (shouldLogSampled(truncated_count, datagram_drop_log_sample_interval)) {
+                    const client = endpointFields(message.from);
+                    log.warn(
+                        "event=udp_drop_ingress_truncated truncated_count={d} dropped_count={d} client_family={d} client_port={d} client_prefix={d}.{d}",
+                        .{ truncated_count, dropped_count, client.family, client.port, client.bytes[0], client.bytes[1] },
+                    );
+                }
                 self.sweepExpiredSessions(io, idle_timeout_ns);
                 continue;
             }
@@ -280,8 +290,15 @@ pub const Runtime = struct {
         const key = makeSessionKey(self.transport_cfg.session_key_mode, client_addr, listener_addr);
         if (self.sessions.get(key)) |session| {
             session.socket.send(io, &session.upstream_addr, payload) catch {
-                _ = self.upstream_forward_errors.fetchAdd(1, .monotonic);
-                _ = self.packets_dropped.fetchAdd(1, .monotonic);
+                const forwarding_error_count = self.upstream_forward_errors.fetchAdd(1, .monotonic) + 1;
+                const dropped_count = self.packets_dropped.fetchAdd(1, .monotonic) + 1;
+                if (shouldLogSampled(forwarding_error_count, forwarding_error_log_sample_interval)) {
+                    const client = endpointFields(client_addr);
+                    log.warn(
+                        "event=udp_forward_ingress_failed count={d} dropped_count={d} upstream_idx={d} client_family={d} client_port={d}",
+                        .{ forwarding_error_count, dropped_count, session.upstream_idx, client.family, client.port },
+                    );
+                }
                 self.strategy.recordFailure(session.upstream_idx);
                 return;
             };
@@ -292,9 +309,22 @@ pub const Runtime = struct {
         }
 
         if (self.sessions.count() >= self.transport_cfg.max_active_sessions) {
-            _ = self.drop_session_capacity.fetchAdd(1, .monotonic);
-            _ = self.packets_dropped.fetchAdd(1, .monotonic);
-            log.warn("udp runtime: dropping datagram due to session capacity", .{});
+            const capacity_drop_count = self.drop_session_capacity.fetchAdd(1, .monotonic) + 1;
+            const dropped_count = self.packets_dropped.fetchAdd(1, .monotonic) + 1;
+            if (shouldLogSampled(capacity_drop_count, session_capacity_log_sample_interval)) {
+                const client = endpointFields(client_addr);
+                log.warn(
+                    "event=udp_drop_session_capacity count={d} dropped_count={d} active_sessions={d} limit={d} client_family={d} client_port={d}",
+                    .{
+                        capacity_drop_count,
+                        dropped_count,
+                        self.sessions.count(),
+                        self.transport_cfg.max_active_sessions,
+                        client.family,
+                        client.port,
+                    },
+                );
+            }
             return;
         }
 
@@ -342,11 +372,25 @@ pub const Runtime = struct {
             return;
         };
 
-        _ = self.session_creations.fetchAdd(1, .monotonic);
+        const session_creation_count = self.session_creations.fetchAdd(1, .monotonic) + 1;
+        if (shouldLogSampled(session_creation_count, session_create_log_sample_interval)) {
+            const client = endpointFields(client_addr);
+            log.info(
+                "event=udp_session_created count={d} upstream_idx={d} client_family={d} client_port={d}",
+                .{ session_creation_count, upstream.idx, client.family, client.port },
+            );
+        }
 
         session.socket.send(io, &session.upstream_addr, payload) catch {
-            _ = self.upstream_forward_errors.fetchAdd(1, .monotonic);
-            _ = self.packets_dropped.fetchAdd(1, .monotonic);
+            const forwarding_error_count = self.upstream_forward_errors.fetchAdd(1, .monotonic) + 1;
+            const dropped_count = self.packets_dropped.fetchAdd(1, .monotonic) + 1;
+            if (shouldLogSampled(forwarding_error_count, forwarding_error_log_sample_interval)) {
+                const client = endpointFields(client_addr);
+                log.warn(
+                    "event=udp_forward_new_session_failed count={d} dropped_count={d} upstream_idx={d} client_family={d} client_port={d}",
+                    .{ forwarding_error_count, dropped_count, upstream.idx, client.family, client.port },
+                );
+            }
             self.strategy.recordFailure(upstream.idx);
             return;
         };
@@ -477,24 +521,42 @@ fn sessionEgressLoop(
                 error.Canceled => return,
                 error.SocketUnconnected => return,
                 else => {
-                    _ = upstream_forward_errors.fetchAdd(1, .monotonic);
-                    log.warn("udp runtime: session receive failed: {s}", .{@errorName(err)});
+                    const forwarding_error_count = upstream_forward_errors.fetchAdd(1, .monotonic) + 1;
+                    if (shouldLogSampled(forwarding_error_count, forwarding_error_log_sample_interval)) {
+                        const client = endpointFields(session.client_addr);
+                        log.warn(
+                            "event=udp_session_receive_failed count={d} error={s} client_family={d} client_port={d}",
+                            .{ forwarding_error_count, @errorName(err), client.family, client.port },
+                        );
+                    }
                     continue;
                 },
             }
         };
 
         if (message.flags.trunc) {
-            _ = drop_egress_truncated.fetchAdd(1, .monotonic);
-            _ = packets_dropped.fetchAdd(1, .monotonic);
-            log.warn("udp runtime: dropped truncated upstream datagram", .{});
+            const truncated_count = drop_egress_truncated.fetchAdd(1, .monotonic) + 1;
+            const dropped_count = packets_dropped.fetchAdd(1, .monotonic) + 1;
+            if (shouldLogSampled(truncated_count, datagram_drop_log_sample_interval)) {
+                const client = endpointFields(session.client_addr);
+                log.warn(
+                    "event=udp_drop_egress_truncated truncated_count={d} dropped_count={d} client_family={d} client_port={d}",
+                    .{ truncated_count, dropped_count, client.family, client.port },
+                );
+            }
             continue;
         }
 
         listener_socket.send(io, &session.client_addr, message.data) catch |err| {
-            _ = upstream_forward_errors.fetchAdd(1, .monotonic);
-            _ = packets_dropped.fetchAdd(1, .monotonic);
-            log.warn("udp runtime: session send failed: {s}", .{@errorName(err)});
+            const forwarding_error_count = upstream_forward_errors.fetchAdd(1, .monotonic) + 1;
+            const dropped_count = packets_dropped.fetchAdd(1, .monotonic) + 1;
+            if (shouldLogSampled(forwarding_error_count, forwarding_error_log_sample_interval)) {
+                const client = endpointFields(session.client_addr);
+                log.warn(
+                    "event=udp_session_send_failed count={d} dropped_count={d} error={s} client_family={d} client_port={d}",
+                    .{ forwarding_error_count, dropped_count, @errorName(err), client.family, client.port },
+                );
+            }
             continue;
         };
 
@@ -618,6 +680,12 @@ fn timeoutForMilliseconds(timeout_ms: u32) Io.Timeout {
     } };
 }
 
+fn shouldLogSampled(counter: u64, interval: u64) bool {
+    assert(counter > 0);
+    assert(interval > 0);
+    return counter % interval == 0;
+}
+
 test "buildUpstream for udp disables tls" {
     const upstream = buildUpstream(.{ .host = "up", .port = 8053, .tls = true }, 0);
     try std.testing.expect(!upstream.tls);
@@ -652,6 +720,13 @@ test "makeSessionKey mode controls grouping" {
     const src_ep_a = makeSessionKey(.source_endpoint, src_a, dst);
     const src_ep_b = makeSessionKey(.source_endpoint, src_b, dst);
     try std.testing.expect(src_ep_a != src_ep_b);
+}
+
+test "shouldLogSampled logs only at interval boundaries" {
+    try std.testing.expect(!shouldLogSampled(1, 32));
+    try std.testing.expect(!shouldLogSampled(31, 32));
+    try std.testing.expect(shouldLogSampled(32, 32));
+    try std.testing.expect(shouldLogSampled(64, 32));
 }
 
 test "udp runtime telemetry counters initialize to zero" {

@@ -1,0 +1,63 @@
+# Serval NetBird reverseproxy DSL configuration
+#
+# Usage:
+#   zig build run-reverseproxy-runtime -- --config-file /etc/serval/netbird.dsl
+#
+# Copy to target host:
+#   cp deploy/examples/netbird/serval-netbird.dsl.example /etc/serval/netbird.dsl
+
+config.component.pool=simple
+config.component.metrics=noop
+config.component.tracing=noop
+
+# Frontend TLS listener.
+# For production internet-facing setups, prefer tls.provider=acme and set domain/email.
+listener netbird 0.0.0.0:443 tls.provider=selfsigned tls.selfsigned.state_dir=/var/lib/serval/netbird-reverseproxy tls.selfsigned.domain=netbird.local tls.selfsigned.rotate_on_boot=false
+
+# Upstream matrix
+# Allowed schemes:
+#   http://host:port   -> HTTP/1.1 plaintext
+#   https://host:port  -> HTTP/1.1 over TLS
+#   h2c://host:port    -> HTTP/2 cleartext
+#   h2://host:port     -> HTTP/2 over TLS
+pool signal-grpc upstream=h2c://signal:10000
+pool management-grpc upstream=h2c://management:80
+pool signal-http upstream=http://signal:80
+pool management-http upstream=http://management:80
+pool relay-http upstream=http://relay:80
+pool zitadel-http upstream=h2c://zitadel:8080
+pool dashboard-http upstream=http://dashboard:80
+
+plugin netbird-core fail_policy=fail_closed
+chain netbird-chain plugin=netbird-core
+
+# host=* means "any host".
+route signal-grpc listener=netbird host=* path=/signalexchange.SignalExchange/ pool=signal-grpc chain=netbird-chain
+route management-grpc listener=netbird host=* path=/management.ManagementService/ pool=management-grpc chain=netbird-chain
+route signal-http listener=netbird host=* path=/ws-proxy/signal pool=signal-http chain=netbird-chain
+route management-http listener=netbird host=* path=/ws-proxy/management pool=management-http chain=netbird-chain
+route relay-http listener=netbird host=* path=/relay pool=relay-http chain=netbird-chain
+route management-api listener=netbird host=* path=/api/ pool=management-http chain=netbird-chain
+
+# Caddy-compat Zitadel matrix
+route zitadel-admin-grpc listener=netbird host=* path=/zitadel.admin.v1.AdminService/ pool=zitadel-http chain=netbird-chain
+route zitadel-admin-rest listener=netbird host=* path=/admin/v1/ pool=zitadel-http chain=netbird-chain
+route zitadel-auth-grpc listener=netbird host=* path=/zitadel.auth.v1.AuthService/ pool=zitadel-http chain=netbird-chain
+route zitadel-auth-rest listener=netbird host=* path=/auth/v1/ pool=zitadel-http chain=netbird-chain
+route zitadel-management-grpc listener=netbird host=* path=/zitadel.management.v1.ManagementService/ pool=zitadel-http chain=netbird-chain
+route zitadel-management-rest listener=netbird host=* path=/management/v1/ pool=zitadel-http chain=netbird-chain
+route zitadel-system-grpc listener=netbird host=* path=/zitadel.system.v1.SystemService/ pool=zitadel-http chain=netbird-chain
+route zitadel-system-rest listener=netbird host=* path=/system/v1/ pool=zitadel-http chain=netbird-chain
+route zitadel-assets listener=netbird host=* path=/assets/v1/ pool=zitadel-http chain=netbird-chain
+route zitadel-saml listener=netbird host=* path=/saml/v2/ pool=zitadel-http chain=netbird-chain
+route zitadel-openapi listener=netbird host=* path=/openapi/ pool=zitadel-http chain=netbird-chain
+route zitadel-debug listener=netbird host=* path=/debug/ pool=zitadel-http chain=netbird-chain
+route zitadel-device listener=netbird host=* path=/device pool=zitadel-http chain=netbird-chain
+route zitadel-device-slash listener=netbird host=* path=/device/ pool=zitadel-http chain=netbird-chain
+route zitadel-user-grpc listener=netbird host=* path=/zitadel.user.v2.UserService/ pool=zitadel-http chain=netbird-chain
+route zitadel-oidc-config listener=netbird host=* path=/.well-known/openid-configuration pool=zitadel-http chain=netbird-chain
+route zitadel-ui listener=netbird host=* path=/ui/ pool=zitadel-http chain=netbird-chain
+route zitadel-oidc listener=netbird host=* path=/oidc/v1/ pool=zitadel-http chain=netbird-chain
+route zitadel-oauth listener=netbird host=* path=/oauth/v2/ pool=zitadel-http chain=netbird-chain
+
+route dashboard-catchall listener=netbird host=* path=/ pool=dashboard-http chain=netbird-chain

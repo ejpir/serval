@@ -5714,6 +5714,39 @@ fn writeReverseproxyDslConfig(
     return writeReverseproxyDslFile(allocator, proxy_port, "single", content);
 }
 
+fn writeReverseproxyNetbirdDslConfig(
+    allocator: std.mem.Allocator,
+    proxy_port: u16,
+    backend_port: u16,
+) ![]u8 {
+    assert(proxy_port > 0);
+    assert(backend_port > 0);
+
+    const content = try std.fmt.allocPrint(
+        allocator,
+        \\listener l1 0.0.0.0:{d}
+        \\pool signal-grpc upstream=h2c://127.0.0.1:{d}
+        \\pool management-grpc upstream=h2c://127.0.0.1:{d}
+        \\pool http-matrix upstream=http://127.0.0.1:{d}
+        \\plugin plugin-a fail_policy=fail_closed
+        \\chain chain-a plugin=plugin-a
+        \\route signal-grpc listener=l1 host=* path=/signalexchange.SignalExchange/ pool=signal-grpc chain=chain-a
+        \\route management-grpc listener=l1 host=* path=/management.ManagementService/ pool=management-grpc chain=chain-a
+        \\route management-proxy listener=l1 host=* path=/management.ProxyService/ pool=management-grpc chain=chain-a
+        \\route ws-signal listener=l1 host=* path=/ws-proxy/signal pool=http-matrix chain=chain-a
+        \\route ws-management listener=l1 host=* path=/ws-proxy/management pool=http-matrix chain=chain-a
+        \\route relay listener=l1 host=* path=/relay pool=http-matrix chain=chain-a
+        \\route api listener=l1 host=* path=/api/ pool=http-matrix chain=chain-a
+        \\route well-known listener=l1 host=* path=/.well-known/ pool=http-matrix chain=chain-a
+        \\route dashboard listener=l1 host=* path=/ pool=http-matrix chain=chain-a
+    ,
+        .{ proxy_port, backend_port, backend_port, backend_port },
+    );
+    defer allocator.free(content);
+
+    return writeReverseproxyDslFile(allocator, proxy_port, "netbird-replacement", content);
+}
+
 test "integration: reverseproxy runtime binary loads dsl config and forwards matched route" {
     const allocator = testing.allocator;
     const backend_port = harness.getPort();
@@ -6445,6 +6478,61 @@ test "integration: reverseproxy runtime tie-break is deterministic (first route 
         try testing.expect(response.backend_id != null);
         try testing.expectEqualStrings("rp-runtime-first", response.backend_id.?);
     }
+}
+
+test "integration: netbird reverseproxy runtime dsl enforces grpc h2c split" {
+    const allocator = testing.allocator;
+    const backend_port = harness.getPort();
+    const proxy_port = harness.getPort();
+
+    var backend = try NetbirdDualBackendServer.start(backend_port);
+    defer backend.stop();
+
+    var pm = harness.ProcessManager.init(allocator);
+    defer pm.deinit();
+
+    const dsl_path = try writeReverseproxyNetbirdDslConfig(allocator, proxy_port, backend_port);
+    defer allocator.free(dsl_path);
+    defer cleanupTempDslFile(dsl_path);
+
+    try pm.startReverseproxyRuntime(proxy_port, .{
+        .config_file = dsl_path,
+    });
+
+    var client = harness.TestClient.init(allocator);
+    defer client.deinit();
+
+    const api_response = try client.get(proxy_port, "/api/accounts");
+    defer api_response.deinit();
+    try testing.expectEqual(@as(u16, 401), api_response.status);
+    try testing.expect(std.mem.indexOf(u8, api_response.body, "api-unauthorized") != null);
+
+    try expectGrpcUnaryThroughNetbirdProxy(
+        proxy_port,
+        "/signalexchange.SignalExchange/Connect",
+        "signal-ping",
+        "signal-pong",
+    );
+
+    try expectGrpcUnaryThroughNetbirdProxy(
+        proxy_port,
+        "/management.ManagementService/GetServerKey",
+        "management-ping",
+        "management-pong",
+    );
+
+    const well_known_response = try client.get(proxy_port, "/.well-known/openid-configuration");
+    defer well_known_response.deinit();
+    try testing.expectEqual(@as(u16, 200), well_known_response.status);
+    try testing.expect(std.mem.indexOf(u8, well_known_response.body, "\"issuer\":\"https://netbird.local\"") != null);
+
+    const catch_all_response = try client.get(proxy_port, "/dashboard");
+    defer catch_all_response.deinit();
+    try testing.expectEqual(@as(u16, 200), catch_all_response.status);
+    try testing.expect(std.mem.indexOf(u8, catch_all_response.body, "dashboard-catch-all") != null);
+
+    try expectWebSocketEchoThroughNetbirdProxy(proxy_port, "/ws-proxy/signal", "ws-signal-echo");
+    try expectWebSocketEchoThroughNetbirdProxy(proxy_port, "/relay", "ws-relay-echo");
 }
 
 test "integration: netbird subprocess serves local health endpoint" {

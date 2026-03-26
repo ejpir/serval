@@ -37,6 +37,7 @@ try runtime.run(.{ .port = 8080 }); // optional override; omit to use DSL listen
 
 Starter DSL config:
 - `examples/reverseproxy/basic.dsl`
+- `examples/reverseproxy/netbird.dsl` (NetBird route matrix replacement)
 - TLS providers example: `examples/reverseproxy/tls_providers.dsl`
 
 Route/listener binding:
@@ -53,6 +54,30 @@ Core DSL object roles:
 `chain` in practice:
 - A chain is the policy pipeline attached to a route.
 - Route matching decides *where* to send traffic (`pool`), and chain decides *what policy logic* runs for that traffic (`plugin` entries).
+
+## Failure Policy Semantics (`fail_open` vs `fail_closed`)
+
+Policy values:
+- `fail_closed`: on plugin failure, do not bypass policy logic; fail the request/stream.
+- `fail_open`: on plugin failure, allow sticky bypass only when safe; otherwise fail the request/stream.
+
+Terminal behavior is protocol-aware:
+- Pre-header plugin/upstream failures: send explicit error response.
+- Mid-stream HTTP/1.1 failures: close the connection.
+- Mid-stream HTTP/2 or h2c failures: reset the active stream.
+
+`fail_open` sticky bypass safety:
+- Allowed before response headers are sent.
+- Not allowed once response body/headers are in-flight.
+
+Implementation source of truth:
+- Canonical policy type: `serval-reverseproxy/ir.zig` (`FailurePolicy`)
+- Runtime decision logic: `serval-reverseproxy/failure.zig` (`classifyFailure`)
+
+Current DSL caveat:
+- DSL currently requires `plugin ... fail_policy=...` syntax.
+- Chain entries are currently emitted with `fail_closed` in parser wiring.
+- So `fail_policy` is validated in DSL today, but chain runtime behavior is currently fail-closed unless parser wiring is extended.
 
 Runtime component selection (binary mode):
 - `config.component.pool=simple|none`

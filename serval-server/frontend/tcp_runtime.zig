@@ -34,6 +34,10 @@ const Socket = serval_socket.Socket;
 const tunnel = serval_proxy.tunnel;
 const ssl = serval_tls.ssl;
 
+const capacity_rejection_log_sample_interval: u64 = 32;
+const connect_failure_log_sample_interval: u64 = 16;
+const timeout_closure_log_sample_interval: u64 = 16;
+
 pub const RuntimeError = error{
     InvalidConfig,
     InvalidAddress,
@@ -195,7 +199,13 @@ pub const Runtime = struct {
         const previous = self.active_connections.fetchAdd(1, .acq_rel);
         if (previous >= self.transport_cfg.max_concurrent_connections) {
             _ = self.active_connections.fetchSub(1, .acq_rel);
-            _ = self.rejected_at_capacity.fetchAdd(1, .monotonic);
+            const rejection_count = self.rejected_at_capacity.fetchAdd(1, .monotonic) + 1;
+            if (shouldLogSampled(rejection_count, capacity_rejection_log_sample_interval)) {
+                log.warn(
+                    "event=tcp_capacity_rejection count={d} active={d} limit={d}",
+                    .{ rejection_count, previous, self.transport_cfg.max_concurrent_connections },
+                );
+            }
             return false;
         }
 
@@ -226,13 +236,23 @@ fn handleAcceptedConnection(runtime: *Runtime, stream: Io.net.Stream, io: Io) vo
     var client = Client.init(std.heap.page_allocator, &runtime.dns_resolver, runtime.client_ctx, runtime.verify_upstream_tls);
     const connect_timeout = timeoutForMilliseconds(runtime.transport_cfg.connect_timeout_ms);
     var connect_result = client.connectWithTimeout(upstream, io, connect_timeout) catch {
-        _ = runtime.connect_failures.fetchAdd(1, .monotonic);
+        const failure_count = runtime.connect_failures.fetchAdd(1, .monotonic) + 1;
+        if (shouldLogSampled(failure_count, connect_failure_log_sample_interval)) {
+            log.warn(
+                "event=tcp_connect_failed count={d} upstream_idx={d} upstream_host={s} upstream_port={d}",
+                .{ failure_count, upstream.idx, upstream.host, upstream.port },
+            );
+        }
         runtime.strategy.recordFailure(upstream.idx);
         return;
     };
     defer connect_result.conn.close();
 
     runtime.strategy.recordSuccess(upstream.idx);
+    log.info(
+        "event=tcp_tunnel_established upstream_idx={d} upstream_host={s} upstream_port={d}",
+        .{ upstream.idx, upstream.host, upstream.port },
+    );
 
     const poll_timeout_ms_u32: u32 = @max(@as(u32, 1), @min(runtime.transport_cfg.idle_timeout_ms, 1000));
     const idle_timeout_ns = time.millisToNanos(@intCast(runtime.transport_cfg.idle_timeout_ms));
@@ -249,8 +269,24 @@ fn handleAcceptedConnection(runtime: *Runtime, stream: Io.net.Stream, io: Io) vo
     _ = runtime.upstream_bytes.fetchAdd(tunnel_stats.client_to_upstream_bytes, .monotonic);
     _ = runtime.downstream_bytes.fetchAdd(tunnel_stats.upstream_to_client_bytes, .monotonic);
     if (tunnel_stats.termination == .idle_timeout) {
-        _ = runtime.timeout_closures.fetchAdd(1, .monotonic);
+        const timeout_count = runtime.timeout_closures.fetchAdd(1, .monotonic) + 1;
+        if (shouldLogSampled(timeout_count, timeout_closure_log_sample_interval)) {
+            log.warn(
+                "event=tcp_tunnel_idle_timeout count={d} upstream_idx={d}",
+                .{ timeout_count, upstream.idx },
+            );
+        }
     }
+
+    log.info(
+        "event=tcp_tunnel_closed upstream_idx={d} term={s} bytes_up={d} bytes_down={d}",
+        .{
+            upstream.idx,
+            @tagName(tunnel_stats.termination),
+            tunnel_stats.client_to_upstream_bytes,
+            tunnel_stats.upstream_to_client_bytes,
+        },
+    );
 }
 
 fn buildUpstream(target: L4Target, tls_mode: TcpTlsMode, idx: UpstreamIndex) Upstream {
@@ -280,6 +316,12 @@ fn timeoutForMilliseconds(timeout_ms: u32) Io.Timeout {
     } };
 }
 
+fn shouldLogSampled(counter: u64, interval: u64) bool {
+    assert(counter > 0);
+    assert(interval > 0);
+    return counter % interval == 0;
+}
+
 test "buildUpstream respects tls mode" {
     const plain_target = L4Target{ .host = "upstream", .port = 9000, .tls = false };
     const passthrough_plain = buildUpstream(plain_target, .passthrough, 0);
@@ -302,6 +344,13 @@ test "timeoutForMilliseconds builds awake duration timeout" {
         },
         else => return error.TestExpectedEqual,
     }
+}
+
+test "shouldLogSampled logs only at interval boundaries" {
+    try std.testing.expect(!shouldLogSampled(1, 16));
+    try std.testing.expect(!shouldLogSampled(15, 16));
+    try std.testing.expect(shouldLogSampled(16, 16));
+    try std.testing.expect(shouldLogSampled(32, 16));
 }
 
 test "tryAcquireSlot enforces max concurrent connections" {

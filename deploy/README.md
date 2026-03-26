@@ -122,6 +122,16 @@ curl http://localhost:31588/static/image.png
 
 See `deploy/examples/netbird/openwrt/README.md` for end-to-end instructions (cross-build, install, procd, fw4).
 
+## NetBird DSL Runtime Quick Start
+
+```bash
+# Prepare DSL config
+cp deploy/examples/netbird/serval-netbird.dsl.example /etc/serval/netbird.dsl
+
+# Run runtime
+zig build run-reverseproxy-runtime -- --config-file /etc/serval/netbird.dsl
+```
+
 ## Build Commands
 
 ```bash
