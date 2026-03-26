@@ -29,6 +29,7 @@ pub const Error = error{
     StreamRefused,
     StreamFlowControlError,
     StreamClosedError,
+    RequestBodyTrackerCapacityExceeded,
     ConnectionProtocolError,
     ConnectionStreamClosedError,
 } || connection.Error || h2.InitialRequestError || h2.ControlError || h2.FlowControlError || h2.FrameError;
@@ -465,7 +466,7 @@ fn startRequestBodyTracking(self: *Runtime, stream_id: u32, request: *const type
 
     const expected_content_length = try parseExpectedContentLength(request);
 
-    var tracker = getOrInsertRequestBodyTracker(self, stream_id);
+    var tracker = try getOrInsertRequestBodyTracker(self, stream_id);
     tracker.expected_content_length = expected_content_length;
     tracker.received_data_bytes = 0;
 
@@ -481,7 +482,7 @@ fn noteRequestData(self: *Runtime, stream_id: u32, data_len: usize, end_stream: 
     assert(@intFromPtr(self) != 0);
     assert(stream_id > 0);
 
-    var tracker = getOrInsertRequestBodyTracker(self, stream_id);
+    var tracker = try getOrInsertRequestBodyTracker(self, stream_id);
     const data_len_u64: u64 = @intCast(data_len);
     const next_bytes = tracker.received_data_bytes +| data_len_u64;
     if (next_bytes < tracker.received_data_bytes) return error.StreamProtocolError;
@@ -516,7 +517,7 @@ fn getRequestBodyTracker(self: *Runtime, stream_id: u32) ?*RequestBodyTracker {
     return null;
 }
 
-fn getOrInsertRequestBodyTracker(self: *Runtime, stream_id: u32) *RequestBodyTracker {
+fn getOrInsertRequestBodyTracker(self: *Runtime, stream_id: u32) Error!*RequestBodyTracker {
     assert(@intFromPtr(self) != 0);
     assert(stream_id > 0);
 
@@ -528,9 +529,7 @@ fn getOrInsertRequestBodyTracker(self: *Runtime, stream_id: u32) *RequestBodyTra
         return tracker;
     }
 
-    const idx: usize = @intCast(stream_id % @as(u32, request_body_tracker_capacity));
-    self.request_body_trackers[idx] = .{ .used = true, .stream_id = stream_id };
-    return &self.request_body_trackers[idx];
+    return error.RequestBodyTrackerCapacityExceeded;
 }
 
 fn removeRequestBodyTracker(self: *Runtime, stream_id: u32) void {
@@ -1305,5 +1304,28 @@ test "Runtime tracks peer GOAWAY and rejects higher streams" {
     try std.testing.expectError(
         error.ConnectionClosing,
         runtime.receiveFrame(headers_header, headers_frame[h2.frame_header_size_bytes .. h2.frame_header_size_bytes + headers_header.length]),
+    );
+}
+
+test "Runtime request-body tracker insertion fails closed when capacity is exhausted" {
+    var runtime = try Runtime.init();
+    var request = types.Request{
+        .method = .POST,
+        .path = "/tracker-capacity",
+    };
+
+    assert(request_body_tracker_capacity <= std.math.maxInt(u32));
+    const tracker_capacity_u32: u32 = @intCast(request_body_tracker_capacity);
+
+    var idx: u32 = 0;
+    while (idx < tracker_capacity_u32) : (idx += 1) {
+        const stream_id: u32 = (idx * 2) + 1;
+        try startRequestBodyTracking(&runtime, stream_id, &request, false);
+    }
+
+    const overflow_stream_id: u32 = (idx * 2) + 1;
+    try std.testing.expectError(
+        error.RequestBodyTrackerCapacityExceeded,
+        startRequestBodyTracking(&runtime, overflow_stream_id, &request, false),
     );
 }

@@ -93,7 +93,11 @@ const DIRECT_REQUEST_BODY_SIZE_BYTES = config.DIRECT_REQUEST_BODY_SIZE_BYTES;
 /// TigerStyle: Bounded spin loop for control-plane activation path.
 const TLS_RELOAD_CONTROL_LOCK_MAX_ATTEMPTS: u32 = 1_000_000;
 
-fn lockTlsReloadControlMutex(mutex: *std.atomic.Mutex) void {
+const TlsReloadControlLockError = error{
+    TlsReloadControlLockTimeout,
+};
+
+fn lockTlsReloadControlMutex(mutex: *std.atomic.Mutex) TlsReloadControlLockError!void {
     assert(@intFromPtr(mutex) != 0);
 
     var attempts: u32 = 0;
@@ -102,7 +106,7 @@ fn lockTlsReloadControlMutex(mutex: *std.atomic.Mutex) void {
         std.atomic.spinLoopHint();
     }
 
-    @panic("Server TLS reload control mutex lock timeout");
+    return error.TlsReloadControlLockTimeout;
 }
 
 const EndpointResolveError = error{
@@ -220,7 +224,7 @@ pub fn Server(
 
         pub const ReloadServerTlsError = error{
             TlsReloadUnavailable,
-        } || ReloadableServerCtxError || ssl.CreateServerCtxFromPemFilesError;
+        } || TlsReloadControlLockError || ReloadableServerCtxError || ssl.CreateServerCtxFromPemFilesError;
 
         /// Atomically activate a new server TLS context generation from PEM paths.
         /// Returns the activated generation number.
@@ -233,7 +237,7 @@ pub fn Server(
             assert(cert_path.len <= std.math.maxInt(u16));
             assert(key_path.len <= std.math.maxInt(u16));
 
-            lockTlsReloadControlMutex(&self.tls_reload_control_mutex);
+            try lockTlsReloadControlMutex(&self.tls_reload_control_mutex);
             defer self.tls_reload_control_mutex.unlock();
 
             const manager = self.tls_ctx_manager_ptr orelse return error.TlsReloadUnavailable;
@@ -243,10 +247,12 @@ pub fn Server(
         }
 
         /// Read current active server TLS generation.
-        pub fn activeServerTlsGeneration(self: *Self) error{TlsReloadUnavailable}!u32 {
+        pub fn activeServerTlsGeneration(
+            self: *Self,
+        ) error{ TlsReloadUnavailable, TlsReloadControlLockTimeout }!u32 {
             assert(@intFromPtr(self) != 0);
 
-            lockTlsReloadControlMutex(&self.tls_reload_control_mutex);
+            try lockTlsReloadControlMutex(&self.tls_reload_control_mutex);
             defer self.tls_reload_control_mutex.unlock();
 
             const manager = self.tls_ctx_manager_ptr orelse return error.TlsReloadUnavailable;
@@ -259,7 +265,10 @@ pub fn Server(
             assert(@intFromPtr(self) != 0);
             assert(@intFromPtr(manager) != 0);
 
-            lockTlsReloadControlMutex(&self.tls_reload_control_mutex);
+            lockTlsReloadControlMutex(&self.tls_reload_control_mutex) catch |err| {
+                log.err("server: publish tls ctx manager lock failed: {s}", .{@errorName(err)});
+                return;
+            };
             defer self.tls_reload_control_mutex.unlock();
 
             assert(self.tls_ctx_manager_ptr == null);
@@ -269,7 +278,10 @@ pub fn Server(
         fn unpublishTlsCtxManager(self: *Self) void {
             assert(@intFromPtr(self) != 0);
 
-            lockTlsReloadControlMutex(&self.tls_reload_control_mutex);
+            lockTlsReloadControlMutex(&self.tls_reload_control_mutex) catch |err| {
+                log.err("server: unpublish tls ctx manager lock failed: {s}", .{@errorName(err)});
+                return;
+            };
             defer self.tls_reload_control_mutex.unlock();
 
             self.tls_ctx_manager_ptr = null;
@@ -760,6 +772,54 @@ pub fn Server(
                 else
                     &[_]u8{},
             };
+        }
+
+        const OnRequestControlFlow = enum {
+            fall_through,
+            continue_h1,
+            close_connection,
+        };
+
+        fn shortCircuitBodyFullyConsumed(
+            parser: *const Parser,
+            maybe_body_reader: ?*const BodyReader,
+            available_body_bytes: u64,
+        ) bool {
+            assert(@intFromPtr(parser) != 0);
+            _ = available_body_bytes;
+
+            return switch (parser.body_framing) {
+                .none => true,
+                .chunked => false,
+                .content_length => |expected| blk: {
+                    const consumed: u64 = if (maybe_body_reader) |body_reader|
+                        body_reader.total_bytes_read
+                    else
+                        0;
+                    break :blk consumed >= expected;
+                },
+            };
+        }
+
+        fn shortCircuitControlFlow(
+            parser: *const Parser,
+            request: *const Request,
+            maybe_body_reader: ?*const BodyReader,
+            available_body_bytes: u64,
+            request_count: u32,
+            max_requests_per_connection: u32,
+        ) OnRequestControlFlow {
+            assert(@intFromPtr(parser) != 0);
+            assert(@intFromPtr(request) != 0);
+            assert(max_requests_per_connection > 0);
+
+            if (!shortCircuitBodyFullyConsumed(parser, maybe_body_reader, available_body_bytes)) {
+                return .close_connection;
+            }
+
+            const should_close = clientWantsClose(&request.headers) or
+                request_count >= max_requests_per_connection;
+            return if (should_close) .close_connection else .continue_h1;
         }
 
         const H2_ERROR_PROTOCOL: u32 = 0x1;
@@ -1898,13 +1958,11 @@ pub fn Server(
                 forwarder.verify_upstream_tls,
             );
             const bridge_sessions = std.heap.page_allocator.create(serval_client.H2UpstreamSessionPool) catch {
-                return forwarder_mod.ForwardError.ConnectFailed;
+                return forwarder_mod.ForwardError.InvalidResponse;
             };
+            defer std.heap.page_allocator.destroy(bridge_sessions);
             bridge_sessions.* = serval_client.H2UpstreamSessionPool.init();
-            defer {
-                bridge_sessions.deinit();
-                std.heap.page_allocator.destroy(bridge_sessions);
-            }
+            defer bridge_sessions.deinit();
 
             var bridge_handler = H2cBridgeHandler.init(
                 handler,
@@ -1995,13 +2053,11 @@ pub fn Server(
                 forwarder.verify_upstream_tls,
             );
             const bridge_sessions = std.heap.page_allocator.create(serval_client.H2UpstreamSessionPool) catch {
-                return forwarder_mod.ForwardError.ConnectFailed;
+                return forwarder_mod.ForwardError.InvalidResponse;
             };
+            defer std.heap.page_allocator.destroy(bridge_sessions);
             bridge_sessions.* = serval_client.H2UpstreamSessionPool.init();
-            defer {
-                bridge_sessions.deinit();
-                std.heap.page_allocator.destroy(bridge_sessions);
-            }
+            defer bridge_sessions.deinit();
 
             var bridge_handler = H2cBridgeHandler.init(
                 handler,
@@ -2120,8 +2176,12 @@ pub fn Server(
             const looks_h2_prefix = serval_h2.looksLikeClientConnectionPrefacePrefix(initial_bytes);
             const looks_h2_attempt = std.mem.startsWith(u8, initial_bytes, "PRI");
             if (!looks_h2_prefix and !looks_h2_attempt) return false;
-            var handoff_buf: [CONNECTION_RECV_BUFFER_SIZE_BYTES + PLAIN_STREAM_READER_BUFFER_SIZE_BYTES]u8 = undefined;
-            const handoff_bytes = buildH2HandoffBytes(plain_reader, recv_buf[0..buffer_len.*], &handoff_buf);
+            const handoff_buf = std.heap.page_allocator.alloc(u8, CONNECTION_RECV_BUFFER_SIZE_BYTES + PLAIN_STREAM_READER_BUFFER_SIZE_BYTES) catch {
+                log.warn("server: conn={d} terminated h2 handoff buffer allocation failed", .{connection_id});
+                return true;
+            };
+            defer std.heap.page_allocator.free(handoff_buf);
+            const handoff_bytes = buildH2HandoffBytes(plain_reader, recv_buf[0..buffer_len.*], handoff_buf);
 
             log.debug("server: conn={d} dispatching prior-knowledge h2c to terminated h2 driver", .{connection_id});
 
@@ -2274,12 +2334,17 @@ pub fn Server(
 
             const parse_start_ns = realtimeNanos();
             var parsed: serval_h2.InitialRequest = undefined;
-            var initial_request_storage_buf: [serval_h2.request_stable_storage_size_bytes]u8 = undefined;
+            const initial_request_storage_buf = std.heap.page_allocator.alloc(u8, serval_h2.request_stable_storage_size_bytes) catch {
+                log.warn("server: conn={d} h2c initial-request storage allocation failed", .{connection_id});
+                sendH2GoAway(maybe_tls, io, stream, 0, H2_ERROR_INTERNAL);
+                return true;
+            };
+            defer std.heap.page_allocator.free(initial_request_storage_buf);
             var local_settings_already_sent = false;
             while (true) {
                 parsed = serval_h2.parseInitialRequest(
                     recv_buf[0..buffer_len.*],
-                    &initial_request_storage_buf,
+                    initial_request_storage_buf,
                 ) catch |err| switch (err) {
                     error.NeedMoreData => {
                         if (!local_settings_already_sent and
@@ -2365,8 +2430,13 @@ pub fn Server(
                     stream,
                     ctx,
                     blk: {
-                        var handoff_buf: [CONNECTION_RECV_BUFFER_SIZE_BYTES + PLAIN_STREAM_READER_BUFFER_SIZE_BYTES]u8 = undefined;
-                        break :blk buildH2HandoffBytes(plain_reader, recv_buf[0..buffer_len.*], &handoff_buf);
+                        const handoff_buf = std.heap.page_allocator.alloc(u8, CONNECTION_RECV_BUFFER_SIZE_BYTES + PLAIN_STREAM_READER_BUFFER_SIZE_BYTES) catch {
+                            log.warn("server: conn={d} h2c bridge handoff buffer allocation failed", .{connection_id});
+                            sendH2GoAway(maybe_tls, io, stream, parsed.stream_id, H2_ERROR_INTERNAL);
+                            return true;
+                        };
+                        defer std.heap.page_allocator.free(handoff_buf);
+                        break :blk buildH2HandoffBytes(plain_reader, recv_buf[0..buffer_len.*], handoff_buf);
                     },
                     connection_id,
                     local_settings_already_sent,
@@ -2741,8 +2811,11 @@ pub fn Server(
                     // Attach body reader to context for handler access
                     ctx._body_reader = &body_reader;
 
+                    var on_request_control_flow: OnRequestControlFlow = .fall_through;
                     switch (handler.onRequest(&ctx, &parser.request, response_buf)) {
-                        .continue_request => {}, // Fall through to selectUpstream
+                        .continue_request => {
+                            on_request_control_flow = .fall_through;
+                        }, // Fall through to selectUpstream
                         .send_response => |resp| {
                             // Handler wants to send direct response without forwarding
                             sendDirectResponseTls(maybe_tls_ptr, &io_mut, stream, resp);
@@ -2751,10 +2824,14 @@ pub fn Server(
                             tracer.setIntAttribute(span_handle, "http.response.status_code", @intCast(resp.status));
                             tracer.endSpan(span_handle, null);
                             buffer_offset += parser.headers_end + body_length_for_offset;
-                            const should_close = clientWantsClose(&parser.request.headers) or
-                                request_count >= cfg.max_requests_per_connection;
-                            if (should_close) return;
-                            continue;
+                            on_request_control_flow = shortCircuitControlFlow(
+                                &parser,
+                                &parser.request,
+                                &body_reader,
+                                initial_body_bytes,
+                                request_count,
+                                cfg.max_requests_per_connection,
+                            );
                         },
                         .reject => |reject| {
                             // Handler wants to reject request (WAF, rate limiting, auth)
@@ -2764,10 +2841,14 @@ pub fn Server(
                             tracer.setIntAttribute(span_handle, "http.response.status_code", @intCast(reject.status));
                             tracer.endSpan(span_handle, reject.reason);
                             buffer_offset += parser.headers_end + body_length_for_offset;
-                            const should_close = clientWantsClose(&parser.request.headers) or
-                                request_count >= cfg.max_requests_per_connection;
-                            if (should_close) return;
-                            continue;
+                            on_request_control_flow = shortCircuitControlFlow(
+                                &parser,
+                                &parser.request,
+                                &body_reader,
+                                initial_body_bytes,
+                                request_count,
+                                cfg.max_requests_per_connection,
+                            );
                         },
                         .stream => |stream_resp| {
                             // Streaming response: call handler.nextChunk() in bounded loop.
@@ -2855,12 +2936,22 @@ pub fn Server(
                                     tracer.endSpan(span_handle, null);
                                 }
                                 buffer_offset += parser.headers_end + body_length_for_offset;
-                                const should_close = clientWantsClose(&parser.request.headers) or
-                                    request_count >= cfg.max_requests_per_connection;
-                                if (should_close) return;
-                                continue;
+                                on_request_control_flow = shortCircuitControlFlow(
+                                    &parser,
+                                    &parser.request,
+                                    &body_reader,
+                                    initial_body_bytes,
+                                    request_count,
+                                    cfg.max_requests_per_connection,
+                                );
                             }
                         },
+                    }
+
+                    switch (on_request_control_flow) {
+                        .fall_through => {},
+                        .continue_h1 => continue,
+                        .close_connection => return,
                     }
                 }
 
@@ -3123,10 +3214,26 @@ pub fn Server(
                                 tracer.setIntAttribute(span_handle, "http.response.status_code", @intCast(rej.status));
                                 tracer.endSpan(span_handle, null);
 
+                                const available_body_bytes: u64 = switch (parser.body_framing) {
+                                    .content_length => |cl| @min(buffer_len - buffer_offset - parser.headers_end, cl),
+                                    .chunked => buffer_len - buffer_offset - parser.headers_end,
+                                    .none => 0,
+                                };
                                 // Advance buffer past this request and continue with next
                                 const body_length = getBodyLength(&parser.request);
                                 buffer_offset += parser.headers_end + body_length;
-                                continue;
+                                switch (shortCircuitControlFlow(
+                                    &parser,
+                                    &parser.request,
+                                    null,
+                                    available_body_bytes,
+                                    request_count,
+                                    cfg.max_requests_per_connection,
+                                )) {
+                                    .fall_through => unreachable,
+                                    .continue_h1 => continue,
+                                    .close_connection => return,
+                                }
                             },
                         }
                     } else {
@@ -3618,4 +3725,66 @@ test "h2 bridge adapter avoids proxy binding table internals" {
     const source = @embedFile("server.zig");
     const needle = "bridge." ++ "binding_table";
     try std.testing.expect(std.mem.indexOf(u8, source, needle) == null);
+}
+
+test "Server short-circuit body gate fails closed for incomplete content-length" {
+    const ServerType = Server(TestHandler, pool_mod.SimplePool, metrics_mod.NoopMetrics, tracing_mod.NoopTracer);
+
+    var parser = Parser.init();
+    parser.body_framing = .{ .content_length = 8 };
+
+    var body_reader = BodyReader{
+        .framing = .{ .content_length = 8 },
+        .bytes_already_read = 4,
+        .initial_body = "BODY",
+        .read_ctx = null,
+        .read_fn = null,
+    };
+
+    try std.testing.expect(!ServerType.shortCircuitBodyFullyConsumed(&parser, &body_reader, 4));
+}
+
+test "Server short-circuit body gate allows fully consumed content-length" {
+    const ServerType = Server(TestHandler, pool_mod.SimplePool, metrics_mod.NoopMetrics, tracing_mod.NoopTracer);
+
+    var parser = Parser.init();
+    parser.body_framing = .{ .content_length = 8 };
+
+    var body_reader = BodyReader{
+        .framing = .{ .content_length = 8 },
+        .bytes_already_read = 8,
+        .initial_body = "BODYDATA",
+        .read_ctx = null,
+        .read_fn = null,
+        .total_bytes_read = 8,
+        .initial_consumed = true,
+    };
+
+    try std.testing.expect(ServerType.shortCircuitBodyFullyConsumed(&parser, &body_reader, 8));
+}
+
+test "Server short-circuit body gate does not treat buffered bytes as consumed" {
+    const ServerType = Server(TestHandler, pool_mod.SimplePool, metrics_mod.NoopMetrics, tracing_mod.NoopTracer);
+
+    var parser = Parser.init();
+    parser.body_framing = .{ .content_length = 8 };
+
+    var body_reader = BodyReader{
+        .framing = .{ .content_length = 8 },
+        .bytes_already_read = 8,
+        .initial_body = "BODYDATA",
+        .read_ctx = null,
+        .read_fn = null,
+    };
+
+    try std.testing.expect(!ServerType.shortCircuitBodyFullyConsumed(&parser, &body_reader, 8));
+}
+
+test "Server short-circuit body gate fails closed for chunked framing" {
+    const ServerType = Server(TestHandler, pool_mod.SimplePool, metrics_mod.NoopMetrics, tracing_mod.NoopTracer);
+
+    var parser = Parser.init();
+    parser.body_framing = .chunked;
+
+    try std.testing.expect(!ServerType.shortCircuitBodyFullyConsumed(&parser, null, 0));
 }

@@ -54,6 +54,8 @@ pub const READY_POLL_INTERVAL_MS: u64 = 50;
 
 /// Base port for test servers. Each test allocates ports sequentially from here.
 pub const BASE_TEST_PORT: u16 = 19_000;
+/// Maximum probes when searching for a free test port.
+const MAX_PORT_SCAN_ATTEMPTS: u32 = 10_000;
 
 /// Maximum number of backends supported in a single load balancer.
 /// TigerStyle: Explicit bound prevents buffer overflow.
@@ -274,12 +276,18 @@ pub const PortPool = struct {
     pub fn next(self: *PortPool) u16 {
         self.mutex.lockUncancelable(std.Options.debug_io);
         defer self.mutex.unlock(std.Options.debug_io);
-        const port = self.next_port;
-        self.next_port +%= 1;
-        if (self.next_port < BASE_TEST_PORT) {
-            self.next_port = BASE_TEST_PORT;
+
+        var attempts: u32 = 0;
+        while (attempts < MAX_PORT_SCAN_ATTEMPTS) : (attempts += 1) {
+            const port = self.next_port;
+            self.next_port +%= 1;
+            if (self.next_port < BASE_TEST_PORT) {
+                self.next_port = BASE_TEST_PORT;
+            }
+            if (!tryConnect(port)) return port;
         }
-        return port;
+
+        @panic("PortPool failed to find a free test port");
     }
 };
 

@@ -1149,6 +1149,21 @@ pub fn build(b: *std.Build) void {
     );
     integration_test_5_step.dependOn(&run_integration_test_5.step);
 
+    const integration_test_echo_backend_200 = b.addTest(.{
+        .name = "integration_test_echo_backend_200",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: echo backend responds with 200"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_echo_backend_200);
+    const run_integration_test_echo_backend_200 = b.addRunArtifact(integration_test_echo_backend_200);
+
+    const integration_test_echo_backend_200_step = b.step(
+        "test-integration-echo-backend-200",
+        "Run integration test (echo backend responds with 200)",
+    );
+    integration_test_echo_backend_200_step.dependOn(&run_integration_test_echo_backend_200.step);
+
     const integration_test_2 = b.addTest(.{
         .name = "integration_test_2",
         .root_module = integration_tests_mod,
@@ -1163,6 +1178,13 @@ pub fn build(b: *std.Build) void {
         "Run integration test 2 (lb forwards to single backend)",
     );
     integration_test_2_step.dependOn(&run_integration_test_2.step);
+
+    const integration_debug_port_step = b.step(
+        "test-integration-debug-port",
+        "Run the two port-sensitive integration tests (echo backend 200 + lb forwards single backend)",
+    );
+    integration_debug_port_step.dependOn(&run_integration_test_echo_backend_200.step);
+    integration_debug_port_step.dependOn(&run_integration_test_2.step);
 
     const integration_test_38 = b.addTest(.{
         .name = "integration_test_38",
@@ -1822,6 +1844,7 @@ pub fn build(b: *std.Build) void {
     run_integration_tests.step.dependOn(&build_echo_backend.step);
     run_integration_tests.step.dependOn(&build_netbird_proxy.step);
     run_integration_tests.step.dependOn(&build_reverseproxy_runtime.step);
+    run_integration_test_echo_backend_200.step.dependOn(&build_echo_backend.step);
     run_integration_test_2.step.dependOn(&build_echo_backend.step);
     run_integration_test_32.step.dependOn(&build_echo_backend.step);
     run_integration_test_34.step.dependOn(&build_echo_backend.step);

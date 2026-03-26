@@ -39,6 +39,7 @@ const upgrade_preamble_size_bytes: usize =
     config.H2_MAX_FRAME_SIZE_BYTES +
     config.H2_MAX_HEADER_BLOCK_SIZE_BYTES;
 const read_max_retry_count: u32 = 30_000;
+const tls_read_readiness_timeout_ns: u64 = config.H2_SERVER_IDLE_TIMEOUT_NS;
 const write_retry_sleep_ns: u64 = time.ns_per_ms;
 const write_stall_timeout_ns: u64 = 30 * time.ns_per_s;
 const write_max_retry_count: u32 = 30_000;
@@ -2334,15 +2335,11 @@ fn readSome(
             break :blk n;
         },
         .tls_stream => |tls_stream| blk: {
+            const readiness_timeout = timeoutForNanoseconds(tls_read_readiness_timeout_ns);
             var retry_count: u32 = 0;
             while (retry_count < read_max_retry_count) : (retry_count += 1) {
                 if (!tls_stream.hasPendingRead()) {
-                    waitUntilReadable(tls_stream.fd, io) catch |err| switch (err) {
-                        error.ConnectionResetByPeer,
-                        error.SocketUnconnected,
-                        => return error.ConnectionClosed,
-                        else => return error.ReadFailed,
-                    };
+                    try waitUntilReadable(tls_stream.fd, io, readiness_timeout);
                 }
 
                 const n: u32 = tls_stream.read(out) catch |err| switch (err) {
@@ -2358,9 +2355,17 @@ fn readSome(
     };
 }
 
-fn waitUntilReadable(fd: i32, io: Io) anyerror!void {
+fn timeoutForNanoseconds(timeout_ns: u64) Io.Timeout {
+    assert(timeout_ns > 0);
+    return .{ .duration = .{
+        .raw = Io.Duration.fromNanoseconds(@intCast(timeout_ns)),
+        .clock = .awake,
+    } };
+}
+
+fn waitUntilReadable(fd: i32, io: Io, timeout: Io.Timeout) Error!void {
     assert(fd >= 0);
-    assert(read_max_retry_count > 0);
+    assert(tls_read_readiness_timeout_ns > 0);
 
     var messages: [1]Io.net.IncomingMessage = .{Io.net.IncomingMessage.init};
     var peek_buf: [1]u8 = undefined;
@@ -2369,9 +2374,15 @@ fn waitUntilReadable(fd: i32, io: Io) anyerror!void {
         &messages,
         &peek_buf,
         .{ .peek = true },
-        .none,
+        timeout,
     );
-    if (maybe_err) |err| return err;
+    if (maybe_err) |err| switch (err) {
+        error.Timeout => return error.ConnectionClosed,
+        error.ConnectionResetByPeer,
+        error.SocketUnconnected,
+        => return error.ConnectionClosed,
+        else => return error.ReadFailed,
+    };
 }
 
 fn writeSome(io_conn: *ConnectionIo, io: Io, out: []const u8) Error!usize {

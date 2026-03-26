@@ -5577,6 +5577,61 @@ fn expectWebSocketEchoThroughNetbirdProxy(proxy_port: u16, path: []const u8, pay
     try performClientCloseHandshake(sock);
 }
 
+test "integration: h1 short-circuit unread body closes connection before pipelined follow-on request" {
+    const backend_port = harness.getPort();
+
+    var backend = try NetbirdDualBackendServer.start(backend_port);
+    defer backend.stop();
+
+    const sock = try connectTcp(backend_port);
+    defer posix.close(sock);
+
+    var request_buf: [1024]u8 = undefined;
+    const pipelined_request = try std.fmt.bufPrint(
+        &request_buf,
+            "POST /api/accounts HTTP/1.1\r\n" ++
+            "Host: 127.0.0.1:{d}\r\n" ++
+            "Content-Length: 8\r\n" ++
+            "Connection: keep-alive\r\n" ++
+            "\r\n" ++
+            "BODYDATA" ++
+            "GET /oauth2/authorize HTTP/1.1\r\n" ++
+            "Host: 127.0.0.1:{d}\r\n" ++
+            "\r\n",
+        .{ backend_port, backend_port },
+    );
+    try sendAllTcp(sock, pipelined_request);
+
+    var response_buf: [2048]u8 = undefined;
+    const first_len = try readUntilHeadersComplete(sock, &response_buf);
+    const first_status = harness.TestClient.parseStatusCode(response_buf[0..first_len]) orelse return error.InvalidResponse;
+    try testing.expectEqual(@as(u16, 401), first_status);
+    try testing.expect(std.mem.indexOf(u8, response_buf[0..first_len], "HTTP/1.1 200") == null);
+
+    var saw_close = false;
+    var recv_buf: [1024]u8 = undefined;
+    var reads: u8 = 0;
+    while (reads < 4) : (reads += 1) {
+        const n = posix.recv(sock, &recv_buf, 0) catch |err| switch (err) {
+            error.ConnectionResetByPeer => {
+                saw_close = true;
+                break;
+            },
+            error.WouldBlock => break,
+            else => return err,
+        };
+
+        if (n == 0) {
+            saw_close = true;
+            break;
+        }
+
+        try testing.expect(std.mem.indexOf(u8, recv_buf[0..n], "HTTP/1.1 200") == null);
+    }
+
+    try testing.expect(saw_close);
+}
+
 test "integration: netbird route matrix enforces grpc h2c only for service paths" {
     const allocator = testing.allocator;
     const backend_port = harness.getPort();
