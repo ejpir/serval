@@ -1,0 +1,84 @@
+• Findings (ordered by severity)
+
+  1. High: acquire() can return dead/stale sockets without liveness check
+
+  - serval-pool/pool.zig:214 returns pooled connections after age/idle checks only.
+  - serval-pool/pool.zig:108 has isUnusable() (poll-based stale detection) but it is never used in SimplePool.acquire.
+  - Impact: recently half-closed/reset upstream sockets can be reused, causing avoidable request failures/retries.
+
+  2. High: checked-out accounting is not semantically correct for “connections in use”
+
+  - Increment only happens on pooled acquire: serval-pool/pool.zig:264.
+  - Decrement happens on every release, but silently saturates at 0: serval-pool/pool.zig:313.
+  - README claims this detects leaked/hung in-use connections: serval-pool/README.md:120, serval-pool/README.md:151.
+  - Impact: observability can under-report in-use/leak behavior and mask misuse.
+
+  3. Medium: checked_out_counts width (u8) is too small for enterprise concurrency
+
+  - Type is u8: serval-pool/pool.zig:187.
+  - Increment has no explicit bound/assert: serval-pool/pool.zig:264.
+  - Impact: overflow/trap risk or incorrect stats at higher concurrency.
+
+  4. Medium (test quality): tests pass undefined sockets through close paths
+
+  - Examples that invoke release(..., healthy=false) / overflow close path with socket = undefined:
+      - serval-pool/pool.zig:727
+      - serval-pool/pool.zig:765
+      - serval-pool/pool.zig:942
+  - Socket.close() asserts valid fd and closes it: serval-socket/socket.zig:150, serval-socket/socket.zig:83.
+  - Impact: nondeterministic/flaky tests, possible accidental FD closes in test process.
+
+  5. Low: dead code / cleanliness
+
+  - Unused debugLog import: serval-pool/pool.zig:18.
+
+---
+
+[Request interrupted by user]
+
+---
+
+cont
+
+---
+
+[Request interrupted by user]
+
+---
+
+just verify and let me know what the plan is
+
+---
+
+verify:
+
+• Verified. The plan is strong, but I’d adjust 4 points before implementation:
+
+  1. Finding 1 needs metric/order + lock discipline
+
+  - Do liveness check before final hit/miss metric emission.
+  - If unusable: close outside lock, but decrement checked_out_counts under lock.
+  - Emit .acquire_evicted and then .acquire_miss (since caller got no connection).
+
+  2. Finding 2 is correct, but update docs semantics
+
+  - from_pool is a good fix.
+  - Also update README wording: checked_out tracks borrowed pooled connections, not all upstream connections in process.
+
+  3. Finding 3 may be unnecessary unless you want future-proofing
+
+  - With from_pool, max checked-out is naturally bounded by pool capacity, so u8 is currently sufficient.
+  - If you keep u16, fine, but then align all assertions/tests and document why.
+
+  4. Finding 4: don’t leak test FDs
+
+  - Use a helper that returns real connected FDs (e.g., socketpair/pipe pair) and closes both via defer.
+  - “Intentionally leaked” in tests is avoidable and conflicts with your quality bar.
+
+  5. Finding 5 is good
+
+  - Remove unused debugLog import.
+
+---
+
+[Request interrupted by user]

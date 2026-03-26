@@ -1,0 +1,31 @@
+{
+  "cli_version": "0.4.3",
+  "checkpoint_id": "9df1ab9aef69",
+  "session_id": "3c329339-b6cc-4cc2-a02f-17db9853b50f",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-26T22:27:52.133165837Z",
+  "branch": "main",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "experiments/tls-poc/boringssl"
+  ],
+  "agent": "Claude Code",
+  "transcript_identifier_at_start": "41b16b76-0f16-445b-a765-781e3c817622",
+  "token_usage": {
+    "input_tokens": 22,
+    "cache_creation_tokens": 51714,
+    "cache_read_tokens": 403478,
+    "output_tokens": 23130,
+    "api_call_count": 12
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-26T22:27:52.101041498Z",
+    "agent_lines": 0,
+    "human_added": 3529078,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 3529078,
+    "agent_percentage": 0
+  },
+  "transcript_path": ".claude/projects/-home-nick-repos-serval/3c329339-b6cc-4cc2-a02f-17db9853b50f.jsonl"
+}
