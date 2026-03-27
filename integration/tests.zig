@@ -669,6 +669,7 @@ fn connectTcpTls(port: u16, desired_alpn: ?[]const u8) !serval.Socket {
         "127.0.0.1",
         false,
         desired_alpn,
+        false,
     );
 }
 
@@ -2910,7 +2911,7 @@ fn sendGrpcUnaryViaStreamBridge(
     var iterations: u32 = 0;
 
     while (iterations < H2_MAX_FRAME_READS) : (iterations += 1) {
-        const action = bridge.receiveForUpstream(upstream.idx) catch |err| switch (err) {
+        const action = bridge.receiveForUpstream(upstream.idx, io) catch |err| switch (err) {
             error.ConnectionClosed => break,
             else => return err,
         };

@@ -287,11 +287,12 @@ pub const StreamBridge = struct {
     pub fn receiveForUpstream(
         self: *StreamBridge,
         upstream_index: config.UpstreamIndex,
+        io: Io,
     ) Error!ReceiveAction {
         assert(@intFromPtr(self) != 0);
 
         const session = self.sessions.get(upstream_index) orelse return error.SessionNotFound;
-        const action = try session.receiveActionHandlingControl();
+        const action = try session.receiveActionHandlingControlTimeout(io, .none);
         return self.mapReceiveAction(upstream_index, session.generation, action);
     }
 

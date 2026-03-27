@@ -69,6 +69,8 @@ pub extern fn SSL_CTX_use_certificate_chain_file(ctx: *SSL_CTX, file: [*:0]const
 pub extern fn SSL_CTX_use_PrivateKey_file(ctx: *SSL_CTX, file: [*:0]const u8, type_: c_int) c_int;
 pub extern fn SSL_CTX_load_verify_locations(ctx: *SSL_CTX, ca_file: ?[*:0]const u8, ca_path: ?[*:0]const u8) c_int;
 pub extern fn SSL_CTX_set_verify(ctx: *SSL_CTX, mode: c_int, callback: ?*anyopaque) void;
+pub extern fn SSL_set_verify(ssl_obj: *SSL, mode: c_int, callback: ?*anyopaque) void;
+pub extern fn SSL_get_verify_mode(ssl_obj: *const SSL) c_int;
 
 pub const ServerNameCallback = *const fn (
     ssl: *SSL,

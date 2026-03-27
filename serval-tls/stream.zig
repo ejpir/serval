@@ -186,6 +186,7 @@ pub const TLSStream = struct {
         allocator: Allocator,
         enable_ktls: bool,
         desired_alpn: ?[]const u8,
+        verify_peer: bool,
     ) !TLSStream {
         // S1: preconditions
         assert(@intFromPtr(ctx) != 0); // S1: precondition - ctx is valid pointer
@@ -204,6 +205,11 @@ pub const TLSStream = struct {
             try ssl.setClientAlpnProtocol(ssl_conn, protocol);
         }
 
+        if (verify_peer) {
+            ssl.SSL_set_verify(ssl_conn, ssl.SSL_VERIFY_PEER, null);
+        } else {
+            ssl.SSL_set_verify(ssl_conn, ssl.SSL_VERIFY_NONE, null);
+        }
         ssl.SSL_set_connect_state(ssl_conn);
 
         // Capture handshake timing

@@ -15,6 +15,8 @@ const HttpProtocol = core.HttpProtocol;
 pub const ForwardError = error{
     /// Failed to connect to upstream
     ConnectFailed,
+    /// Connect-time timeout was requested but backend cannot honor it
+    ConnectTimeoutUnsupported,
     /// Failed to send request to upstream
     SendFailed,
     /// Failed to receive response from upstream
@@ -117,6 +119,7 @@ test "CRITICAL: ForwardError covers all failure modes" {
 
     const all_errors = [_]ForwardError{
         ForwardError.ConnectFailed,
+        ForwardError.ConnectTimeoutUnsupported,
         ForwardError.SendFailed,
         ForwardError.RecvFailed,
         ForwardError.StaleConnection,

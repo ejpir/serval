@@ -3576,6 +3576,7 @@ pub fn Server(
         fn forwardErrorToPhase(err: forwarder_mod.ForwardError) errors.ErrorContext.Phase {
             return switch (err) {
                 forwarder_mod.ForwardError.ConnectFailed,
+                forwarder_mod.ForwardError.ConnectTimeoutUnsupported,
                 forwarder_mod.ForwardError.InvalidAddress,
                 forwarder_mod.ForwardError.DnsResolutionFailed,
                 => .connect,
@@ -3596,6 +3597,7 @@ pub fn Server(
         fn forwardErrorToRequestError(err: forwarder_mod.ForwardError) errors.RequestError {
             return switch (err) {
                 forwarder_mod.ForwardError.ConnectFailed => error.ConnectFailed,
+                forwarder_mod.ForwardError.ConnectTimeoutUnsupported => error.ConnectFailed,
                 forwarder_mod.ForwardError.InvalidAddress => error.ConnectFailed,
                 forwarder_mod.ForwardError.DnsResolutionFailed => error.ConnectFailed,
                 forwarder_mod.ForwardError.SendFailed => error.SendFailed,

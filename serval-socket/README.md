@@ -23,7 +23,7 @@ This allows higher-level modules (pool, proxy, client, server) to work with sock
 | `PlainSocket` | Plain TCP socket wrapper |
 | `Socket.Plain.init_client(fd)` | Create plain client socket from fd |
 | `Socket.Plain.init_server(fd)` | Create plain server socket from fd |
-| `Socket.TLS.TLSSocket.init_client(fd, ctx, host, enable_ktls)` | Create TLS client socket with SNI |
+| `Socket.TLS.TLSSocket.init_client(fd, ctx, host, enable_ktls, desired_alpn, verify_peer)` | Create TLS client socket with SNI |
 | `Socket.TLS.TLSSocket.init_server(fd, ctx)` | Create TLS server socket |
 | `socket.read(buf)` | Read data into buffer |
 | `socket.write(data)` | Write data to socket |
@@ -80,7 +80,7 @@ Create plain server socket from file descriptor. Same as `init_client` for plain
 
 **Returns:** `Socket` with `.plain` variant
 
-### Socket.TLS.TLSSocket.init_client(fd, ctx, host, enable_ktls) SocketError!Socket
+### Socket.TLS.TLSSocket.init_client(fd, ctx, host, enable_ktls, desired_alpn, verify_peer) SocketError!Socket
 
 Create TLS client socket with Server Name Indication (SNI). Performs TLS handshake.
 
@@ -89,6 +89,8 @@ Create TLS client socket with Server Name Indication (SNI). Performs TLS handsha
 - `ctx`: OpenSSL SSL_CTX pointer (caller owns lifecycle)
 - `host`: Hostname for SNI (max 253 chars per RFC 6066)
 - `enable_ktls`: If true, attempt kernel TLS offload. If false, use userspace TLS.
+- `desired_alpn`: Optional ALPN protocol to negotiate (for example `"h2"`)
+- `verify_peer`: If true, enforce certificate verification for this TLS connection
 
 **Returns:** `Socket` with `.tls` variant, or `SocketError`
 
@@ -209,7 +211,14 @@ const ctx = try tls.ssl.createClientContext();
 defer tls.ssl.destroyContext(ctx);
 
 // Create TLS socket with SNI (enable_ktls=true for kernel TLS offload)
-var socket = try Socket.TLS.TLSSocket.init_client(upstream_fd, ctx, "api.example.com", true);
+var socket = try Socket.TLS.TLSSocket.init_client(
+    upstream_fd,
+    ctx,
+    "api.example.com",
+    true,
+    null,
+    true,
+);
 defer socket.close();
 
 // Read/write (encrypted transparently)

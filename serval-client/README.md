@@ -30,7 +30,7 @@ surfacing them as repeated missing-stream errors.
 
 ## Design Principles
 
-- **Async I/O** - Uses `std.Io` (io_uring integration) for non-blocking operations
+- **Async I/O** - H2 connection driver uses `std.Io` (io_uring integration) for fiber-safe operations when an `Io` context is provided; HTTP/1 request/response paths use blocking socket I/O (fiber-safe variants live in `serval-proxy/h1/`)
 - **TigerStyle** - Explicit lifecycle, caller-provided buffers, no hidden allocation
 - **Bounded/Unbounded Separation** - Reads bounded headers, caller handles unbounded body
 - **Fine-grained Errors** - Specific error types for debugging and metrics
@@ -192,6 +192,7 @@ pub const ConnectResult = struct {
     tcp_connect_duration_ns: u64,  // TCP handshake time
     tls_handshake_duration_ns: u64, // TLS handshake time (0 if plaintext)
     local_port: u16,               // Ephemeral port
+    connect_timeout_honored: bool, // false if backend fell back to unbounded connect
 };
 ```
 

@@ -47,6 +47,7 @@ pub const TLSSocket = struct {
         host: []const u8,
         enable_ktls: bool,
         desired_alpn: ?[]const u8,
+        verify_peer: bool,
     ) SocketError!Socket {
         // S1: preconditions
         assert(fd >= 0); // S1: valid fd
@@ -72,6 +73,7 @@ pub const TLSSocket = struct {
             std.heap.page_allocator,
             enable_ktls,
             desired_alpn,
+            verify_peer,
         ) catch |err| {
             return map_tls_error(err);
         };
