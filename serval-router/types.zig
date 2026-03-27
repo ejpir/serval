@@ -15,6 +15,33 @@ pub const LbHandler = lb.LbHandler;
 pub const LbConfig = lb.LbConfig;
 pub const Upstream = core.Upstream;
 
+/// Strip port from hostname, handling IPv6 bracket notation.
+///
+/// RFC 9110 §7.2: Host header may include port.
+/// RFC 3986 §3.2.2: IPv6 addresses in URIs use bracket notation.
+///
+/// TigerStyle: Pure function, no allocation, returns slice into input.
+pub fn stripPort(host: []const u8) []const u8 {
+    if (host.len > 0 and host[0] == '[') {
+        if (std.mem.indexOfScalar(u8, host, ']')) |close| {
+            if (close + 1 == host.len or host[close + 1] == ':') {
+                return host[1..close];
+            }
+            return host;
+        }
+        return host;
+    }
+
+    if (std.mem.indexOfScalar(u8, host, ':')) |first_colon| {
+        if (std.mem.indexOfScalar(u8, host[first_colon + 1 ..], ':') != null) {
+            return host;
+        }
+        return host[0..first_colon];
+    }
+
+    return host;
+}
+
 // =============================================================================
 // Path Matching
 // =============================================================================
@@ -43,7 +70,13 @@ pub const PathMatch = union(enum) {
         return switch (self) {
             .exact => |pattern| std.mem.eql(u8, request_path, pattern),
             .exactPath => |pattern| matchExactPath(pattern, request_path),
-            .prefix => |pattern| std.mem.startsWith(u8, request_path, pattern),
+            .prefix => |pattern| {
+                if (!std.mem.startsWith(u8, request_path, pattern)) return false;
+                if (request_path.len == pattern.len) return true;
+                if (pattern.len > 0 and pattern[pattern.len - 1] == '/') return true;
+                return request_path[pattern.len] == '/' or
+                    request_path[pattern.len] == '?';
+            },
         };
     }
 
@@ -98,7 +131,7 @@ pub const RouteMatcher = struct {
         if (self.host) |expected_host| {
             const actual_host = request_host orelse return false;
             // Strip port if present. RFC 9110 §7.2: Host header may include port.
-            const hostname = if (std.mem.indexOfScalar(u8, actual_host, ':')) |i| actual_host[0..i] else actual_host;
+            const hostname = stripPort(actual_host);
 
             if (!matchHost(expected_host, hostname)) {
                 return false;
@@ -255,6 +288,19 @@ test "PathMatch prefix matches" {
     try std.testing.expect(!pattern.matches("/ap"));
 }
 
+test "PathMatch prefix respects segment boundary" {
+    const pattern = PathMatch{ .prefix = "/api" };
+
+    try std.testing.expect(pattern.matches("/api"));
+    try std.testing.expect(pattern.matches("/api/"));
+    try std.testing.expect(pattern.matches("/api/users"));
+    try std.testing.expect(pattern.matches("/api?key=val"));
+
+    try std.testing.expect(!pattern.matches("/apiary"));
+    try std.testing.expect(!pattern.matches("/api-v2"));
+    try std.testing.expect(!pattern.matches("/apis"));
+}
+
 test "PathMatch exactPath matches" {
     const pattern = PathMatch{ .exactPath = "/healthz" };
 
@@ -370,6 +416,31 @@ test "RouteMatcher strips port from host" {
 
     // Different host with port should not match
     try std.testing.expect(!matcher.matches("other.example.com:8080", "/"));
+}
+
+test "RouteMatcher handles IPv6 host with port" {
+    const matcher = RouteMatcher{
+        .host = "2001:db8::1",
+        .path = .{ .prefix = "/" },
+    };
+
+    try std.testing.expect(matcher.matches("[2001:db8::1]:443", "/"));
+    try std.testing.expect(matcher.matches("[2001:db8::1]:8080", "/"));
+    try std.testing.expect(matcher.matches("[2001:db8::1]", "/"));
+    try std.testing.expect(matcher.matches("2001:db8::1", "/"));
+    try std.testing.expect(!matcher.matches("[2001:db8::2]:443", "/"));
+    try std.testing.expect(!matcher.matches("[2001:db8::1]junk", "/"));
+}
+
+test "RouteMatcher handles IPv4 host unchanged" {
+    const matcher = RouteMatcher{
+        .host = "192.168.1.1",
+        .path = .{ .prefix = "/" },
+    };
+
+    try std.testing.expect(matcher.matches("192.168.1.1:8080", "/"));
+    try std.testing.expect(matcher.matches("192.168.1.1", "/"));
+    try std.testing.expect(!matcher.matches("192.168.1.2:8080", "/"));
 }
 
 test "Route defaults" {

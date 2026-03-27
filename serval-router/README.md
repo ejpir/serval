@@ -212,8 +212,9 @@ pub const RouteMatcher = struct {
 
 ```zig
 pub const PathMatch = union(enum) {
-    exact: []const u8,   // Exact path match
-    prefix: []const u8,  // Prefix match
+    exact: []const u8,      // Exact path match
+    exactPath: []const u8,  // Exact path match ignoring query string
+    prefix: []const u8,     // Prefix match (segment-boundary aware)
 
     pub fn matches(self: PathMatch, request_path: []const u8) bool
     pub fn getPattern(self: PathMatch) []const u8
@@ -290,7 +291,7 @@ See `deploy/README.md` for full deployment commands.
 | Header matching | Not implemented |
 | Regex path matching | Not implemented |
 | Method matching | Not implemented |
-| Wildcard host matching | Not implemented |
+| Wildcard host matching | Complete |
 
 ## Dependencies
 

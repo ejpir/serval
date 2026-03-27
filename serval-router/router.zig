@@ -204,6 +204,9 @@ pub const Router = struct {
         assert(self.pools.len > 0); // S1: Router initialized
         assert(self.allowed_hosts.len <= MAX_ALLOWED_HOSTS); // S1: Bounds check
 
+        // Clear pool_idx to prevent stale values from prior requests on reused Context.
+        ctx.pool_idx = null;
+
         const host = request.headers.getHost();
         log.debug("router: selectUpstream host={s} path={s}", .{ host orelse "(no host)", request.path });
 
@@ -234,6 +237,7 @@ pub const Router = struct {
 
         // Delegate to pool's LbHandler for health-aware selection
         assert(route.pool_idx < self.pools.len); // S1: Valid pool index
+        ctx.pool_idx = route.pool_idx;
         const upstream = self.pools[route.pool_idx].lb_handler.selectUpstream(ctx, request);
         log.debug("router: selected upstream host={s} port={d}", .{ upstream.host, upstream.port });
         return .{ .forward = upstream };
@@ -241,34 +245,38 @@ pub const Router = struct {
 
     /// Handler interface: forward health tracking to correct pool.
     ///
-    /// Finds the pool that owns the upstream and forwards the log entry
-    /// for passive health tracking (5xx = failure).
+    /// Uses pool_idx from Context (set by selectUpstream) to go directly
+    /// to the correct pool, then finds the upstream's local array index
+    /// by matching (host, port).
     ///
-    /// TigerStyle: Bounded loops (MAX_POOLS * MAX_UPSTREAMS).
+    /// TigerStyle: Bounded loop (MAX_UPSTREAMS per pool).
     pub fn onLog(self: *Self, ctx: *Context, entry: LogEntry) void {
         const upstream = entry.upstream orelse return;
+        const pool_idx = ctx.pool_idx orelse {
+            log.warn("onLog: pool_idx not set on context, dropping health update for {s}:{d}", .{
+                upstream.host,
+                upstream.port,
+            });
+            return;
+        };
 
-        // Find which pool owns this upstream and forward onLog
-        // TigerStyle S3: Bounded outer loop (MAX_POOLS)
-        for (self.pools) |*pool| {
-            // TigerStyle S3: Bounded inner loop (MAX_UPSTREAMS per pool)
-            for (pool.lb_handler.upstreams, 0..) |u, local_idx| {
-                if (u.idx == upstream.idx) {
-                    // Create modified entry with local pool index for health tracking.
-                    // The LbHandler uses upstream.idx as the health state index, which
-                    // must be within the pool's backend_count (0..upstreams.len-1).
-                    var local_upstream = u;
-                    local_upstream.idx = @intCast(local_idx);
+        assert(pool_idx < self.pools.len); // S1: Context must contain valid pool index
+        var pool = &self.pools[pool_idx];
 
-                    var local_entry = entry;
-                    local_entry.upstream = local_upstream;
+        // TigerStyle S3: Bounded loop (MAX_UPSTREAMS per pool)
+        for (pool.lb_handler.upstreams, 0..) |u, local_idx| {
+            if (u.port == upstream.port and std.mem.eql(u8, u.host, upstream.host)) {
+                var local_upstream = u;
+                local_upstream.idx = @intCast(local_idx);
 
-                    pool.lb_handler.onLog(ctx, local_entry);
-                    return;
-                }
+                var local_entry = entry;
+                local_entry.upstream = local_upstream;
+
+                pool.lb_handler.onLog(ctx, local_entry);
+                return;
             }
         }
-        // Upstream not found in any pool - ignore (may be from different handler)
+        // Upstream not found in selected pool - ignore (may be from different handler)
     }
 
     /// Find matching route. Returns null if no match.
@@ -327,7 +335,7 @@ pub const Router = struct {
         const h = host orelse return false;
 
         // Strip port if present. RFC 9110 §7.2: Host may include port.
-        const hostname = if (std.mem.indexOfScalar(u8, h, ':')) |i| h[0..i] else h;
+        const hostname = types.stripPort(h);
 
         // S1: Postcondition - hostname length check
         assert(hostname.len <= h.len);
@@ -761,6 +769,160 @@ test "Router onLog still updates pool health after LB strategy extraction" {
     try std.testing.expectEqualStrings("api-2", next.forward.host);
 }
 
+test "Router onLog does not corrupt health across pools with overlapping idx" {
+    const pool0_upstreams = [_]Upstream{
+        .{ .host = "pool0-a", .port = 8001, .idx = 0 },
+        .{ .host = "pool0-b", .port = 8002, .idx = 1 },
+    };
+    const pool1_upstreams = [_]Upstream{
+        .{ .host = "pool1-a", .port = 9001, .idx = 0 },
+        .{ .host = "pool1-b", .port = 9002, .idx = 1 },
+    };
+
+    const routes = [_]Route{
+        .{
+            .name = "api",
+            .matcher = .{ .path = .{ .prefix = "/api/" } },
+            .pool_idx = 0,
+        },
+        .{
+            .name = "static",
+            .matcher = .{ .path = .{ .prefix = "/static/" } },
+            .pool_idx = 1,
+        },
+    };
+
+    const pool_configs = [_]PoolConfig{
+        .{ .name = "pool-0", .upstreams = &pool0_upstreams, .lb_config = .{
+            .enable_probing = false,
+            .unhealthy_threshold = 2,
+            .healthy_threshold = 1,
+        } },
+        .{ .name = "pool-1", .upstreams = &pool1_upstreams, .lb_config = .{
+            .enable_probing = false,
+            .unhealthy_threshold = 2,
+            .healthy_threshold = 1,
+        } },
+    };
+
+    var router: Router = undefined;
+    try router.init(&routes, &pool_configs, &.{}, null, null);
+    defer router.deinit();
+
+    var ctx = Context.init();
+    const req = Request{ .path = "/static/img.png" };
+    const action = router.selectUpstream(&ctx, &req);
+    try std.testing.expect(action == .forward);
+
+    router.onLog(&ctx, makeRouterLogEntry(500, pool1_upstreams[0]));
+    router.onLog(&ctx, makeRouterLogEntry(500, pool1_upstreams[0]));
+
+    const p0 = router.getPool(0).?;
+    try std.testing.expect(p0.lb_handler.isHealthy(0));
+    try std.testing.expect(p0.lb_handler.isHealthy(1));
+
+    const p1 = router.getPool(1).?;
+    try std.testing.expect(!p1.lb_handler.isHealthy(0));
+    try std.testing.expect(p1.lb_handler.isHealthy(1));
+}
+
+test "Router onLog targets correct pool when backend is shared across pools" {
+    const shared_upstream = Upstream{ .host = "shared-backend", .port = 8001, .idx = 0 };
+    const pool0_upstreams = [_]Upstream{shared_upstream};
+    const pool1_upstreams = [_]Upstream{shared_upstream};
+
+    const routes = [_]Route{
+        .{
+            .name = "api",
+            .matcher = .{ .path = .{ .prefix = "/api/" } },
+            .pool_idx = 0,
+        },
+        .{
+            .name = "admin",
+            .matcher = .{ .path = .{ .prefix = "/admin/" } },
+            .pool_idx = 1,
+        },
+    };
+
+    const pool_configs = [_]PoolConfig{
+        .{ .name = "pool-0", .upstreams = &pool0_upstreams, .lb_config = .{
+            .enable_probing = false,
+            .unhealthy_threshold = 2,
+            .healthy_threshold = 1,
+        } },
+        .{ .name = "pool-1", .upstreams = &pool1_upstreams, .lb_config = .{
+            .enable_probing = false,
+            .unhealthy_threshold = 2,
+            .healthy_threshold = 1,
+        } },
+    };
+
+    var router: Router = undefined;
+    try router.init(&routes, &pool_configs, &.{}, null, null);
+    defer router.deinit();
+
+    var ctx = Context.init();
+    const req = Request{ .path = "/admin/dashboard" };
+    const action = router.selectUpstream(&ctx, &req);
+    try std.testing.expect(action == .forward);
+
+    router.onLog(&ctx, makeRouterLogEntry(500, shared_upstream));
+    router.onLog(&ctx, makeRouterLogEntry(500, shared_upstream));
+
+    const p0 = router.getPool(0).?;
+    try std.testing.expect(p0.lb_handler.isHealthy(0));
+
+    const p1 = router.getPool(1).?;
+    try std.testing.expect(!p1.lb_handler.isHealthy(0));
+}
+
+test "Router onLog ignores stale pool_idx after rejected request" {
+    const upstreams = [_]Upstream{
+        .{ .host = "backend-a", .port = 8001, .idx = 0 },
+    };
+
+    const routes = [_]Route{
+        .{
+            .name = "api",
+            .matcher = .{ .path = .{ .prefix = "/" } },
+            .pool_idx = 0,
+        },
+    };
+
+    const pool_configs = [_]PoolConfig{
+        .{ .name = "pool-0", .upstreams = &upstreams, .lb_config = .{
+            .enable_probing = false,
+            .unhealthy_threshold = 2,
+            .healthy_threshold = 1,
+        } },
+    };
+    const allowed_hosts = [_][]const u8{"allowed.example.com"};
+
+    var router: Router = undefined;
+    try router.init(&routes, &pool_configs, &allowed_hosts, null, null);
+    defer router.deinit();
+
+    var ctx = Context.init();
+
+    var req1 = Request{ .path = "/test" };
+    try req1.headers.put("Host", "allowed.example.com");
+    const action1 = router.selectUpstream(&ctx, &req1);
+    try std.testing.expect(action1 == .forward);
+    try std.testing.expectEqual(@as(?u8, 0), ctx.pool_idx);
+
+    var req2 = Request{ .path = "/test" };
+    try req2.headers.put("Host", "disallowed.example.com");
+    const action2 = router.selectUpstream(&ctx, &req2);
+    try std.testing.expect(action2 == .reject);
+    try std.testing.expectEqual(@as(?u8, null), ctx.pool_idx);
+
+    router.onLog(&ctx, makeRouterLogEntry(500, upstreams[0]));
+    router.onLog(&ctx, makeRouterLogEntry(500, upstreams[0]));
+
+    const p0 = router.getPool(0).?;
+    try std.testing.expect(p0.lb_handler.isHealthy(0));
+}
+
 test "Router selectUpstream returns 404 when no route matches" {
     const routes = [_]Route{
         .{
@@ -974,6 +1136,36 @@ test "Router isHostAllowed strips port from host" {
     try std.testing.expect(router.isHostAllowed("example.com:8080"));
     try std.testing.expect(router.isHostAllowed("example.com:443"));
     try std.testing.expect(!router.isHostAllowed("other.com:8080"));
+}
+
+test "Router isHostAllowed handles IPv6 bracket notation" {
+    const routes = [_]Route{
+        .{
+            .name = "default",
+            .matcher = .{ .path = .{ .prefix = "/" } },
+            .pool_idx = 0,
+        },
+    };
+
+    const upstreams = [_]Upstream{
+        .{ .host = "127.0.0.1", .port = 8001, .idx = 0 },
+    };
+
+    const pool_configs = [_]PoolConfig{
+        .{ .name = "pool-0", .upstreams = &upstreams, .lb_config = .{ .enable_probing = false } },
+    };
+
+    const allowed_hosts = [_][]const u8{"2001:db8::1"};
+
+    var router: Router = undefined;
+    try router.init(&routes, &pool_configs, &allowed_hosts, null, null);
+    defer router.deinit();
+
+    try std.testing.expect(router.isHostAllowed("[2001:db8::1]:443"));
+    try std.testing.expect(router.isHostAllowed("[2001:db8::1]:8080"));
+    try std.testing.expect(router.isHostAllowed("[2001:db8::1]"));
+    try std.testing.expect(router.isHostAllowed("2001:db8::1"));
+    try std.testing.expect(!router.isHostAllowed("[2001:db8::2]:443"));
 }
 
 test "Router selectUpstream returns 421 for disallowed host" {

@@ -248,6 +248,10 @@ pub const Context = struct {
     // If null, forwarder uses original request path.
     rewritten_path: ?[]const u8 = null,
 
+    // Set by router to identify which pool handled this request.
+    // Used by onLog to route health updates to the correct pool.
+    pool_idx: ?u8 = null,
+
     // Metrics (updated by server)
     bytes_received: u64 = 0,
     bytes_sent: u64 = 0,
