@@ -79,6 +79,8 @@ pub const ConnectResult = struct {
     tls_handshake_duration_ns: u64,
     /// Local port of the connection.
     local_port: u16,
+    /// Whether requested connect timeout semantics were honored by the IO backend.
+    connect_timeout_honored: bool,
 };
 
 // =============================================================================
@@ -140,10 +142,13 @@ pub fn connectUpstream(
         .raw = Io.Duration.fromNanoseconds(@intCast(cfg.timeout_ns)),
         .clock = .awake,
     } };
-    const client_result = client.connectWithTimeout(upstream.*, io, connect_timeout) catch |err| {
+    var client_result = client.connectWithTimeout(upstream.*, io, connect_timeout) catch |err| {
         debugLog("connect: FAILED err={s}", .{@errorName(err)});
         return mapClientError(err);
     };
+    if (connect_timeout != .none and !client_result.connect_timeout_honored) {
+        debugLog("connect: timeout unsupported by IO backend, continuing with unbounded connect", .{});
+    }
 
     debugLog("connect: complete fd={d} dns_us={d} tcp_us={d} tls_us={d}", .{
         client_result.conn.socket.get_fd(),
@@ -163,6 +168,7 @@ pub fn connectUpstream(
         .tcp_connect_duration_ns = client_result.tcp_connect_duration_ns,
         .tls_handshake_duration_ns = client_result.tls_handshake_duration_ns,
         .local_port = client_result.local_port,
+        .connect_timeout_honored = client_result.connect_timeout_honored,
     };
 }
 
@@ -297,6 +303,7 @@ test "ConnectResult: struct fields are correctly typed" {
         .tcp_connect_duration_ns = 1000000,
         .tls_handshake_duration_ns = 0,
         .local_port = 8080,
+        .connect_timeout_honored = true,
     };
 
     try testing.expectEqual(@as(u64, 12345678), result.created_ns);

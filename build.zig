@@ -1194,6 +1194,28 @@ pub fn build(b: *std.Build) void {
     );
     integration_test_16_step.dependOn(&run_integration_test_16.step);
 
+    const integration_test_18 = b.addTest(.{
+        .name = "integration_test_18",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: netbird route matrix enforces grpc h2c only for service paths"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_18);
+    const run_integration_test_18 = b.addRunArtifact(integration_test_18);
+
+    const integration_test_18_step = b.step(
+        "test-integration-18",
+        "Run integration test 18 (netbird route matrix enforces grpc h2c only for service paths)",
+    );
+    integration_test_18_step.dependOn(&run_integration_test_18.step);
+
+    const integration_ws_netbird_debug_step = b.step(
+        "test-integration-ws-netbird-debug",
+        "Run failing integration tests 16 + 18 for focused debugging",
+    );
+    integration_ws_netbird_debug_step.dependOn(&run_integration_test_16.step);
+    integration_ws_netbird_debug_step.dependOn(&run_integration_test_18.step);
+
     const integration_test_136 = b.addTest(.{
         .name = "integration_test_136",
         .root_module = integration_tests_mod,

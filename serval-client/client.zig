@@ -95,6 +95,13 @@ pub const ConnectResult = struct {
     tls_handshake_duration_ns: u64,
     /// Local port of the connection.
     local_port: u16,
+    /// Whether requested connect timeout semantics were honored by IO backend.
+    connect_timeout_honored: bool,
+};
+
+const TcpConnectResult = struct {
+    fd: i32,
+    timeout_honored: bool,
 };
 
 /// Result of a complete HTTP request (connect + send + read headers).
@@ -216,9 +223,10 @@ pub const Client = struct {
 
         // Step 2: TCP connection (timed)
         const tcp_start_ns = time.monotonicNanos();
-        const fd = tcpConnect(resolve_result.address, io, connect_timeout) catch |err| {
+        const tcp_result = tcpConnect(resolve_result.address, io, connect_timeout) catch |err| {
             return mapConnectError(err);
         };
+        const fd = tcp_result.fd;
         const tcp_end_ns = time.monotonicNanos();
         const tcp_connect_duration_ns = time.elapsedNanos(tcp_start_ns, tcp_end_ns);
 
@@ -261,6 +269,7 @@ pub const Client = struct {
                 sni_host,
                 self.enable_ktls,
                 desired_alpn,
+                self.verify_tls,
             ) catch {
                 closeFd(fd);
                 return ClientError.TlsHandshakeFailed;
@@ -305,6 +314,7 @@ pub const Client = struct {
             .tcp_connect_duration_ns = tcp_connect_duration_ns,
             .tls_handshake_duration_ns = tls_handshake_duration_ns,
             .local_port = local_port,
+            .connect_timeout_honored = tcp_result.timeout_honored,
         };
     }
 
@@ -403,7 +413,7 @@ fn getLocalPort(fd: i32) u16 {
 
 /// Perform TCP connection using Io async API.
 /// TigerStyle: Bounded via Io cancellation, explicit error return.
-fn tcpConnect(address: Io.net.IpAddress, io: Io, connect_timeout: Io.Timeout) !i32 {
+fn tcpConnect(address: Io.net.IpAddress, io: Io, connect_timeout: Io.Timeout) !TcpConnectResult {
     // Use IpAddress.connect() to perform async TCP connect
     // This creates the socket and connects in one step.
     const stream = address.connect(io, .{
@@ -420,12 +430,18 @@ fn tcpConnect(address: Io.net.IpAddress, io: Io, connect_timeout: Io.Timeout) !i
             }) catch |fallback_err| {
                 return fallback_err;
             };
-            return fallback.socket.handle;
+            return .{
+                .fd = fallback.socket.handle,
+                .timeout_honored = false,
+            };
         }
         return err;
     };
 
-    return stream.socket.handle;
+    return .{
+        .fd = stream.socket.handle,
+        .timeout_honored = true,
+    };
 }
 
 /// Map TCP connect errors to ClientError.
