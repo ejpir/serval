@@ -1,0 +1,162 @@
+• ## Findings (ordered by severity)
+
+  1. High — Header-name validation is incomplete (protocol safety / smuggling risk)
+     Code only checks “not uppercase”, but does not enforce RFC token validity (no SP/CTL/separators).
+      - serval-h2/request.zig:316
+      - serval-h2/request.zig:511
+        Impact: malformed names like bad name or control-byte names can pass decode and enter routing/header logic.
+  2. High — Connection token parsing has a hard cutoff that can bypass hop-by-hop stripping
+     headerHasToken stops after 64 tokens; anything after that is ignored. shouldForwardHeader depends on this for suppression.
+      - serval-h2/upgrade.zig:203
+      - serval-h2/upgrade.zig:285
+        Impact: attacker-crafted long Connection lists can cause forbidden hop-by-hop headers to be forwarded.
+  3. Medium — Initial preface parser accepts invalid WINDOW_UPDATE increments
+     In initial-frame parsing, WINDOW_UPDATE only checks length, not semantic validity (increment != 0, bounds).
+      - serval-h2/request.zig:127
+        Impact: fail-open behavior on protocol-invalid bootstrap traffic.
+  4. Low — Error/API contract drift (misleading and harder to operate)
+     Error variants exist but are effectively unreachable/not emitted in current logic.
+      - UnsupportedPriority declared but not actually returned: serval-h2/request.zig:52, priority is accepted in HEADERS path serval-h2/request.zig:190
+      - InvalidFrameType/ReservedBitSet in frame error set are not produced by parser: serval-h2/frame.zig:39, serval-h2/frame.zig:58
+  5. Low — Upgrade validation API forces oversized scratch buffer
+     validateUpgradeRequest requires decoded_settings_out.len >= H2_MAX_FRAME_SIZE_BYTES even though actual SETTINGS payload is typically tiny.
+      - serval-h2/upgrade.zig:69
+        Impact: avoidable stack pressure / awkward callsites.
+
+---
+
+Base directory for this skill: /home/nick/.claude/plugins/cache/superpowers-marketplace/superpowers/4.0.3/skills/writing-plans
+
+# Writing Plans
+
+## Overview
+
+Write comprehensive implementation plans assuming the engineer has zero context for our codebase and questionable taste. Document everything they need to know: which files to touch for each task, code, testing, docs they might need to check, how to test it. Give them the whole plan as bite-sized tasks. DRY. YAGNI. TDD. Frequent commits.
+
+Assume they are a skilled developer, but know almost nothing about our toolset or problem domain. Assume they don't know good test design very well.
+
+**Announce at start:** "I'm using the writing-plans skill to create the implementation plan."
+
+**Context:** This should be run in a dedicated worktree (created by brainstorming skill).
+
+**Save plans to:** `docs/plans/YYYY-MM-DD-<feature-name>.md`
+
+## Bite-Sized Task Granularity
+
+**Each step is one action (2-5 minutes):**
+- "Write the failing test" - step
+- "Run it to make sure it fails" - step
+- "Implement the minimal code to make the test pass" - step
+- "Run the tests and make sure they pass" - step
+- "Commit" - step
+
+## Plan Document Header
+
+**Every plan MUST start with this header:**
+
+```markdown
+# [Feature Name] Implementation Plan
+
+> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+
+**Goal:** [One sentence describing what this builds]
+
+**Architecture:** [2-3 sentences about approach]
+
+**Tech Stack:** [Key technologies/libraries]
+
+---
+```
+
+## Task Structure
+
+```markdown
+### Task N: [Component Name]
+
+**Files:**
+- Create: `exact/path/to/file.py`
+- Modify: `exact/path/to/existing.py:123-145`
+- Test: `tests/exact/path/to/test.py`
+
+**Step 1: Write the failing test**
+
+```python
+def test_specific_behavior():
+    result = function(input)
+    assert result == expected
+```
+
+**Step 2: Run test to verify it fails**
+
+Run: `pytest tests/path/test.py::test_name -v`
+Expected: FAIL with "function not defined"
+
+**Step 3: Write minimal implementation**
+
+```python
+def function(input):
+    return expected
+```
+
+**Step 4: Run test to verify it passes**
+
+Run: `pytest tests/path/test.py::test_name -v`
+Expected: PASS
+
+**Step 5: Commit**
+
+```bash
+git add tests/path/test.py src/path/file.py
+git commit -m "feat: add specific feature"
+```
+```
+
+## Remember
+- Exact file paths always
+- Complete code in plan (not "add validation")
+- Exact commands with expected output
+- Reference relevant skills with @ syntax
+- DRY, YAGNI, TDD, frequent commits
+
+## Execution Handoff
+
+After saving the plan, offer execution choice:
+
+**"Plan complete and saved to `docs/plans/<filename>.md`. Two execution options:**
+
+**1. Subagent-Driven (this session)** - I dispatch fresh subagent per task, review between tasks, fast iteration
+
+**2. Parallel Session (separate)** - Open new session with executing-plans, batch execution with checkpoints
+
+**Which approach?"**
+
+**If Subagent-Driven chosen:**
+- **REQUIRED SUB-SKILL:** Use superpowers:subagent-driven-development
+- Stay in this session
+- Fresh subagent per task + code review
+
+**If Parallel Session chosen:**
+- Guide them to open new session in worktree
+- **REQUIRED SUB-SKILL:** New session uses superpowers:executing-plans
+
+---
+
+• Findings from review of docs/plans/2026-03-27-h2-findings-fixes.md:
+
+  1. High — Task 2 test section contains contradictory/invalid snippet that should be removed
+     The plan includes a broken draft test (cursor += 8; // oops this is 9) before the corrected version. This is easy to copy accidentally and will create churn/confusion.
+     Reference: docs/plans/2026-03-27-h2-findings-fixes.md:131
+  2. Medium — Task 3 fix is incomplete for WINDOW_UPDATE semantics
+     Proposed code checks only increment == 0. Better to reuse control.parseWindowUpdateFrame(header, payload) so initial parser also enforces full increment rules consistently (InvalidIncrement
+     mapping, bounds behavior).
+     Reference: docs/plans/2026-03-27-h2-findings-fixes.md:256
+  3. Medium — Task 5 export step is missing a required pub
+     Plan suggests re-exporting upgrade.max_settings_payload_bytes from mod.zig, but in upgrade.zig that constant must be declared pub const first, otherwise it won’t be accessible.
+     Reference: docs/plans/2026-03-27-h2-findings-fixes.md:454
+  4. Medium — Verification scope is too narrow for touched modules
+     Tasks 4 and 5 change serval-server callsites and shared error sets, but verification only says zig build test-h2. Add at least zig build and zig build test (or targeted server suite) before
+     commit.
+     References: docs/plans/2026-03-27-h2-findings-fixes.md:9, docs/plans/2026-03-27-h2-findings-fixes.md:357
+  5. Low — Task 1 should include one end-to-end parser test, not only helper-unit tests
+     Add a decodeRequestHeaderBlock test that ensures an invalid header name is rejected at API level, not just by direct isHeaderNameLowercase(...) calls.
+     Reference: docs/plans/2026-03-27-h2-findings-fixes.md:22

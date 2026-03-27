@@ -1,0 +1,27 @@
+{
+  "cli_version": "0.4.3",
+  "checkpoint_id": "11ee44f51717",
+  "strategy": "manual-commit",
+  "branch": "main",
+  "checkpoints_count": 2,
+  "files_touched": [
+    "docs/plans/2026-03-27-h2-findings-fixes.md",
+    "experiments/tls-poc/boringssl"
+  ],
+  "sessions": [
+    {
+      "metadata": "/11/ee44f51717/0/metadata.json",
+      "transcript": "/11/ee44f51717/0/full.jsonl",
+      "context": "/11/ee44f51717/0/context.md",
+      "content_hash": "/11/ee44f51717/0/content_hash.txt",
+      "prompt": "/11/ee44f51717/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 36,
+    "cache_creation_tokens": 71437,
+    "cache_read_tokens": 1430110,
+    "output_tokens": 25350,
+    "api_call_count": 31
+  }
+}
