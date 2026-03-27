@@ -1,0 +1,27 @@
+{
+  "cli_version": "0.4.3",
+  "checkpoint_id": "dc758a30a892",
+  "strategy": "manual-commit",
+  "branch": "main",
+  "checkpoints_count": 5,
+  "files_touched": [
+    "docs/plans/2026-03-27-router-findings-fixes.md",
+    "experiments/tls-poc/boringssl"
+  ],
+  "sessions": [
+    {
+      "metadata": "/dc/758a30a892/0/metadata.json",
+      "transcript": "/dc/758a30a892/0/full.jsonl",
+      "context": "/dc/758a30a892/0/context.md",
+      "content_hash": "/dc/758a30a892/0/content_hash.txt",
+      "prompt": "/dc/758a30a892/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 52,
+    "cache_creation_tokens": 99482,
+    "cache_read_tokens": 3126083,
+    "output_tokens": 26554,
+    "api_call_count": 41
+  }
+}
