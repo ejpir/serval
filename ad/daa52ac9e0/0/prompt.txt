@@ -1,0 +1,433 @@
+findings:
+
+• 1. High: connect timeout can be silently disabled
+
+  - serval-client/client.zig:413 falls back to .timeout = .none on OptionUnsupported (serval-client/client.zig:417).
+  - Effect: potentially unbounded connect latency under failure.
+
+  2. High: fiber-unsafe blocking H2 receive path is exposed and used
+
+  - No-Io receive APIs: serval-client/h2/connection.zig:313, serval-client/h2/connection.zig:344.
+  - Those paths can block on direct socket reads (serval-client/h2/connection.zig:487).
+  - Called from proxy path: serval-proxy/h2/bridge.zig:294.
+
+  3. Medium: HTTP/1 timeout semantics are weak
+
+  - SendTimeout is iteration-based, but each write can block indefinitely (serval-client/request.zig:170).
+  - Header read loop is bounded by count, but underlying reads are blocking (serval-client/response.zig:132, serval-client/response.zig:154).
+
+  4. Medium: verify_tls is stored but not enforced in connect path
+
+  - Field exists (serval-client/client.zig:128), but TLS connect does not use it (serval-client/client.zig:258).
+
+  5. Low: README overstates async behavior for HTTP/1
+
+  - Claims async/non-blocking std.Io generally (serval-client/README.md:33), but HTTP/1 APIs are blocking socket paths.
+
+---
+
+Base directory for this skill: /home/nick/.claude/plugins/cache/superpowers-marketplace/superpowers/4.0.3/skills/writing-plans
+
+# Writing Plans
+
+## Overview
+
+Write comprehensive implementation plans assuming the engineer has zero context for our codebase and questionable taste. Document everything they need to know: which files to touch for each task, code, testing, docs they might need to check, how to test it. Give them the whole plan as bite-sized tasks. DRY. YAGNI. TDD. Frequent commits.
+
+Assume they are a skilled developer, but know almost nothing about our toolset or problem domain. Assume they don't know good test design very well.
+
+**Announce at start:** "I'm using the writing-plans skill to create the implementation plan."
+
+**Context:** This should be run in a dedicated worktree (created by brainstorming skill).
+
+**Save plans to:** `docs/plans/YYYY-MM-DD-<feature-name>.md`
+
+## Bite-Sized Task Granularity
+
+**Each step is one action (2-5 minutes):**
+- "Write the failing test" - step
+- "Run it to make sure it fails" - step
+- "Implement the minimal code to make the test pass" - step
+- "Run the tests and make sure they pass" - step
+- "Commit" - step
+
+## Plan Document Header
+
+**Every plan MUST start with this header:**
+
+```markdown
+# [Feature Name] Implementation Plan
+
+> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+
+**Goal:** [One sentence describing what this builds]
+
+**Architecture:** [2-3 sentences about approach]
+
+**Tech Stack:** [Key technologies/libraries]
+
+---
+```
+
+## Task Structure
+
+```markdown
+### Task N: [Component Name]
+
+**Files:**
+- Create: `exact/path/to/file.py`
+- Modify: `exact/path/to/existing.py:123-145`
+- Test: `tests/exact/path/to/test.py`
+
+**Step 1: Write the failing test**
+
+```python
+def test_specific_behavior():
+    result = function(input)
+    assert result == expected
+```
+
+**Step 2: Run test to verify it fails**
+
+Run: `pytest tests/path/test.py::test_name -v`
+Expected: FAIL with "function not defined"
+
+**Step 3: Write minimal implementation**
+
+```python
+def function(input):
+    return expected
+```
+
+**Step 4: Run test to verify it passes**
+
+Run: `pytest tests/path/test.py::test_name -v`
+Expected: PASS
+
+**Step 5: Commit**
+
+```bash
+git add tests/path/test.py src/path/file.py
+git commit -m "feat: add specific feature"
+```
+```
+
+## Remember
+- Exact file paths always
+- Complete code in plan (not "add validation")
+- Exact commands with expected output
+- Reference relevant skills with @ syntax
+- DRY, YAGNI, TDD, frequent commits
+
+## Execution Handoff
+
+After saving the plan, offer execution choice:
+
+**"Plan complete and saved to `docs/plans/<filename>.md`. Two execution options:**
+
+**1. Subagent-Driven (this session)** - I dispatch fresh subagent per task, review between tasks, fast iteration
+
+**2. Parallel Session (separate)** - Open new session with executing-plans, batch execution with checkpoints
+
+**Which approach?"**
+
+**If Subagent-Driven chosen:**
+- **REQUIRED SUB-SKILL:** Use superpowers:subagent-driven-development
+- Stay in this session
+- Fresh subagent per task + code review
+
+**If Parallel Session chosen:**
+- Guide them to open new session in worktree
+- **REQUIRED SUB-SKILL:** New session uses superpowers:executing-plans
+
+---
+
+• 1. Critical: Task 3 introduces unsafe global TLS state mutation
+
+  - Plan proposes calling SSL_CTX_set_verify inside connectWithTimeout on every connect (docs/plans/2026-03-26-client-findings-fixes.md:186, docs/plans/2026-03-26-client-findings-fixes.md:226).
+  - SSL_CTX is shared process/global context; mutating verify mode per-connection can create cross-request policy bleed and concurrency races between clients with different verify_tls values.
+  - For enterprise safety, verify policy should be fixed at client/context construction (or set per SSL object, not by mutating shared ctx in hot path).
+
+  2. High: Task 2 references an API that does not exist on UpstreamSession
+
+  - Plan says to call session.receiveActionHandlingControlIo(io) (docs/plans/2026-03-26-client-findings-fixes.md:141).
+  - In current UpstreamSession, available methods are receiveActionHandlingControl() and receiveActionHandlingControlTimeout(io, timeout), not ...Io.
+  - As written, this step will fail to compile.
+
+  3. High: Task 1 is observability-only, not a reliability fix
+
+  - Problem is unbounded connect fallback; fix is only logging (docs/plans/2026-03-26-client-findings-fixes.md:19 to docs/plans/2026-03-26-client-findings-fixes.md:24).
+  - For enterprise readiness, this should be treated as a behavior fix (fail-fast or enforce bounded connect semantics), not just warning noise.
+
+  4. Medium: Task 3 test does not validate enforcement
+
+  - Proposed test only checks verify_tls field storage (docs/plans/2026-03-26-client-findings-fixes.md:237 to docs/plans/2026-03-26-client-findings-fixes.md:263).
+  - That behavior already exists and does not verify TLS verify-mode application at connect/handshake time.
+
+  5. Medium: Plan claims tasks are independent, but Task 2 is coupled
+
+  - “Can land in any order” (docs/plans/2026-03-26-client-findings-fixes.md:11) conflicts with Task 2’s signature change + caller updates being tightly coupled for build correctness.
+
+---
+
+Base directory for this skill: /home/nick/.claude/plugins/cache/superpowers-marketplace/superpowers/4.0.3/skills/receiving-code-review
+
+# Code Review Reception
+
+## Overview
+
+Code review requires technical evaluation, not emotional performance.
+
+**Core principle:** Verify before implementing. Ask before assuming. Technical correctness over social comfort.
+
+## The Response Pattern
+
+```
+WHEN receiving code review feedback:
+
+1. READ: Complete feedback without reacting
+2. UNDERSTAND: Restate requirement in own words (or ask)
+3. VERIFY: Check against codebase reality
+4. EVALUATE: Technically sound for THIS codebase?
+5. RESPOND: Technical acknowledgment or reasoned pushback
+6. IMPLEMENT: One item at a time, test each
+```
+
+## Forbidden Responses
+
+**NEVER:**
+- "You're absolutely right!" (explicit CLAUDE.md violation)
+- "Great point!" / "Excellent feedback!" (performative)
+- "Let me implement that now" (before verification)
+
+**INSTEAD:**
+- Restate the technical requirement
+- Ask clarifying questions
+- Push back with technical reasoning if wrong
+- Just start working (actions > words)
+
+## Handling Unclear Feedback
+
+```
+IF any item is unclear:
+  STOP - do not implement anything yet
+  ASK for clarification on unclear items
+
+WHY: Items may be related. Partial understanding = wrong implementation.
+```
+
+**Example:**
+```
+your human partner: "Fix 1-6"
+You understand 1,2,3,6. Unclear on 4,5.
+
+❌ WRONG: Implement 1,2,3,6 now, ask about 4,5 later
+✅ RIGHT: "I understand items 1,2,3,6. Need clarification on 4 and 5 before proceeding."
+```
+
+## Source-Specific Handling
+
+### From your human partner
+- **Trusted** - implement after understanding
+- **Still ask** if scope unclear
+- **No performative agreement**
+- **Skip to action** or technical acknowledgment
+
+### From External Reviewers
+```
+BEFORE implementing:
+  1. Check: Technically correct for THIS codebase?
+  2. Check: Breaks existing functionality?
+  3. Check: Reason for current implementation?
+  4. Check: Works on all platforms/versions?
+  5. Check: Does reviewer understand full context?
+
+IF suggestion seems wrong:
+  Push back with technical reasoning
+
+IF can't easily verify:
+  Say so: "I can't verify this without [X]. Should I [investigate/ask/proceed]?"
+
+IF conflicts with your human partner's prior decisions:
+  Stop and discuss with your human partner first
+```
+
+**your human partner's rule:** "External feedback - be skeptical, but check carefully"
+
+## YAGNI Check for "Professional" Features
+
+```
+IF reviewer suggests "implementing properly":
+  grep codebase for actual usage
+
+  IF unused: "This endpoint isn't called. Remove it (YAGNI)?"
+  IF used: Then implement properly
+```
+
+**your human partner's rule:** "You and reviewer both report to me. If we don't need this feature, don't add it."
+
+## Implementation Order
+
+```
+FOR multi-item feedback:
+  1. Clarify anything unclear FIRST
+  2. Then implement in this order:
+     - Blocking issues (breaks, security)
+     - Simple fixes (typos, imports)
+     - Complex fixes (refactoring, logic)
+  3. Test each fix individually
+  4. Verify no regressions
+```
+
+## When To Push Back
+
+Push back when:
+- Suggestion breaks existing functionality
+- Reviewer lacks full context
+- Violates YAGNI (unused feature)
+- Technically incorrect for this stack
+- Legacy/compatibility reasons exist
+- Conflicts with your human partner's architectural decisions
+
+**How to push back:**
+- Use technical reasoning, not defensiveness
+- Ask specific questions
+- Reference working tests/code
+- Involve your human partner if architectural
+
+**Signal if uncomfortable pushing back out loud:** "Strange things are afoot at the Circle K"
+
+## Acknowledging Correct Feedback
+
+When feedback IS correct:
+```
+✅ "Fixed. [Brief description of what changed]"
+✅ "Good catch - [specific issue]. Fixed in [location]."
+✅ [Just fix it and show in the code]
+
+❌ "You're absolutely right!"
+❌ "Great point!"
+❌ "Thanks for catching that!"
+❌ "Thanks for [anything]"
+❌ ANY gratitude expression
+```
+
+**Why no thanks:** Actions speak. Just fix it. The code itself shows you heard the feedback.
+
+**If you catch yourself about to write "Thanks":** DELETE IT. State the fix instead.
+
+## Gracefully Correcting Your Pushback
+
+If you pushed back and were wrong:
+```
+✅ "You were right - I checked [X] and it does [Y]. Implementing now."
+✅ "Verified this and you're correct. My initial understanding was wrong because [reason]. Fixing."
+
+❌ Long apology
+❌ Defending why you pushed back
+❌ Over-explaining
+```
+
+State the correction factually and move on.
+
+## Common Mistakes
+
+| Mistake | Fix |
+|---------|-----|
+| Performative agreement | State requirement or just act |
+| Blind implementation | Verify against codebase first |
+| Batch without testing | One at a time, test each |
+| Assuming reviewer is right | Check if breaks things |
+| Avoiding pushback | Technical correctness > comfort |
+| Partial implementation | Clarify all items first |
+| Can't verify, proceed anyway | State limitation, ask for direction |
+
+## Real Examples
+
+**Performative Agreement (Bad):**
+```
+Reviewer: "Remove legacy code"
+❌ "You're absolutely right! Let me remove that..."
+```
+
+**Technical Verification (Good):**
+```
+Reviewer: "Remove legacy code"
+✅ "Checking... build target is 10.15+, this API needs 13+. Need legacy for backward compat. Current impl has wrong bundle ID - fix it or drop pre-13 support?"
+```
+
+**YAGNI (Good):**
+```
+Reviewer: "Implement proper metrics tracking with database, date filters, CSV export"
+✅ "Grepped codebase - nothing calls this endpoint. Remove it (YAGNI)? Or is there usage I'm missing?"
+```
+
+**Unclear Item (Good):**
+```
+your human partner: "Fix items 1-6"
+You understand 1,2,3,6. Unclear on 4,5.
+✅ "Understand 1,2,3,6. Need clarification on 4 and 5 before implementing."
+```
+
+## GitHub Thread Replies
+
+When replying to inline review comments on GitHub, reply in the comment thread (`gh api repos/{owner}/{repo}/pulls/{pr}/comments/{id}/replies`), not as a top-level PR comment.
+
+## The Bottom Line
+
+**External feedback = suggestions to evaluate, not orders to follow.**
+
+Verify. Question. Then implement.
+
+No performative agreement. Technical rigor always.
+
+---
+
+• Major issues still present:
+
+  1. Critical: unsafe TLS verify strategy
+
+  - Plan still sets SSL_CTX_set_verify during connect (docs/plans/2026-03-26-client-findings-fixes.md:186, docs/plans/2026-03-26-client-findings-fixes.md:226).
+  - That mutates shared context at runtime and can race/policy-bleed across clients.
+
+  2. High: compile-risk in Task 2
+
+  - It instructs session.receiveActionHandlingControlIo(io) (docs/plans/2026-03-26-client-findings-fixes.md:141), but the available method is receiveActionHandlingControlTimeout(io, timeout) on
+    UpstreamSession.
+  - This should be corrected explicitly in the plan.
+
+  3. High: connect-timeout fix is insufficient
+
+  - Task 1 only adds a warning (docs/plans/2026-03-26-client-findings-fixes.md:23).
+  - Enterprise-ready behavior needs boundedness preserved (or explicit fail-fast), not just observability.
+
+  4. Medium: Task 3 test is non-validating
+
+  - Proposed test only checks field storage (docs/plans/2026-03-26-client-findings-fixes.md:244).
+  - It does not verify TLS verification behavior in handshake path.
+
+  5. Medium: “independent tasks” claim is inaccurate
+
+  - Signature/callsite changes in Task 2 are coupled and must land together (docs/plans/2026-03-26-client-findings-fixes.md:11).
+
+---
+
+• Updated plan is much better and fixes the previous major blockers. Remaining issues I’d fix before implementation:
+
+  1. Medium: Task 1 commit scope is incomplete
+
+  - Task 1 says serval-proxy/connect.zig is modified (docs/plans/2026-03-26-client-findings-fixes.md:35), but commit command only stages serval-client/client.zig (docs/plans/2026-03-26-client-
+    findings-fixes.md:198).
+  - This will either miss required changes or create follow-up drift.
+
+  2. Medium: Task 1 lacks explicit edit instructions for serval-proxy/connect.zig
+
+  - File is listed as changed (docs/plans/2026-03-26-client-findings-fixes.md:35), but there is no concrete “before/after” step for how proxy should consume connect_timeout_honored.
+  - Add exact code-level step so behavior is deterministic.
+
+  3. Low: Sample code has confusing always-true expression
+
+  - return .{ .fd = stream.socket.handle, .timeout_honored = connect_timeout == .none or true }; (docs/plans/2026-03-26-client-findings-fixes.md:139).
+  - It works but is misleading; use .timeout_honored = true.
+
+  Everything else looks directionally correct now, including the per-connection TLS verify approach (SSL_set_verify) and the H2 fiber-safe receive fix.
