@@ -21,12 +21,19 @@ const settings = @import("settings.zig");
 const hpack = @import("hpack.zig");
 const preface = @import("preface.zig");
 
+/// Fixed HTTP/1.1 response bytes for a successful h2c upgrade handshake.
+/// The response includes `101 Switching Protocols`, `Connection: Upgrade`, and `Upgrade: h2c` headers terminated by CRLF.
+/// Callers may copy these bytes directly into an output buffer; the value itself owns no memory.
+/// Intended for use after the server has accepted the protocol switch.
 pub const upgrade_response =
     "HTTP/1.1 101 Switching Protocols\r\n" ++
     "Connection: Upgrade\r\n" ++
     "Upgrade: h2c\r\n" ++
     "\r\n";
 
+/// Errors reported by HTTP/2 upgrade validation and request-to-preface conversion.
+/// These cover protocol version mismatches, missing or invalid headers, unsupported body framing, and malformed settings data.
+/// The set is used by upgrade helpers that validate requests before constructing upgrade responses or HTTP/2 prefaces.
 pub const Error = error{
     InvalidVersion,
     MissingConnectionHeader,
@@ -43,6 +50,10 @@ pub const Error = error{
     HeadersTooLarge,
 } || frame.Error || settings.Error || hpack.Error;
 
+/// Returns `true` when the request has the header signals commonly associated with an h2c upgrade.
+/// This is a lightweight heuristic only; it does not fully validate the request.
+/// The check succeeds if `HTTP2-Settings` is present, `Upgrade: h2c` is present, or `Connection` contains the `http2-settings` token.
+/// `request` must be a valid pointer and its header count must stay within `config.MAX_HEADERS`.
 pub fn looksLikeUpgradeRequest(request: *const Request) bool {
     assert(@intFromPtr(request) != 0);
     assert(request.headers.count <= config.MAX_HEADERS);
@@ -60,6 +71,10 @@ pub fn looksLikeUpgradeRequest(request: *const Request) bool {
     return false;
 }
 
+/// Validates an HTTP/1.1 upgrade request for h2c and decodes its `HTTP2-Settings` payload.
+/// On success, returns the decoded SETTINGS bytes stored in `decoded_settings_out` and ready for frame parsing.
+/// `request` must be a valid request pointer and `decoded_settings_out` must be large enough for a full SETTINGS frame payload.
+/// Returns errors for unsupported version or framing, missing or invalid upgrade headers, and invalid or duplicated settings data.
 pub fn validateUpgradeRequest(
     request: *const Request,
     body_framing: BodyFraming,
@@ -91,6 +106,10 @@ pub fn validateUpgradeRequest(
     return decoded;
 }
 
+/// Writes the fixed `101 Switching Protocols` response used for h2c upgrade handling.
+/// The response bytes are copied into `out` and the written slice is returned.
+/// `out` must be large enough to hold the full response or the function returns `error.BufferTooSmall`.
+/// This function does not allocate and does not retain any caller-owned storage.
 pub fn buildUpgradeResponse(out: []u8) Error![]const u8 {
     assert(out.len > 0);
     assert(upgrade_response.len > 0);
@@ -100,6 +119,10 @@ pub fn buildUpgradeResponse(out: []u8) Error![]const u8 {
     return out[0..upgrade_response.len];
 }
 
+/// Builds an HTTP/2 prior-knowledge preface from an upgrade request.
+/// Writes the client connection preface, a SETTINGS frame, and a HEADERS frame into `out` and returns the written slice.
+/// `request` must point to a valid request with a non-empty path and `Host` header; `effective_path` overrides `request.path` when present.
+/// `settings_payload` must already be a valid SETTINGS payload and fit within `config.H2_MAX_FRAME_SIZE_BYTES`; returns `error.MissingPath` or `error.MissingAuthority` when required request data is absent.
 pub fn buildPriorKnowledgePreambleFromUpgrade(
     out: []u8,
     request: *const Request,

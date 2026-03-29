@@ -12,6 +12,11 @@ const config = @import("serval-core").config;
 
 const Scheme = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 
+/// Errors returned by ACME TLS material generation.
+/// `InvalidDomain` means the domain is empty or exceeds `config.ACME_MAX_DOMAIN_NAME_LEN`.
+/// `InvalidKeyAuthorization` means the key authorization input is empty.
+/// `OutputTooSmall` means one of the destination buffers could not fit the encoded output.
+/// `SignatureFailed` means the certificate signature could not be produced.
 pub const Error = error{
     InvalidDomain,
     InvalidKeyAuthorization,
@@ -19,6 +24,10 @@ pub const Error = error{
     SignatureFailed,
 };
 
+/// PEM-encoded materials produced by `generateMaterials`.
+/// `cert_pem` references the encoded certificate stored in the caller-provided certificate buffer.
+/// `key_pem` references the encoded private key stored in the caller-provided key buffer.
+/// Both slices are borrowed views; this type does not own the underlying storage.
 pub const Materials = struct {
     cert_pem: []const u8,
     key_pem: []const u8,
@@ -32,6 +41,11 @@ const oid_subject_alt_name = [_]u8{ 0x06, 0x03, 0x55, 0x1D, 0x11 };
 const oid_acme_identifier = [_]u8{ 0x06, 0x08, 0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x1F };
 const DerCursor = u16;
 
+/// Generates a PEM-encoded TLS certificate and EC private key for `domain`.
+/// Writes both outputs into the caller-provided buffers and returns slices into those buffers.
+/// `domain` must be non-empty and no longer than `config.ACME_MAX_DOMAIN_NAME_LEN`; `key_authorization` must be non-empty.
+/// Returns `error.OutputTooSmall` if either output buffer cannot hold the encoded result, `error.SignatureFailed` if signing fails, or a domain/key-authorization validation error.
+/// The returned slices remain valid only while the backing buffers remain alive and unchanged.
 pub fn generateMaterials(
     io: std.Io,
     domain: []const u8,

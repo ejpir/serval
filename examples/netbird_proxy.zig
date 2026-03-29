@@ -184,6 +184,10 @@ const NetbirdUpstreams = struct {
 const NetbirdProxyHandler = struct {
     upstreams: NetbirdUpstreams,
 
+    /// Handles local health probes and otherwise forwards the request upstream.
+    /// Preconditions: `response_buf.len >= NETBIRD_HEALTH_BODY.len` (asserted).
+    /// If `request.path` is `/healthz` or `/readyz`, returns `.send_response` with status `200`, content type `text/plain`, and a body written into `response_buf`.
+    /// For all other paths, returns `.continue_request`; `self` and `ctx` are not used by this handler.
     pub fn onRequest(
         self: *@This(),
         ctx: *serval.Context,
@@ -210,6 +214,10 @@ const NetbirdProxyHandler = struct {
         return .continue_request;
     }
 
+    /// Selects an upstream target by deriving a route role from `request.path`.
+    /// `ctx` is currently unused; routing depends only on the request path and `self.upstreams`.
+    /// Assumes the resolved role exists in `self.upstreams`; this function does not return recoverable errors.
+    /// Emits a debug log showing path, role, protocol, host, and port, then returns the selected `serval.Upstream` by value.
     pub fn selectUpstream(
         self: *@This(),
         ctx: *serval.Context,
@@ -826,6 +834,11 @@ fn acmeIssueThread(comptime ServerType: type, thread_ctx: *AcmeIssueThreadCtx(Se
     };
 }
 
+/// Entry point for the `netbird_proxy` example: parses CLI arguments, optionally loads a config file, and builds the effective runtime `NetbirdProxyConfig`.
+/// Command-line flags override file values for certificate paths, upstream endpoint specs, ACME settings, and (by default) listen port.
+/// Returns early without error on `--help`/`--version`; prints argument parse diagnostics and returns `error.InvalidArgs` on invalid CLI input.
+/// Allocates temporary config-file storage with a GPA and frees it before return; all temporary I/O state is scoped to this function.
+/// Fails with propagated I/O/config-parse errors and returns `error.InvalidAcmeDomain` when ACME is enabled with an empty domain.
 pub fn main(process_init: std.process.Init) !void {
     var args = cli.Args(NetbirdExtra).init("netbird_proxy", VERSION, process_init.minimal.args);
     switch (args.parse()) {

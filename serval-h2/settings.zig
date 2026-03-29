@@ -10,13 +10,28 @@ const assert = std.debug.assert;
 const config = @import("serval-core").config;
 const frame = @import("frame.zig");
 
+/// Size in bytes of one HTTP/2 SETTINGS entry on the wire.
+/// Each entry is encoded as a 2-byte identifier followed by a 4-byte value.
+/// Used by parsing and encoding helpers to validate payload lengths and advance fixed-width cursors.
 pub const setting_size_bytes: u32 = 6;
+/// Default HPACK header table size in bytes used for new connection state.
+/// This value matches the HTTP/2 default dynamic table size.
 pub const default_header_table_size_bytes: u32 = 4096;
+/// Sentinel meaning the peer did not advertise a concurrent-stream limit.
+/// This uses the maximum `u32` value to represent an effectively unbounded limit.
 pub const max_concurrent_streams_unbounded: u32 = std.math.maxInt(u32);
+/// Sentinel meaning the peer did not advertise a header list size limit.
+/// This uses the maximum `u32` value to represent an effectively unbounded limit.
 pub const max_header_list_size_unbounded: u32 = std.math.maxInt(u32);
+/// Minimum legal HTTP/2 `MAX_FRAME_SIZE` value in bytes.
+/// This is the protocol lower bound for the `max_frame_size_bytes` setting.
 pub const min_max_frame_size_bytes: u32 = 16_384;
+/// Maximum legal HTTP/2 `MAX_FRAME_SIZE` value in bytes.
+/// This is the protocol upper bound for the `max_frame_size_bytes` setting.
 pub const max_max_frame_size_bytes: u32 = 16_777_215;
 
+/// Named HTTP/2 SETTINGS identifiers defined by the protocol.
+/// These values are encoded on the wire as `u16` identifiers and are used by `Setting.knownId` and validation helpers.
 pub const SettingId = enum(u16) {
     header_table_size = 0x1,
     enable_push = 0x2,
@@ -27,10 +42,16 @@ pub const SettingId = enum(u16) {
     enable_connect_protocol = 0x8,
 };
 
+/// A raw HTTP/2 SETTINGS entry with a numeric identifier and 32-bit value.
+/// Use `knownId` to map `id` to a typed `SettingId` when the identifier is recognized.
+/// The struct stores the wire-format fields without allocating or owning external resources.
 pub const Setting = struct {
     id: u16,
     value: u32,
 
+    /// Returns the known `SettingId` for this setting number, if one is defined.
+    /// The mapping is based only on `self.id`; unknown identifiers yield `null`.
+    /// This asserts the enum discriminants expected by the decoder before calling `decodeSettingId`.
     pub fn knownId(self: Setting) ?SettingId {
         assert(@intFromEnum(SettingId.header_table_size) == 0x1);
         assert(@intFromEnum(SettingId.enable_connect_protocol) == 0x8);
@@ -38,6 +59,9 @@ pub const Setting = struct {
     }
 };
 
+/// In-memory representation of HTTP/2 connection settings.
+/// Field values default to the protocol or Serval-configured initial state used when constructing a SETTINGS frame.
+/// `enable_push` and `enable_connect_protocol` are boolean feature toggles; the remaining fields are size or count limits.
 pub const Settings = struct {
     header_table_size_bytes: u32 = default_header_table_size_bytes,
     enable_push: bool = true,
@@ -48,6 +72,9 @@ pub const Settings = struct {
     enable_connect_protocol: bool = true,
 };
 
+/// Errors returned by SETTINGS frame parsing, validation, and encoding helpers.
+/// These cover frame-shape violations, buffer sizing failures, and invalid setting values.
+/// Callers should treat these as protocol or caller-input errors, not transport failures.
 pub const Error = error{
     InvalidFrameType,
     InvalidStreamId,
@@ -60,6 +87,10 @@ pub const Error = error{
     InvalidMaxFrameSize,
 };
 
+/// Validates HTTP/2 SETTINGS frame invariants for `header` and `payload`.
+/// The frame must use stream 0, and ACK frames must have an empty payload.
+/// Non-ACK payloads must have a valid SETTINGS length and stay within `config.H2_MAX_SETTINGS_PER_FRAME`.
+/// Returns the relevant `Error` when a frame-level constraint is violated.
 pub fn validateFrame(header: frame.FrameHeader, payload: []const u8) Error!void {
     assert(header.length == payload.len);
     assert(header.frame_type == .settings);
@@ -76,6 +107,10 @@ pub fn validateFrame(header: frame.FrameHeader, payload: []const u8) Error!void 
     }
 }
 
+/// Validates and parses a SETTINGS frame header and payload into `out_settings`.
+/// `header` must describe a SETTINGS frame whose length matches `payload.len`.
+/// ACK frames must carry an empty payload; otherwise this returns `error.AckMustBeEmpty`.
+/// For non-empty payloads, this delegates to `parsePayload` and returns its errors.
 pub fn parseFrame(
     header: frame.FrameHeader,
     payload: []const u8,
@@ -89,6 +124,10 @@ pub fn parseFrame(
     return parsePayload(payload, out_settings);
 }
 
+/// Parses an HTTP/2 SETTINGS payload into `out_settings`.
+/// `payload.len` must be a valid SETTINGS payload length and `out_settings` must have room for every decoded entry.
+/// Each decoded setting is validated before being stored; invalid entries return the corresponding `Error`.
+/// On success, returns the initialized prefix of `out_settings` containing the decoded settings.
 pub fn parsePayload(payload: []const u8, out_settings: []Setting) Error![]const Setting {
     assert(out_settings.len >= config.H2_MAX_SETTINGS_PER_FRAME or out_settings.len > 0);
     assert(payload.len <= config.H2_MAX_FRAME_SIZE_BYTES);
@@ -113,6 +152,10 @@ pub fn parsePayload(payload: []const u8, out_settings: []Setting) Error![]const 
     return out_settings[0..count];
 }
 
+/// Encodes `settings` into HTTP/2 SETTINGS payload bytes in network byte order.
+/// `out` must be large enough for `settings.len * 6` bytes, and `settings.len` must not exceed `config.H2_MAX_SETTINGS_PER_FRAME`.
+/// Each setting is validated before it is written; invalid settings return the corresponding `Error`.
+/// On success, returns the initialized prefix of `out` containing the encoded payload.
 pub fn buildPayload(out: []u8, settings: []const Setting) Error![]const u8 {
     assert(settings.len <= config.H2_MAX_SETTINGS_PER_FRAME);
     assert(setting_size_bytes == 6);
@@ -131,6 +174,9 @@ pub fn buildPayload(out: []u8, settings: []const Setting) Error![]const u8 {
     return out[0..needed];
 }
 
+/// Applies each SETTINGS entry in `settings` to `target` in order.
+/// `target` must be a valid pointer, and `settings.len` must not exceed `config.H2_MAX_SETTINGS_PER_FRAME`.
+/// Returns the first validation or application error raised by `applySetting`.
 pub fn applySettings(target: *Settings, settings: []const Setting) Error!void {
     assert(@intFromPtr(target) != 0);
     assert(settings.len <= config.H2_MAX_SETTINGS_PER_FRAME);

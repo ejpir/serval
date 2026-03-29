@@ -144,6 +144,10 @@ fn runServers(
     };
 }
 
+/// Entry point for the router example binary.
+/// Parses CLI arguments from `process_init.minimal.args` and exits early for `--help`/`--version`.
+/// Returns `error.InvalidArgs` after printing parse errors, and `error.NoBackends` if either backend list yields no valid upstreams.
+/// The parsed upstream slices reference stack-allocated buffers that remain valid for the duration of `main`.
 pub fn main(process_init: std.process.Init) !void {
     // Parse command-line arguments
     var args = cli.Args(RouterExtra).init("router", VERSION, process_init.minimal.args);

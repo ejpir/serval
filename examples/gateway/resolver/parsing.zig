@@ -12,10 +12,25 @@ const assert = std.debug.assert;
 // Import types from types.zig
 const resolver_types = @import("types.zig");
 
+/// Maximum number of endpoints permitted per service.
+/// This is an alias of `resolver_types.MAX_ENDPOINTS_PER_SERVICE`.
+/// The limit is shared across resolver code paths to keep validation consistent.
 pub const MAX_ENDPOINTS_PER_SERVICE = resolver_types.MAX_ENDPOINTS_PER_SERVICE;
+/// Maximum allowed certificate size for resolver input.
+/// This is an alias of `resolver_types.MAX_CERT_SIZE`.
+/// Use the shared constant instead of hard-coding certificate limits.
 pub const MAX_CERT_SIZE = resolver_types.MAX_CERT_SIZE;
+/// Maximum accepted textual length for an IP address string.
+/// This is an alias of `resolver_types.MAX_IP_LEN`.
+/// The limit is shared with other resolver parsing code.
 pub const MAX_IP_LEN = resolver_types.MAX_IP_LEN;
+/// Maximum allowed input size for base64-decoded resolver material.
+/// This is an alias of `resolver_types.MAX_BASE64_INPUT_SIZE`.
+/// Keep this value in sync with the shared resolver limits.
 pub const MAX_BASE64_INPUT_SIZE = resolver_types.MAX_BASE64_INPUT_SIZE;
+/// Error set used by resolver parsing and validation.
+/// This is a direct alias of `resolver_types.ResolverError`.
+/// See the resolver types module for the exact failure modes.
 pub const ResolverError = resolver_types.ResolverError;
 
 // Internal type aliases
@@ -35,15 +50,24 @@ pub const EndpointsJson = struct {
     subsets: ?[]const SubsetJson = null,
 };
 
+/// JSON representation of a resolver subset.
+/// `addresses` and `ports` are both optional and default to `null` when absent.
+/// Each slice is borrowed from the decoded JSON and must not outlive its backing buffer.
 pub const SubsetJson = struct {
     addresses: ?[]const AddressJson = null,
     ports: ?[]const PortJson = null,
 };
 
+/// JSON representation of an address entry.
+/// `ip` is required and carries the address string exactly as parsed.
+/// The slice is borrowed; the caller owns the backing storage.
 pub const AddressJson = struct {
     ip: []const u8,
 };
 
+/// JSON representation of a port entry.
+/// `port` is required and stored as an unsigned 16-bit integer.
+/// Use this when decoding endpoint port data from resolver input.
 pub const PortJson = struct {
     port: u16,
 };
@@ -54,6 +78,9 @@ pub const SecretJson = struct {
     data: ?DataJson = null,
 };
 
+/// Optional TLS material carried in resolver data JSON.
+/// `tls.crt` and `tls.key` are both optional and default to `null` when omitted.
+/// The field names use JSON-compatible escaped identifiers because they contain dots.
 pub const DataJson = struct {
     @"tls.crt": ?[]const u8 = null,
     @"tls.key": ?[]const u8 = null,

@@ -24,6 +24,10 @@ pub const websocket_accept_key_size_bytes: u32 = 28;
 /// Maximum input length for key + GUID when computing accept value.
 const websocket_accept_input_size_bytes: u32 = 128;
 
+/// Errors returned when validating or completing a WebSocket handshake.
+/// These values indicate that the HTTP request or response is missing a required
+/// handshake field, contains an invalid field value, or uses an unsupported version.
+/// `UnexpectedMessageBody` and `InvalidStatusCode` apply to handshake responses.
 pub const HandshakeError = error{
     InvalidMethod,
     MissingConnectionHeader,

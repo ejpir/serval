@@ -46,6 +46,10 @@ const MAX_RESPONSE_BUFFER_SIZE: u32 = 128 * 1024;
 // Error Types (TigerStyle S6: Explicit error set)
 // ============================================================================
 
+/// Errors returned while resolving endpoints from a Kubernetes `EndpointSlice`.
+/// Covers request and JSON parsing failures, missing or invalid endpoint data, and URL/buffer sizing limits.
+/// `NoEndpointsFound`, `PortNotFound`, and `InvalidEndpoint` indicate the slice was parsed but did not contain a usable target.
+/// `BufferOverflow` and `UrlTooLarge` mean the destination buffers were too small for the generated output.
 pub const EndpointSliceError = error{
     /// K8s API request failed.
     RequestFailed,

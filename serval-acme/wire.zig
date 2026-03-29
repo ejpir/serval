@@ -17,6 +17,9 @@ const max_host_bytes = config.ACME_MAX_DOMAIN_NAME_LEN;
 const max_path_bytes = config.ACME_MAX_DIRECTORY_URL_BYTES;
 const max_body_bytes = config.ACME_MAX_JWS_BODY_BYTES;
 
+/// Errors raised while parsing or validating wire-format URL and ACME response data.
+/// This set includes invalid URL parts, oversize host or path data, invalid ports, oversized bodies, and missing ACME headers.
+/// Match on the named tags instead of relying on any numeric representation.
 pub const Error = error{
     InvalidUrl,
     InvalidScheme,
@@ -29,6 +32,9 @@ pub const Error = error{
     MissingLocationHeader,
 };
 
+/// Parsed URL data stored inline with fixed-size host and path buffers.
+/// Use `init()` to obtain the default `/` path, then read host and path through the accessor methods.
+/// `host()` and `path()` return slices into the embedded storage, and `toUpstream()` converts the parsed values into an upstream descriptor.
 pub const ParsedUrl = struct {
     tls: bool = false,
     host_len: u16 = 0,
@@ -37,6 +43,9 @@ pub const ParsedUrl = struct {
     path_len: u16 = 1,
     path_bytes: [max_path_bytes]u8 = [_]u8{0} ** max_path_bytes,
 
+    /// Returns a default `ParsedUrl` with the path initialized to `/`.
+    /// The host is empty, the port is unset, and `tls` defaults to `false`.
+    /// `max_host_bytes` and `max_path_bytes` must both be greater than zero.
     pub fn init() ParsedUrl {
         assert(max_host_bytes > 0);
         assert(max_path_bytes > 0);
@@ -46,12 +55,18 @@ pub const ParsedUrl = struct {
         return parsed;
     }
 
+    /// Returns the parsed host as a slice into the internal host buffer.
+    /// `self.host_len` must not exceed `max_host_bytes`.
+    /// The returned slice is borrowed from `self`; this function does not allocate or copy.
     pub fn host(self: *const ParsedUrl) []const u8 {
         assert(@intFromPtr(self) != 0);
         assert(self.host_len <= max_host_bytes);
         return self.host_bytes[0..self.host_len];
     }
 
+    /// Returns the parsed path as a slice into the internal path buffer.
+    /// `self.path_len` must be at least 1 and no larger than `max_path_bytes`; `init()` sets the default path to `/`.
+    /// The returned slice is borrowed from `self` and remains valid only while the buffer is unchanged.
     pub fn path(self: *const ParsedUrl) []const u8 {
         assert(@intFromPtr(self) != 0);
         assert(self.path_len >= 1);
@@ -59,6 +74,9 @@ pub const ParsedUrl = struct {
         return self.path_bytes[0..self.path_len];
     }
 
+    /// Builds an upstream descriptor from this parsed URL.
+    /// `self` must already contain a non-empty host and a port greater than zero.
+    /// The returned value borrows the host slice from `self`, copies the port and TLS flag, and always uses HTTP/1.
     pub fn toUpstream(self: *const ParsedUrl, idx: config.UpstreamIndex) types.Upstream {
         assert(@intFromPtr(self) != 0);
         assert(self.host_len > 0);
@@ -74,6 +92,9 @@ pub const ParsedUrl = struct {
     }
 };
 
+/// A wire-format HTTP request built from parsed URL data and optional payload metadata.
+/// `body` and header value slices are borrowed; the caller owns the backing storage.
+/// Public helpers on this type expose the request path, upstream endpoint, and body presence.
 pub const WireRequest = struct {
     method: Method,
     target: ParsedUrl,
@@ -81,18 +102,27 @@ pub const WireRequest = struct {
     content_type: ?[]const u8 = null,
     accept: []const u8 = "application/json",
 
+    /// Converts the request target into an upstream endpoint using `idx`.
+    /// The target must contain a valid host before conversion.
+    /// The returned upstream value is derived from the stored parsed URL and does not allocate.
     pub fn upstream(self: *const WireRequest, idx: config.UpstreamIndex) types.Upstream {
         assert(@intFromPtr(self) != 0);
         assert(self.target.host_len > 0);
         return self.target.toUpstream(idx);
     }
 
+    /// Returns the request path from the parsed target URL.
+    /// The target must already contain a non-empty path component.
+    /// The returned slice aliases the stored target URL and remains valid with `self`.
     pub fn path(self: *const WireRequest) []const u8 {
         assert(@intFromPtr(self) != 0);
         assert(self.target.path_len >= 1);
         return self.target.path();
     }
 
+    /// Returns `true` when the request body is non-empty.
+    /// The body length is expected to stay within `max_body_bytes`.
+    /// This does not inspect headers or method; it only checks the payload slice.
     pub fn hasBody(self: *const WireRequest) bool {
         assert(@intFromPtr(self) != 0);
         assert(self.body.len <= max_body_bytes);
@@ -100,8 +130,14 @@ pub const WireRequest = struct {
     }
 };
 
+/// Errors that can occur while composing a signed request.
+/// This combines wire-format validation errors with JWS serialization errors.
+/// Callers can handle request-building and serialization failures through one error set.
 pub const ComposeSignedRequestError = Error || jws.Error;
 
+/// Parses an absolute URL from `url` into a `ParsedUrl`.
+/// The input must contain a valid `http://` or `https://` URL string.
+/// Propagates the validation and parsing errors produced by `parseAbsoluteUrlSlice`.
 pub fn parseAbsoluteUrl(url: *const client.Url) Error!ParsedUrl {
     assert(@intFromPtr(url) != 0);
     const parsed = try parseAbsoluteUrlSlice(url.slice());
@@ -109,6 +145,9 @@ pub fn parseAbsoluteUrl(url: *const client.Url) Error!ParsedUrl {
     return parsed;
 }
 
+/// Parses an absolute `http://` or `https://` URL from `value` into a `ParsedUrl`.
+/// Requires a non-empty input with a supported scheme and an authority component.
+/// Returns `error.InvalidUrl`, `error.InvalidScheme`, or other parse errors from authority and path handling.
 pub fn parseAbsoluteUrlSlice(value: []const u8) Error!ParsedUrl {
     assert(max_host_bytes > 0);
     assert(max_path_bytes > 0);
@@ -150,6 +189,9 @@ pub fn parseAbsoluteUrlSlice(value: []const u8) Error!ParsedUrl {
     return parsed;
 }
 
+/// Builds a HEAD request to the directory's `new_nonce_url`.
+/// The request body is empty and the content type is unset.
+/// The returned request borrows the directory URL data; the caller must keep `directory` valid.
 pub fn buildNewNonceRequest(directory: *const client.Directory) Error!WireRequest {
     assert(@intFromPtr(directory) != 0);
     var request = WireRequest{
@@ -162,6 +204,9 @@ pub fn buildNewNonceRequest(directory: *const client.Directory) Error!WireReques
     return request;
 }
 
+/// Builds a POST request to the directory's `new_account_url` with a JOSE JSON body.
+/// Rejects bodies larger than `max_body_bytes` with `error.BodyTooLarge`.
+/// The returned request stores `body` by slice reference; the caller retains ownership of the backing memory.
 pub fn buildNewAccountRequest(directory: *const client.Directory, body: []const u8) Error!WireRequest {
     assert(@intFromPtr(directory) != 0);
 
@@ -176,6 +221,9 @@ pub fn buildNewAccountRequest(directory: *const client.Directory, body: []const 
     return request;
 }
 
+/// Builds a POST request to the directory's `new_order_url` with a JOSE JSON body.
+/// Rejects bodies larger than `max_body_bytes` with `error.BodyTooLarge`.
+/// The returned request stores `body` by slice reference; the caller retains ownership of the backing memory.
 pub fn buildNewOrderRequest(directory: *const client.Directory, body: []const u8) Error!WireRequest {
     assert(@intFromPtr(directory) != 0);
 
@@ -190,6 +238,9 @@ pub fn buildNewOrderRequest(directory: *const client.Directory, body: []const u8
     return request;
 }
 
+/// Builds a POST request to `target_url` with a JOSE JSON body.
+/// Rejects bodies larger than `max_body_bytes` with `error.BodyTooLarge`.
+/// The returned request stores `body` by slice reference; the caller retains ownership of the backing memory.
 pub fn buildSignedPostRequest(target_url: *const client.Url, body: []const u8) Error!WireRequest {
     assert(@intFromPtr(target_url) != 0);
 
@@ -204,6 +255,9 @@ pub fn buildSignedPostRequest(target_url: *const client.Url, body: []const u8) E
     return request;
 }
 
+/// Serializes `params` into `body_out` as flattened JWS and builds a new-account POST request.
+/// `body_out` must provide enough space for the serialized payload.
+/// Returns a request-building or JWS serialization error from the underlying helpers.
 pub fn composeNewAccountRequestWithFlattenedJws(
     body_out: []u8,
     directory: *const client.Directory,
@@ -216,6 +270,9 @@ pub fn composeNewAccountRequestWithFlattenedJws(
     return try buildNewAccountRequest(directory, body);
 }
 
+/// Serializes `params` into `body_out` as flattened JWS and builds a new-order POST request.
+/// `body_out` must provide enough space for the serialized payload.
+/// Returns a request-building or JWS serialization error from the underlying helpers.
 pub fn composeNewOrderRequestWithFlattenedJws(
     body_out: []u8,
     directory: *const client.Directory,
@@ -228,6 +285,9 @@ pub fn composeNewOrderRequestWithFlattenedJws(
     return try buildNewOrderRequest(directory, body);
 }
 
+/// Serializes `params` into `body_out` as flattened JWS and builds a signed POST request.
+/// `body_out` must provide enough space for the serialized payload.
+/// Returns a request-building or JWS serialization error from the underlying helpers.
 pub fn composeSignedPostRequestWithFlattenedJws(
     body_out: []u8,
     target_url: *const client.Url,
@@ -240,6 +300,9 @@ pub fn composeSignedPostRequestWithFlattenedJws(
     return try buildSignedPostRequest(target_url, body);
 }
 
+/// Extracts the `Replay-Nonce` header from `headers` and parses it as a nonce.
+/// Returns `error.MissingReplayNonceHeader` when the header is absent.
+/// Propagates nonce parsing errors from `client.parseReplayNonceHeader`.
 pub fn parseReplayNonceFromHeaders(headers: *const HeaderMap) (Error || client.Error)!client.ReplayNonce {
     assert(@intFromPtr(headers) != 0);
     assert(config.MAX_HEADERS > 0);
@@ -248,6 +311,9 @@ pub fn parseReplayNonceFromHeaders(headers: *const HeaderMap) (Error || client.E
     return client.parseReplayNonceHeader(replay_nonce_value);
 }
 
+/// Extracts the `Location` header from `headers` and parses it as a client URL.
+/// Returns `error.MissingLocationHeader` when the header is absent.
+/// Propagates URL parsing errors from `client.parseLocationHeader`.
 pub fn parseLocationFromHeaders(headers: *const HeaderMap) (Error || client.Error)!client.Url {
     assert(@intFromPtr(headers) != 0);
     assert(config.MAX_HEADERS > 0);

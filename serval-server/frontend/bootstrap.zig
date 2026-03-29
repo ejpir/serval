@@ -7,11 +7,18 @@ const assert = std.debug.assert;
 const Io = std.Io;
 const core_config = @import("serval-core").config;
 
+/// Errors returned while validating and resolving frontend bootstrap listen configuration.
+/// `InvalidTransportConfig` indicates the transport settings failed validation.
+/// `InvalidAddress` indicates the configured host and port could not be parsed into an IP address.
 pub const FrontendBootstrapError = error{
     InvalidTransportConfig,
     InvalidAddress,
 };
 
+/// Checks whether the transport-related fields in `cfg` are valid for frontend bootstrap.
+/// Requires `cfg` to be a non-null `Config` pointer.
+/// Maps any validation failure from `core_config.validateTransportConfig` to `error.InvalidTransportConfig`.
+/// Does not allocate or take ownership of `cfg`; it only inspects the referenced configuration.
 pub fn validateTransportReadiness(cfg: *const core_config.Config) FrontendBootstrapError!void {
     assert(@intFromPtr(cfg) != 0);
 
@@ -21,6 +28,10 @@ pub fn validateTransportReadiness(cfg: *const core_config.Config) FrontendBootst
 
 }
 
+/// Validates transport readiness for `cfg` and resolves the configured listen address.
+/// Requires `cfg` to point to a non-null `Config` with `port > 0` and a non-empty `listen_host`.
+/// Returns `error.InvalidTransportConfig` if transport validation fails, or `error.InvalidAddress` if `listen_host:port` cannot be parsed.
+/// On success, returns the parsed IP address to bind the frontend listener.
 pub fn preflightAndResolveListenAddress(cfg: *const core_config.Config) FrontendBootstrapError!Io.net.IpAddress {
     assert(@intFromPtr(cfg) != 0);
     assert(cfg.port > 0);

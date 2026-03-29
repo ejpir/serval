@@ -38,8 +38,14 @@ const SpanExporter = processor.SpanExporter;
 // Constants (from serval-core/config.zig - single source of truth)
 // =============================================================================
 
+/// Default OTLP collector endpoint used when no endpoint is provided in configuration.
+/// This is an alias of the shared Serval core OTEL default endpoint value.
 pub const DEFAULT_ENDPOINT = core_config.OTEL_DEFAULT_ENDPOINT;
+/// Maximum number of bytes reserved for OTLP export payload assembly.
+/// This is an alias of the shared Serval core OTEL export buffer size configuration value.
 pub const MAX_EXPORT_BUFFER_SIZE = core_config.OTEL_MAX_EXPORT_BUFFER_SIZE_BYTES;
+/// HTTP timeout in milliseconds used by the OTLP exporter.
+/// This is an alias of the shared Serval core OTEL timeout configuration value.
 pub const HTTP_TIMEOUT_MS = core_config.OTEL_HTTP_TIMEOUT_MS;
 
 /// Maximum hostname length for parsed endpoints.
@@ -58,28 +64,43 @@ pub const FixedBufferWriter = struct {
 
     const Self = @This();
 
+    /// Initializes a buffer writer over `buffer` with an empty write position.
+    /// The caller retains ownership of the backing slice and must keep it valid for the lifetime of the writer.
+    /// The writer starts at position `0` and does not clear the buffer contents.
     pub fn init(buffer: []u8) Self {
         return .{ .buffer = buffer, .pos = 0 };
     }
 
+    /// Appends all bytes from `data` to the buffer.
+    /// Returns `error.NoSpaceLeft` if the full payload cannot fit contiguously in the remaining capacity.
+    /// On success, copies the bytes into the buffer and advances the write position by `data.len`.
     pub fn writeAll(self: *Self, data: []const u8) !void {
         if (self.pos + data.len > self.buffer.len) return error.NoSpaceLeft;
         @memcpy(self.buffer[self.pos .. self.pos + data.len], data);
         self.pos += data.len;
     }
 
+    /// Appends a single byte to the buffer.
+    /// Returns `error.NoSpaceLeft` when the buffer is already full.
+    /// On success, stores the byte at the current position and advances the cursor by one.
     pub fn writeByte(self: *Self, byte: u8) !void {
         if (self.pos >= self.buffer.len) return error.NoSpaceLeft;
         self.buffer[self.pos] = byte;
         self.pos += 1;
     }
 
+    /// Appends formatted text to the buffer.
+    /// Fails with `error.NoSpaceLeft` if the formatted output does not fit in the remaining capacity.
+    /// On success, advances the write position by the number of bytes written.
     pub fn print(self: *Self, comptime fmt: []const u8, args: anytype) !void {
         const remaining = self.buffer[self.pos..];
         const written = std.fmt.bufPrint(remaining, fmt, args) catch return error.NoSpaceLeft;
         self.pos += written.len;
     }
 
+    /// Returns the bytes written so far into the buffer.
+    /// The returned slice aliases the underlying storage and is valid until the buffer is mutated or reset.
+    /// The slice length is always `self.pos`.
     pub fn getWritten(self: Self) []const u8 {
         return self.buffer[0..self.pos];
     }
@@ -200,6 +221,9 @@ fn parseEndpoint(url: []const u8) !ParsedEndpoint {
 // OTLP Exporter Configuration
 // =============================================================================
 
+/// Runtime configuration for the OTLP exporter.
+/// `endpoint` selects the collector URL, `service_name` and `service_version` populate resource attributes, and `timeout_ms` controls HTTP request timeouts.
+/// Field defaults come from Serval core OTEL configuration constants where applicable.
 pub const Config = struct {
     /// OTLP collector endpoint (e.g., "http://localhost:4318/v1/traces")
     endpoint: []const u8 = DEFAULT_ENDPOINT,
@@ -242,6 +266,9 @@ pub const OTLPExporter = struct {
     /// Response buffer size (4KB is plenty for OTLP responses)
     const RESPONSE_BUF_SIZE: usize = 4096;
 
+    /// Allocates and initializes a new OTLP exporter instance.
+    /// Parses the configured endpoint, creates TLS state when the endpoint requires it, and wires up the I/O runtime, DNS resolver, and HTTP client.
+    /// Returns an owned pointer that must be released with `deinit`; allocation, endpoint parsing, and TLS setup failures are reported as errors.
     pub fn init(allocator: std.mem.Allocator, cfg: Config) !*Self {
         const self = try allocator.create(Self);
         errdefer allocator.destroy(self);
@@ -307,6 +334,9 @@ pub const OTLPExporter = struct {
         return self;
     }
 
+    /// Releases all resources owned by this exporter and destroys the instance.
+    /// Frees the TLS context when present, shuts down the I/O runtime, and releases both internal buffers.
+    /// The pointer becomes invalid after this call and must not be used again.
     pub fn deinit(self: *Self) void {
         if (self.tls_ctx) |ctx| {
             ssl.SSL_CTX_free(ctx);
@@ -317,6 +347,9 @@ pub const OTLPExporter = struct {
         self.allocator.destroy(self);
     }
 
+    /// Returns a `SpanExporter` adapter backed by this exporter instance.
+    /// The returned adapter stores `self` by pointer, so it is only valid while `self` remains alive.
+    /// Its vtable wires span export and shutdown to this exporter implementation.
     pub fn asSpanExporter(self: *Self) SpanExporter {
         return .{
             .ptr = self,

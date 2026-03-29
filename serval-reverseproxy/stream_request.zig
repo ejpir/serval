@@ -5,17 +5,26 @@ const assert = std.debug.assert;
 const config = @import("serval-core").config;
 const sdk = @import("serval-filter-sdk");
 
+/// Errors returned by request-stream execution helpers and backpressure polling.
+/// `BackpressureTimeout` indicates that writable readiness was not observed in time.
+/// `EmitFailed` indicates that forwarding bytes to the emit writer did not succeed.
 pub const StreamError = error{
     BackpressureTimeout,
     EmitFailed,
 };
 
+/// Encapsulates backpressure polling for stream execution.
+/// `ctx` must be a valid, non-null context pointer and both `max_wait_attempts` and `wait_timeout_ns` must be greater than zero.
+/// `waitWritable` returns `error.BackpressureTimeout` after the configured number of unsuccessful attempts.
 pub const BackpressureController = struct {
     ctx: *anyopaque,
     wait_writable_fn: *const fn (ctx: *anyopaque, timeout_ns: u64) bool,
     max_wait_attempts: u32,
     wait_timeout_ns: u64,
 
+    /// Waits until the underlying stream becomes writable or the retry budget is exhausted.
+    /// Repeatedly calls `wait_writable_fn` with `wait_timeout_ns` up to `max_wait_attempts` times.
+    /// Returns `error.BackpressureTimeout` if no attempt reports writable.
     pub fn waitWritable(self: BackpressureController) StreamError!void {
         assert(@intFromPtr(self.ctx) != 0);
         assert(self.max_wait_attempts > 0);
@@ -30,12 +39,18 @@ pub const BackpressureController = struct {
     }
 };
 
+/// Counts request-stream callbacks and emitted bytes for observability tests.
+/// `request_headers_calls`, `request_chunk_calls`, and `request_end_calls` track hook invocation counts.
+/// Call `init` to obtain a zero-initialized value before passing it to stream execution helpers.
 pub const StreamObservation = struct {
     request_headers_calls: u32,
     request_chunk_calls: u32,
     request_end_calls: u32,
     emitted_bytes: u64,
 
+    /// Initializes a zeroed `StreamObservation` record.
+    /// All counters start at `0`, including emitted byte tracking.
+    /// Use this when beginning a new stream execution trace.
     pub fn init() StreamObservation {
         return .{
             .request_headers_calls = 0,
@@ -46,6 +61,9 @@ pub const StreamObservation = struct {
     }
 };
 
+/// Executes a request-stream filter over headers, chunks, and the end callback in order.
+/// Rejects immediately if any filter hook rejects; otherwise returns `.continue_filtering`.
+/// Waits for writable backpressure before each chunk and before `onRequestEnd`, and updates `observation` with callback counts and emitted byte totals.
 pub fn executeRequestStream(
     comptime Filter: type,
     filter: *Filter,
@@ -98,6 +116,9 @@ pub fn executeRequestStream(
 
 test "request stream enforces backpressure timeout" {
     const Filter = struct {
+        /// A no-op header callback that always continues filtering.
+        /// `self`, `ctx`, and `headers` are unused and no state is updated.
+        /// The provided header slice remains owned by the caller.
         pub fn onRequestHeaders(self: *@This(), ctx: *sdk.FilterContext, headers: sdk.HeaderSliceView) sdk.Decision {
             _ = self;
             _ = ctx;
@@ -105,6 +126,9 @@ test "request stream enforces backpressure timeout" {
             return .continue_filtering;
         }
 
+        /// Forwards each request chunk to the emit writer and records success only through the return value.
+        /// If emitting fails, returns `.reject` with status `500` and reason `"emit"`.
+        /// `self` and `ctx` are unused; the chunk payload is not modified.
         pub fn onRequestChunk(self: *@This(), ctx: *sdk.FilterContext, chunk: sdk.ChunkView, emit: *sdk.EmitWriter) sdk.Decision {
             _ = self;
             _ = ctx;
@@ -112,6 +136,9 @@ test "request stream enforces backpressure timeout" {
             return .continue_filtering;
         }
 
+        /// A no-op end-of-request callback that always continues filtering.
+        /// `self`, `ctx`, and `emit` are unused, and no bytes are written.
+        /// This hook is suitable when request completion needs no special handling.
         pub fn onRequestEnd(self: *@This(), ctx: *sdk.FilterContext, emit: *sdk.EmitWriter) sdk.Decision {
             _ = self;
             _ = ctx;
@@ -158,6 +185,9 @@ test "request stream enforces backpressure timeout" {
 
 test "request stream stress enforces output cap under many chunks" {
     const Filter = struct {
+        /// A no-op header callback that always continues filtering.
+        /// `self`, `ctx`, and `headers` are unused, so no state is recorded.
+        /// The header slice is not retained beyond the call.
         pub fn onRequestHeaders(self: *@This(), ctx: *sdk.FilterContext, headers: sdk.HeaderSliceView) sdk.Decision {
             _ = self;
             _ = ctx;
@@ -165,6 +195,9 @@ test "request stream stress enforces output cap under many chunks" {
             return .continue_filtering;
         }
 
+        /// Forwards each request chunk to the emit writer without modifying it.
+        /// If emitting fails, returns `.reject` with status `413` and reason `"expansion cap"`.
+        /// `self` and `ctx` are unused; `chunk.bytes` is written as received.
         pub fn onRequestChunk(self: *@This(), ctx: *sdk.FilterContext, chunk: sdk.ChunkView, emit: *sdk.EmitWriter) sdk.Decision {
             _ = self;
             _ = ctx;
@@ -174,6 +207,9 @@ test "request stream stress enforces output cap under many chunks" {
             return .continue_filtering;
         }
 
+        /// A no-op end-of-request hook that always continues filtering.
+        /// `self`, `ctx`, and `emit` are unused, so this hook has no side effects.
+        /// Use this when the filter does not need to inspect request completion.
         pub fn onRequestEnd(self: *@This(), ctx: *sdk.FilterContext, emit: *sdk.EmitWriter) sdk.Decision {
             _ = self;
             _ = ctx;
@@ -228,6 +264,9 @@ test "request stream lifecycle calls headers/chunk/end and keeps bounded emit" {
         chunk_calls: u32 = 0,
         end_calls: u32 = 0,
 
+        /// Records that request headers were observed and continues filtering.
+        /// `ctx` and `headers` are unused; this hook only updates `header_calls`.
+        /// Never rejects and does not retain the header slice.
         pub fn onRequestHeaders(self: *@This(), ctx: *sdk.FilterContext, headers: sdk.HeaderSliceView) sdk.Decision {
             _ = ctx;
             _ = headers;
@@ -235,6 +274,9 @@ test "request stream lifecycle calls headers/chunk/end and keeps bounded emit" {
             return .continue_filtering;
         }
 
+        /// Records a chunk callback and forwards the chunk bytes to the emit writer.
+        /// Returns `.reject` with status `500` and reason `"emit"` if emitting fails.
+        /// `ctx` is unused; `chunk.bytes` is passed through unchanged.
         pub fn onRequestChunk(self: *@This(), ctx: *sdk.FilterContext, chunk: sdk.ChunkView, emit: *sdk.EmitWriter) sdk.Decision {
             _ = ctx;
             self.chunk_calls += 1;
@@ -242,6 +284,9 @@ test "request stream lifecycle calls headers/chunk/end and keeps bounded emit" {
             return .continue_filtering;
         }
 
+        /// Records that the request body finished and continues filtering.
+        /// `ctx` and `emit` are intentionally unused; this hook only updates `end_calls`.
+        /// Never rejects and does not emit any bytes.
         pub fn onRequestEnd(self: *@This(), ctx: *sdk.FilterContext, emit: *sdk.EmitWriter) sdk.Decision {
             _ = ctx;
             _ = emit;

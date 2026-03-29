@@ -11,8 +11,14 @@ const eqlIgnoreCase = core.eqlIgnoreCase;
 const grpc_content_type = "application/grpc";
 const trailers_value = "trailers";
 
+/// Maximum accepted numeric value for `grpc-status`.
+/// Parsed status codes must be less than or equal to this bound.
+/// This constant is used by gRPC status parsing and validation.
 pub const max_grpc_status_code: u8 = 16;
 
+/// Classification of a request after gRPC signal inspection and validation.
+/// `.grpc` indicates a valid gRPC request, `.non_grpc` indicates no gRPC signals were present, and `.invalid_grpc_like` indicates a failed gRPC validation.
+/// Use this when routing or handling requests that may or may not speak gRPC.
 pub const RequestClass = enum {
     grpc,
     non_grpc,
@@ -29,6 +35,9 @@ const RequestSignals = enum {
     grpc_like,
 };
 
+/// Validation errors returned while parsing or checking gRPC request metadata.
+/// These cover missing required headers, invalid header formats, and invalid gRPC status values.
+/// Callers should treat these as request-level validation failures, not transport errors.
 pub const Error = error{
     InvalidMethod,
     MissingPath,
@@ -41,6 +50,9 @@ pub const Error = error{
     InvalidGrpcStatusRange,
 };
 
+/// Reports whether `value` is a gRPC content type prefix.
+/// Comparison is ASCII case-insensitive and accepts exact matches or values followed by `+` or `;` suffixes.
+/// The function assumes content-type values stay within `core.config.MAX_HEADER_SIZE_BYTES`.
 pub fn isGrpcContentType(value: []const u8) bool {
     assert(grpc_content_type.len <= core.config.MAX_HEADER_SIZE_BYTES);
     if (value.len < grpc_content_type.len) return false;
@@ -52,14 +64,24 @@ pub fn isGrpcContentType(value: []const u8) bool {
     return suffix_delimiter == '+' or suffix_delimiter == ';';
 }
 
+/// Validates `request` using compatibility-mode gRPC request rules.
+/// Returns the first validation error encountered when the request is missing required metadata or contains invalid metadata.
+/// `request` must be a valid, non-null pointer to a request with bounded header count.
 pub fn validateRequest(request: *const Request) Error!void {
     try validateRequestWithMode(request, .compatibility);
 }
 
+/// Validates `request` using strict gRPC request rules.
+/// Returns the first validation error encountered when the request does not satisfy the strict contract.
+/// `request` must be a valid, non-null pointer to a request with bounded header count.
 pub fn validateRequestStrict(request: *const Request) Error!void {
     try validateRequestWithMode(request, .strict);
 }
 
+/// Classifies `request` as gRPC, non-gRPC, or invalid gRPC-like traffic.
+/// Requests with no gRPC signals are reported as `.non_grpc`; gRPC-like requests are validated before being accepted as `.grpc`.
+/// Invalid gRPC-like requests are downgraded to `.invalid_grpc_like` instead of surfacing validation errors.
+/// `request` must be a valid, non-null pointer and its headers must stay within `core.config.MAX_HEADERS`.
 pub fn classifyRequest(request: *const Request) RequestClass {
     assert(@intFromPtr(request) != 0);
     assert(request.headers.count <= core.config.MAX_HEADERS);
@@ -73,6 +95,9 @@ pub fn classifyRequest(request: *const Request) RequestClass {
     };
 }
 
+/// Reads and validates the `grpc-status` header from `headers`.
+/// Returns the parsed status code on success, or an error if the header is missing, empty, malformed, or out of range.
+/// `headers` must be a valid, non-null pointer and must not exceed `core.config.MAX_HEADERS`.
 pub fn parseGrpcStatus(headers: *const core.HeaderMap) Error!u8 {
     assert(@intFromPtr(headers) != 0);
     assert(headers.count <= core.config.MAX_HEADERS);
@@ -85,6 +110,9 @@ pub fn parseGrpcStatus(headers: *const core.HeaderMap) Error!u8 {
     return status;
 }
 
+/// Parses `grpc-status` from `headers` and returns success if the status is valid.
+/// Returns an error when the header is missing, empty, malformed, or outside the allowed range.
+/// `headers` must be a valid, non-null pointer to a header map within configured header limits.
 pub fn requireGrpcStatus(headers: *const core.HeaderMap) Error!void {
     _ = try parseGrpcStatus(headers);
 }

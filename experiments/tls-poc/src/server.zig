@@ -3,6 +3,12 @@ const log = @import("serval-core").log.scoped(.tls_experiment);
 const ssl = @import("ssl.zig");
 const posix = std.posix;
 
+/// Starts the TLS server proof-of-concept on port `8443`.
+/// Initializes BoringSSL, creates a server `SSL_CTX`, loads `cert.pem` and `key.pem`,
+/// and binds a threaded `std.Io` listener to `0.0.0.0`.
+/// The function then enters an infinite accept loop; each accepted client stream is
+/// owned by the loop and closed with `defer` after use.
+/// Returns an error if allocator, TLS setup, certificate/key loading, or listen/accept setup fails.
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();

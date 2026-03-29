@@ -63,11 +63,17 @@ const ConnectionIo = union(enum) {
     }
 };
 
+/// A single HTTP/2 header field as a borrowed name/value pair.
+/// Both slices are read during header-block encoding; this type does not own
+/// the bytes and does not impose any normalization beyond what callers provide.
 pub const Header = struct {
     name: []const u8,
     value: []const u8,
 };
 
+/// Describes why a tracked HTTP/2 stream was closed.
+/// `local_end_stream` and `local_reset` indicate server-initiated completion,
+/// while `peer_reset` and `connection_close` indicate remote or connection-level termination.
 pub const StreamCloseReason = enum {
     local_end_stream,
     peer_reset,
@@ -75,6 +81,9 @@ pub const StreamCloseReason = enum {
     connection_close,
 };
 
+/// Per-stream accounting captured when a stream is closed.
+/// `duration_ns` is measured from stream start to close using monotonic time,
+/// and `reset_error_code_raw` preserves the raw HTTP/2 reset or GOAWAY code.
 pub const StreamSummary = struct {
     connection_id: u64,
     stream_id: u32,
@@ -86,6 +95,9 @@ pub const StreamSummary = struct {
     reset_error_code_raw: u32,
 };
 
+/// Errors returned by HTTP/2 server connection and response-writing routines.
+/// This set combines server-local state errors with runtime, frame, HPACK,
+/// and h2c-upgrade failures from the imported subsystems.
 pub const Error = error{
     InvalidPreface,
     ReadFailed,
@@ -349,6 +361,10 @@ const StreamTrackerTable = struct {
     }
 };
 
+/// Writer for sending HTTP/2 response frames on a single stream.
+/// Holds borrowed pointers to connection I/O, runtime state, and tracking tables; those pointed-to values must outlive the writer.
+/// `stream_id` must be set to a positive stream id before calling the send methods.
+/// Use the public send methods to drive the stream lifecycle and emit response frames.
 pub const ResponseWriter = struct {
     io_conn: *ConnectionIo,
     io: Io,
@@ -358,6 +374,10 @@ pub const ResponseWriter = struct {
     states: *ResponseStateTable,
     stream_trackers: *StreamTrackerTable,
 
+    /// Send the response HEADERS for an open stream.
+    /// Requires `status >= 100` and fails if headers were already sent or the stream is closed.
+    /// Encodes the response headers, writes the frame sequence, records stream state, and finalizes the stream when `end_stream` is true.
+    /// Returns errors from header encoding, frame assembly, write, or stream tracking.
     pub fn sendHeaders(self: *ResponseWriter, status: u16, headers: []const Header, end_stream: bool) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(status >= 100);
@@ -387,6 +407,10 @@ pub const ResponseWriter = struct {
         if (end_stream) try self.finishStream(state);
     }
 
+    /// Send response DATA on an open stream after response headers have been sent.
+    /// Rejects payloads larger than one frame and returns `PendingResponseData` if buffered data is still outstanding.
+    /// An empty payload only emits an empty final DATA frame when `end_stream` is true.
+    /// Otherwise the payload is buffered, flushed according to flow control, and the stream is finalized when the end of stream is reached.
     pub fn sendData(self: *ResponseWriter, payload: []const u8, end_stream: bool) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(self.stream_id > 0);
@@ -419,6 +443,10 @@ pub const ResponseWriter = struct {
         if (ended_stream) try self.finishStream(state);
     }
 
+    /// Send trailer headers on an open stream after response headers have been sent.
+    /// Fails if the stream state is missing, already closed, or has not emitted headers yet.
+    /// Encodes the trailers into HEADERS/CONTINUATION frames, writes them, marks response end, and finalizes the stream.
+    /// Returns errors from header encoding, frame assembly, write, tracking, or stream finalization.
     pub fn sendTrailers(self: *ResponseWriter, trailers: []const Header) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(self.stream_id > 0);
@@ -445,6 +473,10 @@ pub const ResponseWriter = struct {
         try self.finishStream(state);
     }
 
+    /// Send a stream reset using the raw HTTP/2 error code value.
+    /// Requires a live response writer with a positive `stream_id`.
+    /// If response state is still tracked for the stream, the stream is finalized locally after the reset is sent.
+    /// Returns any I/O or runtime error raised while emitting the reset.
     pub fn sendReset(self: *ResponseWriter, error_code_raw: u32) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(self.stream_id > 0);
@@ -540,6 +572,10 @@ fn responsePeerMaxFrameSizeBytes(runtime: *const runtime_mod.Runtime) usize {
     return @intCast(peer_max_frame_size_bytes);
 }
 
+/// Validate that `Handler` satisfies the HTTP/2 handler contract at comptime.
+/// The type must be a struct that declares `handleH2Headers` and `handleH2Data`.
+/// Optional hooks are accepted only when their parameter and return types match the expected signatures.
+/// Violations are reported as compile errors rather than runtime errors.
 pub fn verifyHandler(comptime Handler: type) void {
     assert(@typeInfo(Handler) == .@"struct");
     assert(@typeName(Handler).len > 0);
@@ -955,18 +991,30 @@ fn processUpgradeSyntheticRequestAndBody(
     );
 }
 
+/// Serve a plain connection without any extra initial bytes.
+/// Equivalent to calling `servePlainConnectionWithInitialBytes(..., &[_]u8{})`.
+/// `fd` must be a valid non-negative descriptor and remains owned by the caller.
+/// Propagates any error from the underlying plain connection driver.
 pub fn servePlainConnection(comptime Handler: type, handler: *Handler, fd: i32, io: Io, connection_id: u64) Error!void {
     assert(@intFromPtr(handler) != 0);
     assert(fd >= 0);
     return servePlainConnectionWithInitialBytes(Handler, handler, fd, io, connection_id, &[_]u8{});
 }
 
+/// Serve a TLS connection without any extra initial bytes.
+/// Equivalent to calling `serveTlsConnectionWithInitialBytes(..., &[_]u8{})`.
+/// `tls_stream` is borrowed for the call and is not closed by this helper.
+/// Propagates any error from the underlying TLS connection driver.
 pub fn serveTlsConnection(comptime Handler: type, handler: *Handler, tls_stream: *TLSStream, io: Io, connection_id: u64) Error!void {
     assert(@intFromPtr(handler) != 0);
     assert(@intFromPtr(tls_stream) != 0);
     return serveTlsConnectionWithInitialBytes(Handler, handler, tls_stream, io, connection_id, &[_]u8{});
 }
 
+/// Error set returned by `run`.
+/// Combines HTTP/2 bootstrap errors, frontend-orchestrator errors, and server-startup failures.
+/// Includes listener creation failure plus TLS certificate, key, and context creation failures.
+/// Use this type when starting the server accept loop or preparing TLS state can fail.
 pub const RunError = h2_bootstrap.H2BootstrapError || frontend.FrontendOrchestratorError || error{
     ListenFailed,
     LoadCertFailed,
@@ -976,6 +1024,10 @@ pub const RunError = h2_bootstrap.H2BootstrapError || frontend.FrontendOrchestra
     OutOfMemory,
 };
 
+/// Start the server accept loop for the configured HTTP/2 listener.
+/// Resolves the listen address, starts the frontend runtime orchestrator, and records the listener fd when `listener_fd_out` is provided.
+/// Accepted connections are handed to per-connection tasks until `shutdown` becomes true.
+/// Returns setup, TLS-configuration, listen, or orchestrator errors from server startup and accept-loop processing.
 pub fn run(
     comptime Handler: type,
     handler: *Handler,
@@ -1093,12 +1145,20 @@ fn handleAcceptedConnection(
     };
 }
 
+/// Options that adjust plain-connection bootstrap behavior.
+/// Set `local_settings_already_sent` when the server SETTINGS frame has already been written before entering the driver.
+/// The runtime still expects the peer ACK and validates it either way.
+/// Defaults to `false`.
 pub const PlainConnectionOptions = struct {
     /// Caller has already sent server SETTINGS for this connection.
     /// Runtime still expects an ACK and will validate it.
     local_settings_already_sent: bool = false,
 };
 
+/// Serve a plain connection with pre-read bytes and default plain-connection options.
+/// Equivalent to calling `servePlainConnectionWithInitialBytesOptions(..., .{})`.
+/// `fd` must be non-negative and remains owned by the caller.
+/// Propagates any error returned by the optioned wrapper.
 pub fn servePlainConnectionWithInitialBytes(
     comptime Handler: type,
     handler: *Handler,
@@ -1121,6 +1181,10 @@ pub fn servePlainConnectionWithInitialBytes(
     );
 }
 
+/// Serve a TLS connection with pre-read bytes and default plain-connection options.
+/// Equivalent to calling `serveTlsConnectionWithInitialBytesOptions(..., .{})`.
+/// `tls_stream` is borrowed for the duration of the call and is not closed by this helper.
+/// Propagates any error returned by the optioned wrapper.
 pub fn serveTlsConnectionWithInitialBytes(
     comptime Handler: type,
     handler: *Handler,
@@ -1143,6 +1207,10 @@ pub fn serveTlsConnectionWithInitialBytes(
     );
 }
 
+/// Serve a plain connection with pre-read bytes and explicit plain-connection options.
+/// `fd` must be a non-negative, open file descriptor and remains owned by the caller.
+/// Initializes plain connection I/O and forwards to the shared connection driver without closing the descriptor.
+/// Returns any error raised by the shared driver.
 pub fn servePlainConnectionWithInitialBytesOptions(
     comptime Handler: type,
     handler: *Handler,
@@ -1166,6 +1234,10 @@ pub fn servePlainConnectionWithInitialBytesOptions(
     );
 }
 
+/// Serve a TLS connection with pre-read bytes and explicit plain-connection options.
+/// `tls_stream` is borrowed for the call; this wrapper does not take ownership of the TLS stream.
+/// Initializes a connection I/O view over the TLS stream and forwards to the shared connection driver.
+/// Returns any error raised by the shared driver.
 pub fn serveTlsConnectionWithInitialBytesOptions(
     comptime Handler: type,
     handler: *Handler,
@@ -1340,6 +1412,10 @@ fn applyUpgradeSyntheticHeaders(
     closeCompletedStreams(Handler, handler, connection_id, stream_trackers);
 }
 
+/// Serve an upgraded HTTP/2 connection on a plain file descriptor.
+/// `request`, `settings_payload`, `initial_body`, and `initial_client_h2_bytes` are borrowed inputs and must stay valid for the duration of the call.
+/// Validates the handler at comptime, initializes per-connection runtime state, and starts background tasks when the handler provides them.
+/// Returns bootstrap, frame-processing, I/O, or runtime errors encountered while driving the upgraded body and frame loop.
 pub fn serveUpgradedConnection(
     comptime Handler: type,
     handler: *Handler,

@@ -6,6 +6,9 @@ const config = @import("serval-core").config;
 const ir = @import("ir.zig");
 const components = @import("components.zig");
 
+/// Errors returned while parsing or validating reverse proxy DSL input.
+/// These cover structural issues, capacity limits, unsupported syntax, and unresolved references.
+/// Callers should treat the set as non-exhaustive for higher-level validation failures surfaced by the parser.
 pub const ParseError = error{
     TooManyLines,
     InvalidStatement,
@@ -23,6 +26,9 @@ pub const ParseError = error{
     UnknownPluginReference,
 };
 
+/// In-memory representation of the reverse proxy DSL after parsing and validation.
+/// Stores listeners, pools, plugins, chains, and routes in fixed-capacity arrays with explicit counts for the used prefix.
+/// Also carries component selection and OpenTelemetry defaults used when building canonical IR.
 pub const ParsedDsl = struct {
     listeners: [config.MAX_ALLOWED_HOSTS]ir.Listener,
     listener_count: u32,
@@ -45,6 +51,9 @@ pub const ParsedDsl = struct {
     component_tracing_otel_scope_name: []const u8,
     component_tracing_otel_scope_version: []const u8,
 
+    /// Initializes a `ParsedDsl` with zero counts and default component settings.
+    /// The fixed-capacity arrays are left undefined until entries are parsed and counted into them.
+    /// No allocation is performed; the default tracing service and scope values are prefilled.
     pub fn init() ParsedDsl {
         return .{
             .listeners = undefined,
@@ -69,6 +78,9 @@ pub const ParsedDsl = struct {
         };
     }
 
+    /// Converts the parsed DSL into canonical IR using the populated prefixes of each fixed-capacity array.
+    /// The returned slices borrow storage from `self` and remain valid only while `self` is unchanged and alive.
+    /// Asserts that every count is within the corresponding array capacity before slicing.
     pub fn toCanonicalIr(self: *const ParsedDsl) ir.CanonicalIr {
         assert(self.listener_count <= self.listeners.len);
         assert(self.pool_count <= self.pools.len);
@@ -87,6 +99,9 @@ pub const ParsedDsl = struct {
     }
 };
 
+/// Parses reverse proxy DSL text into a validated `ParsedDsl` value.
+/// Blank lines and lines starting with `#` are ignored after trimming ASCII space, tab, and carriage return.
+/// Requires non-empty input and returns `error.TooManyLines`, `error.UnsupportedConstruct`, or a validation error from the parsed content.
 pub fn parse(source: []const u8) ParseError!ParsedDsl {
     assert(source.len > 0);
 

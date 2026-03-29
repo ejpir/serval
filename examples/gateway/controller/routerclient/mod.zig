@@ -16,7 +16,13 @@ const core_config = serval_core.config;
 // Re-exports
 // ============================================================================
 
+/// Re-export of the router client implementation used by the gateway controller.
+/// Create and use this type through the public API surface of this module.
+/// Behavior, configuration, and cleanup rules are defined in `client.zig`.
 pub const RouterClient = @import("client.zig").RouterClient;
+/// Re-export of the push result type used by the router client API.
+/// Use this type to inspect the outcome of a config push without depending on the implementation module.
+/// Ownership and lifetime semantics are defined by `types.zig`.
 pub const PushResult = @import("types.zig").PushResult;
 
 // ============================================================================
@@ -48,6 +54,9 @@ pub const ADMIN_ROUTES_PATH: []const u8 = "/routes/update";
 // Error Types (TigerStyle S6: Explicit error set)
 // ============================================================================
 
+/// Errors returned by `RouterClient` when a router push cannot complete.
+/// The set covers config validation, backend or endpoint discovery, request/response failures,
+/// router rejection, and retry exhaustion.
 pub const RouterClientError = error{
     /// No config to push.
     NoConfig,

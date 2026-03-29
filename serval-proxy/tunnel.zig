@@ -20,6 +20,10 @@ const debugLog = serval_core.debugLog;
 const serval_socket = @import("serval-socket");
 const Socket = serval_socket.Socket;
 
+/// Indicates why a tunnel session terminated.
+/// `client_closed`/`upstream_closed` mean an orderly close by that peer.
+/// `client_error`/`upstream_error` mean termination due to an I/O or protocol error on that side.
+/// `idle_timeout` means the tunnel was closed after exceeding its configured inactivity limit.
 pub const Termination = enum {
     client_closed,
     upstream_closed,
@@ -28,6 +32,10 @@ pub const Termination = enum {
     idle_timeout,
 };
 
+/// Aggregated counters and outcome metadata for a completed tunnel session.
+/// `client_to_upstream_bytes` and `upstream_to_client_bytes` record total bytes forwarded in each direction.
+/// `duration_ns` stores the tunnel lifetime in nanoseconds.
+/// Fields are value-owned and default to zeroed counters with `termination = .idle_timeout` until explicitly set.
 pub const TunnelStats = struct {
     client_to_upstream_bytes: u64 = 0,
     upstream_to_client_bytes: u64 = 0,
@@ -160,6 +168,10 @@ const RelayShared = struct {
     }
 };
 
+/// Relays bytes between `client_socket` and `upstream_socket`, returning aggregate `TunnelStats`.
+/// Sends `initial_client_to_upstream` and `initial_upstream_to_client` as the initial payloads before normal relay flow.
+/// This is the default-mode entry point and delegates to `relayImpl(..., .{})`.
+/// `client_socket` and `upstream_socket` must remain valid for the duration of the call; ownership and cleanup remain with the caller.
 pub fn relay(
     io: Io,
     client_socket: *Socket,
@@ -170,6 +182,11 @@ pub fn relay(
     return relayImpl(io, client_socket, upstream_socket, initial_client_to_upstream, initial_upstream_to_client, .{});
 }
 
+/// Relays bidirectional traffic between `client_socket` and `upstream_socket` using explicit timeout settings.
+/// Sends `initial_client_to_upstream` and `initial_upstream_to_client` as initial payloads before normal relay flow.
+/// Requires `idle_timeout_ns > 0` and `poll_timeout_ms > 0`; these are asserted and will trap if violated.
+/// `client_socket` and `upstream_socket` must remain valid for the duration of the call.
+/// Returns `TunnelStats` from the underlying relay operation (`relayImpl`).
 pub fn relayWithConfig(
     io: Io,
     client_socket: *Socket,

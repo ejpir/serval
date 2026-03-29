@@ -22,15 +22,27 @@ const ParseError = errors.ParseError;
 // Parser
 // =============================================================================
 
+/// Stateful HTTP/1.x request-header parser that stores parsed metadata in `request`, plus `headers_end` and derived `body_framing`.
+/// `parseHeaders` expects a complete header block ending in `\r\n\r\n`; it rejects empty input, oversized headers, malformed syntax, and invalid framing.
+/// Parsed string slices are zero-copy views into the caller-provided buffer, so that buffer must remain alive and unchanged while `request` is used.
+/// Reuse the same instance across requests by calling `reset()`, which clears all parser and request state back to defaults.
 pub const Parser = struct {
     request: Request = .{},
     headers_end: usize = 0, // byte offset after \r\n\r\n
     body_framing: BodyFraming = .none, // determined by Transfer-Encoding or Content-Length
 
+    /// Initializes a `Parser` with its default zero-value state.
+    /// This constructor takes no inputs and has no preconditions.
+    /// The returned `Parser` is owned by the caller and can be stored by value.
+    /// Does not allocate and cannot fail.
     pub fn init() Parser {
         return .{};
     }
 
+    /// Resets parser state to its initial empty values for reuse.
+    /// Clears `request`, sets `headers_end` to `0`, and sets `body_framing` to `.none`.
+    /// Preconditions: `self` must point to a valid mutable `Parser`.
+    /// This function is infallible and performs no allocation.
     pub fn reset(self: *Parser) void {
         self.request = .{};
         self.headers_end = 0;

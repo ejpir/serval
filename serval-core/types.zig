@@ -11,13 +11,22 @@ const config = @import("config.zig");
 
 // Re-export HeaderMap from dedicated module
 const header_map = @import("header_map.zig");
+/// Re-export of the shared `header_map.Header` type used throughout serval-core.
+/// Use this alias for individual HTTP header fields when working with the shared header-map API.
+/// Storage and lifetime rules are inherited from the underlying `header_map` module.
 pub const Header = header_map.Header;
+/// Re-export of the shared `header_map.HeaderMap` type used throughout serval-core.
+/// Use this alias to store and pass HTTP headers without introducing a separate header-map implementation.
+/// Ownership, allocation, and lookup behavior are defined by the underlying `header_map` module.
 pub const HeaderMap = header_map.HeaderMap;
 
 // =============================================================================
 // HTTP Method
 // =============================================================================
 
+/// Standard HTTP request methods accepted by the core types.
+/// The set includes the common RFC-defined methods and can be used for parsing, routing, and handler dispatch.
+/// This enum carries no additional semantics beyond the method token itself.
 pub const Method = enum {
     GET,
     HEAD,
@@ -34,6 +43,9 @@ pub const Method = enum {
 // HTTP Version
 // =============================================================================
 
+/// Supported HTTP protocol versions for request and response handling.
+/// `HTTP/1.0` and `HTTP/1.1` are represented as explicit tagged enum values.
+/// Use this type when parsing or emitting protocol version tokens; it does not perform conversion or validation by itself.
 pub const Version = enum {
     @"HTTP/1.0",
     @"HTTP/1.1",
@@ -89,6 +101,9 @@ pub const BodyFraming = union(enum) {
 // Request (zero-copy, references buffer)
 // =============================================================================
 
+/// HTTP request metadata and body for zero-copy request handling.
+/// `method`, `path`, `version`, `headers`, and `body` all have safe defaults for a basic HTTP/1.1 GET request.
+/// Any slice stored in `path`, header values, or `body` must outlive the request consumer; this type does not copy data.
 pub const Request = struct {
     method: Method = .GET,
     path: []const u8 = "",
@@ -101,6 +116,9 @@ pub const Request = struct {
 // Response
 // =============================================================================
 
+/// HTTP response metadata and body for zero-copy response handling.
+/// `headers` starts empty and `body` is optional; a `null` body means no payload bytes are attached.
+/// The response does not allocate or own header or body storage, so referenced slices must remain valid while in use.
 pub const Response = struct {
     status: u16 = 200,
     headers: HeaderMap = .{},
@@ -121,6 +139,9 @@ pub const HttpProtocol = enum {
     h2,
 };
 
+/// Describes an upstream origin target for proxying and load balancing.
+/// `host` and any referenced slices must remain valid for as long as the upstream is used.
+/// `idx` selects the connection-pool slot, `tls` enables TLS, and `http_protocol` controls the HTTP transport mode.
 pub const Upstream = struct {
     host: []const u8,
     port: u16,

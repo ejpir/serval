@@ -13,6 +13,9 @@ const types = serval_core.types;
 const serval_websocket = @import("serval-websocket");
 const session = @import("session.zig");
 
+/// Errors returned while preparing or sending a WebSocket upgrade response.
+/// `MissingRequestKey` and `InvalidRequestKey` cover request-header and key-validation failures.
+/// `InvalidSelectedSubprotocol`, `InvalidExtraHeaders`, `HeadersTooLarge`, and `WriteFailed` cover response validation, buffer limits, and transport I/O.
 pub const AcceptError = error{
     MissingRequestKey,
     InvalidRequestKey,
@@ -22,6 +25,9 @@ pub const AcceptError = error{
     WriteFailed,
 };
 
+/// Send a WebSocket switching-protocols response on `transport` for `request`.
+/// Requires a `Sec-WebSocket-Key` header, and rejects a selected subprotocol that does not validate against the request.
+/// Returns the number of response bytes written, or an `AcceptError` if validation, response assembly, or the transport write fails.
 pub fn sendSwitchingProtocols(
     transport: *const session.Transport,
     request: *const types.Request,
@@ -60,6 +66,9 @@ pub fn sendSwitchingProtocols(
     return response.len;
 }
 
+/// Build an HTTP 101 Switching Protocols response into `buffer`.
+/// Returns the written slice on success, or `null` if the buffer cannot hold the full response.
+/// `accept_key` must be `serval_websocket.websocket_accept_key_size_bytes` bytes long, and the returned slice aliases `buffer` until it is overwritten.
 pub fn buildSwitchingProtocolsResponse(
     buffer: []u8,
     accept_key: []const u8,

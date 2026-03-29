@@ -26,6 +26,10 @@ const PathMatch = @import("serval-router").PathMatch;
 // Admin Handler (implements serval-server Handler interface)
 // ============================================================================
 
+/// Admin API handler for the gateway controller's direct responses.
+/// Stores borrowed pointers to the controller-owned ready flag and gateway config; it does not own either and they must outlive the handler.
+/// Uses an internal bounded response buffer for JSON replies.
+/// Handles `/healthz`, `/readyz`, and `/config` locally without forwarding traffic.
 pub const AdminHandler = struct {
     const Self = @This();
 

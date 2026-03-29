@@ -12,9 +12,23 @@ pub const HandshakeInfo = struct {
     const Self = @This();
 
     // Buffer size constants (TigerStyle: named constants)
+    /// Fixed buffer size for storing a TLS version string representation.
+    /// Callers that format or copy version text should provide a buffer of at least `VERSION_BUF_SIZE` bytes.
+    /// This constant has no runtime failure behavior; using a smaller buffer may cause downstream formatting/copy errors.
     pub const VERSION_BUF_SIZE: u8 = 16; // "TLSv1.3" etc
+    /// Fixed byte capacity for cipher-related buffers in handshake metadata.
+    /// Callers that provide storage for cipher data should allocate at least this many bytes.
+    /// Stored as `u8` to keep the size explicit and bounded at compile time.
     pub const CIPHER_BUF_SIZE: u8 = 128; // "TLS_AES_256_GCM_SHA384" etc
+    /// Fixed ALPN buffer capacity, in bytes, used by this module.
+    /// Value is `32` and is stored as `u8`, so it is suitable for length/capacity checks in `u8`-typed APIs.
+    /// Callers allocating ALPN storage should provide at least `ALPN_BUF_SIZE` bytes.
+    /// This declaration cannot fail and does not perform allocation or ownership transfer.
     pub const ALPN_BUF_SIZE: u8 = 32; // "h2", "http/1.1"
+    /// Maximum capacity, in bytes, of each fixed X.509 name buffer in `HandshakeInfo`.
+    /// Applies to both `cert_subject_buf` and `cert_issuer_buf`.
+    /// Any stored name length must remain `<= CERT_NAME_BUF_SIZE` to satisfy accessor assertions.
+    /// This is a size constant only; it performs no allocation and returns no errors.
     pub const CERT_NAME_BUF_SIZE: u16 = 256; // X509 name strings
 
     // Protocol info

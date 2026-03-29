@@ -11,6 +11,9 @@ const config = @import("serval-core").config;
 
 const Scheme = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 
+/// Errors returned by CSR generation.
+/// `InvalidStateDir` and `InvalidDomainCount` report empty or otherwise unusable inputs.
+/// `InvalidDomain`, `KeyTooLarge`, and `CsrTooLarge` report validation or output-buffer limits; the remaining errors cover encoding, signing, or configuration failures.
 pub const Error = error{
     InvalidStateDir,
     InvalidDomainCount,
@@ -22,6 +25,9 @@ pub const Error = error{
     SignatureFailed,
 };
 
+/// Generated CSR and private-key output stored in caller-provided buffers.
+/// `csr_der` points into the caller's CSR buffer, and `key_pem` points into the caller's PEM buffer.
+/// Both slices remain valid only while the backing buffers remain alive and unchanged.
 pub const Result = struct {
     csr_der: []const u8,
     key_pem: []const u8,
@@ -35,6 +41,10 @@ const oid_extension_request = [_]u8{ 0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0
 const oid_subject_alt_name = [_]u8{ 0x06, 0x03, 0x55, 0x1D, 0x11 };
 const DerCursor = u16;
 
+/// Generate a PEM-encoded EC private key and a DER-encoded CSR for the given domains.
+/// `state_dir` must be non-empty; the function ensures the directory path exists before generating output.
+/// `domains` must contain at least one name, and each entry must be non-empty and no longer than `config.ACME_MAX_DOMAIN_NAME_LEN`.
+/// On success, the returned slices alias `csr_der_buf` and `key_pem_buf`; errors report invalid input, buffer exhaustion, or key/signature encoding failures.
 pub fn generate(
     allocator: std.mem.Allocator,
     state_dir: []const u8,

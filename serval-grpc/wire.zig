@@ -6,19 +6,35 @@ const std = @import("std");
 const assert = std.debug.assert;
 const config = @import("serval-core").config;
 
+/// The fixed size, in bytes, of a gRPC wire prefix.
+/// This includes the 1-byte compression flag and 4-byte big-endian length field.
+/// All frame parsing and encoding helpers assume this constant is 5.
+/// It is used to keep prefix arithmetic explicit and consistent.
 pub const prefix_size_bytes: u32 = 5;
 
+/// The decoded 5-byte gRPC message prefix.
+/// `compressed` reflects the wire flag, and `length_bytes` is the payload size.
+/// `length_bytes` is validated against the configured maximum before returning.
+/// This type carries no ownership; it is a plain value.
 pub const MessagePrefix = struct {
     compressed: bool,
     length_bytes: u32,
 };
 
+/// A parsed gRPC frame view backed by the original input buffer.
+/// `prefix` describes the frame header and `payload` borrows from the source bytes.
+/// `frame_size_bytes` records the full frame length, including prefix and payload.
+/// No memory is owned by this struct.
 pub const FrameView = struct {
     prefix: MessagePrefix,
     payload: []const u8,
     frame_size_bytes: u32,
 };
 
+/// Errors returned by gRPC wire parsing and frame construction helpers.
+/// `NeedMoreData` means the provided buffer ended before a complete prefix or frame.
+/// `BufferTooSmall` means the output buffer cannot hold the encoded frame.
+/// `InvalidCompressionFlag` and `MessageTooLarge` indicate malformed input.
 pub const Error = error{
     NeedMoreData,
     BufferTooSmall,
@@ -26,6 +42,10 @@ pub const Error = error{
     MessageTooLarge,
 };
 
+/// Parses the 5-byte gRPC message prefix from `raw`.
+/// The prefix is `compressed` flag byte plus a big-endian 32-bit payload length.
+/// Returns `error.NeedMoreData` if fewer than 5 bytes are available.
+/// Returns `error.InvalidCompressionFlag` or `error.MessageTooLarge` for invalid input.
 pub fn parsePrefix(raw: []const u8) Error!MessagePrefix {
     assert(prefix_size_bytes == 5);
     if (raw.len < prefix_size_bytes) return error.NeedMoreData;
@@ -44,11 +64,19 @@ pub fn parsePrefix(raw: []const u8) Error!MessagePrefix {
     };
 }
 
+/// Returns the total size, in bytes, of the gRPC frame described by `raw`.
+/// This validates the frame prefix before computing the frame length.
+/// The result includes the 5-byte gRPC prefix and the message payload.
+/// Returns the same errors as `parsePrefix` when the prefix is incomplete or invalid.
 pub fn frameLengthBytes(raw: []const u8) Error!u32 {
     const prefix = try parsePrefix(raw);
     return totalFrameSizeBytes(prefix.length_bytes);
 }
 
+/// Parses a complete gRPC frame from `raw` and returns a borrowed frame view.
+/// The payload slice aliases `raw` and spans exactly `prefix.length_bytes` bytes.
+/// Returns `error.NeedMoreData` when `raw` does not contain the full frame.
+/// Returns prefix parsing errors if the compression flag or message length is invalid.
 pub fn parseFrame(raw: []const u8) Error!FrameView {
     const prefix = try parsePrefix(raw);
     const frame_size_bytes_u32 = totalFrameSizeBytes(prefix.length_bytes);
@@ -68,6 +96,10 @@ pub fn parseFrame(raw: []const u8) Error!FrameView {
     };
 }
 
+/// Builds a gRPC message frame into `out` and returns the written prefix of `out`.
+/// The returned slice aliases `out`; the payload bytes are copied into the buffer.
+/// Returns `error.MessageTooLarge` if `payload` exceeds the configured maximum.
+/// Returns `error.BufferTooSmall` if `out` cannot hold the 5-byte prefix plus payload.
 pub fn buildMessage(out: []u8, compressed: bool, payload: []const u8) Error![]const u8 {
     assert(prefix_size_bytes == 5);
     if (payload.len > config.GRPC_MAX_MESSAGE_SIZE_BYTES) return error.MessageTooLarge;
@@ -82,11 +114,19 @@ pub fn buildMessage(out: []u8, compressed: bool, payload: []const u8) Error![]co
     return out[0..total_len];
 }
 
+/// Parses `raw` as a complete gRPC frame and returns only the message payload.
+/// The returned slice aliases `raw` and is valid only while `raw` remains valid.
+/// Returns `error.NeedMoreData` if `raw` does not contain a full frame.
+/// Returns other `Error` values if the prefix is invalid or the message is too large.
 pub fn parseMessage(raw: []const u8) Error![]const u8 {
     const frame = try parseFrame(raw);
     return frame.payload;
 }
 
+/// Returns the next gRPC frame starting at `cursor_bytes` within `raw`.
+/// On success, advances `cursor_bytes` by the full frame size in bytes.
+/// Returns `null` when the cursor is already at the end of `raw`.
+/// The returned view borrows from `raw`; it does not copy payload data.
 pub fn nextFrame(raw: []const u8, cursor_bytes: *u32) Error!?FrameView {
     assert(@intFromPtr(cursor_bytes) != 0);
     assert(raw.len <= std.math.maxInt(u32));

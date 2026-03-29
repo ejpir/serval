@@ -27,44 +27,68 @@ const Request = types.Request;
 const Response = types.Response;
 const HeaderMap = types.HeaderMap;
 
+/// Error set returned by stream-bridge operations when lookup, mapping, or upstream session handling fails.
+/// Includes bridge-local failures such as `SessionNotFound` and `UnexpectedReceiveAction`.
+/// Also propagates binding-table errors and HTTP/2 upstream session errors from the client layer.
 pub const Error = error{
     SessionNotFound,
     UnexpectedReceiveAction,
 } || bindings.Error || serval_client.H2UpstreamSessionError;
 
+/// Result returned when the bridge successfully opens an upstream stream for a downstream request.
+/// `binding` records the downstream-to-upstream stream mapping established for the request.
+/// `connect` reports the upstream connection-acquisition statistics returned by the client pool.
 pub const OpenResult = struct {
     binding: bindings.Binding,
     connect: serval_client.H2UpstreamConnectStats,
 };
 
+/// Carries response headers for a mapped downstream stream.
+/// `downstream_stream_id` identifies the stream that should receive the headers.
+/// `end_stream` indicates whether the response ends with the headers, and `response` holds the parsed response metadata.
 pub const ResponseHeadersAction = struct {
     downstream_stream_id: u32,
     end_stream: bool,
     response: Response,
 };
 
+/// Carries a chunk of response DATA for a mapped downstream stream.
+/// `downstream_stream_id` identifies the stream that should receive the payload.
+/// `end_stream` indicates whether this DATA frame completes the stream, and `payload` holds the bytes to forward.
 pub const ResponseDataAction = struct {
     downstream_stream_id: u32,
     end_stream: bool,
     payload: []const u8,
 };
 
+/// Carries a downstream stream's trailing headers after the upstream side has produced them.
+/// `downstream_stream_id` identifies the stream the trailers belong to.
+/// `trailers` contains the header map to pass along with the trailing metadata.
 pub const ResponseTrailersAction = struct {
     downstream_stream_id: u32,
     trailers: HeaderMap,
 };
 
+/// Describes a downstream stream reset that should be forwarded or reported by the bridge.
+/// `downstream_stream_id` identifies the affected client-facing stream.
+/// `error_code_raw` preserves the HTTP/2 reset code as a raw integer value.
 pub const StreamResetAction = struct {
     downstream_stream_id: u32,
     error_code_raw: u32,
 };
 
+/// Describes a GOAWAY-driven upstream connection close event that the bridge has mapped back to downstream state.
+/// `upstream_index` and `upstream_session_generation` identify the exact upstream session that emitted the close.
+/// `goaway` is the received HTTP/2 GOAWAY frame, including the peer's last-stream and error-code information.
 pub const ConnectionCloseAction = struct {
     upstream_index: config.UpstreamIndex,
     upstream_session_generation: u32,
     goaway: h2.GoAway,
 };
 
+/// Tagged union of downstream-facing actions produced by bridge receive polling.
+/// Each non-`.none` tag carries the stream-specific event that should be forwarded or handled.
+/// The union mirrors the bridge's HTTP/2 mapping results rather than raw upstream frames.
 pub const ReceiveAction = union(enum) {
     none,
     response_headers: ResponseHeadersAction,
@@ -91,6 +115,9 @@ fn goawayAffectsActiveTargetStream(upstream_stream_id: u32, goaway: h2.GoAway) b
     return upstream_stream_id > goaway.last_stream_id;
 }
 
+/// Public state for mapping downstream HTTP/2 streams to upstream sessions.
+/// The bridge stores borrowed pointers to the client and session pool; it does not own either.
+/// Use the public methods to open streams, forward data, and surface upstream receive events.
 pub const StreamBridge = struct {
     client: *serval_client.Client,
     sessions: *serval_client.H2UpstreamSessionPool,
@@ -98,6 +125,9 @@ pub const StreamBridge = struct {
     poll_scan_cursor: u16 = 0,
     debug_connection_id: u64 = 0,
 
+    /// Initializes a bridge around an existing client and upstream session pool.
+    /// The pointers are borrowed; the bridge does not allocate or take ownership.
+    /// The returned bridge starts with an empty binding table and a zero poll cursor.
     pub fn init(client: *serval_client.Client, sessions: *serval_client.H2UpstreamSessionPool) StreamBridge {
         assert(@intFromPtr(client) != 0);
         assert(@intFromPtr(sessions) != 0);
@@ -108,6 +138,9 @@ pub const StreamBridge = struct {
         };
     }
 
+    /// Clears the bridge's binding state and resets the poll cursor.
+    /// Also closes all tracked upstream sessions through the session pool.
+    /// The bridge does not own the `client` or `sessions` pointers; it only releases its bookkeeping.
     pub fn deinit(self: *StreamBridge) void {
         assert(@intFromPtr(self) != 0);
 
@@ -116,11 +149,17 @@ pub const StreamBridge = struct {
         self.sessions.closeAll();
     }
 
+    /// Stores a connection identifier used in bridge logging.
+    /// This value does not affect routing or stream mapping.
+    /// It only updates the debug field on the bridge.
     pub fn setDebugConnectionId(self: *StreamBridge, connection_id: u64) void {
         assert(@intFromPtr(self) != 0);
         self.debug_connection_id = connection_id;
     }
 
+    /// Opens or reuses an upstream HTTP/2 session, sends request headers, and records the downstream-to-upstream binding.
+    /// Duplicate downstream stream ids fail with `error.DuplicateDownstreamStream`.
+    /// The bridge retries across at most `config.H2_MAX_SESSIONS_PER_UPSTREAM` attempts and closes generations that become `ConnectionClosing`.
     pub fn openDownstreamStream(
         self: *StreamBridge,
         io: Io,
@@ -170,6 +209,9 @@ pub const StreamBridge = struct {
         return error.ConnectionClosing;
     }
 
+    /// Forwards DATA to the mapped upstream stream for a downstream request.
+    /// Missing bindings or sessions are returned as errors; some connection-closure cases keep the binding alive for a final response.
+    /// When forwarding fails on a non-terminal send, the binding is removed and the upstream generation is closed.
     pub fn sendDownstreamData(
         self: *StreamBridge,
         downstream_stream_id: u32,
@@ -257,6 +299,9 @@ pub const StreamBridge = struct {
         };
     }
 
+    /// Looks up the stored binding for a downstream stream id.
+    /// Returns `null` when the bridge has no active mapping for that stream.
+    /// The returned binding is a copy of the table entry.
     pub fn bindingForDownstream(self: *const StreamBridge, downstream_stream_id: u32) ?bindings.Binding {
         assert(@intFromPtr(self) != 0);
         assert(downstream_stream_id > 0);
@@ -264,6 +309,9 @@ pub const StreamBridge = struct {
         return self.binding_table.getByDownstream(downstream_stream_id);
     }
 
+    /// Removes the downstream binding and sends a reset to the mapped upstream stream.
+    /// A missing downstream binding is treated as a no-op; a missing upstream session returns `error.SessionNotFound`.
+    /// If the upstream stream is already gone, the reset is suppressed after the binding has been removed.
     pub fn cancelDownstreamStream(
         self: *StreamBridge,
         downstream_stream_id: u32,
@@ -284,6 +332,9 @@ pub const StreamBridge = struct {
         };
     }
 
+    /// Fetches the upstream session for `upstream_index` and maps one receive action into a bridge `ReceiveAction`.
+    /// If no session exists for the requested upstream, returns `error.SessionNotFound`.
+    /// Any action that cannot be represented by the bridge is reported through the mapping error path.
     pub fn receiveForUpstream(
         self: *StreamBridge,
         upstream_index: config.UpstreamIndex,
@@ -296,6 +347,9 @@ pub const StreamBridge = struct {
         return self.mapReceiveAction(upstream_index, session.generation, action);
     }
 
+    /// Looks up the downstream binding, waits for an upstream action, and maps the result back to the downstream stream id.
+    /// If the upstream stream has already disappeared, the stale binding is removed and a downstream `CANCEL` reset is returned.
+    /// `timeout` bounds the wait; stale bridge state is reported as `error.BindingNotFound` or `error.SessionNotFound`.
     pub fn receiveForDownstream(
         self: *StreamBridge,
         io: Io,
@@ -397,6 +451,9 @@ pub const StreamBridge = struct {
         return self.mapReceiveAction(binding.upstream_index, binding.upstream_session_generation, action);
     }
 
+    /// Scans active bindings in round-robin order and asks each one for its next downstream-facing action.
+    /// Transient binding, session, and I/O failures are skipped so polling can continue on other streams.
+    /// Returns `error.WouldBlock` when no actionable event is available.
     pub fn pollNextAction(
         self: *StreamBridge,
         io: Io,
@@ -444,6 +501,9 @@ pub const StreamBridge = struct {
         return error.WouldBlock;
     }
 
+    /// Collects downstream stream ids whose upstream bindings are affected by the supplied GOAWAY.
+    /// Matching bindings are removed from the table as they are recorded in `downstream_stream_ids`.
+    /// The output slice must be large enough to hold every slot in the binding table; the function returns the number written.
     pub fn takeAffectedDownstreamsForConnectionClose(
         self: *StreamBridge,
         close: ConnectionCloseAction,
@@ -478,6 +538,9 @@ pub const StreamBridge = struct {
         return downstream_count;
     }
 
+    /// Drops all bindings associated with `upstream_index` and closes the matching upstream sessions.
+    /// Bindings for other upstreams are left untouched.
+    /// This cleanup path does not return an error.
     pub fn closeUpstream(self: *StreamBridge, upstream_index: config.UpstreamIndex) void {
         assert(@intFromPtr(self) != 0);
 
@@ -485,6 +548,9 @@ pub const StreamBridge = struct {
         self.sessions.close(upstream_index);
     }
 
+    /// Returns the current number of active downstream-to-upstream bindings.
+    /// This is a read-only snapshot of the bridge's binding table and does not mutate state.
+    /// The count is reported as `u16`, matching the table's stored count type.
     pub fn activeBindingCount(self: *const StreamBridge) u16 {
         assert(@intFromPtr(self) != 0);
         return self.binding_table.count;

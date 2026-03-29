@@ -63,6 +63,11 @@ const EchoHandler = struct {
     extra_headers_buf: [128]u8 = std.mem.zeroes([128]u8),
     extra_headers_len: u8 = 0,
 
+    /// Initializes an `EchoHandler` with the provided backend identity, port, and behavior flags.
+    /// Requires `id.len > 0` and `port > 0`; these are enforced with `assert`.
+    /// Stores `id` by reference (no copy), so the backing bytes must remain valid for the handler lifetime.
+    /// Pre-formats `X-Backend-Id` into the internal extra-header buffer for reuse across requests.
+    /// Header formatting errors are swallowed (`catch ""`), leaving `extra_headers_len` as `0` instead of failing initialization.
     pub fn init(id: []const u8, port: u16, debug: bool, chunked: bool, echo_body: bool, drain_body: bool) EchoHandler {
         // Preconditions
         assert(id.len > 0);
@@ -219,6 +224,11 @@ const EchoHandler = struct {
         } };
     }
 
+    /// Reads the next request-body chunk into `response_buf` when `echo_body` is enabled.
+    /// Returns `null` if body echoing is disabled or when `ctx.readBodyChunk` reports no more data.
+    /// On success, returns the number of bytes written, guaranteed to be `<= response_buf.len`.
+    /// Preconditions: `self` must be valid and `response_buf.len > 0`.
+    /// Propagates any `ctx.readBodyChunk` error unchanged (with optional debug logging when `debug` is true).
     pub fn nextChunk(self: *@This(), ctx: *serval.Context, response_buf: []u8) !?usize {
         assert(@intFromPtr(self) != 0);
         assert(response_buf.len > 0);
@@ -320,6 +330,11 @@ fn formatEchoBody(
     return position;
 }
 
+/// Entry point for the echo backend example: parses CLI args, validates TLS flags, and initializes the echo handler/runtime.
+/// `process_init.minimal.args` must contain valid arguments for `cli.Args(EchoExtra)`; `.help`/`.version` return without error.
+/// If argument parsing fails, prints the parse error and returns `error.InvalidArgs`.
+/// TLS options must be provided as a pair: `--cert` without `--key` returns `error.MissingTlsKey`, and `--key` without `--cert` returns `error.MissingTlsCert`.
+/// Constructs server dependencies on the stack (`handler`, pool, metrics, tracer, threaded I/O) and deinitializes the threaded runtime via `defer`.
 pub fn main(process_init: std.process.Init) !void {
     // Parse command-line arguments
     var args = cli.Args(EchoExtra).init("echo_backend", VERSION, process_init.minimal.args);

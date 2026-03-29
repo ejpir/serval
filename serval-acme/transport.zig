@@ -53,6 +53,9 @@ const ChunkParseContext = struct {
     chunk_remaining: u64 = 0,
 };
 
+/// Error set used by `execute` for client failures and HTTP response parsing/reading failures.
+/// Covers invalid buffers, header limits, response body size and chunking errors, and body read failures.
+/// These errors indicate the upstream response could not be safely converted into an `ExecuteResponse`.
 pub const Error = ClientError || error{
     InvalidHeaderBuffer,
     TooManyRequestHeaders,
@@ -66,9 +69,15 @@ pub const Error = ClientError || error{
     ChunkedTrailerTooLarge,
 };
 
+/// Error set returned by `executeOperation`.
+/// Includes request construction, transport, wire, and orchestration protocol/response failures.
+/// Callers should treat any of these errors as a terminal failure for the operation.
 pub const ExecuteOperationError =
     Error || orchestration.ProtocolError || orchestration.Error || wire.Error;
 
+/// Parameters for `execute`, which sends a prebuilt wire request to an upstream.
+/// `wire_request` must point to a valid request for the duration of the call.
+/// `header_buf` and `body_buf` provide workspace for parsing and body collection, and `upstream_idx` selects the upstream.
 pub const ExecuteParams = struct {
     wire_request: *const wire.WireRequest,
     io: Io,
@@ -77,6 +86,10 @@ pub const ExecuteParams = struct {
     upstream_idx: config.UpstreamIndex = 0,
 };
 
+/// Parameters for `executeOperation`, including the orchestration operation and buffers used
+/// while building and processing the upstream request/response exchange.
+/// `signed_body` defaults to empty when the operation does not require a body signature.
+/// `header_buf` and `body_buf` must remain valid for the duration of the call; `upstream_idx` selects the upstream.
 pub const ExecuteOperationParams = struct {
     operation: orchestration.Operation,
     signed_body: []const u8 = &.{},
@@ -86,11 +99,17 @@ pub const ExecuteOperationParams = struct {
     upstream_idx: config.UpstreamIndex = 0,
 };
 
+/// Result returned by `execute`, containing the upstream HTTP status, headers, and response body.
+/// The body slice is owned by the caller's response storage and is not independently allocated here.
+/// `responseView` exposes a borrowed orchestration view over these fields.
 pub const ExecuteResponse = struct {
     status: u16,
     headers: HeaderMap,
     body: []const u8,
 
+    /// Returns an orchestration response view that borrows the status, headers, and body from this result.
+    /// `self` must remain alive while the returned view is in use.
+    /// The status is expected to be a valid HTTP status code in the 100-599 range.
     pub fn responseView(self: *const ExecuteResponse) orchestration.ResponseView {
         assert(@intFromPtr(self) != 0);
         assert(self.status >= 100 and self.status <= 599);
@@ -102,6 +121,10 @@ pub const ExecuteResponse = struct {
     }
 };
 
+/// Executes a prebuilt wire request against the selected upstream and returns the upstream status,
+/// headers, and response body bytes collected into `params.body_buf`.
+/// `params.header_buf` must not be empty; this function returns `error.InvalidHeaderBuffer` otherwise.
+/// The upstream connection is closed before return, and any request, header, or body-read errors propagate.
 pub fn execute(client: *Client, params: ExecuteParams) Error!ExecuteResponse {
     assert(@intFromPtr(client) != 0);
     assert(@intFromPtr(params.wire_request) != 0);
@@ -144,6 +167,10 @@ pub fn execute(client: *Client, params: ExecuteParams) Error!ExecuteResponse {
     };
 }
 
+/// Builds a wire request from `params.operation` and `params.signed_body`,
+/// sends it through `client`, and converts the upstream reply into a handled response.
+/// `flow_ctx` and `client` must be valid non-null pointers for the duration of the call.
+/// Errors from request construction, transport execution, or response handling are propagated.
 pub fn executeOperation(
     flow_ctx: *orchestration.FlowContext,
     client: *Client,

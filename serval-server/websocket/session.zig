@@ -15,17 +15,26 @@ const serval_websocket = @import("serval-websocket");
 const frame = serval_websocket.frame;
 const close_mod = serval_websocket.close;
 
+/// High-level classification of a WebSocket message payload.
+/// `text` messages are expected to contain valid UTF-8, while `binary` messages carry opaque bytes.
+/// The kind is derived from the initial data frame opcode for the message.
 pub const WebSocketMessageKind = enum {
     text,
     binary,
 };
 
+/// A complete WebSocket message returned by the session reader.
+/// `kind` identifies the message opcode class, `payload` borrows the assembled bytes, and `fragmented` reports whether the message spanned multiple frames.
+/// The payload slice is owned by the caller-provided buffer used during reading.
 pub const WebSocketMessage = struct {
     kind: WebSocketMessageKind,
     payload: []const u8,
     fragmented: bool,
 };
 
+/// Parameters used to accept a WebSocket upgrade and configure the resulting session.
+/// `subprotocol` is echoed when selected, `extra_headers` are appended to the upgrade response, and `max_message_size_bytes` and `idle_timeout_ns` constrain session behavior.
+/// `auto_pong` controls whether ping control frames are answered automatically by the session.
 pub const WebSocketAccept = struct {
     subprotocol: ?[]const u8 = null,
     extra_headers: []const u8 = "",
@@ -34,18 +43,27 @@ pub const WebSocketAccept = struct {
     auto_pong: bool = true,
 };
 
+/// Result of routing a WebSocket request.
+/// `decline` leaves the request unhandled, `accept` carries the parameters needed to start a session, and `reject` carries an HTTP rejection response.
+/// The route layer uses this to separate policy decisions from session setup.
 pub const WebSocketRouteAction = union(enum) {
     decline,
     accept: WebSocketAccept,
     reject: types.RejectResponse,
 };
 
+/// Current lifecycle state of a WebSocket session.
+/// `open` means normal message processing is allowed, `close_sent` means a close frame has been sent, and `closed` means the session is finished.
+/// Callers should not continue message reads once the session is no longer `open`.
 pub const SessionState = enum {
     open,
     close_sent,
     closed,
 };
 
+/// Per-session accounting and close-state information.
+/// `bytes_received` and `bytes_sent` track payload movement, while `close_code` records the last close code seen or sent.
+/// `peer_closed` indicates whether the remote side has initiated close processing.
 pub const SessionStats = struct {
     bytes_received: u64 = 0,
     bytes_sent: u64 = 0,
@@ -53,6 +71,9 @@ pub const SessionStats = struct {
     peer_closed: bool = false,
 };
 
+/// Transport-level I/O errors reported by the callback adapter.
+/// These cover connection closure, connection reset, read and write failures, and unexpected backend conditions.
+/// WebSocket code may map these into higher-level session errors.
 pub const TransportError = error{
     ConnectionClosed,
     ConnectionReset,
@@ -61,6 +82,9 @@ pub const TransportError = error{
     Unexpected,
 };
 
+/// Function table and context pointer used to adapt a concrete I/O backend to the WebSocket session code.
+/// The callbacks must remain valid for as long as the transport value is used and must interpret `ctx` consistently.
+/// `read`, `writeAll`, `getFd`, and `hasPendingRead` are thin wrappers around these callbacks.
 pub const Transport = struct {
     ctx: *anyopaque,
     read_fn: *const fn (ctx: *anyopaque, buf: []u8) TransportError!u32,
@@ -68,25 +92,40 @@ pub const Transport = struct {
     get_fd_fn: *const fn (ctx: *anyopaque) i32,
     has_pending_read_fn: *const fn (ctx: *anyopaque) bool,
 
+    /// Reads up to `buf.len` bytes from the underlying transport.
+    /// `buf` must be non-empty; the call forwards to the transport callback and returns the number of bytes read.
+    /// A return value of `0` is transport-defined and may indicate end-of-stream or a closed connection.
     pub fn read(self: *const Transport, buf: []u8) TransportError!u32 {
         assert(buf.len > 0);
         return self.read_fn(self.ctx, buf);
     }
 
+    /// Writes the full `data` buffer through the underlying transport.
+    /// `data` must be non-empty; the call forwards to the transport callback and may fail with a transport error.
+    /// The buffer is borrowed for the duration of the call and is not retained by this API.
     pub fn writeAll(self: *const Transport, data: []const u8) TransportError!void {
         assert(data.len > 0);
         return self.write_all_fn(self.ctx, data);
     }
 
+    /// Returns the file descriptor associated with the transport.
+    /// This is a thin delegation to the transport callback.
+    /// The returned descriptor is owned by the transport implementation and is not transferred.
     pub fn getFd(self: *const Transport) i32 {
         return self.get_fd_fn(self.ctx);
     }
 
+    /// Returns whether the underlying transport reports unread input pending.
+    /// This is a thin delegation to the transport callback and does not consume data.
+    /// The result depends on the transport implementation and its current state.
     pub fn hasPendingRead(self: *const Transport) bool {
         return self.has_pending_read_fn(self.ctx);
     }
 };
 
+/// Errors reported by WebSocket session operations.
+/// These cover protocol validation, payload limits, UTF-8 checks, connection and I/O failures, timeouts, and invalid close information.
+/// Callers should treat `SessionClosed` and `ConnectionClosed` as terminal for the session.
 pub const SessionError = error{
     ProtocolViolation,
     InvalidUtf8,
@@ -101,6 +140,9 @@ pub const SessionError = error{
     InvalidCloseReason,
 };
 
+/// Represents a live WebSocket session bound to a transport and accept policy.
+/// `init` requires `accept.max_message_size_bytes > 0` and `accept.idle_timeout_ns > 0` and stores borrowed input slices.
+/// `readMessage` only operates while the session is open; it may consume initial input and network frames, and it can fail with session, protocol, timeout, UTF-8, close-handshake, read, or write errors.
 pub const WebSocketSession = struct {
     transport: Transport,
     accept: WebSocketAccept,
@@ -110,6 +152,10 @@ pub const WebSocketSession = struct {
     initial_offset: usize = 0,
     stats_value: SessionStats = .{},
 
+    /// Initializes a `WebSocketSession` from the transport and negotiated accept parameters.
+    /// `accept.max_message_size_bytes` and `accept.idle_timeout_ns` must both be greater than zero.
+    /// The returned session stores the provided transport, accept settings, selected subprotocol, and initial input slice.
+    /// This function performs no allocation and takes no ownership of the input slices.
     pub fn init(
         transport: Transport,
         accept: WebSocketAccept,
@@ -127,6 +173,11 @@ pub const WebSocketSession = struct {
         };
     }
 
+    /// Reads the next complete WebSocket message into `buf` and returns it.
+    /// `buf` must be non-empty and fit within `u32`; otherwise this function asserts.
+    /// The session must be open; a closed session returns `error.SessionClosed`.
+    /// Ping, pong, and close control frames are handled internally; close returns `null`.
+    /// Returns `error.MessageTooLarge`, `error.ProtocolViolation`, or transport/read errors when the message cannot be completed safely.
     pub fn readMessage(self: *WebSocketSession, buf: []u8) SessionError!?WebSocketMessage {
         assert(buf.len > 0);
         assert(buf.len <= std.math.maxInt(u32));
@@ -209,6 +260,10 @@ pub const WebSocketSession = struct {
         return error.MessageTooLarge;
     }
 
+    /// Sends `payload` as a WebSocket text frame on this session.
+    /// `payload` must be valid UTF-8; otherwise this returns `error.InvalidUtf8`.
+    /// The session must be in a writable state, or `ensureWritableState` returns an error.
+    /// Propagates transport/frame encoding failures from the underlying send path.
     pub fn sendText(self: *WebSocketSession, payload: []const u8) SessionError!void {
         assert(payload.len <= std.math.maxInt(u32));
 
@@ -217,6 +272,10 @@ pub const WebSocketSession = struct {
         try self.sendFrameRaw(.text, payload);
     }
 
+    /// Sends a websocket binary frame with the given payload.
+    /// The payload length must fit in a `u32`, matching the frame length encoding limit.
+    /// The session must be writable before the frame is sent.
+    /// The payload slice is borrowed for the duration of the call and is not retained.
     pub fn sendBinary(self: *WebSocketSession, payload: []const u8) SessionError!void {
         assert(payload.len <= std.math.maxInt(u32));
 
@@ -224,6 +283,10 @@ pub const WebSocketSession = struct {
         try self.sendFrameRaw(.binary, payload);
     }
 
+    /// Sends a websocket ping control frame with the given payload.
+    /// The payload length must not exceed `config.WEBSOCKET_MAX_CONTROL_PAYLOAD_SIZE_BYTES`.
+    /// The session must be in a writable state; otherwise `ensureWritableState` returns an error.
+    /// The payload slice is borrowed for the duration of the call and is not retained.
     pub fn sendPing(self: *WebSocketSession, payload: []const u8) SessionError!void {
         assert(payload.len <= config.WEBSOCKET_MAX_CONTROL_PAYLOAD_SIZE_BYTES);
 
@@ -231,6 +294,10 @@ pub const WebSocketSession = struct {
         try self.sendControlFrame(.ping, payload);
     }
 
+    /// Sends a websocket close frame with the provided code and reason.
+    /// Returns `error.SessionClosed` if the session is already closed.
+    /// If a close frame has already been sent, this is a no-op.
+    /// On success, the session transitions to `.close_sent` and the close code is recorded in stats.
     pub fn close(self: *WebSocketSession, code: u16, reason: []const u8) SessionError!void {
         if (self.state_value == .closed) return error.SessionClosed;
         if (self.state_value == .close_sent) return;
@@ -245,6 +312,10 @@ pub const WebSocketSession = struct {
         self.stats_value.close_code = code;
     }
 
+    /// Completes the websocket close handshake after a close frame has been sent.
+    /// If the session is not in `.close_sent`, this returns immediately without changing state.
+    /// The method waits until the configured close timeout, handling control frames and auto-pong replies when enabled.
+    /// On protocol violation or timeout, the session is transitioned to `.closed` and an error is returned.
     pub fn finishCloseHandshake(self: *WebSocketSession) SessionError!void {
         if (self.state_value != .close_sent) return;
 
@@ -292,14 +363,26 @@ pub const WebSocketSession = struct {
         return error.CloseHandshakeTimeout;
     }
 
+    /// Returns the negotiated subprotocol, if one was selected.
+    /// The returned slice points into session-owned state and must not be freed by the caller.
+    /// The value remains valid only while the session keeps the underlying storage alive.
+    /// Returns `null` when no subprotocol was selected during the handshake.
     pub fn subprotocol(self: *const WebSocketSession) ?[]const u8 {
         return self.selected_subprotocol;
     }
 
+    /// Returns the current websocket session state.
+    /// The value is read directly from the session and does not change state.
+    /// This is a cheap snapshot accessor with no allocation or I/O.
+    /// Use this to inspect lifecycle transitions before calling mutating methods.
     pub fn state(self: *const WebSocketSession) SessionState {
         return self.state_value;
     }
 
+    /// Returns the current session statistics snapshot.
+    /// The returned value is read from the session's internal stats state.
+    /// This does not mutate the session or allocate.
+    /// The caller receives a copy of the stats structure.
     pub fn stats(self: *const WebSocketSession) SessionStats {
         return self.stats_value;
     }

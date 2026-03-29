@@ -11,23 +11,42 @@ const config = core.config;
 // Constants (from serval-core/config.zig - single source of truth)
 // =============================================================================
 
+/// Maximum number of trace state entries permitted.
+/// This is a direct alias of the configured OpenTelemetry limit.
+/// Keep validation in sync with `config.OTEL_MAX_TRACE_STATE_ENTRIES`.
 pub const MAX_TRACE_STATE_ENTRIES = config.OTEL_MAX_TRACE_STATE_ENTRIES;
+/// Maximum allowed length of a trace state key.
+/// This is a direct alias of the configured OpenTelemetry limit.
+/// Keep validation in sync with `config.OTEL_MAX_TRACE_STATE_KEY_LEN`.
 pub const MAX_TRACE_STATE_KEY_LEN = config.OTEL_MAX_TRACE_STATE_KEY_LEN;
+/// Maximum allowed length of a trace state value.
+/// This is a direct alias of the configured OpenTelemetry limit.
+/// Keep validation in sync with `config.OTEL_MAX_TRACE_STATE_VALUE_LEN`.
 pub const MAX_TRACE_STATE_VALUE_LEN = config.OTEL_MAX_TRACE_STATE_VALUE_LEN;
 
 // =============================================================================
 // TraceID - 128-bit trace identifier
 // =============================================================================
 
+/// 16-byte OpenTelemetry trace identifier stored in binary form.
+/// `zero()` returns the invalid sentinel value; `isValid()` checks for any non-zero byte.
+/// `toHex()` writes a 32-character lowercase hex string into the provided buffer.
+/// `fromHex()` accepts exactly 32 hex characters and propagates parse errors.
 pub const TraceID = struct {
     bytes: [16]u8,
 
     const Self = @This();
 
+    /// Wraps a 16-byte binary Trace ID value without validation.
+    /// The input bytes are copied into the returned value exactly as provided.
+    /// This constructor does not allocate and cannot fail.
     pub fn init(value: [16]u8) Self {
         return .{ .bytes = value };
     }
 
+    /// Returns the all-zero Trace ID value.
+    /// This is a pure constructor and does not allocate or fail.
+    /// Use it when you need the invalid/empty sentinel representation.
     pub fn zero() Self {
         return .{ .bytes = [_]u8{0} ** 16 };
     }
@@ -64,15 +83,25 @@ pub const TraceID = struct {
 // SpanID - 64-bit span identifier
 // =============================================================================
 
+/// 8-byte OpenTelemetry span identifier stored in binary form.
+/// `zero()` returns the invalid sentinel value; `isValid()` checks for any non-zero byte.
+/// `toHex()` writes a 16-character lowercase hex string into the provided buffer.
+/// `fromHex()` accepts exactly 16 hex characters and propagates parse errors.
 pub const SpanID = struct {
     bytes: [8]u8,
 
     const Self = @This();
 
+    /// Wraps an 8-byte binary Span ID value without validation.
+    /// The input bytes are copied into the returned value exactly as provided.
+    /// This constructor does not allocate and cannot fail.
     pub fn init(value: [8]u8) Self {
         return .{ .bytes = value };
     }
 
+    /// Returns the all-zero Span ID value.
+    /// This is a pure constructor and does not allocate or fail.
+    /// Use it when you need the invalid/empty sentinel representation.
     pub fn zero() Self {
         return .{ .bytes = [_]u8{0} ** 8 };
     }
@@ -109,6 +138,9 @@ pub const SpanID = struct {
 // TraceFlags - W3C Trace Context flags (8-bit)
 // =============================================================================
 
+/// Bitfield wrapper for OpenTelemetry trace flags.
+/// The `SAMPLED` bit is exposed as a named constant, and `default()` sets that bit.
+/// Use `setSampled()` to mutate the sampled state in place; `isSampled()` reads it without allocating.
 pub const TraceFlags = struct {
     value: u8,
 
@@ -117,6 +149,9 @@ pub const TraceFlags = struct {
     /// Sampled flag bit position
     pub const SAMPLED: u8 = 0x01;
 
+    /// Creates a trace-flags value from a raw byte.
+    /// The byte is stored as provided with no validation or normalization.
+    /// No allocation is performed and this function cannot fail.
     pub fn init(value: u8) Self {
         return .{ .value = value };
     }
@@ -126,10 +161,16 @@ pub const TraceFlags = struct {
         return .{ .value = SAMPLED };
     }
 
+    /// Returns whether the sampled bit is set in this flag value.
+    /// This is a pure read of the underlying `u8` bitfield.
+    /// No allocation or error handling is involved.
     pub fn isSampled(self: Self) bool {
         return (self.value & SAMPLED) != 0;
     }
 
+    /// Sets or clears the sampled bit in place.
+    /// Only the sampled flag is modified; all other bits are preserved.
+    /// The caller must pass a writable `TraceFlags` reference.
     pub fn setSampled(self: *Self, sampled: bool) void {
         if (sampled) {
             self.value |= SAMPLED;
@@ -143,6 +184,9 @@ pub const TraceFlags = struct {
 // TraceState - W3C Trace Context vendor-specific state (fixed-size)
 // =============================================================================
 
+/// Fixed-capacity storage for W3C trace-state key/value pairs.
+/// Keys and values are stored inline and are returned as slices into the struct.
+/// Insertions are bounded by the configured entry and field-size limits.
 pub const TraceState = struct {
     const Entry = struct {
         key: [MAX_TRACE_STATE_KEY_LEN]u8,
@@ -156,6 +200,9 @@ pub const TraceState = struct {
 
     const Self = @This();
 
+    /// Creates an empty trace-state container.
+    /// The entry array is left uninitialized until values are inserted.
+    /// No allocation is performed and this function cannot fail.
     pub fn init() Self {
         return .{
             .entries = undefined,
@@ -221,6 +268,9 @@ pub const TraceState = struct {
 // SpanContext - immutable trace context propagated across process boundaries
 // =============================================================================
 
+/// Immutable trace context propagated across process boundaries.
+/// A context is valid only when both the trace ID and span ID are valid.
+/// Sampling state and trace-state metadata are carried by value.
 pub const SpanContext = struct {
     trace_id: TraceID,
     span_id: SpanID,
@@ -230,6 +280,9 @@ pub const SpanContext = struct {
 
     const Self = @This();
 
+    /// Creates a span context from the provided identifiers and trace metadata.
+    /// All fields are stored by value, including the trace state and remote marker.
+    /// This constructor does not validate the identifiers.
     pub fn init(
         trace_id: TraceID,
         span_id: SpanID,
@@ -251,6 +304,9 @@ pub const SpanContext = struct {
         return self.trace_id.isValid() and self.span_id.isValid();
     }
 
+    /// Returns whether the sampled flag bit is set.
+    /// This is a read-only check on the current `trace_flags` value.
+    /// No allocation or error handling is involved.
     pub fn isSampled(self: Self) bool {
         return self.trace_flags.isSampled();
     }
@@ -260,6 +316,9 @@ pub const SpanContext = struct {
 // SpanKind - type of span (maps to OTLP SpanKind)
 // =============================================================================
 
+/// Classifies the kind of operation a span represents.
+/// These values map directly to OTLP `SpanKind` semantics.
+/// The enum uses stable `u8` discriminants.
 pub const SpanKind = enum(u8) {
     /// Default. Indicates that the span represents an internal operation.
     Internal = 0,
@@ -277,12 +336,18 @@ pub const SpanKind = enum(u8) {
 // Status - span completion status
 // =============================================================================
 
+/// Span completion status with an optional fixed-size error description.
+/// The description is only meaningful when `code == .Error` and is stored inline.
+/// Use `getDescription` to read a slice backed by the struct's storage.
 pub const Status = struct {
     code: Code,
     /// Error description (only used when code == .Error). Points to fixed-size buffer.
     description_buf: [256]u8,
     description_len: u16,
 
+    /// W3C-style status codes for span completion.
+    /// `Unset` is the default, `Ok` marks a validated span, and `Error` marks a span failure.
+    /// The numeric values are stable `u8` discriminants.
     pub const Code = enum(u8) {
         /// The default status.
         Unset = 0,
@@ -294,6 +359,9 @@ pub const Status = struct {
 
     const Self = @This();
 
+    /// Creates a status with code `.Unset`.
+    /// The description buffer is left uninitialized because it is not used for this code.
+    /// No allocation is performed and this function cannot fail.
     pub fn unset() Self {
         return .{
             .code = .Unset,
@@ -302,6 +370,9 @@ pub const Status = struct {
         };
     }
 
+    /// Creates a status with code `.Ok`.
+    /// The description buffer is left uninitialized because it is not used for this code.
+    /// No allocation is performed and this function cannot fail.
     pub fn ok() Self {
         return .{
             .code = .Ok,
@@ -310,6 +381,9 @@ pub const Status = struct {
         };
     }
 
+    /// Creates an error status with the provided description.
+    /// The description is copied into the fixed-size buffer and truncated to fit.
+    /// No allocation is performed and this function cannot fail.
     pub fn err(description: []const u8) Self {
         var status = Self{
             .code = .Error,
@@ -332,6 +406,9 @@ pub const Status = struct {
 // InstrumentationScope - identifies the instrumentation library
 // =============================================================================
 
+/// Identifies the instrumentation library that produced telemetry data.
+/// The name and version are stored in fixed-size buffers and truncated on init.
+/// Use the accessor methods to read slices backed by the struct's storage.
 pub const InstrumentationScope = struct {
     /// Library name (e.g., "serval-proxy")
     name_buf: [64]u8,
@@ -342,6 +419,9 @@ pub const InstrumentationScope = struct {
 
     const Self = @This();
 
+    /// Creates an instrumentation scope from the provided library name and version.
+    /// Each field is copied into the fixed-size buffers and truncated to fit.
+    /// No allocation is performed and this function cannot fail.
     pub fn init(name: []const u8, version: []const u8) Self {
         var scope = Self{
             .name_buf = undefined,

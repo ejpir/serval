@@ -5,6 +5,9 @@ const assert = std.debug.assert;
 const dsl = @import("dsl.zig");
 const ir = @import("ir.zig");
 
+/// Enumerates the mismatch categories reported by equivalence comparison.
+/// The `*_count` variants indicate that the two IRs have different list lengths.
+/// The `*_id` variants indicate that the lists have the same length but a different item ID at the reported index.
 pub const MismatchReason = enum(u8) {
     listener_count,
     pool_count,
@@ -18,16 +21,26 @@ pub const MismatchReason = enum(u8) {
     route_id,
 };
 
+/// Describes a specific mismatch found during equivalence comparison.
+/// `reason` identifies the kind of count or ID difference that was observed.
+/// `index` points to the matching element position when the mismatch is element-specific; it is `0` for count mismatches.
 pub const Mismatch = struct {
     reason: MismatchReason,
     index: u32,
 };
 
+/// Result of an equivalence comparison between two canonical IR values.
+/// `equivalent` is `true` when the compared structures match under this module's rules.
+/// When `equivalent` is `false`, `mismatch` describes the first observed difference; otherwise it is `null`.
 pub const EquivalenceReport = struct {
     equivalent: bool,
     mismatch: ?Mismatch,
 };
 
+/// Parses `dsl_source` and compares the resulting canonical IR against `expected`.
+/// Returns a DSL parse error if parsing fails, otherwise returns the same equivalence report as `compareCanonical`.
+/// `dsl_source` must be non-empty and `expected` must point to a valid canonical IR.
+/// The parsed value is used only for the duration of the call; this function does not transfer ownership.
 pub fn compareDslToCanonical(dsl_source: []const u8, expected: *const ir.CanonicalIr) dsl.ParseError!EquivalenceReport {
     assert(dsl_source.len > 0);
     assert(@intFromPtr(expected) != 0);
@@ -37,6 +50,10 @@ pub fn compareDslToCanonical(dsl_source: []const u8, expected: *const ir.Canonic
     return compareCanonical(&actual, expected);
 }
 
+/// Compares two canonical IR values for structural equivalence.
+/// Returns `.equivalent = false` with a populated `mismatch` on the first count or ID difference.
+/// Both pointers must be valid non-null references for the duration of the call.
+/// This comparison checks listener, pool, plugin, chain, and route ordering and IDs only.
 pub fn compareCanonical(actual: *const ir.CanonicalIr, expected: *const ir.CanonicalIr) EquivalenceReport {
     assert(@intFromPtr(actual) != 0);
     assert(@intFromPtr(expected) != 0);

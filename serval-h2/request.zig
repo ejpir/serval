@@ -18,11 +18,18 @@ const settings = @import("settings.zig");
 const hpack = @import("hpack.zig");
 const preface = @import("preface.zig");
 
+/// Result of decoding a single request header block.
+/// `request` contains the decoded request and `stream_id` identifies the HTTP/2 stream.
+/// The request data is zero-copy and points into caller-provided stable storage.
 pub const RequestHead = struct {
     request: Request,
     stream_id: u32,
 };
 
+/// Result of parsing the initial HTTP/2 request sequence.
+/// `request` contains the decoded request, `stream_id` is the request stream, and
+/// `consumed_bytes` is the number of input bytes consumed up to the end of the request headers.
+/// All request slices point into caller-provided stable storage.
 pub const InitialRequest = struct {
     request: Request,
     stream_id: u32,
@@ -39,8 +46,14 @@ const HeaderAssembly = struct {
 
 const priority_field_size_bytes: u32 = 5;
 // Reserve one header-block budget for copied names and one for copied values.
+/// Minimum caller-provided stable storage, in bytes, required to decode one request.
+/// This is currently sized as two full header-block budgets: one for copied header names and one
+/// for copied header values.
 pub const request_stable_storage_size_bytes: u32 = config.H2_MAX_HEADER_BLOCK_SIZE_BYTES * 2;
 
+/// Error set returned by HTTP/2 request parsing and header decoding.
+/// It covers preface, frame, HPACK, header-validation, and storage-capacity failures, including
+/// errors forwarded from `frame`, `settings`, and `hpack`.
 pub const Error = error{
     NeedMoreData,
     InvalidPreface,
@@ -70,6 +83,13 @@ pub const Error = error{
     StableStorageTooSmall,
 } || frame.Error || settings.Error || hpack.Error;
 
+/// Parses the client connection preface and the initial HTTP/2 frame sequence for the first request.
+/// Returns an `InitialRequest` once the request header block has been fully assembled and decoded.
+/// `input` must begin with the HTTP/2 client preface prefix, and the first frame after the preface
+/// must be a SETTINGS frame. Incomplete input returns `error.NeedMoreData`.
+/// The returned request uses slices backed by `request_storage_out`; those slices are valid only
+/// while that storage remains intact. `consumed_bytes` reports how many input bytes were consumed
+/// through the end of the request header block.
 pub fn parseInitialRequest(input: []const u8, request_storage_out: []u8) Error!InitialRequest {
     assert(input.len > 0);
     assert(preface.client_connection_preface.len > 0);
@@ -266,6 +286,12 @@ fn buildInitialRequest(
     };
 }
 
+/// Decodes an HPACK request header block using a fresh decoder instance.
+/// This is a convenience wrapper around `decodeRequestHeaderBlockWithDecoder` for callers that do
+/// not need to reuse HPACK decoder state across requests.
+/// The same bounds and storage requirements apply: `stream_id` must be non-zero, the header block
+/// must fit within `config.H2_MAX_HEADER_BLOCK_SIZE_BYTES`, and `request_storage_out` must be
+/// large enough for stable request storage.
 pub fn decodeRequestHeaderBlock(
     header_block: []const u8,
     stream_id: u32,
@@ -297,6 +323,13 @@ const HeaderDecodeState = struct {
     storage_cursor: u32 = 0,
 };
 
+/// Decodes an HPACK request header block into a zero-copy `RequestHead`.
+/// The decoder must be valid, `stream_id` must be non-zero, and `header_block` must not exceed
+/// `config.H2_MAX_HEADER_BLOCK_SIZE_BYTES`. `request_storage_out` must be large enough for stable
+/// header and path storage, or the call fails with `error.StableStorageTooSmall`.
+/// Header names must already be lowercase and pseudo headers must satisfy HTTP/2 request rules.
+/// Slices stored in the returned request reference `request_storage_out` and remain valid until that
+/// storage is overwritten or reused.
 pub fn decodeRequestHeaderBlockWithDecoder(
     decoder: *hpack.Decoder,
     header_block: []const u8,

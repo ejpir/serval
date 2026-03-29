@@ -5,8 +5,15 @@ const assert = std.debug.assert;
 const config = @import("serval-core").config;
 const ir = @import("ir.zig");
 
+/// Maximum number of plugin IDs that can appear in an `EffectiveChain`.
+/// This is tied to `config.MAX_ROUTES`, so the chain capacity follows the router configuration.
+/// Composition fails with `CompositionError.TooManyEffectivePlugins` if the effective set would exceed this limit.
 pub const MAX_EFFECTIVE_PLUGINS: usize = config.MAX_ROUTES;
 
+/// Errors returned while composing an effective plugin chain.
+/// `TooManyEffectivePlugins` is reported when appending would exceed `MAX_EFFECTIVE_PLUGINS`.
+/// The missing-plugin errors indicate that a referenced ID was not found in the supplied catalog.
+/// The waiver and disable errors indicate that policy forbids the requested disable operation.
 pub const CompositionError = error{
     TooManyEffectivePlugins,
     MissingGlobalPlugin,
@@ -16,20 +23,36 @@ pub const CompositionError = error{
     MissingRequiredWaiver,
 };
 
+/// A fixed-capacity list of plugin IDs that represents the computed effective chain.
+/// `plugin_ids` stores up to `MAX_EFFECTIVE_PLUGINS` borrowed ID slices, and `count` tracks the valid prefix.
+/// Use `init()` to create an empty value and `slice()` to read the active portion safely.
+/// The type owns no heap memory; lifetime of the stored IDs follows the input slices they reference.
 pub const EffectiveChain = struct {
     plugin_ids: [MAX_EFFECTIVE_PLUGINS][]const u8,
     count: u32,
 
+    /// Create an empty effective chain with no active plugin IDs.
+    /// The backing array is left undefined because `count` is zero and no elements are valid yet.
+    /// Use this as the starting point for composition before appending any plugin IDs.
+    /// Callers must not read `plugin_ids` entries directly until they have been populated.
     pub fn init() EffectiveChain {
         return .{ .plugin_ids = undefined, .count = 0 };
     }
 
+    /// Returns the initialized prefix of this chain as a slice of plugin IDs.
+    /// `self.count` must be at most `MAX_EFFECTIVE_PLUGINS`; this is asserted before slicing.
+    /// The returned slice aliases `self` and is valid for as long as `self` remains alive.
+    /// Only the first `count` entries are part of the chain; the remaining array slots are ignored.
     pub fn slice(self: *const EffectiveChain) []const []const u8 {
         assert(self.count <= MAX_EFFECTIVE_PLUGINS);
         return self.plugin_ids[0..self.count];
     }
 };
 
+/// Compose the effective plugin chain for a route from the global catalog and route overrides.
+/// Returns plugin IDs in execution order, rejecting unknown plugins and invalid disable requests.
+/// The returned chain borrows plugin ID slices from `global_plugin_ids` and `route`; it does not allocate.
+/// Fails with `CompositionError` when a required plugin is missing, the chain would exceed capacity, or a waiver is required but absent.
 pub fn composeEffectiveChain(
     plugins: []const ir.PluginCatalogEntry,
     global_plugin_ids: []const []const u8,

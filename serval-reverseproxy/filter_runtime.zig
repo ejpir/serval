@@ -7,8 +7,14 @@ const sdk = @import("serval-filter-sdk");
 const ir = @import("ir.zig");
 const request_stream = @import("stream_request.zig");
 
+/// Maximum number of loaded filters the registry can store.
+/// This is tied to `config.MAX_ROUTES` so the filter registry capacity tracks the configured route limit.
+/// Use this constant when sizing registry-backed storage or validating plugin registration limits.
 pub const MAX_LOADED_FILTERS: usize = config.MAX_ROUTES;
 
+/// Errors returned by filter registry setup and route hook execution.
+/// `TooManyLoadedFilters` and `DuplicatePluginBinding` report registry binding failures.
+/// `MissingRoute`, `MissingChain`, and `MissingFilterImplementation` report lookup failures during route execution.
 pub const RuntimeError = error{
     TooManyLoadedFilters,
     DuplicatePluginBinding,
@@ -17,6 +23,9 @@ pub const RuntimeError = error{
     MissingFilterImplementation,
 };
 
+/// Counts how many times each request and response hook was invoked during execution.
+/// All counters start at `0` and are incremented by `executeRouteHooks` after each dispatch.
+/// `init` returns a zero-initialized observation record for a fresh run.
 pub const HookObservation = struct {
     request_headers_calls: u32 = 0,
     request_chunk_calls: u32 = 0,
@@ -25,11 +34,17 @@ pub const HookObservation = struct {
     response_chunk_calls: u32 = 0,
     response_end_calls: u32 = 0,
 
+    /// Returns a zero-initialized `HookObservation`.
+    /// The struct starts with all hook counters set to `0`.
+    /// Use this when you need to collect per-hook invocation counts during runtime execution.
     pub fn init() HookObservation {
         return .{};
     }
 };
 
+/// Function pointers used by `FilterRegistry` to invoke filter hooks at runtime.
+/// Each callback receives the stored filter state as `*anyopaque` and the current request context.
+/// Use `forType` to build a table for a concrete filter type; the registry calls these hooks in chain order.
 pub const FilterVTable = struct {
     on_request_headers: *const fn (state: *anyopaque, ctx: *sdk.FilterContext, headers: sdk.HeaderWriteView) sdk.Decision,
     on_request_chunk: *const fn (state: *anyopaque, ctx: *sdk.FilterContext, chunk: sdk.ChunkView, emit: *sdk.EmitWriter) sdk.Decision,
@@ -38,6 +53,9 @@ pub const FilterVTable = struct {
     on_response_chunk: *const fn (state: *anyopaque, ctx: *sdk.FilterContext, chunk: sdk.ChunkView, emit: *sdk.EmitWriter) sdk.Decision,
     on_response_end: *const fn (state: *anyopaque, ctx: *sdk.FilterContext, emit: *sdk.EmitWriter) sdk.Decision,
 
+    /// Builds a `FilterVTable` for `Filter` by wiring each supported hook to the matching method.
+    /// `sdk.verifyFilter(Filter)` is enforced at comptime before the table is produced.
+    /// Falls back to the default no-op hook implementations when `Filter` does not declare a given hook.
     pub fn forType(comptime Filter: type) FilterVTable {
         comptime sdk.verifyFilter(Filter);
 
@@ -98,14 +116,23 @@ const LoadedFilter = struct {
     vtable: FilterVTable,
 };
 
+/// Stores runtime-loaded filter bindings and dispatches route hooks through generated vtables.
+/// Loaded filter pointers are borrowed; the registry does not manage their lifetime.
+/// Use `init` to create an empty registry and `registerTyped` to bind plugin IDs to typed filter state.
 pub const FilterRegistry = struct {
     loaded: [MAX_LOADED_FILTERS]LoadedFilter = undefined,
     loaded_count: u32 = 0,
 
+    /// Returns an empty `FilterRegistry` with no loaded filters.
+    /// The returned registry can be populated with `registerTyped` before executing routes.
+    /// No allocation or external initialization is performed.
     pub fn init() FilterRegistry {
         return .{};
     }
 
+    /// Registers a typed filter instance under `plugin_id` without taking ownership of the state pointer.
+    /// `state` must be a pointer to `Filter`, and the registry stores that pointer together with the generated vtable.
+    /// Returns `error.TooManyLoadedFilters` when the registry is full and `error.DuplicatePluginBinding` when the plugin is already registered.
     pub fn registerTyped(self: *FilterRegistry, plugin_id: []const u8, state: anytype, comptime Filter: type) RuntimeError!void {
         assert(@intFromPtr(self) != 0);
         assert(plugin_id.len > 0);
@@ -124,6 +151,9 @@ pub const FilterRegistry = struct {
         self.loaded_count += 1;
     }
 
+    /// Executes the loaded filter chain for the resolved route and returns the final decision.
+    /// Looks up the route and chain by ID, then runs each registered plugin in chain order.
+    /// Propagates `RuntimeError` and stream backpressure errors; returns `.reject` immediately if any hook rejects.
     pub fn executeRouteHooks(
         self: *FilterRegistry,
         candidate: *const ir.CanonicalIr,
@@ -299,6 +329,9 @@ test "filter runtime executes loaded custom filter hooks across lifecycle" {
         response_chunk_calls: u32 = 0,
         response_end_calls: u32 = 0,
 
+        /// Records that request headers were observed for this filter instance.
+        /// `headers` is accepted for the hook contract but is not used here.
+        /// Increments the `request_headers` counter on `ctx` and then returns `.continue_filtering`.
         pub fn onRequestHeaders(self: *@This(), ctx: *sdk.FilterContext, headers: sdk.HeaderSliceView) sdk.Decision {
             _ = headers;
             self.request_headers_calls += 1;
@@ -306,6 +339,9 @@ test "filter runtime executes loaded custom filter hooks across lifecycle" {
             return .continue_filtering;
         }
 
+        /// Records a request chunk hook invocation and forwards the chunk bytes to `emit`.
+        /// `ctx` is accepted for the hook contract but is not used here.
+        /// If emission fails, returns a reject decision with status `500` and reason `"req emit"`; otherwise continues filtering.
         pub fn onRequestChunk(self: *@This(), ctx: *sdk.FilterContext, chunk: sdk.ChunkView, emit: *sdk.EmitWriter) sdk.Decision {
             _ = ctx;
             self.request_chunk_calls += 1;
@@ -313,6 +349,9 @@ test "filter runtime executes loaded custom filter hooks across lifecycle" {
             return .continue_filtering;
         }
 
+        /// Records that request end was observed for this filter instance.
+        /// `ctx` and `emit` are accepted for the hook contract but are not used here.
+        /// Always returns `.continue_filtering` after incrementing `request_end_calls`.
         pub fn onRequestEnd(self: *@This(), ctx: *sdk.FilterContext, emit: *sdk.EmitWriter) sdk.Decision {
             _ = ctx;
             _ = emit;
@@ -320,6 +359,9 @@ test "filter runtime executes loaded custom filter hooks across lifecycle" {
             return .continue_filtering;
         }
 
+        /// Records that response headers were observed for this filter instance.
+        /// `headers` is accepted for the hook contract but is not used here.
+        /// Sets the `phase` tag to `"response_headers"` on `ctx` and then returns `.continue_filtering`.
         pub fn onResponseHeaders(self: *@This(), ctx: *sdk.FilterContext, headers: sdk.HeaderSliceView) sdk.Decision {
             _ = headers;
             self.response_headers_calls += 1;
@@ -327,6 +369,9 @@ test "filter runtime executes loaded custom filter hooks across lifecycle" {
             return .continue_filtering;
         }
 
+        /// Records a response chunk hook invocation and forwards the chunk bytes to `emit`.
+        /// `ctx` is accepted for the hook contract but is not used here.
+        /// If emission fails, returns a reject decision with status `500` and reason `"res emit"`; otherwise continues filtering.
         pub fn onResponseChunk(self: *@This(), ctx: *sdk.FilterContext, chunk: sdk.ChunkView, emit: *sdk.EmitWriter) sdk.Decision {
             _ = ctx;
             self.response_chunk_calls += 1;
@@ -334,6 +379,9 @@ test "filter runtime executes loaded custom filter hooks across lifecycle" {
             return .continue_filtering;
         }
 
+        /// Records that response end was observed for this filter instance.
+        /// `ctx` and `emit` are accepted for the hook contract but are not used here.
+        /// Always returns `.continue_filtering` after incrementing `response_end_calls`.
         pub fn onResponseEnd(self: *@This(), ctx: *sdk.FilterContext, emit: *sdk.EmitWriter) sdk.Decision {
             _ = ctx;
             _ = emit;

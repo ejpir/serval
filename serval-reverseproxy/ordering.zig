@@ -4,8 +4,14 @@ const std = @import("std");
 const assert = std.debug.assert;
 const config = @import("serval-core").config;
 
+/// Maximum number of plugins that can participate in one resolved chain.
+/// This is the fixed capacity used by `resolve()` and `OrderedChain`.
+/// The value is sourced from `config.MAX_ROUTES`.
 pub const MAX_CHAIN_PLUGINS: usize = config.MAX_ROUTES;
 
+/// Describes one plugin and its relative ordering constraints.
+/// `plugin_id` names the plugin being placed; `before` and `after` list peer plugin IDs that must come later or earlier.
+/// The struct does not own any strings; all slices borrow caller-provided data.
 pub const ConstraintEntry = struct {
     plugin_id: []const u8,
     priority: i32,
@@ -13,6 +19,9 @@ pub const ConstraintEntry = struct {
     after: []const []const u8,
 };
 
+/// Errors returned while resolving plugin ordering constraints.
+/// `TooManyPlugins` means the input exceeds the fixed chain capacity.
+/// `DuplicatePluginId`, `MissingDependency`, and `CycleDetected` report invalid or unsatisfiable ordering constraints.
 pub const OrderingError = error{
     TooManyPlugins,
     DuplicatePluginId,
@@ -20,10 +29,16 @@ pub const OrderingError = error{
     CycleDetected,
 };
 
+/// Stores a resolved plugin ordering and the number of valid entries.
+/// The chain owns no allocations; it only holds borrowed plugin ID slices copied into fixed storage.
+/// Use `init()` to create an empty value and `slice()` to read the populated prefix.
 pub const OrderedChain = struct {
     plugin_ids: [MAX_CHAIN_PLUGINS][]const u8,
     count: u32,
 
+    /// Initialize an empty ordered chain.
+    /// The chain starts with `count == 0` and an uninitialized backing array.
+    /// Populate the `plugin_ids` entries before exposing the chain through `slice()` or other readers.
     pub fn init() OrderedChain {
         return .{
             .plugin_ids = undefined,
@@ -31,12 +46,19 @@ pub const OrderedChain = struct {
         };
     }
 
+    /// Return the ordered plugin IDs as a slice view into this chain.
+    /// The returned slice is valid for as long as `self` remains alive and is not modified.
+    /// `count` must not exceed `MAX_CHAIN_PLUGINS`; this is asserted before the slice is formed.
     pub fn slice(self: *const OrderedChain) []const []const u8 {
         assert(self.count <= MAX_CHAIN_PLUGINS);
         return self.plugin_ids[0..self.count];
     }
 };
 
+/// Resolve a constraint graph into a deterministic plugin order.
+/// The input slice is not owned; the returned chain stores copied plugin IDs from `entries`.
+/// Returns `error.TooManyPlugins`, `error.DuplicatePluginId`, `error.MissingDependency`, or `error.CycleDetected` when the constraints cannot be satisfied.
+/// `entries.len` must fit in `u32` and must not exceed `MAX_CHAIN_PLUGINS`; both are enforced at runtime.
 pub fn resolve(entries: []const ConstraintEntry) OrderingError!OrderedChain {
     assert(entries.len <= std.math.maxInt(u32));
 

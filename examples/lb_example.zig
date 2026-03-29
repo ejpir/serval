@@ -293,6 +293,10 @@ fn parseBackends(
     return count;
 }
 
+/// Entry point for the load balancer example.
+/// Parses `process_init.minimal.args`, exits early on `--help`/`--version`, and reports invalid CLI input as `error.InvalidArgs`.
+/// Validates backend and TLS configuration before starting; returns `error.NoBackends`, `error.MissingTlsKey`, `error.MissingTlsCert`, or `error.TlsInitFailed` on setup failures.
+/// Initializes the connection pool, metrics, DNS resolver, health probes, and optional tracing/stats display, then runs the server until shutdown or a runtime error.
 pub fn main(process_init: std.process.Init) !void {
     // Parse command-line arguments
     var args = cli.Args(LbExtra).init("lb_example", VERSION, process_init.minimal.args);

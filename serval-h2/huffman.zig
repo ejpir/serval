@@ -6,6 +6,9 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
+/// Errors returned by `decode` when the Huffman stream is malformed or the destination buffer is too small.
+/// `InvalidHuffman` indicates that the input does not resolve to a valid code path or has invalid trailing bits.
+/// `BufferTooSmall` indicates that decoding would write past the end of the provided output buffer.
 pub const Error = error{
     InvalidHuffman,
     BufferTooSmall,
@@ -28,6 +31,9 @@ const Trie = struct {
 
 const trie: Trie = buildTrie();
 
+/// Decodes an HPACK-style Huffman bitstream from `input` into `out` and returns the written prefix.
+/// Bits are consumed most-significant-bit first from each byte. The returned slice aliases `out` and is only valid as long as `out` remains alive.
+/// Returns `error.InvalidHuffman` for malformed codes or invalid trailing padding, and `error.BufferTooSmall` if `out` cannot hold the decoded bytes.
 pub fn decode(input: []const u8, out: []u8) Error![]const u8 {
     assert(out.len > 0 or input.len == 0);
     assert(trie.count > 0);

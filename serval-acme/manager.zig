@@ -26,6 +26,10 @@ const Client = serval_client.Client;
 const serval_tls = @import("serval-tls");
 const ReloadableServerCtx = serval_tls.ReloadableServerCtx;
 
+/// Errors returned by ACME manager helpers when local validation fails before a transport call.
+/// `InvalidTransitionLimit` means the manager was configured with zero allowed transitions per tick.
+/// `InvalidHeaderBuffer` and `InvalidBodyBuffer` mean the caller passed an empty scratch buffer.
+/// `MissingSignedBody` means a required signed request body was not configured.
 pub const Error = error{
     InvalidTransitionLimit,
     InvalidHeaderBuffer,
@@ -35,6 +39,10 @@ pub const Error = error{
 
 const max_error_count: u16 = std.math.maxInt(u16);
 
+/// Collection of prebuilt signed request bodies used by ACME operations.
+/// Each field stores the payload for one operation and defaults to an empty slice when no body is configured.
+/// `bodyForOperation` returns the matching body or `error.MissingSignedBody` when the operation requires a non-empty payload that is absent.
+/// The struct does not copy body bytes; callers remain responsible for the lifetime of the referenced buffers.
 pub const SignedBodies = struct {
     new_account_body: []const u8 = &.{},
     fetch_account_body: []const u8 = &.{},
@@ -42,6 +50,10 @@ pub const SignedBodies = struct {
     fetch_order_body: []const u8 = &.{},
     finalize_order_body: []const u8 = &.{},
 
+    /// Returns the signed JWS body required for a given ACME operation.
+    /// Operations that do not need a body, such as `fetch_nonce`, return an empty slice.
+    /// Operations that require a signed body return `error.MissingSignedBody` if the configured body is empty.
+    /// `self` must remain valid while the returned slice is in use; the slice aliases storage owned by `self`.
     pub fn bodyForOperation(self: *const SignedBodies, operation: orchestration.Operation) Error![]const u8 {
         assert(@intFromPtr(self) != 0);
         assert(self.new_account_body.len <= config.ACME_MAX_JWS_BODY_BYTES);
@@ -64,12 +76,20 @@ pub const SignedBodies = struct {
     }
 };
 
+/// Summary of work performed during a manager tick.
+/// `transitions_executed` counts successful state transitions, `did_work` records whether any transition ran, and `state` captures the manager state after the tick.
+/// The struct is returned by tick helpers so callers can observe progress without reading manager internals.
+/// All fields default to the idle/no-work state.
 pub const TickResult = struct {
     transitions_executed: u8 = 0,
     did_work: bool = false,
     state: acme_types.CertState = .idle,
 };
 
+/// Opaque executor wrapper used to dispatch transport operations through a stored callback.
+/// The wrapper carries an optional context pointer plus the function to invoke for each operation.
+/// `init` constructs a generic executor, `fromClient` binds one to a concrete `Client`, and `execute` performs the dispatch.
+/// The executor does not manage the lifetime of the context it points at.
 pub const Executor = struct {
     context: ?*anyopaque,
     execute_fn: *const fn (
@@ -78,6 +98,10 @@ pub const Executor = struct {
         params: transport.ExecuteOperationParams,
     ) transport.ExecuteOperationError!orchestration.HandledResponse,
 
+    /// Creates an executor from an arbitrary opaque context and operation callback.
+    /// The callback must accept the same context pointer that is supplied here and must be safe to call for every execution.
+    /// `execute_fn` must be non-null and compatible with the `transport.ExecuteOperationError!orchestration.HandledResponse` contract.
+    /// The executor does not own `context`; lifetime management remains the caller's responsibility.
     pub fn init(
         context: ?*anyopaque,
         execute_fn: *const fn (
@@ -94,6 +118,10 @@ pub const Executor = struct {
         };
     }
 
+    /// Builds an executor that dispatches transport operations through the ACME client helper.
+    /// The returned executor stores `client_ptr` as opaque context and uses `executeWithClient` as its callback.
+    /// `client_ptr` must remain valid for as long as the executor may be used.
+    /// This is a convenience constructor for code that already has a concrete `Client` pointer.
     pub fn fromClient(client_ptr: *Client) Executor {
         assert(@intFromPtr(client_ptr) != 0);
         assert(@intFromPtr(executeWithClient) != 0);
@@ -103,6 +131,10 @@ pub const Executor = struct {
         };
     }
 
+    /// Executes a single transport operation through the stored callback.
+    /// `flow_ctx` must be non-null and valid, and `self.execute_fn` must point to a compatible implementation.
+    /// Forwards `self.context` unchanged to the callback and returns whatever response or transport error it produces.
+    /// This wrapper does not take ownership of the context pointer or the flow context.
     pub fn execute(
         self: Executor,
         flow_ctx: *orchestration.FlowContext,
@@ -138,6 +170,10 @@ const ExecutionDisposition = enum(u8) {
     fatal,
 };
 
+/// ACME issuance and renewal state machine plus retry bookkeeping.
+/// The manager tracks the current certificate state, orchestration flow context, transition cap, upstream selection, and backoff state.
+/// `init` creates a new idle manager; `startRenewal` resets the machine to begin at `fetch_nonce`; `runAutomatedIssuanceOnce` performs one full issuance attempt.
+/// Callers must preserve any referenced context objects used by the embedded flow context and runtime helpers.
 pub const Manager = struct {
     state: acme_types.CertState = .idle,
     flow_ctx: orchestration.FlowContext,
@@ -149,6 +185,10 @@ pub const Manager = struct {
     last_response_assessment: ?orchestration.ResponseAssessment = null,
     last_error_assessment: ?orchestration.ErrorAssessment = null,
 
+    /// Constructs a manager with the default retry backoff configuration and an idle state.
+    /// The returned manager owns its `FlowContext` value but borrows `directory` only for initialization.
+    /// `directory` must be non-null, and the configured backoff bounds must be valid (`min_ms > 0` and `min_ms <= max_ms`).
+    /// `upstream_idx` is stored unchanged and used to select the upstream route later.
     pub fn init(directory: *const client.Directory, upstream_idx: config.UpstreamIndex) Manager {
         assert(@intFromPtr(directory) != 0);
         assert(config.ACME_DEFAULT_FAIL_BACKOFF_MIN_MS > 0);
@@ -167,6 +207,10 @@ pub const Manager = struct {
         };
     }
 
+    /// Starts a renewal cycle from the beginning of the ACME flow.
+    /// Resets backoff timing and failure counters, then moves the manager state to `fetch_nonce`.
+    /// `max_transitions_per_tick` must be greater than zero before calling this function.
+    /// Clears any cached response or error assessment so the next tick starts from a clean slate.
     pub fn startRenewal(self: *Manager) void {
         assert(@intFromPtr(self) != 0);
         assert(self.max_transitions_per_tick > 0);
@@ -178,6 +222,10 @@ pub const Manager = struct {
         self.last_response_assessment = null;
     }
 
+    /// Runs one automated ACME issuance attempt and updates manager bookkeeping around the call.
+    /// Sets the manager state to `fetch_nonce` before invoking the runtime helper, then restores `idle` and clears failure tracking on success.
+    /// `runtime_config`, `signer`, and `client_ptr` must remain valid for the duration of the call; `work` is passed through to the runtime helper.
+    /// Propagates errors from either this manager's `Error` set or `runtime.runIssuanceOnce`'s `runtime.Error` set.
     pub fn runAutomatedIssuanceOnce(
         self: *Manager,
         runtime_config: *const acme_types.RuntimeConfig,
@@ -209,6 +257,10 @@ pub const Manager = struct {
         return persisted;
     }
 
+    /// Convenience wrapper around `runTickWithExecutor` for a concrete `Client` implementation.
+    /// Builds an `Executor` from `client_ptr` and forwards the same buffers, I/O handle, and signed bodies to the tick runner.
+    /// `client_ptr` and `signed_bodies` must be non-null and valid for the duration of the call.
+    /// Propagates any error returned by the underlying tick execution.
     pub fn runTick(
         self: *Manager,
         client_ptr: *Client,
@@ -225,6 +277,10 @@ pub const Manager = struct {
         return try self.runTickWithExecutor(executor, signed_bodies, io, header_buf, body_buf);
     }
 
+    /// Runs ACME manager steps through an injected executor until no more work is available.
+    /// Stops early when the manager reaches a terminal state, when a step is skipped, or when the transition limit is hit.
+    /// `header_buf` and `body_buf` must be non-empty scratch buffers; otherwise this returns `error.InvalidHeaderBuffer` or `error.InvalidBodyBuffer`.
+    /// Propagates step execution errors from `runStep` and reports the final manager state in the returned `TickResult`.
     pub fn runTickWithExecutor(
         self: *Manager,
         executor: Executor,

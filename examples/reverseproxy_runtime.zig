@@ -10,6 +10,11 @@ const Extra = struct {
     @"config-file": []const u8 = "",
 };
 
+/// Parses CLI arguments for the `reverseproxy_runtime` entrypoint using `process_init.minimal.args`.
+/// Returns early with success when `--help` or `--version` is handled; on parse errors, prints details and returns `error.InvalidArgs`.
+/// Requires a non-empty `--config-file`; otherwise returns `error.MissingConfigFile`.
+/// Loads the reverse-proxy runtime from the provided config file, guarantees cleanup via `defer runtime.deinit()`, and then runs it on `args.port`.
+/// Propagates any errors returned by runtime loading or execution.
 pub fn main(process_init: std.process.Init) !void {
     var args = cli.Args(Extra).init("reverseproxy_runtime", VERSION, process_init.minimal.args);
     switch (args.parse()) {

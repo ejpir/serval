@@ -18,11 +18,19 @@ const Request = core.types.Request;
 const Client = serval_client.Client;
 const DnsResolver = net.DnsResolver;
 
+/// Context passed to HTTP probe adapter operations.
+/// Holds a non-owning pointer to the shared `Client` used for probe requests.
+/// `health_path` is the request path to probe (for example, `"/health"`), stored as a non-owning byte slice.
+/// Callers must ensure both `client` and `health_path` remain valid for the full lifetime of this context.
 pub const HttpProbeAdapterContext = struct {
     client: *Client,
     health_path: []const u8,
 };
 
+/// Runs an HTTP health probe for `upstream` using adapter state from `context`.
+/// `context` must be a valid, correctly aligned `*HttpProbeAdapterContext` whose `health_path` is non-empty (asserted).
+/// The call forwards `client`, `health_path`, and `io` to `probeHttp` and returns its boolean result.
+/// This function does not allocate and does not take ownership of `context`, `upstream`, or `io`.
 pub fn httpProbe(context: *anyopaque, upstream: Upstream, io: Io) bool {
     const adapter_context: *HttpProbeAdapterContext = @ptrCast(@alignCast(context));
     assert(adapter_context.health_path.len > 0);
@@ -30,10 +38,17 @@ pub fn httpProbe(context: *anyopaque, upstream: Upstream, io: Io) bool {
     return probeHttp(adapter_context.client, upstream, adapter_context.health_path, io);
 }
 
+/// Adapter context for TCP probe operations, carrying the probe client instance.
+/// `client` is a borrowed pointer and is not owned by this context.
+/// The referenced `Client` must remain valid for the full lifetime of any adapter use of this context.
 pub const TcpProbeAdapterContext = struct {
     client: *Client,
 };
 
+/// Attempts a TCP connect check using the adapter client for `upstream` and `io`.
+/// `context` must be a valid, properly aligned `*TcpProbeAdapterContext` for this probe call.
+/// On successful `client.connect`, the returned connection socket is immediately closed and not retained.
+/// Returns `true` only when connect succeeds; returns `false` for any connect error.
 pub fn tcpConnectProbe(context: *anyopaque, upstream: Upstream, io: Io) bool {
     const adapter_context: *TcpProbeAdapterContext = @ptrCast(@alignCast(context));
 
@@ -45,12 +60,21 @@ pub fn tcpConnectProbe(context: *anyopaque, upstream: Upstream, io: Io) bool {
     return true;
 }
 
+/// Controls how a UDP probe interacts with the target endpoint.
+/// `passive_only` performs no outbound UDP send and only evaluates passive observations.
+/// `active_send` sends a UDP probe packet without requiring any response.
+/// `active_send_expect` sends a UDP probe packet and expects a response for success.
 pub const UdpProbeMode = enum {
     passive_only,
     active_send,
     active_send_expect,
 };
 
+/// Context/configuration for UDP probe adapter execution.
+/// `dns_resolver` must point to a valid `DnsResolver` for target resolution and must outlive any adapter use of this context.
+/// `probe_mode` selects probe behavior; default is `.passive_only`.
+/// `payload` is the probe payload for active sends, and `expect_payload` (if set) is the exact response payload to match; both slices are borrowed and must remain valid.
+/// `response_timeout_ms` sets the response wait timeout in milliseconds (default `500`).
 pub const UdpProbeAdapterContext = struct {
     dns_resolver: *DnsResolver,
     probe_mode: UdpProbeMode = .passive_only,
@@ -59,6 +83,11 @@ pub const UdpProbeAdapterContext = struct {
     response_timeout_ms: u32 = 500,
 };
 
+/// Performs a UDP probe using `adapter_context` from `context` and returns `true` only when the configured probe condition succeeds.
+/// In `.passive_only` mode it always returns `false`; in active modes it resolves `upstream`, opens a datagram socket, sends `payload`, and closes the socket before returning.
+/// Preconditions: `context` must point to a valid `UdpProbeAdapterContext`; `payload.len > 0` and `response_timeout_ms > 0` are required (asserted).
+/// `.active_send` succeeds after a successful send; `.active_send_expect` additionally requires a non-empty response before timeout and, when `expect_payload` is set, an exact length/content match.
+/// Any resolution/socket/send/setsockopt/recv failure (or invalid fd/empty response) results in `false`.
 pub fn udpProbe(context: *anyopaque, upstream: Upstream, io: Io) bool {
     const adapter_context: *UdpProbeAdapterContext = @ptrCast(@alignCast(context));
 

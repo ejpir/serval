@@ -9,6 +9,9 @@ const key_path_buf_size_bytes: u16 = 1024;
 const cert_pem_buf_size_bytes: u16 = 8192;
 const key_pem_buf_size_bytes: u16 = 4096;
 
+/// Errors returned by the self-signed certificate provider.
+/// `InvalidConfig` indicates required configuration values were empty.
+/// `PathTooLong`, `CreateDirFailed`, `GenerateFailed`, and `WriteFailed` report path construction, directory creation, certificate generation, and file-write failures.
 pub const Error = error{
     InvalidConfig,
     PathTooLong,
@@ -17,6 +20,9 @@ pub const Error = error{
     WriteFailed,
 };
 
+/// Provider state for self-signed TLS certificate management.
+/// Stores the configuration, listener identifier, and precomputed certificate/key paths in fixed-size buffers.
+/// Use `init` to construct a value, `loadInitial` to obtain or create certificate material, and `deinit` to finish the lifecycle.
 pub const Provider = struct {
     cfg: ir.SelfSignedTlsConfig,
     listener_id: []const u8,
@@ -27,6 +33,10 @@ pub const Provider = struct {
     key_path_len: u16,
     key_path_bytes: [key_path_buf_size_bytes]u8,
 
+    /// Initialize a self-signed TLS provider for one listener.
+    /// `cfg.state_dir_path` and `cfg.domain` must be non-empty, and `listener_id` must not be empty.
+    /// Builds the certificate and key paths under `<state_dir>/listeners/<listener_id>/selfsigned/`.
+    /// Returns `error.InvalidConfig` if required config fields are missing, or `error.PathTooLong` if either path does not fit.
     pub fn init(cfg: ir.SelfSignedTlsConfig, listener_id: []const u8) Error!Provider {
         assert(listener_id.len > 0);
         if (cfg.state_dir_path.len == 0 or cfg.domain.len == 0) return error.InvalidConfig;
@@ -57,11 +67,18 @@ pub const Provider = struct {
         return service;
     }
 
+    /// Release any resources associated with the provider.
+    /// The provider stores fixed-size path buffers and does not allocate heap memory here.
+    /// Call this when the provider is no longer needed.
     pub fn deinit(self: *Provider) void {
         assert(@intFromPtr(self) != 0);
         assert(self.cert_path_len <= cert_path_buf_size_bytes);
     }
 
+    /// Load the initial certificate material for this provider.
+    /// Reuses existing certificate and key files when `rotate_on_boot` is disabled and both paths already exist.
+    /// Otherwise generates new PEM material, creates the parent directory, and writes both files before returning their paths.
+    /// Returns `error.PathTooLong`, `error.CreateDirFailed`, `error.GenerateFailed`, or `error.WriteFailed` on failure.
     pub fn loadInitial(self: *Provider, io: std.Io) Error!provider.CertMaterial {
         assert(@intFromPtr(self) != 0);
         assert(self.key_path_len <= key_path_buf_size_bytes);
@@ -92,6 +109,9 @@ pub const Provider = struct {
         return .{ .cert_path = cert_path, .key_path = key_path };
     }
 
+    /// Run the self-signed certificate provider lifecycle hook.
+    /// This implementation does not perform any background work and ignores all inputs.
+    /// The provider is activated through `loadInitial`; `run` returns immediately.
     pub fn run(
         self: *Provider,
         shutdown: *std.atomic.Value(bool),

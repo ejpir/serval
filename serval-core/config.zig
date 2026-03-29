@@ -667,6 +667,10 @@ pub const UdpTransportConfig = struct {
     probe_mode: UdpProbeMode = .passive_only,
 };
 
+/// Top-level runtime configuration for the HTTP server and optional transport subsystems.
+/// String slices such as `listen_host` borrow caller-owned storage and must remain valid for use.
+/// Optional fields leave the corresponding subsystem disabled when set to `null`.
+/// Field defaults provide the standard listener, timeout, buffer, and policy values used by the server.
 pub const Config = struct {
     /// Host/address to bind the frontend listener to.
     /// Examples:
@@ -776,6 +780,9 @@ pub const TlsConfig = struct {
     io_timeout_ns: u64 = time.secondsToNanos(30),
 };
 
+/// Errors returned when validating TCP or UDP transport configuration.
+/// Each tag identifies a specific invalid listener, target set, port, timeout, or session limit.
+/// These errors are surfaced by `validateTransportConfig` and its transport-specific helpers.
 pub const TransportConfigError = error{
     TcpListenerHostEmpty,
     TcpListenerPortInvalid,
@@ -794,6 +801,10 @@ pub const TransportConfigError = error{
     UdpSessionIdleTimeoutInvalid,
 };
 
+/// Validate the optional transport sub-configurations attached to `cfg`.
+/// The pointer must be non-null; the function asserts this in debug builds.
+/// If `tcp_transport` or `udp_transport` is present, the corresponding validator is run.
+/// Returns the first `TransportConfigError` reported by a nested validator.
 pub fn validateTransportConfig(cfg: *const Config) TransportConfigError!void {
     assert(@intFromPtr(cfg) != 0);
 

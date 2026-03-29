@@ -17,11 +17,15 @@ const assert = std.debug.assert;
 const config = @import("serval-core").config;
 const huffman = @import("huffman.zig");
 
+/// A decoded HTTP header field.
+/// `name` and `value` are borrowed slices; this type does not allocate or own storage.
 pub const HeaderField = struct {
     name: []const u8,
     value: []const u8,
 };
 
+/// Errors returned by HPACK encoding and decoding operations.
+/// Covers incomplete input, buffer exhaustion, integer and Huffman decoding failures, header-count limits, and invalid dynamic-table updates.
 pub const Error = error{
     NeedMoreData,
     BufferTooSmall,
@@ -49,6 +53,9 @@ const DynamicEntry = struct {
     size_bytes: u32,
 };
 
+/// HPACK decoder state, including dynamic-table metadata and scratch storage.
+/// Reuse a single instance when decoding multiple blocks that share table state.
+/// The embedded buffers are owned by the decoder value itself.
 pub const Decoder = struct {
     max_dynamic_table_size_bytes: u32 = default_dynamic_table_size_bytes,
     dynamic_table_size_limit_bytes: u32 = default_dynamic_table_size_bytes,
@@ -66,12 +73,18 @@ pub const Decoder = struct {
     huffman_scratch_len: u16 = 0,
     huffman_scratch_buf: [huffman_scratch_capacity_bytes]u8 = undefined,
 
+    /// Initializes a decoder with default dynamic-table limits and empty state.
+    /// The returned value can be used immediately with the decode and table-size APIs.
+    /// No allocation is performed.
     pub fn init() Decoder {
         assert(dynamic_entry_capacity > 0);
         assert(dynamic_storage_capacity_bytes > 0);
         return .{};
     }
 
+    /// Sets the decoder's maximum dynamic-table size in bytes.
+    /// If the new limit is below the current table size, oldest entries are evicted until the table fits.
+    /// Returns `error.DynamicTableSizeTooLarge` when `max_size_bytes` exceeds the decoder's storage capacity.
     pub fn setMaxDynamicTableSize(self: *Decoder, max_size_bytes: u32) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(self.dynamic_entry_count <= dynamic_entry_capacity);
@@ -87,6 +100,9 @@ pub const Decoder = struct {
         }
     }
 
+    /// Decodes one HPACK header block using `self` and writes decoded fields into `out_fields`.
+    /// Supports indexed headers, literal headers with and without incremental indexing, and dynamic-table size updates.
+    /// Returns a slice of `out_fields`; mutates the decoder's dynamic table and may return `error.TooManyHeaders` or malformed-input errors.
     pub fn decodeHeaderBlock(self: *Decoder, input: []const u8, out_fields: []HeaderField) Error![]const HeaderField {
         assert(@intFromPtr(self) != 0);
         assert(out_fields.len > 0);
@@ -138,6 +154,9 @@ pub const Decoder = struct {
     }
 };
 
+/// Decodes an HPACK header block using a fresh decoder instance.
+/// This is a convenience wrapper for one-shot decoding when no decoder state needs to be reused.
+/// The returned slice aliases `out_fields`; decoder state is not retained after the call.
 pub fn decodeHeaderBlock(input: []const u8, out_fields: []HeaderField) Error![]const HeaderField {
     assert(dynamic_entry_capacity > 0);
     assert(huffman_scratch_capacity_bytes >= dynamic_storage_capacity_bytes);
@@ -145,6 +164,9 @@ pub fn decodeHeaderBlock(input: []const u8, out_fields: []HeaderField) Error![]c
     return decoder.decodeHeaderBlock(input, out_fields);
 }
 
+/// Decodes `input` with the provided `decoder` and writes results into `out_fields`.
+/// The decoder's dynamic-table state is preserved and updated by the decode operation.
+/// The returned slice aliases `out_fields` and contains only the headers that were decoded.
 pub fn decodeHeaderBlockWithDecoder(
     decoder: *Decoder,
     input: []const u8,
@@ -155,6 +177,9 @@ pub fn decodeHeaderBlockWithDecoder(
     return decoder.decodeHeaderBlock(input, out_fields);
 }
 
+/// Encodes a literal header field without indexing into `out`.
+/// The header name must be non-empty; the name is encoded in lowercase before the value is written.
+/// On success, the returned slice aliases `out`. Returns `error.BufferTooSmall` if `out` cannot hold the full encoding.
 pub fn encodeLiteralHeaderWithoutIndexing(
     out: []u8,
     name: []const u8,
@@ -173,6 +198,9 @@ pub fn encodeLiteralHeaderWithoutIndexing(
     return out[0..cursor];
 }
 
+/// Encodes a literal header field with incremental indexing into `out`.
+/// The header name must be non-empty; the name is encoded in lowercase before the value is written.
+/// On success, the returned slice aliases `out`. Returns `error.BufferTooSmall` if `out` cannot hold the full encoding.
 pub fn encodeLiteralHeaderWithIncrementalIndexing(
     out: []u8,
     name: []const u8,
@@ -191,6 +219,9 @@ pub fn encodeLiteralHeaderWithIncrementalIndexing(
     return out[0..cursor];
 }
 
+/// Encodes an HPACK indexed header field into `out` and returns the written prefix.
+/// `index` must be nonzero and refer to a valid static or dynamic table entry; otherwise returns `error.InvalidIndex`.
+/// The returned slice aliases `out` and is valid until `out` is reused or modified.
 pub fn encodeIndexedHeaderField(out: []u8, index: u32) Error![]const u8 {
     assert(static_table.len > 0);
     assert(dynamic_entry_capacity > 0);

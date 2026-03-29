@@ -14,6 +14,10 @@ const Scheme = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 const max_body_bytes = config.ACME_MAX_JWS_BODY_BYTES;
 const max_sig_bytes = Scheme.Signature.encoded_length;
 
+/// Errors returned by ACME account signing and key-authorization helpers.
+/// These cover token validation, nonce and URL validation, payload and header size limits, and signing or JWK rendering failures.
+/// Check the specific helper method to see which subset can be emitted on a given call.
+/// Size-related errors mean the caller-provided buffers or encoded payload exceeded the module's limits.
 pub const Error = error{
     InvalidNonce,
     InvalidUrl,
@@ -28,9 +32,17 @@ pub const Error = error{
     KeyAuthorizationTooLarge,
 };
 
+/// ACME account signer backed by a `Scheme.KeyPair`.
+/// The value stores the private key material needed to render JWK coordinates and produce JWS payloads.
+/// Methods on this type write into caller-provided buffers and return slices into those buffers.
+/// No allocator is embedded in the type; ownership stays with the caller who holds the value.
 pub const AccountSigner = struct {
     key_pair: Scheme.KeyPair,
 
+    /// Generate an `AccountSigner` using randomness from `io`.
+    /// This returns a signer value by copy and does not allocate.
+    /// The caller owns the returned signer and is responsible for its lifetime.
+    /// Panics or traps are not documented here; any failure handling is delegated to `Scheme.KeyPair.generate`.
     pub fn generate(io: std.Io) AccountSigner {
         assert(max_body_bytes > 0);
         assert(max_sig_bytes > 0);
@@ -38,6 +50,10 @@ pub const AccountSigner = struct {
         return .{ .key_pair = key_pair };
     }
 
+    /// Deterministically derive an `AccountSigner` from `seed`.
+    /// `seed` must have exactly `Scheme.KeyPair.seed_length` bytes.
+    /// Returns a signer value by copy; no allocator is involved.
+    /// Propagates any failure reported by `Scheme.KeyPair.generateDeterministic`.
     pub fn generateDeterministic(seed: [Scheme.KeyPair.seed_length]u8) !AccountSigner {
         assert(Scheme.KeyPair.seed_length > 0);
         assert(seed.len == Scheme.KeyPair.seed_length);
@@ -122,6 +138,10 @@ pub const AccountSigner = struct {
         return try self.finalizeJws(out_body, protected, payload_json);
     }
 
+    /// Compute the ACME key authorization string for `token` using this account key.
+    /// `token` must be non-empty, at most `u16`-sized, and limited to ASCII letters, digits, `-`, and `_`.
+    /// Writes into `out` and returns a slice of that buffer; the returned slice aliases caller-owned memory.
+    /// Returns `error.InvalidToken` for invalid input, `error.MissingJwkCoordinates` if the public key cannot be rendered, and `error.KeyAuthorizationTooLarge` if the result does not fit.
     pub fn computeKeyAuthorization(
         self: *const AccountSigner,
         token: []const u8,

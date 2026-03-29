@@ -18,14 +18,25 @@ const session = @import("session.zig");
 const Transport = session.Transport;
 const TransportError = session.TransportError;
 
+/// Upper bound on write-loop iterations in WebSocket I/O.
+/// Used as a safety cap to keep write progress loops bounded and prevent unbounded retry/spin behavior.
+/// Value is a fixed compile-time limit (`u32`) of `1024` iterations.
 pub const max_write_iterations_count: u32 = 1024;
 
+/// Caller-owned connection state used to back a WebSocket `Transport`.
+/// `fd` is the accepted socket descriptor for plain I/O and must remain valid while the transport is in use.
+/// `maybe_tls` points at the active TLS stream for the same connection when TLS is enabled, or is `null` for plain connections.
+/// `connection_id` is carried into debug logging for I/O failures; this struct does not own any of the referenced resources.
 pub const ConnectionTransportContext = struct {
     fd: i32,
     maybe_tls: ?*TLSStream,
     connection_id: u64,
 };
 
+/// Builds a `Transport` that forwards WebSocket I/O through the supplied connection context.
+/// `ctx.fd` must be a valid non-negative descriptor; this function asserts that precondition before returning.
+/// The returned transport borrows `ctx` and does not take ownership of the socket or TLS stream.
+/// If `ctx.maybe_tls` is set, reads and writes are routed through that TLS stream; otherwise the raw file descriptor is used.
 pub fn initConnectionTransport(ctx: *ConnectionTransportContext) Transport {
     assert(ctx.fd >= 0);
 

@@ -27,7 +27,11 @@ const core = @import("serval-core");
 const config = core.config;
 
 // Re-export from config for backward compatibility.
+/// Maximum number of chunk-processing iterations allowed while forwarding a chunked body.
+/// This is an alias of `config.MAX_CHUNK_ITERATIONS` and is used to keep the forwarding loop bounded.
 pub const MAX_CHUNK_ITERATIONS = config.MAX_CHUNK_ITERATIONS;
+/// Buffer size, in bytes, used while forwarding chunked bodies.
+/// This is an alias of `config.CHUNK_BUFFER_SIZE_BYTES` so the proxy layer follows the shared configuration value.
 pub const CHUNK_BUFFER_SIZE_BYTES = config.CHUNK_BUFFER_SIZE_BYTES;
 
 // =============================================================================
@@ -47,6 +51,11 @@ pub fn forwardChunkedBodyWithPreread(
     return forwardChunkedBodyWithPrereadIo(source, dest, pre_read, null);
 }
 
+/// Forwards a chunked body from `source` to `dest`, optionally seeding the parser with `pre_read` bytes.
+/// `source` and `dest` must have valid file descriptors; the function asserts this before processing starts.
+/// The loop is bounded by `MAX_CHUNK_ITERATIONS` and stops after the terminating chunk is forwarded.
+/// Parsing errors are mapped through the chunk parser error translation, and I/O failures are returned as `ForwardError`.
+/// The returned count includes forwarded chunk framing, payload bytes, and the final trailer section when present.
 pub fn forwardChunkedBodyWithPrereadIo(
     source: *Socket,
     dest: *Socket,
@@ -118,6 +127,9 @@ pub fn forwardChunkedBody(
     return forwardChunkedBodyWithPrereadIo(source, dest, &.{}, null);
 }
 
+/// Forwards an HTTP/1 chunked body from `source` to `dest` using `io` for transport.
+/// The sockets must already be open and valid for reading and writing respectively.
+/// Returns the number of bytes forwarded, or `ForwardError` if parsing or I/O fails.
 pub fn forwardChunkedBodyIo(
     source: *Socket,
     dest: *Socket,

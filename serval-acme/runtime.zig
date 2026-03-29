@@ -30,6 +30,9 @@ const serval_tls = @import("serval-tls");
 const ReloadableServerCtx = serval_tls.ReloadableServerCtx;
 const ssl = serval_tls.ssl;
 
+/// Public error set for the ACME runtime.
+/// Includes local validation failures, missing TLS-ALPN support, challenge and polling failures, and missing or empty certificate responses.
+/// Also wraps lower-level errors from client, wire, transport, signer, CSR generation, storage, TLS reload, and cancellation operations.
 pub const Error = error{
     InvalidRuntimeConfig,
     MissingTlsAlpnHookProvider,
@@ -41,6 +44,9 @@ pub const Error = error{
     CertResponseEmpty,
 } || client.Error || wire.Error || transport.Error || transport.ExecuteOperationError || signer_mod.Error || csr_mod.Error || storage.Error || tls_alpn_hook_mod.Error || tls_alpn_cert_mod.Error || serval_tls.ReloadableServerCtxError || serval_tls.ssl.CreateServerCtxFromPemFilesError || Io.Cancelable;
 
+/// Scratch buffers reused across the ACME issuance flow.
+/// The caller owns every slice and must keep them alive and writable for the duration of a run.
+/// `cert_path_buf` and `key_path_buf` receive the persisted output paths, so they must remain valid for as long as the returned paths are used.
 pub const WorkBuffers = struct {
     header_buf: []u8,
     body_buf: []u8,
@@ -52,6 +58,9 @@ pub const WorkBuffers = struct {
     key_path_buf: []u8,
 };
 
+/// Runs one complete ACME issuance cycle for the configured runtime.
+/// Fetches the directory and nonce, ensures the account exists, creates and authorizes the order, finalizes it, downloads the certificate, then persists it and optionally reloads TLS.
+/// `runtime_config`, `acme_client`, and `signer` must be non-null; a TLS-ALPN hook provider is required, and the returned persisted paths alias the caller-provided work buffers.
 pub fn runIssuanceOnce(
     runtime_config: *const acme_types.RuntimeConfig,
     acme_client: *Client,

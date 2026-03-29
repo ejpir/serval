@@ -9,13 +9,22 @@ const Io = std.Io;
 const core_config = @import("serval-core").config;
 const frontend_bootstrap = @import("../frontend/bootstrap.zig");
 
+/// Error set returned by the HTTP/2 bootstrap helpers.
+/// This is an alias of `frontend_bootstrap.FrontendBootstrapError`, so callers
+/// should handle the same bootstrap validation failures in either module.
 pub const H2BootstrapError = frontend_bootstrap.FrontendBootstrapError;
 
+/// Validates that the configured transports are ready for HTTP/2 startup.
+/// Delegates to the shared frontend bootstrap implementation and returns
+/// `error.InvalidTransportConfig` when transport validation fails.
 pub fn validateTransportReadiness(cfg: *const core_config.Config) H2BootstrapError!void {
     assert(@intFromPtr(cfg) != 0);
     return frontend_bootstrap.validateTransportReadiness(cfg);
 }
 
+/// Resolves the listen address used by the HTTP/2 server bootstrap path.
+/// Delegates to the shared frontend bootstrap implementation, so it follows
+/// the same transport-readiness checks and address parsing rules.
 pub fn preflightAndResolveListenAddress(cfg: *const core_config.Config) H2BootstrapError!Io.net.IpAddress {
     assert(@intFromPtr(cfg) != 0);
     return frontend_bootstrap.preflightAndResolveListenAddress(cfg);

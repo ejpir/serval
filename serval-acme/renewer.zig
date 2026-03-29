@@ -27,20 +27,32 @@ const DnsResolver = serval_net.DnsResolver;
 const serval_tls = @import("serval-tls");
 const ssl = serval_tls.ssl;
 
+/// Outcome reported by an activation callback.
+/// `success` means the new certificate is active, `transient_failure` means the operation can be retried, and `fatal_failure` means renewal must stop.
+/// This enum is interpreted by the renewer and scheduler; it does not carry additional error detail.
 pub const ActivationResult = enum {
     success,
     transient_failure,
     fatal_failure,
 };
 
+/// Callback used to activate a renewed certificate and key pair.
+/// `ctx` is an opaque caller-supplied context, and `cert_path` and `key_path` point to the certificate and private key files to activate.
+/// The callback returns an `ActivationResult` that tells the renewer whether to retry, stop, or treat the failure as fatal.
 pub const ActivateFn = *const fn (ctx: *anyopaque, cert_path: []const u8, key_path: []const u8) ActivationResult;
 
+/// Scratch buffers used while parsing an existing certificate chain.
+/// `cert_pem_read_buf` stores the raw PEM input, `cert_pem_b64_buf` stores the decoded base64 content, and `cert_der_buf` stores the DER form.
+/// The caller must provide writable slices with enough capacity for the expected certificate data.
 pub const ParseBuffers = struct {
     cert_pem_read_buf: []u8,
     cert_pem_b64_buf: []u8,
     cert_der_buf: []u8,
 };
 
+/// Inputs required to create a borrow-only `Renewer` view.
+/// The pointed-to runtime config, ACME client, signer, hook provider, and activation context must outlive the returned renewer.
+/// `cert_current_path` and the buffers in `work` and `parse_buffers` are used directly and must remain writable or readable as declared.
 pub const Params = struct {
     runtime_config: *const types.RuntimeConfig,
     acme_client: *Client,
@@ -63,6 +75,9 @@ const cert_pem_read_buf_size_bytes = 24 * 1024;
 const cert_pem_base64_buf_size_bytes = 24 * 1024;
 const cert_der_buf_size_bytes = 16 * 1024;
 
+/// Inputs used to build a `ManagedRenewer` from an already materialized runtime config.
+/// `runtime_config`, `hook_provider`, `activate_ctx`, and `activate_fn` must remain valid while the managed renewer is running.
+/// `verify_tls` defaults to `true` and controls TLS peer verification on the ACME client context.
 pub const ManagedParams = struct {
     allocator: std.mem.Allocator,
     runtime_config: *const types.RuntimeConfig,
@@ -73,6 +88,9 @@ pub const ManagedParams = struct {
     verify_tls: bool = true,
 };
 
+/// Inputs used to build a `ManagedRenewer` from ACME configuration.
+/// `allocator` is forwarded to the ACME client, while `hook_provider`, `activate_ctx`, and `activate_fn` must remain valid for the managed renewer's lifetime.
+/// `verify_tls` defaults to `true` and controls whether the client TLS context verifies peers.
 pub const ManagedFromAcmeConfigParams = struct {
     allocator: std.mem.Allocator,
     acme_config: config.AcmeConfig,
@@ -82,6 +100,9 @@ pub const ManagedFromAcmeConfigParams = struct {
     verify_tls: bool = true,
 };
 
+/// Errors returned by managed renewer initialization and execution.
+/// `InvalidCheckInterval` and `InvalidCertPath` report invalid input, `CertPathTooLong` reports path construction overflow, and `TlsClientCtxInitFailed` reports TLS client setup failure.
+/// `FatalFailure` is used when the renewal loop determines the operation cannot safely continue.
 pub const Error = error{
     InvalidCheckInterval,
     InvalidCertPath,
@@ -90,6 +111,9 @@ pub const Error = error{
     FatalFailure,
 } || types.Error || backoff_mod.Error || scheduler_mod.Error || runtime.Error || Io.Cancelable;
 
+/// Holds the dependencies and working storage needed to perform renewal attempts.
+/// All pointer fields and buffer slices are borrowed; this type does not own the referenced allocations.
+/// Construct with `init` and execute with `run` using the same backing state for the full lifetime of the value.
 pub const Renewer = struct {
     runtime_config: *const types.RuntimeConfig,
     acme_client: *Client,
@@ -103,6 +127,9 @@ pub const Renewer = struct {
     activate_ctx: *anyopaque,
     activate_fn: ActivateFn,
 
+    /// Creates a borrow-only `Renewer` view over preallocated state and caller-owned dependencies.
+    /// `check_interval_ms` must be non-zero and `cert_current_path` must not be empty.
+    /// The returned value does not copy buffers; all referenced config, client, signer, and activation state must outlive it.
     pub fn init(params: Params) Error!Renewer {
         if (params.check_interval_ms == 0) return error.InvalidCheckInterval;
         if (params.cert_current_path.len == 0) return error.InvalidCertPath;
@@ -126,6 +153,9 @@ pub const Renewer = struct {
         };
     }
 
+    /// Runs the renewal scheduler until shutdown or an unrecoverable failure occurs.
+    /// `self` and `shutdown` must be valid pointers for the duration of the call.
+    /// Returns `error.FatalFailure` when the scheduler reports a fatal callback failure; otherwise propagates scheduler errors unchanged.
     pub fn run(self: *Renewer, io: Io, shutdown: *std.atomic.Value(bool)) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(@intFromPtr(shutdown) != 0);
@@ -190,6 +220,9 @@ pub const Renewer = struct {
     }
 };
 
+/// Owns the long-lived state required to drive certificate renewal and activation.
+/// This includes the runtime config, DNS resolver, ACME client, signer, TLS client context, backoff state, and fixed-size working buffers.
+/// Call `deinit` to release the ACME client and any TLS context before discarding the struct.
 pub const ManagedRenewer = struct {
     runtime_config: types.RuntimeConfig,
     check_interval_ms: u32,
@@ -218,6 +251,9 @@ pub const ManagedRenewer = struct {
     cert_pem_b64_buf: [cert_pem_base64_buf_size_bytes]u8,
     cert_der_buf: [cert_der_buf_size_bytes]u8,
 
+    /// Initializes a managed renewer with owned buffers, client state, and TLS context.
+    /// `params.runtime_config` and `params.activate_ctx` must be valid pointers, and `check_interval_ms` must be non-zero.
+    /// Returns `error.InvalidCheckInterval` for a zero interval, `error.TlsClientCtxInitFailed` if the TLS client context cannot be created, and may fail from signer or backoff initialization.
     pub fn init(params: ManagedParams, io: Io) Error!ManagedRenewer {
         assert(@intFromPtr(params.runtime_config) != 0);
         assert(@intFromPtr(params.activate_ctx) != 0);
@@ -270,6 +306,9 @@ pub const ManagedRenewer = struct {
         return service;
     }
 
+    /// Builds a managed renewer from ACME configuration and runtime services.
+    /// `params.activate_ctx` and `params.hook_provider` must be non-null and remain valid for the lifetime of the returned value.
+    /// Delegates to `init` after deriving the runtime config and check interval from `acme_config`.
     pub fn initFromAcmeConfig(params: ManagedFromAcmeConfigParams, io: Io) Error!ManagedRenewer {
         assert(@intFromPtr(params.activate_ctx) != 0);
         assert(@intFromPtr(params.hook_provider) != 0);
@@ -286,6 +325,9 @@ pub const ManagedRenewer = struct {
         }, io);
     }
 
+    /// Releases the ACME client and any OpenSSL client context owned by this instance.
+    /// Call this once when the managed renewer is no longer needed; the pointer fields inside the struct are not owned here.
+    /// After this returns, `client_ctx` is cleared to `null` and must not be reused.
     pub fn deinit(self: *ManagedRenewer) void {
         assert(@intFromPtr(self) != 0);
         assert(self.client_ctx == null or @intFromPtr(self.client_ctx.?) != 0);
@@ -297,6 +339,9 @@ pub const ManagedRenewer = struct {
         }
     }
 
+    /// Builds a stack-local `Renewer` view from the managed state and runs it.
+    /// The `ManagedRenewer` must remain alive for the full call because the returned `Renewer` borrows its buffers, client, signer, and config.
+    /// Returns any validation, scheduler, ACME, or fatal renewal error reported by `Renewer.run`.
     pub fn run(self: *ManagedRenewer, io: Io, shutdown: *std.atomic.Value(bool)) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(@intFromPtr(shutdown) != 0);

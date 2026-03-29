@@ -7,14 +7,36 @@ const std = @import("std");
 const assert = std.debug.assert;
 const config = @import("serval-core").config;
 
+/// Size of an HTTP/2 frame header in bytes.
+/// Frame headers are fixed at 9 bytes on the wire.
+/// Parsing and serialization helpers use this constant to validate buffer lengths.
 pub const frame_header_size_bytes: u32 = 9;
 
+/// `END_STREAM` frame flag bit.
+/// This value is the raw wire bit mask for the end-of-stream flag.
+/// It shares the same bit position as `flags_ack`, but applies to different frame types.
 pub const flags_end_stream: u8 = 0x1;
+/// `ACK` frame flag bit.
+/// This value is the raw wire bit mask for the acknowledgement flag.
+/// It shares the same bit position as `flags_end_stream`, but applies to different frame types.
 pub const flags_ack: u8 = 0x1;
+/// `END_HEADERS` frame flag bit.
+/// This value is the raw wire bit mask for the end-of-headers flag.
+/// Combine it with a frame header's `flags` field using bitwise operations.
 pub const flags_end_headers: u8 = 0x4;
+/// `PADDED` frame flag bit.
+/// This value is the raw wire bit mask for the padded flag.
+/// Combine it with a frame header's `flags` field using bitwise operations.
 pub const flags_padded: u8 = 0x8;
+/// `PRIORITY` frame flag bit.
+/// This value is the raw wire bit mask for the priority flag.
+/// Combine it with a frame header's `flags` field using bitwise operations.
 pub const flags_priority: u8 = 0x20;
 
+/// HTTP/2 frame type codes used on the wire.
+/// The numeric values match the protocol encoding for standard frame types.
+/// `.extension` is used for unknown or extension frame types.
+/// This enum is stored as `u8` so it can be written to and read from frame headers directly.
 pub const FrameType = enum(u8) {
     data = 0x0,
     headers = 0x1,
@@ -29,6 +51,10 @@ pub const FrameType = enum(u8) {
     extension = 0xff,
 };
 
+/// Decoded HTTP/2 frame header fields.
+/// `length` is the payload length in bytes, `frame_type` is the frame type, and `flags` is the raw flags octet.
+/// `stream_id` is the 31-bit stream identifier with the reserved bit cleared.
+/// This struct owns no memory and is copied by value.
 pub const FrameHeader = struct {
     length: u32,
     frame_type: FrameType,
@@ -36,6 +62,10 @@ pub const FrameHeader = struct {
     stream_id: u32,
 };
 
+/// Errors returned by frame header parsing and encoding helpers.
+/// `NeedMoreData` indicates the input buffer is incomplete.
+/// `FrameTooLarge` and `BufferTooSmall` report protocol-size and output-buffer validation failures.
+/// `InvalidFrameType` and `ReservedBitSet` are reserved for callers that perform stricter validation.
 pub const Error = error{
     NeedMoreData,
     InvalidFrameType,
@@ -44,6 +74,10 @@ pub const Error = error{
     BufferTooSmall,
 };
 
+/// Parses a 9-byte HTTP/2 frame header from `raw` and returns its decoded fields.
+/// Returns `error.NeedMoreData` if `raw` is shorter than the fixed header size, or `error.FrameTooLarge` if the encoded length exceeds `config.H2_MAX_FRAME_SIZE_BYTES`.
+/// Unknown frame-type codes are mapped to `.extension` rather than failing the parse.
+/// The reserved bit in the stream identifier is masked off in the returned `FrameHeader`.
 pub fn parseFrameHeader(raw: []const u8) Error!FrameHeader {
     assert(raw.len > 0);
     assert(frame_header_size_bytes == 9);
@@ -71,6 +105,10 @@ pub fn parseFrameHeader(raw: []const u8) Error!FrameHeader {
     };
 }
 
+/// Serializes `header` into the HTTP/2 wire-format frame header in `out`.
+/// Returns a slice backed by `out` containing exactly 9 bytes when successful.
+/// Fails with `error.BufferTooSmall` if `out` cannot hold the fixed-size header, or `error.FrameTooLarge` if `header.length` exceeds `config.H2_MAX_FRAME_SIZE_BYTES`.
+/// The caller must ensure `header.stream_id` fits in 31 bits; the reserved bit is not written.
 pub fn buildFrameHeader(out: []u8, header: FrameHeader) Error![]const u8 {
     assert(out.len > 0);
     assert(header.stream_id <= 0x7fff_ffff);

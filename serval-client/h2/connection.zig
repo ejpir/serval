@@ -30,6 +30,10 @@ const request_headers_frame_buffer_size_bytes: usize = config.H2_MAX_HEADER_BLOC
 const data_frame_buffer_size_bytes: usize = h2.frame_header_size_bytes + config.H2_MAX_FRAME_SIZE_BYTES;
 const window_update_frame_size_bytes: usize = h2.frame_header_size_bytes + h2.control.window_update_payload_size_bytes;
 
+/// Errors returned by HTTP/2 client connection setup and frame I/O.
+/// `ReadFailed` and `WriteFailed` report socket-level I/O failures.
+/// `ConnectionClosed` and `ConnectionClosing` indicate that the peer or local side is no longer accepting traffic.
+/// `WouldBlock`, `FrameLimitExceeded`, `SendWindowExhausted`, and `UnexpectedHandshakeFrame` cover transport, framing, and handshake conditions.
 pub const Error = error{
     ReadFailed,
     WriteFailed,
@@ -41,6 +45,10 @@ pub const Error = error{
     ConnectionClosing,
 } || runtime_mod.Error || h2.FrameError;
 
+/// Client-side HTTP/2 connection state tied to one socket.
+/// The socket pointer is borrowed; the caller retains ownership and must keep it valid for the lifetime of the connection.
+/// `init` and `initWithIo` initialize the runtime and can fail with `Error` if setup cannot be completed.
+/// Sending methods write directly to the underlying connection and propagate `Error` on I/O, protocol, or flow-control failures.
 pub const ClientConnection = struct {
     socket: *Socket,
     io: ?Io = null,
@@ -50,12 +58,18 @@ pub const ClientConnection = struct {
     pending_discard_len: usize = 0,
     frame_count: u32 = 0,
 
+    /// Initialize a client connection that uses the socket's default I/O path.
+    /// Requires a non-null socket pointer with an open file descriptor; the socket remains owned by the caller.
+    /// Propagates any error returned by shared connection initialization.
     pub fn init(socket: *Socket) Error!ClientConnection {
         assert(@intFromPtr(socket) != 0);
         assert(socket.get_fd() >= 0);
         return initMaybeIo(socket, null);
     }
 
+    /// Initialize a client connection that uses the provided I/O object for network operations.
+    /// Requires a non-null socket pointer with an open file descriptor; the socket remains owned by the caller.
+    /// Propagates any error returned by shared connection initialization.
     pub fn initWithIo(socket: *Socket, io: Io) Error!ClientConnection {
         assert(@intFromPtr(socket) != 0);
         assert(socket.get_fd() >= 0);
@@ -73,6 +87,9 @@ pub const ClientConnection = struct {
         };
     }
 
+    /// Send the client connection preface followed by the initial SETTINGS frame.
+    /// Requires an open socket and writes the runtime-encoded preface/settings bytes to the connection.
+    /// Propagates any error from frame encoding or writing.
     pub fn sendClientPrefaceAndSettings(self: *ClientConnection) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(self.socket.get_fd() >= 0);
@@ -83,6 +100,9 @@ pub const ClientConnection = struct {
         try self.writeAll(frame);
     }
 
+    /// Send the pending SETTINGS acknowledgment frame.
+    /// Requires that the peer settings ACK is still pending and writes the runtime's encoded ACK frame to the connection.
+    /// Propagates any error from frame encoding or writing.
     pub fn sendPendingSettingsAck(self: *ClientConnection) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(self.runtime.state.peer_settings_ack_pending);
@@ -92,6 +112,9 @@ pub const ClientConnection = struct {
         try self.writeAll(frame);
     }
 
+    /// Send an HTTP/2 `PING` acknowledgment frame with the provided opaque payload.
+    /// Requires an 8-byte payload and writes a frame whose length matches the preallocated buffer.
+    /// Propagates any error from frame encoding or writing.
     pub fn sendPingAck(
         self: *ClientConnection,
         opaque_data: [h2.control.ping_payload_size_bytes]u8,
@@ -105,6 +128,9 @@ pub const ClientConnection = struct {
         try self.writeAll(frame);
     }
 
+    /// Complete the HTTP/2 client handshake by sending the preface and waiting for the peer's settings state.
+    /// Loops until peer settings are received and acknowledged, or until `config.H2_MAX_INITIAL_PARSE_FRAMES` frames have been parsed.
+    /// Returns `error.ConnectionClosing`, `error.UnexpectedHandshakeFrame`, `error.MissingInitialSettings`, or `error.WriteFailed` for the corresponding handshake failure.
     pub fn completeHandshake(self: *ClientConnection) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(config.H2_MAX_INITIAL_PARSE_FRAMES > 0);
@@ -131,6 +157,9 @@ pub const ClientConnection = struct {
         if (self.runtime.state.peer_settings_ack_pending) return error.WriteFailed;
     }
 
+    /// Serialize request headers for a new request stream and write them to the connection.
+    /// Requires a non-empty request path; `request` and `effective_path` are borrowed inputs and are not retained.
+    /// Returns the allocated stream ID on success and propagates any error from header encoding or writing.
     pub fn sendRequestHeaders(
         self: *ClientConnection,
         request: *const Request,
@@ -146,6 +175,9 @@ pub const ClientConnection = struct {
         return write.stream_id;
     }
 
+    /// Send request body data for an existing stream.
+    /// Requires `stream_id > 0` and a payload length that fits in `u32`; an empty payload only sends a frame when `end_stream` is true.
+    /// Propagates any error from frame chunking or writing, and does not transfer ownership of `payload`.
     pub fn sendRequestData(
         self: *ClientConnection,
         stream_id: u32,
@@ -280,6 +312,9 @@ pub const ClientConnection = struct {
         return error.StreamNotFound;
     }
 
+    /// Send an HTTP/2 `RST_STREAM` frame for the given stream.
+    /// Requires `stream_id > 0` and writes the frame using the runtime's frame encoder.
+    /// Propagates any error returned by frame construction or by the underlying write.
     pub fn sendStreamReset(self: *ClientConnection, stream_id: u32, error_code_raw: u32) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(stream_id > 0);
@@ -292,6 +327,9 @@ pub const ClientConnection = struct {
         try self.writeAll(frame);
     }
 
+    /// Replenish the connection and stream receive windows after bytes have been consumed.
+    /// A `consumed_bytes` value of zero is a no-op; otherwise both window counters are incremented and WINDOW_UPDATE frames are sent.
+    /// Propagates any error from window accounting, frame निर्माण, or writing either update frame.
     pub fn replenishReceiveWindows(self: *ClientConnection, stream_id: u32, consumed_bytes: u32) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(stream_id > 0);
@@ -310,18 +348,27 @@ pub const ClientConnection = struct {
         try self.writeAll(stream_window_update);
     }
 
+    /// Receive and dispatch the next frame using the connection's default I/O path.
+    /// Requires that the discard bookkeeping is already consistent with the buffered receive data.
+    /// Propagates any error returned by the timeout-based receive path.
     pub fn receiveAction(self: *ClientConnection) Error!runtime_mod.ReceiveAction {
         assert(@intFromPtr(self) != 0);
         assert(self.pending_discard_len <= self.recv_len);
         return self.receiveActionTimeout(null, .none);
     }
 
+    /// Receive and dispatch the next frame using the provided I/O source.
+    /// Requires an open socket and delegates to `receiveActionTimeout` with no receive timeout.
+    /// Propagates any error returned by the timeout-based receive path.
     pub fn receiveActionIo(self: *ClientConnection, io: Io) Error!runtime_mod.ReceiveAction {
         assert(@intFromPtr(self) != 0);
         assert(self.socket.get_fd() >= 0);
         return self.receiveActionTimeout(io, .none);
     }
 
+    /// Read the next HTTP/2 frame, finalize any pending discard state, and dispatch the frame to the runtime.
+    /// Requires that `pending_discard_len` does not exceed the buffered receive length and that the frame budget has not been exhausted.
+    /// Returns `error.FrameLimitExceeded` when the frame limit is reached, `error.ConnectionClosed` when no more data can be read, and propagates parse or runtime errors.
     pub fn receiveActionTimeout(self: *ClientConnection, maybe_io: ?Io, timeout: Io.Timeout) Error!runtime_mod.ReceiveAction {
         assert(@intFromPtr(self) != 0);
         assert(self.pending_discard_len <= self.recv_len);
@@ -341,18 +388,27 @@ pub const ClientConnection = struct {
         return action;
     }
 
+    /// Receive and dispatch the next frame while skipping over control frames.
+    /// Uses the connection's default I/O path and no timeout, and stops after `config.H2_CLIENT_MAX_FRAME_COUNT` frames.
+    /// Returns `error.FrameLimitExceeded` if the control-frame bound is reached, and otherwise propagates receive or runtime errors.
     pub fn receiveActionHandlingControl(self: *ClientConnection) Error!runtime_mod.ReceiveAction {
         assert(@intFromPtr(self) != 0);
         assert(config.H2_CLIENT_MAX_FRAME_COUNT > 0);
         return self.receiveActionHandlingControlTimeout(null, .none);
     }
 
+    /// Receive and dispatch the next frame using the provided I/O source.
+    /// Requires an open socket and delegates to `receiveActionHandlingControlTimeout` with no receive timeout.
+    /// Propagates any error returned by the timeout-based receive path.
     pub fn receiveActionHandlingControlIo(self: *ClientConnection, io: Io) Error!runtime_mod.ReceiveAction {
         assert(@intFromPtr(self) != 0);
         assert(self.socket.get_fd() >= 0);
         return self.receiveActionHandlingControlTimeout(io, .none);
     }
 
+    /// Receive and dispatch the next frame while continuing past control frames.
+    /// Stops after `config.H2_CLIENT_MAX_FRAME_COUNT` control frames and returns `error.FrameLimitExceeded` if that bound is reached.
+    /// Uses `maybe_io` and `timeout` for frame reads, and propagates any I/O, parse, or runtime errors from the underlying receive path.
     pub fn receiveActionHandlingControlTimeout(
         self: *ClientConnection,
         maybe_io: ?Io,

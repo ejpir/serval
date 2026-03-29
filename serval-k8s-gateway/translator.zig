@@ -54,6 +54,11 @@ const MAX_ROUTE_ITERATIONS: u32 = @as(u32, MAX_ROUTES) * @as(u32, gw_config.MAX_
 // Error Types
 // ============================================================================
 
+/// Errors returned by the K8s gateway translator when generating JSON output.
+/// These cover capacity limits in the input config, invalid config references,
+/// and lookup failures while resolving backend services or route pools.
+/// `BufferTooSmall` indicates the caller-provided output buffer was insufficient.
+/// `NoRoutes` is returned when translation produces no routes, including empty configs.
 pub const TranslatorError = error{
     /// JSON output buffer is too small.
     BufferTooSmall,

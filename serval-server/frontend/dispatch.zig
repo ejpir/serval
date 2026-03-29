@@ -8,12 +8,20 @@ const assert = std.debug.assert;
 const config = @import("serval-core").config;
 const TLSStream = @import("serval-tls").TLSStream;
 
+/// Dispatch outcome for a TLS-terminated frontend connection.
+/// `continue_h1` preserves HTTP/1 parsing, `generic_h2` uses the generic
+/// HTTP/2 frontend path, and `terminated_h2` uses the terminated HTTP/2 path.
+/// The selected value is returned by the ALPN dispatch helpers.
 pub const TlsDispatchAction = enum {
     continue_h1,
     generic_h2,
     terminated_h2,
 };
 
+/// Reads the negotiated ALPN from `maybe_tls` and dispatches from it.
+/// A `null` TLS stream is treated as having no ALPN and returns
+/// `continue_h1`.
+/// This function does not allocate or return errors.
 pub fn selectTlsAlpnDispatchAction(
     maybe_tls: ?*TLSStream,
     frontend_mode: config.TlsH2FrontendMode,
@@ -23,6 +31,11 @@ pub fn selectTlsAlpnDispatchAction(
     return selectTlsAlpnDispatchActionFromAlpn(alpn, frontend_mode, has_terminated_h2_handler);
 }
 
+/// Selects the dispatch action from the negotiated ALPN value.
+/// A missing ALPN or any value other than exact `h2` keeps the request on
+/// the HTTP/1 path.
+/// When `h2` is negotiated, the result depends on frontend mode and whether a
+/// terminated HTTP/2 handler is available.
 pub fn selectTlsAlpnDispatchActionFromAlpn(
     alpn: ?[]const u8,
     frontend_mode: config.TlsH2FrontendMode,

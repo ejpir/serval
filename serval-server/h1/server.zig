@@ -183,6 +183,10 @@ fn set_client_endpoint_from_socket(ctx: *Context, socket_fd: i32) EndpointResolv
 // Server
 // =============================================================================
 
+/// Returns the concrete HTTP/1 server type for the given handler, pool, metrics, and tracer types.
+/// The supplied types are verified at compile time against the required Serval interfaces,
+/// including websocket handler extensions, pool, metrics, and tracer contracts.
+/// Instances of the returned type store pointers to externally owned dependencies and use the provided config and runtime wiring.
 pub fn Server(
     comptime Handler: type,
     comptime Pool: type,
@@ -222,6 +226,10 @@ pub fn Server(
         /// Null when server-side TLS is disabled or run() is not active.
         tls_ctx_manager_ptr: ?*ReloadableServerCtx = null,
 
+        /// Errors that can be returned while reloading the server TLS context from PEM files.
+        /// `TlsReloadUnavailable` is returned when no reloadable server TLS manager is currently published.
+        /// This set also includes control-mutex acquisition timeout errors, reload-manager errors,
+        /// and server-ctx creation errors from PEM input.
         pub const ReloadServerTlsError = error{
             TlsReloadUnavailable,
         } || TlsReloadControlLockError || ReloadableServerCtxError || ssl.CreateServerCtxFromPemFilesError;
@@ -287,6 +295,10 @@ pub fn Server(
             self.tls_ctx_manager_ptr = null;
         }
 
+        /// Initializes the top-level H1 server with the supplied dependencies and configuration.
+        /// The forwarder is built immediately with the pool, tracer, client context, and DNS configuration.
+        /// Uses `cfg.tls.verify_upstream` when present, otherwise defaults upstream TLS verification to `true`.
+        /// `client_ctx` is stored but not owned; the caller remains responsible for its lifetime.
         pub fn init(
             handler: *Handler,
             pool: *Pool,
@@ -924,6 +936,9 @@ pub fn Server(
                 };
             }
 
+            /// Delegates H2 header handling to the wrapped handler.
+            /// Any error returned by the inner handler is surfaced unchanged to the caller.
+            /// `writer` is forwarded unchanged.
             pub fn handleH2Headers(
                 self: *@This(),
                 stream_id: u32,
@@ -934,6 +949,9 @@ pub fn Server(
                 return self.inner.handleH2Headers(stream_id, request, end_stream, writer);
             }
 
+            /// Delegates H2 DATA handling to the wrapped handler.
+            /// Any error returned by the inner handler is surfaced unchanged to the caller.
+            /// `writer` is forwarded unchanged.
             pub fn handleH2Data(
                 self: *@This(),
                 stream_id: u32,
@@ -944,18 +962,28 @@ pub fn Server(
                 return self.inner.handleH2Data(stream_id, payload, end_stream, writer);
             }
 
+            /// Forwards H2 stream-reset notifications to the inner handler when supported.
+            /// The `stream_id` and raw error code are passed through unchanged.
+            /// If the handler does not implement the hook, this is a no-op.
             pub fn handleH2StreamReset(self: *@This(), stream_id: u32, error_code_raw: u32) void {
                 if (comptime @hasDecl(Handler, "handleH2StreamReset")) {
                     self.inner.handleH2StreamReset(stream_id, error_code_raw);
                 }
             }
 
+            /// Forwards H2 connection-close notifications to the inner handler when supported.
+            /// The `goaway` frame is passed through unchanged.
+            /// If the handler does not implement the hook, this is a no-op.
             pub fn handleH2ConnectionClose(self: *@This(), goaway: serval_h2.GoAway) void {
                 if (comptime @hasDecl(Handler, "handleH2ConnectionClose")) {
                     self.inner.handleH2ConnectionClose(goaway);
                 }
             }
 
+            /// Starts metrics, tracing, and stream bookkeeping for a newly opened H2 stream.
+            /// Creates a request span, stores the stream metadata, and annotates supported tracer attributes.
+            /// Forwards the open event to the inner handler when that hook exists.
+            /// `request` must remain valid for the duration of the call.
             pub fn handleH2StreamOpen(self: *@This(), stream_id: u32, request: *const Request) void {
                 if (self.emit_stream_metrics) {
                     self.metrics.requestStart();
@@ -990,6 +1018,10 @@ pub fn Server(
                 }
             }
 
+            /// Records stream completion metrics, tracing, and optional structured logs for a closed H2 stream.
+            /// Removes the stream from local bookkeeping before emitting spans or logs.
+            /// Forwards the close notification to the inner handler when that hook exists.
+            /// `summary` supplies the final status, byte counts, duration, and error metadata.
             pub fn handleH2StreamClose(self: *@This(), summary: h2_server.StreamSummary) void {
                 const status = streamSummaryStatus(summary);
                 if (self.emit_stream_metrics) {
@@ -1274,6 +1306,9 @@ pub fn Server(
             pending_resets: [pending_reset_capacity]PendingReset = [_]PendingReset{.{}} ** pending_reset_capacity,
             grpc_completion_policy: GrpcCompletionPolicy = .{},
 
+            /// Error set returned by the H2 bridge adapter.
+            /// Covers upstream selection, protocol validation, binding/state lookup, and bridge/runtime failures.
+            /// Use this type for callers that need to handle bridge-specific H2 errors as a single group.
             pub const BridgeError = error{
                 UpstreamRejected,
                 UnsupportedProtocol,
@@ -1285,6 +1320,10 @@ pub fn Server(
                 TooManyTrackedGrpcCompletionStreams,
             } || serval_proxy.H2StreamBridgeError || h2_server.Error;
 
+            /// Initializes a bridge handler for one connection.
+            /// Stores the supplied handler, I/O runtime, bridge client, session pool, and connection context without taking ownership.
+            /// The bridge is initialized immediately and tagged with the connection ID for debug logging.
+            /// All input pointers must remain valid for the lifetime of the returned instance.
             pub fn init(
                 inner: *Handler,
                 io: Io,
@@ -1307,6 +1346,9 @@ pub fn Server(
                 return instance;
             }
 
+            /// Shuts down bridge background work and deinitializes the stream bridge.
+            /// Cancels the upstream-reader group if it was started, then marks it stopped.
+            /// This does not free the caller-owned `self` or any external dependencies.
             pub fn deinit(self: *@This()) void {
                 assert(@intFromPtr(self) != 0);
                 if (self.upstream_reader_started) {
@@ -1321,6 +1363,10 @@ pub fn Server(
                 self.bridge.deinit();
             }
 
+            /// Starts the upstream-reader background task and stores the current writer template and connection mutex.
+            /// If the task is already running, the stored pointers are refreshed and no second task is spawned.
+            /// Launch failures are logged and leave `upstream_reader_started` false.
+            /// The provided pointers must remain valid until the background task is stopped.
             pub fn startH2BackgroundTasks(
                 self: *@This(),
                 writer_template: *h2_server.ResponseWriter,
@@ -1346,6 +1392,9 @@ pub fn Server(
                 log.debug("h2 bridge: conn={d} started upstream reader task", .{self.connection_ctx.connection_id});
             }
 
+            /// Stops the upstream-reader background task group if it is running.
+            /// Sets the stop flag, cancels the task group, and clears the started state.
+            /// If no background task was started, this is a no-op.
             pub fn stopH2BackgroundTasks(self: *@This()) void {
                 assert(@intFromPtr(self) != 0);
 
@@ -1413,6 +1462,10 @@ pub fn Server(
                 return null;
             }
 
+            /// Opens a downstream bridge stream for an incoming H2 request and tracks bridge-side state.
+            /// Returns `UpstreamConnectionClosing` for a pending reset and `UnsupportedProtocol` for unsupported upstreams.
+            /// `request` is used to choose the upstream and `end_stream` is forwarded to the bridge open call.
+            /// `writer` is intentionally ignored.
             pub fn handleH2Headers(
                 self: *@This(),
                 stream_id: u32,
@@ -1482,6 +1535,10 @@ pub fn Server(
                 }
             }
 
+            /// Forwards DATA frames to the downstream bridge for an already-open stream.
+            /// Returns `UpstreamConnectionClosing` if a reset was already recorded for `stream_id`.
+            /// Returns `MissingBinding` when no downstream binding exists for the stream.
+            /// `payload` is sent under the bridge mutex and `writer` is intentionally ignored.
             pub fn handleH2Data(
                 self: *@This(),
                 stream_id: u32,
@@ -1508,6 +1565,10 @@ pub fn Server(
                 try self.bridge.sendDownstreamData(stream_id, payload, end_stream);
             }
 
+            /// Cancels a pending downstream reset for `stream_id` and clears local tracking.
+            /// `stream_id == 0` is ignored. Matching gRPC completion tracking is removed first.
+            /// Bridge cancellation errors for missing bindings, streams, or sessions are swallowed.
+            /// `error_code_raw` is forwarded to the downstream cancel path unchanged.
             pub fn handleH2StreamReset(self: *@This(), stream_id: u32, error_code_raw: u32) void {
                 assert(@intFromPtr(self) != 0);
                 if (stream_id == 0) return;
@@ -3625,6 +3686,9 @@ pub fn MinimalServer(comptime Handler: type) type {
 const TestHandler = struct {
     call_count: u32 = 0,
 
+    /// Increments `call_count` and returns a fixed loopback upstream.
+    /// `ctx` and `request` are ignored by this test helper.
+    /// The returned upstream always targets `127.0.0.1:8001` with index `0`.
     pub fn selectUpstream(self: *@This(), ctx: *Context, request: *const Request) types.Upstream {
         _ = ctx;
         _ = request;

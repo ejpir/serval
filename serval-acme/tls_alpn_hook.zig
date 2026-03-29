@@ -12,6 +12,10 @@ const ssl = tls.ssl;
 const max_domain_len: u8 = 253;
 const lock_max_attempts: u32 = 1_000_000;
 
+/// Errors returned by `TlsAlpnHookProvider` validation and lifecycle methods.
+/// `DomainTooLong` means the supplied domain exceeds `max_domain_len`; `InvalidDomain` means the domain slice was empty.
+/// `HookInUse` reports a conflicting global hook, and `NotInstalled` reports that the provider is not installed.
+/// `MissingCtx` is part of the public error set for callers that need to signal an absent SSL context.
 pub const Error = error{
     DomainTooLong,
     InvalidDomain,
@@ -34,6 +38,9 @@ fn storeInstalledProvider(provider: ?*TlsAlpnHookProvider) void {
     @atomicStore(?*TlsAlpnHookProvider, &installed_provider, provider, .release);
 }
 
+/// Fixed-capacity state for the process-wide ACME TLS-ALPN hook provider.
+/// Use `init`, `install`, `activateChallenge`, `clearChallenge`, and `uninstall` as one lifecycle.
+/// The provider stores only borrowed pointers and copies the selected domain into internal storage.
 pub const TlsAlpnHookProvider = struct {
     mutex: std.atomic.Mutex = .unlocked,
     installed: bool = false,
@@ -42,12 +49,18 @@ pub const TlsAlpnHookProvider = struct {
     domain_len: u8 = 0,
     domain_buf: [max_domain_len]u8 = [_]u8{0} ** max_domain_len,
 
+    /// Returns a zero-initialized `TlsAlpnHookProvider` with no hooks installed and no active challenge.
+    /// The returned value owns no external resources and can be used immediately with `install`.
+    /// Assertions in this constructor rely on the module constants remaining valid.
     pub fn init() TlsAlpnHookProvider {
         assert(max_domain_len > 0);
         assert(lock_max_attempts > 0);
         return .{};
     }
 
+    /// Installs this provider's process-wide ALPN and certificate hooks.
+    /// Returns immediately if the provider is already installed; otherwise it fails with `error.HookInUse` if another hook/provider is active.
+    /// State changes are serialized with the internal mutex, and the provider is marked installed on success.
     pub fn install(self: *TlsAlpnHookProvider) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(self.domain_len <= max_domain_len);
@@ -66,6 +79,9 @@ pub const TlsAlpnHookProvider = struct {
         self.installed = true;
     }
 
+    /// Removes this provider's process-wide ALPN and certificate hooks.
+    /// Fails with `error.NotInstalled` if the provider is not installed or is no longer the installed instance.
+    /// On success, the provider is detached and its challenge state and stored domain are cleared.
     pub fn uninstall(self: *TlsAlpnHookProvider) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(self.domain_len <= max_domain_len);
@@ -85,6 +101,10 @@ pub const TlsAlpnHookProvider = struct {
         self.domain_len = 0;
     }
 
+    /// Activates TLS-ALPN-01 handling for one domain and challenge certificate context.
+    /// `domain` must be non-empty and no longer than `max_domain_len`; the domain bytes are copied into the provider.
+    /// `challenge_ctx` is borrowed, not owned, and must remain valid while the challenge is active.
+    /// Returns `error.NotInstalled` if the provider is not currently installed.
     pub fn activateChallenge(
         self: *TlsAlpnHookProvider,
         domain: []const u8,
@@ -107,6 +127,9 @@ pub const TlsAlpnHookProvider = struct {
         self.challenge_active = true;
     }
 
+    /// Disables the currently active challenge and clears stored domain/context state.
+    /// Returns `error.NotInstalled` if the provider has not been installed.
+    /// This only resets challenge state; it does not uninstall the process-wide hooks.
     pub fn clearChallenge(self: *TlsAlpnHookProvider) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(self.domain_len <= max_domain_len);

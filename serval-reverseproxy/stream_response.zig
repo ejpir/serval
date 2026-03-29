@@ -7,12 +7,18 @@ const config = core.config;
 const sdk = @import("serval-filter-sdk");
 const request_stream = @import("stream_request.zig");
 
+/// Describes how response bytes should be framed on the wire.
+/// `h1_content_length` and `h1_chunked` are HTTP/1.1 plans; `h2_data_stream` is used for HTTP/2.
+/// Use this to decide whether the response needs a content-length header or chunked transfer encoding.
 pub const ResponseFramingPlan = enum(u8) {
     h1_content_length,
     h1_chunked,
     h2_data_stream,
 };
 
+/// Chooses the response framing plan for the negotiated HTTP protocol.
+/// For HTTP/1.1, transformed responses without a known length use chunked framing; otherwise content length framing is used.
+/// For HTTP/2 and HTTP/2 cleartext, the response is always treated as a data stream.
 pub fn planResponseFraming(protocol: core.HttpProtocol, transformed: bool, content_length_known: bool) ResponseFramingPlan {
     assert(@intFromEnum(protocol) <= @intFromEnum(core.HttpProtocol.h2));
 
@@ -22,17 +28,26 @@ pub fn planResponseFraming(protocol: core.HttpProtocol, transformed: bool, conte
     };
 }
 
+/// Returns whether the response should carry an explicit `Content-Length` header.
+/// Only the `h1_content_length` framing plan emits a content length.
+/// Other framing plans stream without a content-length declaration.
 pub fn shouldEmitContentLength(plan: ResponseFramingPlan) bool {
     assert(@intFromEnum(plan) <= @intFromEnum(ResponseFramingPlan.h2_data_stream));
     return plan == .h1_content_length;
 }
 
+/// Captures how a response stream was processed during execution.
+/// Tracks header, chunk, and end callback counts, plus the total bytes emitted.
+/// Call `init()` to obtain a zeroed observation before passing it to stream execution.
 pub const ResponseObservation = struct {
     response_headers_calls: u32,
     response_chunk_calls: u32,
     response_end_calls: u32,
     emitted_bytes: u64,
 
+    /// Creates a zero-initialized `ResponseObservation`.
+    /// All callback counters and the emitted-byte total start at zero.
+    /// Use this before executing a response stream if you need to collect metrics.
     pub fn init() ResponseObservation {
         return .{
             .response_headers_calls = 0,
@@ -43,6 +58,10 @@ pub const ResponseObservation = struct {
     }
 };
 
+/// Drives a filter through the full response stream lifecycle.
+/// Calls `onResponseHeaders`, then each chunk after `waitWritable()`, and finally `onResponseEnd`.
+/// Propagates backpressure errors with `try` and returns the first filter rejection unchanged.
+/// Updates `observation` with callback counts and the emit writer's final emitted byte total.
 pub fn executeResponseStream(
     comptime Filter: type,
     filter: *Filter,
@@ -115,6 +134,9 @@ test "response stream lifecycle executes headers/chunks/end" {
         chunk_calls: u32 = 0,
         end_calls: u32 = 0,
 
+        /// Records that response headers were delivered to this test filter.
+        /// The `ctx` and `headers` parameters are accepted for API compatibility and are not used.
+        /// Increments the header-call counter and always continues filtering.
         pub fn onResponseHeaders(self: *@This(), ctx: *sdk.FilterContext, headers: sdk.HeaderSliceView) sdk.Decision {
             _ = ctx;
             _ = headers;
@@ -122,6 +144,9 @@ test "response stream lifecycle executes headers/chunks/end" {
             return .continue_filtering;
         }
 
+        /// Records a response chunk callback and forwards the chunk bytes to the emit writer.
+        /// The `ctx` parameter is accepted for API compatibility and is not used.
+        /// Returns a 500 rejection with reason `"emit"` if writing the chunk bytes fails.
         pub fn onResponseChunk(self: *@This(), ctx: *sdk.FilterContext, chunk: sdk.ChunkView, emit: *sdk.EmitWriter) sdk.Decision {
             _ = ctx;
             self.chunk_calls += 1;
@@ -129,6 +154,9 @@ test "response stream lifecycle executes headers/chunks/end" {
             return .continue_filtering;
         }
 
+        /// Records that the response stream has ended for this test filter.
+        /// The `ctx` and `emit` parameters are accepted for API compatibility and are not used.
+        /// Increments the end-call counter and always continues filtering.
         pub fn onResponseEnd(self: *@This(), ctx: *sdk.FilterContext, emit: *sdk.EmitWriter) sdk.Decision {
             _ = ctx;
             _ = emit;

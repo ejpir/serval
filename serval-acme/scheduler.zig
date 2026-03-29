@@ -13,31 +13,52 @@ const config = core.config;
 const time = core.time;
 const backoff_mod = @import("backoff.zig");
 
+/// Errors returned by scheduler configuration and execution.
+/// `InvalidCheckInterval` is raised when the polling interval is zero, `FatalFailure` signals an unrecoverable callback result, and `MaxIterationsExceeded` caps the run loop.
+/// These errors describe scheduler-level failures only; I/O cancellation is reported separately through `Io.Cancelable`.
 pub const Error = error{
     InvalidCheckInterval,
     FatalFailure,
     MaxIterationsExceeded,
 };
 
+/// Outcome of the renewal decision callback.
+/// `skip` means nothing should be issued now and the scheduler should wait for the next normal check interval.
+/// `renew_now` requests immediate issuance, while `fatal_failure` aborts the scheduler with `error.FatalFailure`.
 pub const ShouldRenewResult = enum {
     skip,
     renew_now,
     fatal_failure,
 };
 
+/// Outcome of the renewal issuance callback.
+/// `success` means the renewal step completed and the scheduler may resume the normal check interval.
+/// `transient_failure` keeps retrying with backoff, while `fatal_failure` aborts the scheduler with `error.FatalFailure`.
 pub const IssueResult = enum {
     success,
     transient_failure,
     fatal_failure,
 };
 
+/// Callback used to decide whether the scheduler should renew at a given monotonic timestamp.
+/// The function receives the opaque scheduler context and the current time in nanoseconds.
+/// It returns a `ShouldRenewResult` and must not retain the passed context pointer unless the caller's lifetime guarantees permit it.
 pub const ShouldRenewFn = *const fn (ctx: *anyopaque, now_ns: u64) ShouldRenewResult;
+/// Callback used to issue or trigger the ACME renewal action.
+/// The function receives the opaque scheduler context plus the I/O handle to use for side effects.
+/// It returns an `IssueResult` and does not transfer ownership of either argument.
 pub const IssueFn = *const fn (ctx: *anyopaque, io: Io) IssueResult;
 
+/// Scheduler configuration used to control polling cadence and loop bounds.
+/// `check_interval_ms` sets the nominal delay between successful checks, and `max_iterations` limits the run loop.
+/// Use `init` to validate the interval before constructing a config for production use.
 pub const Config = struct {
     check_interval_ms: u32,
     max_iterations: u32 = 1_000_000_000,
 
+    /// Validate and construct a polling configuration.
+    /// `check_interval_ms` must be non-zero or `error.InvalidCheckInterval` is returned.
+    /// The function leaves all other policy fields at their default values.
     pub fn init(check_interval_ms: u32) Error!Config {
         assert(config.ACME_MAX_POLL_ATTEMPTS > 0);
         assert(check_interval_ms <= std.math.maxInt(u32));
@@ -46,10 +67,16 @@ pub const Config = struct {
     }
 };
 
+/// Result of one scheduler step.
+/// `sleep_until_ns` is an absolute monotonic deadline; the caller should sleep until that time when it is in the future.
+/// A deadline less than or equal to the current time means the scheduler wants to continue immediately.
 pub const StepAction = struct {
     sleep_until_ns: u64,
 };
 
+/// Stateful ACME renewal scheduler that tracks callback wiring and retry state.
+/// Use `init` to construct a valid instance, then call `step` for single-shot decisions or `run` for the polling loop.
+/// The scheduler keeps transient failure count and the next scheduled check timestamp in its own state.
 pub const Scheduler = struct {
     config: Config,
     backoff: backoff_mod.BoundedBackoff,
@@ -60,6 +87,9 @@ pub const Scheduler = struct {
     consecutive_failures: u16 = 0,
     next_check_ns: u64 = 0,
 
+    /// Create a scheduler with the supplied configuration, backoff policy, context, and callback functions.
+    /// The context pointer must be non-null and the check interval must be greater than zero.
+    /// The returned scheduler owns no heap memory; it stores the provided pointers and function references for later calls.
     pub fn init(
         scheduler_config: Config,
         backoff: backoff_mod.BoundedBackoff,
@@ -79,6 +109,9 @@ pub const Scheduler = struct {
         };
     }
 
+    /// Run the scheduler loop until shutdown, sleep interruption, or the configured iteration limit.
+    /// Each iteration reads the current monotonic time, calls `step`, and sleeps until the returned deadline when one is in the future.
+    /// Returns `error.MaxIterationsExceeded` if the loop reaches `config.max_iterations`, and otherwise propagates errors from `step` or sleeping.
     pub fn run(
         self: *Scheduler,
         io: Io,
@@ -107,6 +140,9 @@ pub const Scheduler = struct {
         return error.MaxIterationsExceeded;
     }
 
+    /// Advance the scheduler once at the given monotonic timestamp.
+    /// If the next check is still in the future, returns that deadline without invoking callbacks.
+    /// Otherwise it consults `should_renew_fn`, then `issue_fn` when renewal is required, and propagates `error.FatalFailure` on unrecoverable callback failure.
     pub fn step(self: *Scheduler, now_ns: u64, io: Io) Error!StepAction {
         assert(@intFromPtr(self) != 0);
         assert(now_ns > 0);

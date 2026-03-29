@@ -8,6 +8,9 @@ const types = @import("types.zig");
 
 const time = core.time;
 
+/// Incremental update produced by burst-tracking logic for a single evaluation step.
+/// `tracker_degraded` is `true` when the tracker is in a degraded state after the update.
+/// The zero/default value (`.{} `) means no degradation signal (`tracker_degraded == false`).
 pub const OutcomeUpdate = struct {
     tracker_degraded: bool = false,
 };
@@ -32,6 +35,10 @@ const Entry = struct {
     path_hashes: [types.MAX_TRACKED_PATH_HASHES]u64 = [_]u64{0} ** types.MAX_TRACKED_PATH_HASHES,
 };
 
+/// Tracks burst-observation state per client in a fixed-capacity, in-place slot table over a nanosecond window.
+/// Call `init` before use; it requires non-null `self` and `config` and derives enabled/capacity/retry settings from `types.Config`.
+/// All state is owned by `Tracker` (embedded `slots`, no heap ownership or external lifetime requirements).
+/// Public operations are non-throwing; if the internal lock cannot be acquired, results are marked with `tracker_degraded = true`.
 pub const Tracker = struct {
     enabled: bool,
     window_ns: u64,
@@ -40,6 +47,11 @@ pub const Tracker = struct {
     lock: std.atomic.Value(u8),
     slots: [types.MAX_TRACKER_CAPACITY]Entry,
 
+    /// Initializes `Tracker` from `config`, overwriting all existing state in `self`.
+    /// Preconditions: `self` and `config` must be non-null (enforced via `assert`).
+    /// Copies burst settings from `config`; when burst tracking is disabled, sets `capacity = 0` and `retry_budget = 1`.
+    /// Resets the lock to unlocked and initializes every slot up to `types.MAX_TRACKER_CAPACITY` with a zero-value `Entry`.
+    /// Does not take ownership of `config`; it is only read during this call and this function cannot fail.
     pub fn init(self: *Tracker, config: *const types.Config) void {
         assert(@intFromPtr(self) != 0);
         assert(@intFromPtr(config) != 0);
@@ -58,6 +70,11 @@ pub const Tracker = struct {
         }
     }
 
+    /// Returns a point-in-time behavioral snapshot for `input.client_addr` from the tracker's current window.
+    /// If tracking is disabled, or no slot exists for the client, returns an empty/default `types.BehavioralSnapshot` (`.{}`).
+    /// If the internal lock cannot be acquired immediately, returns `.{ .tracker_degraded = true }` to signal contention/degraded read.
+    /// Requires valid `self` and `input` pointers; this function only reads tracker state and does not take ownership of `input`.
+    /// Never throws errors; degradation and missing state are represented in returned snapshot fields.
     pub fn snapshot(self: *Tracker, input: *const types.InspectionInput) types.BehavioralSnapshot {
         if (!self.enabled) return .{};
         const now_ns = time.monotonicNanos();
@@ -79,6 +96,10 @@ pub const Tracker = struct {
         };
     }
 
+    /// Commits one inspected request into the tracker and returns an `OutcomeUpdate` with degradation state.
+    /// If tracking is disabled, it is a no-op and returns an empty update; if the tracker lock cannot be acquired, it returns `.tracker_degraded = true`.
+    /// On success, it updates the client entry for `input.client_addr`, resets an expired window, sets `last_seen_ns`, and saturating-increments `request_count`.
+    /// It also records the lowercased path hash and sensitive-path family for the entry; `input` is read-only and must remain valid for this call.
     pub fn commitRequest(self: *Tracker, input: *const types.InspectionInput) OutcomeUpdate {
         if (!self.enabled) return .{};
         const now_ns = time.monotonicNanos();
@@ -97,6 +118,11 @@ pub const Tracker = struct {
         return .{ .tracker_degraded = degraded };
     }
 
+    /// Records a miss/reject outcome for `client_addr` and returns tracker health in `OutcomeUpdate`.
+    /// No-op (returns `.{} `) when tracking is disabled or when both `is_miss` and `is_reject` are false.
+    /// Uses `client_addr` only to hash and locate/create the per-client entry; the slice is not retained.
+    /// If the tracker lock cannot be acquired, returns `{ .tracker_degraded = true }` without updating counters.
+    /// On success, refreshes the client window/timestamp and saturating-increments `miss_reject_count`.
     pub fn commitOutcome(self: *Tracker, client_addr: []const u8, is_miss: bool, is_reject: bool) OutcomeUpdate {
         if (!self.enabled) return .{};
         if (!is_miss and !is_reject) return .{};

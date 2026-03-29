@@ -12,6 +12,10 @@ const HttpProtocol = core.HttpProtocol;
 // Forward Errors
 // =============================================================================
 
+/// Errors that can be returned while forwarding a request to an upstream backend.
+/// Covers connection setup, DNS/address validation, request send/response receive, and response parsing/size limits.
+/// Includes backend capability/protocol mismatches (`ConnectTimeoutUnsupported`, `UnsupportedProtocol`) and transport failures (`StaleConnection`, `SpliceFailed`).
+/// Callers should handle these as forward-path failures and branch on specific tags when retryability or reporting differs.
 pub const ForwardError = error{
     /// Failed to connect to upstream
     ConnectFailed,
@@ -43,6 +47,11 @@ pub const ForwardError = error{
 // Forward Result
 // =============================================================================
 
+/// Summary of a completed upstream forward attempt: HTTP `status`, total `response_bytes`, and whether the upstream connection was reused.
+/// Includes nanosecond timing breakdown fields (`*_ns`) for DNS, TCP connect, send, receive, and pool wait phases (all default to `0`).
+/// `upstream_local_port` is the local source port used for the upstream connection, defaulting to `0` when unavailable/unset.
+/// This is a plain value struct with no owned resources or cleanup requirements.
+/// Error details are not represented here; failures are expected to be reported via separate error-return paths.
 pub const ForwardResult = struct {
     // Core response metadata
     status: u16,

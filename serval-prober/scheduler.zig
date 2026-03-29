@@ -15,11 +15,19 @@ const HealthState = health_mod.HealthState;
 const UpstreamIndex = core.config.UpstreamIndex;
 const SHUTDOWN_POLL_MS: u32 = 100;
 
+/// Adapter that binds an opaque probe state pointer to a concrete probe callback.
+/// `context` is type-erased and passed back to `probeFn` unchanged on each probe attempt.
+/// Callers must ensure `context` remains valid for every invocation using this adapter.
+/// The callback reports probe outcome via `bool`; no error union is propagated by this interface.
 pub const ProbeAdapter = struct {
     context: *anyopaque,
     probeFn: *const fn (context: *anyopaque, upstream: Upstream, io: Io) bool,
 };
 
+/// Context bundle consumed by the probe scheduler to run health checks for configured upstreams.
+/// `upstreams` is a borrowed, immutable slice; the pointed data must outlive all scheduler use.
+/// `health` and `probe_running` are shared mutable state pointers and must remain valid for the same lifetime.
+/// `probe_interval_ms` configures probe cadence, and `adapter` provides the probe execution mechanism.
 pub const SchedulerContext = struct {
     upstreams: []const Upstream,
     health: *HealthState,
@@ -28,6 +36,11 @@ pub const SchedulerContext = struct {
     adapter: ProbeAdapter,
 };
 
+/// Runs the unhealthy-probe loop using the provided I/O implementation.
+/// Preconditions: `ctx.probe_interval_ms > 0` (enforced by assertion) and `ctx.probe_running` is initialized.
+/// While `ctx.probe_running` is `true`, this calls `probeUnhealthyOnce(ctx, io)` then sleeps via `interruptibleSleep`.
+/// The sleep is interruptible through `ctx.probe_running`; the function returns once the flag is observed `false`.
+/// This function returns no error; any failures must be handled by the called operations.
 pub fn runLoopWithIo(ctx: SchedulerContext, io: Io) void {
     assert(ctx.probe_interval_ms > 0);
 
@@ -50,6 +63,10 @@ fn interruptibleSleep(probe_running: *std.atomic.Value(bool), total_ms: u32, io:
     _ = io;
 }
 
+/// Probes each upstream that is currently marked unhealthy exactly once.
+/// Requires `ctx.upstreams.len > 0`; this is asserted before any probe runs.
+/// For every unhealthy upstream, calls `ctx.adapter.probeFn(ctx.adapter.context, upstream, io)` and records success in `ctx.health` when it returns `true`.
+/// Returns `void` and does not report probe failures; healthy upstreams are skipped.
 pub fn probeUnhealthyOnce(ctx: SchedulerContext, io: Io) void {
     assert(ctx.upstreams.len > 0);
 

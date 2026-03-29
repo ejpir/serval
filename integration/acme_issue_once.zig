@@ -8,6 +8,11 @@ const net = @import("serval-net");
 const client_mod = @import("serval-client");
 const tls = @import("serval-tls");
 
+/// Runs a one-shot ACME issuance against the local test directory and prints the persisted cert and key paths.
+/// Initializes the ACME runtime, DNS resolver, TLS client context, and account signer, then invokes issuance once.
+/// The stack buffers passed to `runAcmeIssuanceOnce` must remain valid for the duration of the call.
+/// The temporary ALPN hook provider is installed before issuance and uninstalled on return.
+/// Returns any error from runtime setup, hook installation, TLS/client initialization, or the issuance flow.
 pub fn main() !void {
     const io = std.Options.debug_io;
 

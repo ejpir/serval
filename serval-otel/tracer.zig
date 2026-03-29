@@ -32,6 +32,10 @@ pub const SpanProcessor = struct {
         onEndFn: *const fn (ptr: *anyopaque, span: Span) void,
     };
 
+    /// Dispatches span-end handling to the processor's vtable implementation.
+    /// Preconditions: `self` must reference a valid `SpanProcessor` instance with a live `ptr` and `onEndFn`.
+    /// `span` is passed through unchanged to the underlying processor; this function does not transfer ownership.
+    /// This API is infallible (`void`): any failure behavior is implementation-defined by the target `onEndFn`.
     pub fn onEnd(self: SpanProcessor, span: Span) void {
         self.vtable.onEndFn(self.ptr, span);
     }
@@ -39,6 +43,10 @@ pub const SpanProcessor = struct {
 
 /// No-op processor for when tracing is disabled
 pub const NoopProcessor = struct {
+    /// Returns a `SpanProcessor` view over this `NoopProcessor` instance.
+    /// The returned processor stores `self` in `.ptr` and binds only `.onEndFn` in its vtable.
+    /// `self` must remain valid for the full lifetime of any use of the returned `SpanProcessor`.
+    /// This is a plain value conversion with no allocation and no error path.
     pub fn asSpanProcessor(self: *NoopProcessor) SpanProcessor {
         return .{
             .ptr = self,
@@ -206,6 +214,10 @@ test "TracerProvider with processor" {
     const TestProcessor = struct {
         spans_received: u32 = 0,
 
+        /// Returns a `SpanProcessor` view of this tracer by binding `self` as the processor context.
+        /// The returned processor uses this type's `onEnd` callback in its vtable (`.onEndFn = onEnd`).
+        /// `self` is borrowed, not owned; it must remain valid for as long as the returned `SpanProcessor` is used.
+        /// This conversion is infallible and does not allocate.
         pub fn asSpanProcessor(self: *@This()) SpanProcessor {
             return .{
                 .ptr = self,

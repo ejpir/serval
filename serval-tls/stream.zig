@@ -22,6 +22,10 @@ const ktls = @import("ktls.zig");
 const handshake_info = @import("handshake_info.zig");
 const Allocator = std.mem.Allocator;
 
+/// Alias of `handshake_info.HandshakeInfo`, used by `TLSStream` to carry completed-handshake metadata.
+/// Pure type alias: fields, methods, and invariants are exactly those defined in `handshake_info.zig`.
+/// Values are plain struct data with fixed-size internal buffers and no heap ownership transfer.
+/// Declaring or referencing this alias has no runtime side effects and no error behavior.
 pub const HandshakeInfo = handshake_info.HandshakeInfo;
 
 /// TLS operation mode.
@@ -43,6 +47,10 @@ fn monotonicNanos() u64 {
     return @intCast(ts.nanoseconds);
 }
 
+/// Represents an established TLS stream on `fd`, with runtime state for either userspace TLS or manual kTLS I/O.
+/// `mode` selects backend behavior: `.userspace` carries an OpenSSL connection, while `.ktls` uses direct fd-based kernel offload semantics.
+/// `info` holds handshake-derived metadata (including cached kTLS enablement) used for fast status checks without extra work.
+/// Introspection methods on this type are non-throwing and return conservative fallbacks (`false`/`null`) when backend state is not available.
 pub const TLSStream = struct {
     fd: c_int,
     mode: Mode,

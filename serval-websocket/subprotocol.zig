@@ -6,6 +6,9 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
+/// Errors returned by subprotocol parsing and selection validation.
+/// `InvalidToken` means a candidate or header token contains bytes outside the allowed token set.
+/// `EmptyToken`, `TooManyTokens`, and `ProtocolNotOffered` report malformed headers or a selected protocol that is not offered.
 pub const SubprotocolError = error{
     InvalidToken,
     EmptyToken,
@@ -13,6 +16,9 @@ pub const SubprotocolError = error{
     ProtocolNotOffered,
 };
 
+/// Validates a comma-separated `Sec-WebSocket-Protocol` header value.
+/// Each token must be non-empty after trimming ASCII spaces and tabs, and each token must satisfy `isToken`.
+/// Returns `error.EmptyToken` for empty entries, `error.InvalidToken` for invalid bytes, and `error.TooManyTokens` when more than 64 tokens are present.
 pub fn validateHeaderValue(value: []const u8) SubprotocolError!void {
     assert(value.len > 0);
     assert(value.len <= std.math.maxInt(u32));
@@ -31,6 +37,9 @@ pub fn validateHeaderValue(value: []const u8) SubprotocolError!void {
     assert(count <= max_tokens);
 }
 
+/// Returns `true` when `value` contains `protocol` as an exact comma-separated token after trimming ASCII spaces and tabs.
+/// Comparison is case-sensitive and requires `protocol` to be non-empty.
+/// At most 64 tokens are examined; additional tokens are ignored once that limit is reached.
 pub fn headerOffersProtocol(value: []const u8, protocol: []const u8) bool {
     assert(protocol.len > 0);
     assert(value.len <= std.math.maxInt(u32));
@@ -50,6 +59,10 @@ pub fn headerOffersProtocol(value: []const u8, protocol: []const u8) bool {
     return false;
 }
 
+/// Validates that `selected_protocol` may be accepted for the offered `Sec-WebSocket-Protocol` header value.
+/// When `selected_protocol` is non-null, it must be a valid token and must appear as an exact comma-separated token in `offered_header_value`.
+/// Returns `error.ProtocolNotOffered` when no protocol was selected or the selected value is not present, and propagates header parsing errors from `validateHeaderValue`.
+/// The input slices are borrowed; this function does not take ownership or modify them.
 pub fn validateSelection(offered_header_value: ?[]const u8, selected_protocol: ?[]const u8) SubprotocolError!void {
     assert(selected_protocol == null or selected_protocol.?.len <= std.math.maxInt(u32));
 
@@ -66,6 +79,9 @@ pub fn validateSelection(offered_header_value: ?[]const u8, selected_protocol: ?
     if (!headerOffersProtocol(offered, selected)) return error.ProtocolNotOffered;
 }
 
+/// Returns `true` when `value` is a non-empty HTTP token.
+/// Allowed bytes are the token characters accepted by the subprotocol parser; any other byte returns `false`.
+/// This function does not allocate and only inspects the provided slice.
 pub fn isToken(value: []const u8) bool {
     assert(value.len <= std.math.maxInt(u32));
 

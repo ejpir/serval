@@ -35,6 +35,9 @@ pub const SOL_TLS: u32 = 282;
 
 /// TLS socket options
 pub const TLS_TX: u32 = 1; // Set transmit parameters
+/// Selector value for the TLS receive (RX) direction in kTLS configuration.
+/// Use this constant when an API expects a `u32` direction flag for RX state.
+/// It is a protocol constant (`2`), not an owned resource, and has no lifetime concerns.
 pub const TLS_RX: u32 = 2; // Set receive parameters
 
 /// TCP ULP option for attaching TLS
@@ -42,27 +45,71 @@ pub const TCP_ULP: u32 = 31;
 
 /// TLS versions for kTLS (wire format)
 pub const TLS_1_2_VERSION: u16 = 0x0303;
+/// Numeric protocol version identifier for TLS 1.3.
+/// Fixed 16-bit value `0x0304` (`u16`) for version field comparisons/serialization.
+/// Compile-time constant with no ownership or lifetime concerns.
+/// Does not perform validation or I/O; it cannot fail.
 pub const TLS_1_3_VERSION: u16 = 0x0304;
 
 /// kTLS cipher type identifiers (from linux/tls.h)
 pub const TLS_CIPHER_AES_GCM_128: u16 = 51;
+/// Kernel TLS (kTLS) cipher identifier for AES-GCM with a 256-bit key.
+/// Value `52` matches the Linux UAPI constant used when configuring TLS offload.
+/// Preconditions: only meaningful in kTLS socket configuration paths that consume cipher IDs.
 pub const TLS_CIPHER_AES_GCM_256: u16 = 52;
+/// Linux kTLS cipher identifier for ChaCha20-Poly1305.
+/// Use this value in kTLS configuration fields that expect a `u16` cipher id.
+/// Preconditions: the negotiated TLS connection must use ChaCha20-Poly1305, and kernel support must be available.
+/// Unsupported or mismatched use is rejected by kTLS setup calls as an OS error.
 pub const TLS_CIPHER_CHACHA20_POLY1305: u16 = 54;
 
 /// Cipher key/IV/salt sizes
 pub const AES_GCM_128_KEY_SIZE: u8 = 16;
+/// Size in bytes of the AES-GCM-128 IV value used by this kTLS module.
+/// This constant is fixed at `8` and should be used for buffer sizing and
+/// validation when handling AES-GCM-128 IV inputs.
 pub const AES_GCM_128_IV_SIZE: u8 = 8;
+/// Size, in bytes, of the fixed salt component used with AES-GCM-128.
+/// Use this constant when validating or allocating salt storage to avoid hard-coded lengths.
+/// Preconditions: any AES-GCM-128 salt buffer should be exactly `AES_GCM_128_SALT_SIZE` bytes.
 pub const AES_GCM_128_SALT_SIZE: u8 = 4;
+/// Size, in bytes, of the TLS record sequence value used with AES-GCM-128.
+/// This constant is `8` and is intended for buffer sizing and bounds checks where
+/// the record sequence length must be encoded or validated.
 pub const AES_GCM_128_REC_SEQ_SIZE: u8 = 8;
 
+/// Size in bytes of an AES-256-GCM symmetric key.
+/// Use this constant when validating or allocating key material for AES-GCM-256 operations.
+/// Valid keys for this mode must be exactly `32` bytes long.
 pub const AES_GCM_256_KEY_SIZE: u8 = 32;
+/// Size in bytes of the AES-GCM-256 IV used by this kTLS module.
+/// Use this constant when validating or sizing IV buffers for AES-GCM-256 paths.
+/// Value is fixed at `8` bytes.
 pub const AES_GCM_256_IV_SIZE: u8 = 8;
+/// Size, in bytes, of the fixed salt value for `AES_GCM_256` kTLS nonce material.
+/// This constant is used for buffer sizing and bounds checks when composing per-record nonces.
+/// Preconditions: callers must provide at least this many bytes where a GCM-256 salt is required.
 pub const AES_GCM_256_SALT_SIZE: u8 = 4;
+/// Size in bytes of the TLS record sequence value used with AES-256-GCM in kTLS paths.
+/// Use this constant when allocating or validating buffers that store the record sequence.
+/// Callers should ensure any provided sequence buffer is exactly `8` bytes for this mode.
 pub const AES_GCM_256_REC_SEQ_SIZE: u8 = 8;
 
+/// Size, in bytes, of a ChaCha20-Poly1305 symmetric key.
+/// Callers should provide exactly `CHACHA20_POLY1305_KEY_SIZE` bytes
+/// when constructing or validating key material for this cipher.
 pub const CHACHA20_POLY1305_KEY_SIZE: u8 = 32;
+/// Size in bytes of a ChaCha20-Poly1305 IV (nonce).
+/// This constant is `12`, matching the standard 96-bit nonce length.
+/// Use it to validate buffer lengths when accepting or constructing IV data.
 pub const CHACHA20_POLY1305_IV_SIZE: u8 = 12;
+/// Salt size, in bytes, for `CHACHA20_POLY1305` in this kTLS implementation.
+/// This value is always `0`, meaning no per-connection salt bytes are expected or stored.
+/// Code that allocates or validates salt buffers for this cipher must treat the required length as zero.
 pub const CHACHA20_POLY1305_SALT_SIZE: u8 = 0; // ChaCha20 uses full IV, no salt
+/// Size in bytes of the record sequence value used with kTLS ChaCha20-Poly1305.
+/// Callers that provide or parse this sequence must use exactly `CHACHA20_POLY1305_REC_SEQ_SIZE` bytes.
+/// This is a fixed protocol-size constant (`8`) and does not allocate or return errors.
 pub const CHACHA20_POLY1305_REC_SEQ_SIZE: u8 = 8;
 
 // ============================================================================
@@ -209,6 +256,10 @@ fn procAvailableUlpsContainsTls(content: []const u8) bool {
     return false;
 }
 
+/// Returns whether kTLS appears usable at runtime on this host.
+/// This is `false` on non-Linux platforms, when kTLS is explicitly disabled via the configured env var, or when `/proc` ULP probing cannot be opened/read.
+/// On env-var disable, a debug log is emitted naming the disable variable.
+/// This function is best-effort and non-throwing: probe failures are treated as "not available" and reported as `false`.
 pub fn isKtlsRuntimeAvailable() bool {
     if (builtin.os.tag != .linux) return false;
 

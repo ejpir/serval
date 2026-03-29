@@ -1,5 +1,10 @@
 const std = @import("std");
 
+/// Configures the TLS proof-of-concept build for the selected target and optimize mode.
+/// Defines three executables: `tls_client`, `tls_server`, and `test_client`, each linking against
+/// the BoringSSL static libraries at `boringssl/build/libssl.a` and `boringssl/build/libcrypto.a`.
+/// Installs all three artifacts and registers `run-client`, `run-server`, and `run-test` steps
+/// that depend on the install step before running the corresponding executable.
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});

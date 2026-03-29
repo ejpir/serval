@@ -14,6 +14,9 @@ const eqlIgnoreCase = strings.eqlIgnoreCase;
 // Header
 // =============================================================================
 
+/// One stored HTTP header field.
+/// Both `name` and `value` are borrowed slices; this type does not allocate or copy bytes.
+/// Callers must keep the backing storage valid for as long as the header is used by `HeaderMap`.
 pub const Header = struct {
     name: []const u8,
     value: []const u8,
@@ -41,10 +44,17 @@ pub const HeaderMap = struct {
     connection_idx: ?u8 = null,
     transfer_encoding_idx: ?u8 = null,
 
+    /// Construct an empty `HeaderMap` with no active headers.
+    /// All counters and cached indices start cleared.
+    /// The returned value is ready for `put`, `get`, and `reset` without further initialization.
     pub fn init() HeaderMap {
         return .{};
     }
 
+    /// Append a header to the map without copying either slice.
+    /// Returns `error.TooManyHeaders` when the map is already at `config.MAX_HEADERS`.
+    /// Returns `error.DuplicateContentLength` if a second `Content-Length` header has a different value.
+    /// The `name` slice must be non-empty, and the caller retains ownership of both slices.
     pub fn put(self: *HeaderMap, name: []const u8, value: []const u8) error{ TooManyHeaders, DuplicateContentLength }!void {
         assert(self.count <= config.MAX_HEADERS);
         assert(name.len > 0); // Header names must be non-empty per HTTP spec
@@ -93,6 +103,9 @@ pub const HeaderMap = struct {
         }
     }
 
+    /// Return the first header value whose name matches `name` case-insensitively.
+    /// Searches only the active portion of the map and performs a linear scan.
+    /// Returns a borrowed slice from the stored header value, or `null` when no matching header exists.
     pub fn get(self: *const HeaderMap, name: []const u8) ?[]const u8 {
         assert(self.count <= config.MAX_HEADERS);
 
@@ -140,6 +153,9 @@ pub const HeaderMap = struct {
         return self.headers[idx].value;
     }
 
+    /// Reset this map to the empty state.
+    /// The active header count is set to zero and cached header indices are cleared.
+    /// This does not overwrite the backing header storage; previously stored slices become unreachable through the map.
     pub fn reset(self: *HeaderMap) void {
         self.count = 0;
         // Clear cached indices to prevent stale lookups after reset.

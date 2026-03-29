@@ -10,6 +10,10 @@ const ChunkView = types.ChunkView;
 const EmitWriter = types.EmitWriter;
 const Decision = types.Decision;
 
+/// Verify at comptime that `Filter` implements at least one supported hook with the expected signature.
+/// Each optional hook is checked against the corresponding parameter and return types, and the count of implemented hooks is tracked locally.
+/// If `Filter` provides none of the supported request or response hooks, compilation fails with a `@compileError`.
+/// This function performs validation only; it does not instantiate `Filter` or run any runtime logic.
 pub fn verifyFilter(comptime Filter: type) void {
     var implemented_hooks: u8 = 0;
 
@@ -61,6 +65,10 @@ fn verifyOptional(
 
 test "verifyFilter accepts well-typed filter" {
     const GoodFilter = struct {
+        /// Handle incoming request headers for this filter implementation.
+        /// This default implementation ignores `self`, `ctx`, and `headers` and always continues filtering.
+        /// It does not retain any pointers or take ownership of the provided context or header view.
+        /// Use this as a no-op hook or as a template for filters that only need the callback to exist.
         pub fn onRequestHeaders(self: *@This(), ctx: *FilterContext, headers: HeaderSliceView) Decision {
             _ = self;
             _ = ctx;

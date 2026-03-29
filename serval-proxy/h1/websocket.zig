@@ -45,18 +45,27 @@ const Connection = pool_mod.Connection;
 
 const Request = types.Request;
 
+/// Optional forwarded values injected into a WebSocket upgrade request.
+/// Empty slices omit the corresponding `X-Forwarded-*` header.
+/// The slices are borrowed and must remain valid until the request buffer is built.
 pub const ForwardedHeaders = struct {
     host: []const u8 = "",
     proto: []const u8 = "",
     client_ip: []const u8 = "",
 };
 
+/// Result of reading or forwarding a WebSocket upgrade response.
+/// `status` is the upstream HTTP status code, `response_bytes` is the number of bytes consumed or forwarded, and `upgraded` reports a `101` response.
+/// The structure carries no ownership; it is a plain value summary of the exchange.
 pub const UpgradeResponseResult = struct {
     status: u16,
     response_bytes: u64,
     upgraded: bool,
 };
 
+/// Serializes an HTTP/1.1 WebSocket upgrade request into `buffer`.
+/// Hop-by-hop request headers are skipped, then the upgrade headers and any non-empty forwarded headers are appended.
+/// Returns the number of bytes written, or `null` if the request line or headers do not fit in the destination buffer.
 pub fn buildUpgradeRequestBuffer(
     buffer: []u8,
     request: *const Request,
@@ -116,6 +125,9 @@ pub fn buildUpgradeRequestBuffer(
     return pos;
 }
 
+/// Serializes and sends a WebSocket upgrade request on `conn`.
+/// `effective_path`, when provided, overrides `request.path`; the chosen path must be non-empty.
+/// Returns `ForwardError.SendFailed` if the request does not fit in the internal buffer, or any send error from `sendBuffer`.
 pub fn sendUpgradeRequest(
     conn: *Connection,
     io: Io,
@@ -134,6 +146,9 @@ pub fn sendUpgradeRequest(
     try sendBuffer(conn, io, buffer[0..header_len]);
 }
 
+/// Reads an upstream response and forwards it to `client_socket`.
+/// `101` upgrade responses are validated and forwarded as received; other statuses forward the header block and any buffered body.
+/// The returned `response_bytes` counts the bytes forwarded from the buffered response, not ownership of either socket.
 pub fn forwardUpgradeResponse(
     io: Io,
     upstream_conn: *Connection,
@@ -182,6 +197,9 @@ pub fn forwardUpgradeResponse(
     };
 }
 
+/// Reads an upstream response and interprets it as a WebSocket upgrade response.
+/// Returns the upstream status code and whether the response successfully upgraded.
+/// `101` responses are validated against `expected_accept_key`; parse or validation failures return `ForwardError.InvalidResponse`.
 pub fn receiveUpgradeResponse(
     io: Io,
     upstream_conn: *Connection,

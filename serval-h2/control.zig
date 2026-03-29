@@ -10,15 +10,28 @@ const assert = std.debug.assert;
 const config = @import("serval-core").config;
 const frame = @import("frame.zig");
 
+/// Size, in bytes, of an HTTP/2 PING payload.
+/// HTTP/2 requires PING frames to carry exactly 8 octets of opaque data.
+/// Use this constant when validating or constructing PING frame payload buffers.
+/// No allocation or ownership is involved.
 pub const ping_payload_size_bytes: u32 = 8;
+/// Fixed RST_STREAM payload size in bytes.
+/// The payload contains a single 4-byte error code.
 pub const rst_stream_payload_size_bytes: u32 = 4;
+/// Fixed WINDOW_UPDATE payload size in bytes.
+/// The payload contains a single 4-byte window increment.
 pub const window_update_payload_size_bytes: u32 = 4;
+/// Minimum GOAWAY payload size in bytes before optional debug data.
+/// This covers the 4-byte last-stream-id field and the 4-byte error-code field.
 pub const goaway_min_payload_size_bytes: u32 = 8;
 
 comptime {
     assert(ping_payload_size_bytes == 8);
 }
 
+/// HTTP/2 error codes used by GOAWAY and RST_STREAM frames.
+/// The numeric values are the on-wire 32-bit codes defined by the protocol.
+/// Unknown raw codes are intentionally left out of the enum.
 pub const ErrorCode = enum(u32) {
     no_error = 0x0,
     protocol_error = 0x1,
@@ -36,11 +49,17 @@ pub const ErrorCode = enum(u32) {
     http_1_1_required = 0xd,
 };
 
+/// Parsed or constructed GOAWAY frame data.
+/// `debug_data` borrows from frame storage; it is not owned by this struct.
+/// Use `errorCode()` to convert `error_code_raw` to a typed `ErrorCode` when possible.
 pub const GoAway = struct {
     last_stream_id: u32,
     error_code_raw: u32,
     debug_data: []const u8,
 
+    /// Map a GOAWAY error code to the corresponding `ErrorCode` value.
+    /// Returns `null` when `error_code_raw` is not one of the known enum tags.
+    /// The method asserts that `last_stream_id` is 31-bit clean and that `debug_data` is within the configured frame-size bound.
     pub fn errorCode(self: GoAway) ?ErrorCode {
         assert(self.last_stream_id <= 0x7fff_ffff);
         assert(self.debug_data.len <= config.H2_MAX_FRAME_SIZE_BYTES);
@@ -48,17 +67,27 @@ pub const GoAway = struct {
     }
 };
 
+/// Errors returned by the control-frame parse and build helpers in this module.
+/// `InvalidStreamId` reports a frame that uses a forbidden stream identifier.
+/// `InvalidPayloadLength` reports a payload with the wrong size, and `InvalidIncrement` reports an invalid WINDOW_UPDATE increment.
 pub const Error = error{
     InvalidStreamId,
     InvalidPayloadLength,
     InvalidIncrement,
 } || frame.Error;
 
+/// Build an ACK-only SETTINGS frame into `out`.
+/// The frame is sent on stream 0 with an empty payload.
+/// Returns the written frame prefix in the caller-provided buffer.
 pub fn buildSettingsAckFrame(out: []u8) Error![]const u8 {
     assert(out.len > 0);
     return buildFrame(out, .settings, frame.flags_ack, 0, &[_]u8{});
 }
 
+/// Parse a PING frame from the supplied header and payload.
+/// The header must describe a PING frame on stream 0 with an 8-byte payload.
+/// Returns `error.InvalidStreamId` or `error.InvalidPayloadLength` when the frame is malformed.
+/// On success, returns a copied 8-byte opaque payload array.
 pub fn parsePingFrame(header: frame.FrameHeader, payload: []const u8) Error![ping_payload_size_bytes]u8 {
     assert(header.length == payload.len);
     assert(header.frame_type == .ping);
@@ -71,12 +100,19 @@ pub fn parsePingFrame(header: frame.FrameHeader, payload: []const u8) Error![pin
     return opaque_data;
 }
 
+/// Build a PING frame into `out` with the provided flags and opaque payload.
+/// `flags` may only set the ACK bit; the frame is always sent on stream 0.
+/// `opaque_data` is copied verbatim into the caller-provided buffer.
 pub fn buildPingFrame(out: []u8, flags: u8, opaque_data: [ping_payload_size_bytes]u8) Error![]const u8 {
     assert(out.len > 0);
     assert(flags & ~frame.flags_ack == 0);
     return buildFrame(out, .ping, flags, 0, &opaque_data);
 }
 
+/// Parse a WINDOW_UPDATE frame from the supplied header and payload.
+/// The payload must be exactly 4 bytes and encode a nonzero 31-bit increment.
+/// Returns `error.InvalidPayloadLength` for the wrong size and `error.InvalidIncrement` for an invalid value.
+/// On success, returns the parsed window increment.
 pub fn parseWindowUpdateFrame(header: frame.FrameHeader, payload: []const u8) Error!u32 {
     assert(header.length == payload.len);
     assert(header.frame_type == .window_update);
@@ -91,6 +127,9 @@ pub fn parseWindowUpdateFrame(header: frame.FrameHeader, payload: []const u8) Er
     return increment;
 }
 
+/// Build a WINDOW_UPDATE frame into `out` for the given stream.
+/// `stream_id` must fit in 31 bits and `increment` must be in the range `1..=config.H2_MAX_WINDOW_SIZE_BYTES`.
+/// Returns `error.InvalidIncrement` when the window increment is zero or exceeds the configured maximum.
 pub fn buildWindowUpdateFrame(out: []u8, stream_id: u32, increment: u32) Error![]const u8 {
     assert(out.len > 0);
     assert(stream_id <= 0x7fff_ffff);
@@ -104,6 +143,10 @@ pub fn buildWindowUpdateFrame(out: []u8, stream_id: u32, increment: u32) Error![
     return buildFrame(out, .window_update, 0, stream_id, &payload);
 }
 
+/// Parse an RST_STREAM frame from the supplied header and payload.
+/// The header must describe an RST_STREAM frame with a nonzero `stream_id` and a 4-byte payload.
+/// Returns `error.InvalidStreamId` or `error.InvalidPayloadLength` when the frame is malformed.
+/// On success, returns the raw 32-bit error code stored in the payload.
 pub fn parseRstStreamFrame(header: frame.FrameHeader, payload: []const u8) Error!u32 {
     assert(header.length == payload.len);
     assert(header.frame_type == .rst_stream);
@@ -114,6 +157,9 @@ pub fn parseRstStreamFrame(header: frame.FrameHeader, payload: []const u8) Error
     return std.mem.readInt(u32, payload[0..rst_stream_payload_size_bytes], .big);
 }
 
+/// Build an RST_STREAM frame into `out` for the given stream.
+/// `stream_id` must be nonzero; `error_code_raw` is written as a 4-byte big-endian payload.
+/// Returns the written frame prefix in the caller-provided buffer.
 pub fn buildRstStreamFrame(out: []u8, stream_id: u32, error_code_raw: u32) Error![]const u8 {
     assert(out.len > 0);
     assert(stream_id > 0);
@@ -123,6 +169,10 @@ pub fn buildRstStreamFrame(out: []u8, stream_id: u32, error_code_raw: u32) Error
     return buildFrame(out, .rst_stream, 0, stream_id, &payload);
 }
 
+/// Parse a GOAWAY frame from the supplied header and payload.
+/// The header must describe a GOAWAY frame with `stream_id == 0`, and the payload must be at least 8 bytes.
+/// Returns `error.InvalidStreamId` or `error.InvalidPayloadLength` when the frame is malformed.
+/// The returned `debug_data` slice borrows from `payload` and does not allocate.
 pub fn parseGoAwayFrame(header: frame.FrameHeader, payload: []const u8) Error!GoAway {
     assert(header.length == payload.len);
     assert(header.frame_type == .goaway);
@@ -140,6 +190,9 @@ pub fn parseGoAwayFrame(header: frame.FrameHeader, payload: []const u8) Error!Go
     };
 }
 
+/// Build a GOAWAY frame into `out` and return the written prefix.
+/// `last_stream_id` must fit in 31 bits; `debug_data` is copied into the caller-provided buffer.
+/// Returns `error.BufferTooSmall` if `out` cannot hold the header and payload.
 pub fn buildGoAwayFrame(
     out: []u8,
     last_stream_id: u32,

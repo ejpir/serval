@@ -14,6 +14,12 @@ const max_signature_bytes = config.ACME_MAX_JWS_SIGNATURE_BYTES;
 const max_jwk_coordinate_b64_bytes = 96;
 const JwsLen = u16;
 
+/// Error set used by ACME JWS header, signing-input, and flattened-JWS
+/// serialization helpers.
+/// These errors cover invalid nonce, URL, kid, and JWK coordinate values as
+/// well as size checks for headers, payloads, signatures, and output buffers.
+/// Serialization helpers return these errors directly when validation or
+/// bounded-buffer checks fail.
 pub const Error = error{
     InvalidNonce,
     InvalidUrl,
@@ -28,12 +34,25 @@ pub const Error = error{
     OutputTooSmall,
 };
 
+/// Fixed-size storage for a P-256 JSON Web Key coordinate pair.
+/// The struct keeps `x` and `y` in caller-managed memory and exposes them
+/// through slices that reference the internal buffers.
+/// Call `setCoordinates` to validate and populate both coordinates; call
+/// `xSlice` and `ySlice` to read back the stored base64url text.
+/// The public API is bounded and does not allocate.
 pub const JwkP256 = struct {
     x_len: u8 = 0,
     x_bytes: [max_jwk_coordinate_b64_bytes]u8 = [_]u8{0} ** max_jwk_coordinate_b64_bytes,
     y_len: u8 = 0,
     y_bytes: [max_jwk_coordinate_b64_bytes]u8 = [_]u8{0} ** max_jwk_coordinate_b64_bytes,
 
+    /// Stores validated base64url `x` and `y` coordinates in the fixed buffers.
+    /// Both inputs must be non-empty, must fit within the coordinate limit, and
+    /// must contain only unpadded base64url characters.
+    /// On success, the previous contents are cleared before the new values are
+    /// copied in place; no allocation is performed.
+    /// Returns `error.InvalidJwkCoordinate` for empty or malformed input and
+    /// `error.JwkCoordinateTooLong` when either coordinate exceeds the limit.
     pub fn setCoordinates(self: *JwkP256, x_b64u: []const u8, y_b64u: []const u8) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(self.x_len <= max_jwk_coordinate_b64_bytes);
@@ -51,12 +70,22 @@ pub const JwkP256 = struct {
         assert(self.x_len == @as(u8, @intCast(x_b64u.len)));
     }
 
+    /// Returns the stored `y` coordinate as a base64url slice without padding.
+    /// The slice aliases the struct's internal buffer and is valid until the
+    /// `JwkP256` value is mutated or discarded.
+    /// Preconditions are enforced with assertions: the receiver must be non-null
+    /// and the stored length must stay within the fixed coordinate buffer.
     pub fn xSlice(self: *const JwkP256) []const u8 {
         assert(@intFromPtr(self) != 0);
         assert(self.x_len <= max_jwk_coordinate_b64_bytes);
         return self.x_bytes[0..self.x_len];
     }
 
+    /// Returns the stored `x` coordinate as a base64url slice without padding.
+    /// The slice aliases the struct's internal buffer and is valid until the
+    /// `JwkP256` value is mutated or discarded.
+    /// Preconditions are enforced with assertions: the receiver must be non-null
+    /// and the stored length must stay within the fixed coordinate buffer.
     pub fn ySlice(self: *const JwkP256) []const u8 {
         assert(@intFromPtr(self) != 0);
         assert(self.y_len <= max_jwk_coordinate_b64_bytes);
@@ -64,24 +93,39 @@ pub const JwkP256 = struct {
     }
 };
 
+/// Borrowed inputs for building a protected header that carries a JWK.
+/// The nonce, URL, and JWK are not owned here; they must remain valid for
+/// the duration of any serialization that reads them.
+/// Use this with `serializeProtectedHeaderWithJwk` when the ACME request
+/// authenticates with an embedded P-256 public key.
 pub const ProtectedHeaderJwkParams = struct {
     nonce: *const client.ReplayNonce,
     url: *const client.Url,
     jwk: *const JwkP256,
 };
 
+/// Inputs for building a protected header with a `kid` reference.
+/// `nonce`, `url`, and `kid` are borrowed pointers to existing client values and are not owned here.
+/// The referenced values must remain valid for the duration of serialization.
 pub const ProtectedHeaderKidParams = struct {
     nonce: *const client.ReplayNonce,
     url: *const client.Url,
     kid: *const client.Url,
 };
 
+/// Inputs for serializing a flattened JWS object.
+/// The fields are borrowed slices; the caller retains ownership of the underlying data.
+/// Each field must contain the JSON fragment to encode for the protected header, payload, and signature.
 pub const FlattenedJwsParams = struct {
     protected_header_json: []const u8,
     payload_json: []const u8,
     signature: []const u8,
 };
 
+/// Serializes an ACME protected header containing `alg`, `nonce`, `url`, and an embedded EC JWK.
+/// `nonce` must be valid base64url text, `url` must be valid JSON string content, and both JWK coordinates must be present.
+/// The embedded JWK is emitted as `{"kty":"EC","crv":"P-256",...}` using the coordinate slices from `params.jwk`.
+/// Returns validation or size errors if any required field is empty, malformed, or does not fit in `out`.
 pub fn serializeProtectedHeaderWithJwk(
     out: []u8,
     params: ProtectedHeaderJwkParams,
@@ -118,6 +162,10 @@ pub fn serializeProtectedHeaderWithJwk(
     return out[0..@intCast(cursor)];
 }
 
+/// Serializes an ACME protected header containing `alg`, `nonce`, `url`, and `kid`.
+/// `nonce` must be valid base64url text, while `url` and `kid` must be valid JSON string content.
+/// The returned slice aliases `out`; the caller owns the buffer and must keep it alive for the result's lifetime.
+/// Returns validation or size errors if any field is empty, malformed, or does not fit in `out`.
 pub fn serializeProtectedHeaderWithKid(
     out: []u8,
     params: ProtectedHeaderKidParams,
@@ -152,6 +200,10 @@ pub fn serializeProtectedHeaderWithKid(
     return out[0..@intCast(cursor)];
 }
 
+/// Serializes JWS signing input into `out` as `<protected>.<payload>`.
+/// Both inputs are base64url-encoded without padding and concatenated with a single `'.'` separator.
+/// Rejects empty or oversized protected headers and oversized payloads before writing.
+/// Returns `error.OutputTooSmall` if the output buffer cannot hold the encoded input.
 pub fn serializeSigningInput(
     out: []u8,
     protected_header_json: []const u8,
@@ -197,6 +249,10 @@ pub fn serializeSigningInput(
     return out[0..@intCast(cursor)];
 }
 
+/// Serializes a flattened JWS object into `out` and returns the written slice.
+/// The protected header, payload, and signature are base64url-encoded without padding and wrapped in the flattened JSON shape.
+/// Returns `error.EmptyProtectedHeader`, `error.InvalidSignature`, or size-related errors for empty or oversized inputs.
+/// Returns `error.OutputTooSmall` when `out` cannot hold the full serialized object.
 pub fn serializeFlattenedJws(out: []u8, params: FlattenedJwsParams) Error![]const u8 {
     assert(max_signature_bytes > 0);
     if (params.protected_header_json.len == 0) return error.EmptyProtectedHeader;

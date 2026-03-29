@@ -18,6 +18,9 @@ const Config = core_config.Config;
 const DnsConfig = serval_net.DnsConfig;
 const ssl = serval_tls.ssl;
 
+/// Errors returned by `RuntimeOrchestrator.start` when a transport cannot be brought up.
+/// The variants distinguish TCP versus UDP and runtime initialization versus worker-thread spawn failure.
+/// Callers can use the specific error to report which transport and which phase failed.
 pub const OrchestratorError = error{
     TcpRuntimeInitFailed,
     TcpRuntimeThreadSpawnFailed,
@@ -25,6 +28,9 @@ pub const OrchestratorError = error{
     UdpRuntimeThreadSpawnFailed,
 };
 
+/// Coordinates the frontend TCP and UDP runtime lifecycles for a single server instance.
+/// Holds the shared shutdown flag, runtime configuration, optional TLS client context, and thread/context handles for each transport.
+/// Use `init` to seed the state, `start` to launch enabled transports, and `stop` to request shutdown and join workers.
 pub const RuntimeOrchestrator = struct {
     shutdown: *std.atomic.Value(bool),
     dns_config: DnsConfig,
@@ -37,6 +43,9 @@ pub const RuntimeOrchestrator = struct {
 
     const Self = @This();
 
+    /// Initializes the orchestrator with shared shutdown state and runtime configuration.
+    /// Stores the DNS, client TLS, and upstream TLS verification settings, and clears all thread and context slots.
+    /// This function does not allocate and cannot fail; `shutdown` must point to a valid atomic boolean for the lifetime of the orchestrator.
     pub fn init(
         self: *Self,
         shutdown: *std.atomic.Value(bool),
@@ -59,6 +68,9 @@ pub const RuntimeOrchestrator = struct {
         };
     }
 
+    /// Starts the enabled transport runtimes described by `cfg`.
+    /// UDP is started first when present and enabled; TCP is started only when present and enabled.
+    /// If initialization or thread creation fails for either transport, any started UDP state is torn down and the corresponding `OrchestratorError` is returned.
     pub fn start(self: *Self, cfg: *const Config) OrchestratorError!void {
         assert(@intFromPtr(self) != 0);
         assert(@intFromPtr(cfg) != 0);
@@ -109,6 +121,9 @@ pub const RuntimeOrchestrator = struct {
         }
     }
 
+    /// Requests orchestrator shutdown and stops any running transport workers.
+    /// Sets the shared shutdown flag first, then stops the TCP thread and the UDP thread.
+    /// This function does not report errors; cleanup is performed through the transport stop helpers.
     pub fn stop(self: *Self) void {
         assert(@intFromPtr(self) != 0);
 

@@ -12,6 +12,10 @@ const config = @import("serval-core").config;
 const slot_capacity: usize = config.TLS_RELOADABLE_CTX_SLOT_COUNT;
 const mutex_lock_max_attempts: u32 = 1_000_000;
 
+/// Errors returned by `ReloadableServerCtx` lease/reload operations.
+/// `error.NoActiveContext` is returned by `acquire` when no valid active slot/context is available.
+/// `error.RefCountOverflow` is returned by `acquire` when the active slot lease counter cannot be incremented.
+/// `error.NoFreeSlot` is returned by `activate` when every fixed-capacity slot is already in use.
 pub const Error = error{
     NoActiveContext,
     RefCountOverflow,
@@ -26,12 +30,21 @@ const Slot = struct {
     ctx: ?*ssl.SSL_CTX = null,
 };
 
+/// Snapshot of an acquired TLS context slot, returned by `ReloadableServerCtx.acquire`.
+/// `ctx` points to the leased `SSL_CTX`; `generation` and `slot_index` identify the exact slot/version.
+/// Treat this as an opaque handle: pass the same value back to `ReloadableServerCtx.release` unchanged.
+/// Lifetime is tied to the lease; releasing decrements the slot refcount and may allow retired contexts to be freed.
 pub const Lease = struct {
     ctx: *ssl.SSL_CTX,
     generation: u32,
     slot_index: u8,
 };
 
+/// Thread-safe manager for a reloadable server `SSL_CTX` using fixed slots and generation tracking.
+/// `init` requires a non-null initial context pointer; slot capacity is compile-time constrained to `[2, maxInt(u8)+1]`.
+/// `acquire` returns a `Lease` for the current active context and increments that slot's refcount under `mutex`.
+/// `acquire` fails with `error.NoActiveContext` if no valid active slot exists, or `error.RefCountOverflow` on saturation.
+/// `deinit` frees all used slot contexts and asserts all slot refcounts are zero (no outstanding leases).
 pub const ReloadableServerCtx = struct {
     mutex: std.atomic.Mutex = .unlocked,
     slots: [slot_capacity]Slot = [_]Slot{.{}} ** slot_capacity,
@@ -47,6 +60,10 @@ pub const ReloadableServerCtx = struct {
         }
     }
 
+    /// Initializes a `ReloadableServerCtx` with `initial_ctx` as the active TLS context.
+    /// Preconditions: `initial_ctx` must be non-null (`assert(@intFromPtr(initial_ctx) != 0)`).
+    /// The returned manager starts with slot `0` marked used/active, generation `1`, and ref count `0`.
+    /// `next_generation` is set to `2`; the context pointer is stored as-is (caller must keep it valid).
     pub fn init(initial_ctx: *ssl.SSL_CTX) ReloadableServerCtx {
         assert(@intFromPtr(initial_ctx) != 0);
 
@@ -63,6 +80,10 @@ pub const ReloadableServerCtx = struct {
         return manager;
     }
 
+    /// Deinitializes all occupied TLS context slots in this reloadable server context.
+    /// Preconditions: `self` must be a valid non-null pointer, and every `used` slot must have `ref_count == 0` (enforced by `assert`).
+    /// Takes `self.mutex` for the full operation, frees each slot's `SSL_CTX` when present, then resets the slot to empty.
+    /// This function returns no errors; violated preconditions trigger assertion failure.
     pub fn deinit(self: *ReloadableServerCtx) void {
         assert(@intFromPtr(self) != 0);
 
@@ -80,6 +101,11 @@ pub const ReloadableServerCtx = struct {
         }
     }
 
+    /// Acquires a `Lease` for the currently active TLS context slot.
+    /// Requires `self` to be a valid pointer; the active slot index must remain within `slot_capacity` (asserted).
+    /// Under `self.mutex`, this validates that the active slot is `used`, `active`, and has a non-null `ctx`, then increments `ref_count`.
+    /// Returns `error.NoActiveContext` if no usable active context exists, or `error.RefCountOverflow` if `ref_count` is already `maxInt(u32)`.
+    /// The returned lease carries `ctx`, `generation`, and `slot_index`, and represents one counted reference to that slot.
     pub fn acquire(self: *ReloadableServerCtx) Error!Lease {
         assert(@intFromPtr(self) != 0);
 
@@ -105,6 +131,10 @@ pub const ReloadableServerCtx = struct {
         };
     }
 
+    /// Releases one held `Lease` reference back to this reloadable server context.
+    /// Preconditions: `lease` must originate from this instance and still match the slot (`slot_index`, `generation`, and `ctx`); violations trip assertions.
+    /// Decrements the slot `ref_count` under the mutex and returns immediately if the slot is still active or still referenced.
+    /// When the slot is inactive and this was the last reference, the slot is freed (`freeSlotLocked`); this function does not return an error.
     pub fn release(self: *ReloadableServerCtx, lease: Lease) void {
         assert(@intFromPtr(self) != 0);
         assert(lease.slot_index < slot_capacity);
@@ -125,6 +155,11 @@ pub const ReloadableServerCtx = struct {
         freeSlotLocked(slot);
     }
 
+    /// Atomically switches the active TLS server context to `new_ctx` under the internal mutex and returns the assigned generation.
+    /// `self` and `new_ctx` must be valid non-null pointers (enforced by assertions).
+    /// Fails with `error.NoFreeSlot` when no inactive slot is available; on failure, the active slot is unchanged.
+    /// Marks the previous active slot inactive and frees it immediately only if its `ref_count` is zero.
+    /// Generation increments with wraparound and never returns `0` (that value is skipped).
     pub fn activate(self: *ReloadableServerCtx, new_ctx: *ssl.SSL_CTX) Error!u32 {
         assert(@intFromPtr(self) != 0);
         assert(@intFromPtr(new_ctx) != 0);
@@ -182,6 +217,10 @@ pub const ReloadableServerCtx = struct {
         return generation;
     }
 
+    /// Returns the generation number of the currently active TLS context slot.
+    /// Requires `self` to be a valid non-null `*ReloadableServerCtx`.
+    /// Acquires `self.mutex` for the read and releases it before returning; the value is a snapshot taken under lock.
+    /// Asserts that the selected slot is both `used` and `active`; assertion failures indicate broken internal invariants.
     pub fn activeGeneration(self: *ReloadableServerCtx) u32 {
         assert(@intFromPtr(self) != 0);
 

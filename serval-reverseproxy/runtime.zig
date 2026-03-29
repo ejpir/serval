@@ -14,14 +14,24 @@ const components = @import("components.zig");
 
 const DnsConfig = net.DnsConfig;
 
+/// Options for loading a reverseproxy runtime from disk.
+/// `config_file` must name a readable DSL file and cannot be empty.
+/// The file is loaded relative to the current working directory.
 pub const LoadOptions = struct {
     config_file: []const u8,
 };
 
+/// Options for starting the runtime server.
+/// When `port` is null, `run` derives the listener port from the config.
+/// A zero port is rejected as `error.InvalidListenerPort`.
 pub const RunOptions = struct {
     port: ?u16 = null,
 };
 
+/// Loaded reverseproxy runtime state.
+/// Owns the parsed DSL, derived routing tables, and threaded IO context.
+/// Call `deinit` to release `dsl_source` and shut down the IO thread.
+/// `run` reuses the stored DSL to configure and start the server.
 pub const Runtime = struct {
     io_threaded: std.Io.Threaded,
     dsl_source: []u8,
@@ -32,12 +42,20 @@ pub const Runtime = struct {
     pool_upstream_storage: [core.config.MAX_POOLS]core.Upstream,
     pool_count: u32,
 
+    /// Releases the runtime's owned DSL buffer and shuts down its threaded IO context.
+    /// Call this once after a successful `load` to avoid leaking runtime resources.
+    /// The runtime must not be used after `deinit` returns.
     pub fn deinit(self: *Runtime) void {
         assert(@intFromPtr(self) != 0);
         std.heap.page_allocator.free(self.dsl_source);
         self.io_threaded.deinit();
     }
 
+    /// Activates the parsed DSL and starts the proxy server.
+    /// If `options.port` is null, the listener port is derived from the config; zero is rejected.
+    /// Builds routing artifacts in the runtime's internal storage and initializes the router before serving traffic.
+    /// May initialize TLS providers and an ACME background thread when the active listener enables TLS.
+    /// Returns any validation, configuration, or server startup error from the setup path.
     pub fn run(self: *Runtime, options: RunOptions) !void {
         assert(@intFromPtr(self) != 0);
 
@@ -184,6 +202,10 @@ const ProxyHandler = struct {
     router: *router_mod.Router,
     default_upstream: core.Upstream,
 
+    /// Routes a request through the configured router and maps the result to a server action.
+    /// Requires `response_buf.len >= 16` so reject bodies can be copied into caller-provided storage.
+    /// Forward decisions store the selected upstream in `ctx.upstream` and continue the request.
+    /// Reject decisions write a plain-text response body into `response_buf` and return `send_response`.
     pub fn onRequest(self: *@This(), ctx: *core.Context, request: *core.Request, response_buf: []u8) core.Action {
         assert(response_buf.len >= 16);
 
@@ -200,12 +222,19 @@ const ProxyHandler = struct {
         }
     }
 
+    /// Returns the upstream already stored on the request context when present.
+    /// Falls back to `default_upstream` when the context has not selected one yet.
+    /// `request` is currently unused and is accepted for interface compatibility.
     pub fn selectUpstream(self: *@This(), ctx: *core.Context, request: *const core.Request) core.Upstream {
         _ = request;
         return ctx.upstream orelse self.default_upstream;
     }
 };
 
+/// Loads and validates a reverseproxy runtime from `options.config_file`.
+/// The file is read from the current working directory into an owned buffer.
+/// The returned `Runtime` owns that buffer and the threaded IO handle; call `deinit`.
+/// Returns parse, IO, or validation errors, and `error.InvalidCanonicalIr` if validation reports diagnostics.
 pub fn load(options: LoadOptions) !Runtime {
     assert(options.config_file.len > 0);
 

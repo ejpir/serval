@@ -13,45 +13,149 @@ const config = serval_core.config;
 const posix = std.posix;
 
 // Opaque types
+/// Opaque handle type for an SSL/TLS context object from the underlying C library.
+/// This type has no known layout in Zig and is intended to be used only via pointers (`*SSL_CTX`/`?*SSL_CTX`).
+/// Instances are not created or destroyed directly in Zig; use the corresponding library functions for lifecycle management.
+/// This declaration itself does not perform operations and therefore does not return Zig errors.
 pub const SSL_CTX = opaque {};
+/// Opaque handle type for a TLS session object (`SSL`).
+/// Callers must treat this as an external/foreign type and only access it through API functions that accept `*SSL`.
+/// This declaration defines no ownership or error behavior by itself; lifecycle and failures are determined by those APIs.
 pub const SSL = opaque {};
+/// Opaque BoringSSL method descriptor type used to configure `SSL_CTX`.
+/// Values are obtained from `TLS_method`, `TLS_client_method`, or `TLS_server_method` and passed as `?*const SSL_METHOD` to `SSL_CTX_new`.
+/// This type has no accessible fields and must not be instantiated or dereferenced in Zig.
+/// The pointer is library-managed; this binding exposes no allocator/free API or direct error surface for `SSL_METHOD` itself.
 pub const SSL_METHOD = opaque {};
+/// Opaque BoringSSL cipher-suite descriptor used by Serval TLS bindings.
+/// Instances are not constructed or freed directly in Zig; obtain pointers from BoringSSL APIs such as `SSL_get_current_cipher`.
+/// Use `SSL_CIPHER_get_name`, `SSL_CIPHER_get_id`, and `SSL_CIPHER_get_protocol_id` to read metadata.
+/// Ownership and lifetime are external to Zig and managed by the underlying SSL/BoringSSL objects.
 pub const SSL_CIPHER = opaque {};
+/// Opaque handle type for a TLS session object managed by the underlying SSL library.
+/// The session internals are intentionally hidden and cannot be accessed from Zig code.
+/// Use `*SSL_SESSION` only with the corresponding SSL API functions that create, reference, or free it.
+/// Ownership and lifetime are defined by those APIs, not by this type declaration itself.
 pub const SSL_SESSION = opaque {};
+/// Opaque OpenSSL/BoringSSL BIO handle type used by these TLS bindings.
+/// `*BIO` is an external library pointer; Zig code must not inspect or construct it directly.
+/// In this module, BIO pointers are obtained from `SSL_get_rbio`/`SSL_get_wbio` and used with `BIO_ctrl`.
+/// This declaration defines only the type; ownership, lifetime, and errors are governed by the called C APIs.
 pub const BIO = opaque {};
+/// Opaque handle to an OpenSSL `X509` certificate object.
+/// The certificate contents are not accessible directly from Zig; use `X509_*` extern APIs.
+/// Ownership is API-dependent: a pointer returned by `SSL_get1_peer_certificate` must be released with `X509_free`.
+/// This type itself has no error behavior; nullability and failures are expressed by functions that return or consume `*X509`.
 pub const X509 = opaque {};
+/// Opaque C type representing an `EVP_PKEY` key object from the SSL/crypto library.
+/// The concrete layout is hidden; Zig code must not construct, copy, or inspect it by value.
+/// Use `*EVP_PKEY` only when calling the corresponding C APIs.
+/// Ownership and lifetime are determined by those APIs (allocation/freeing is not defined by this declaration).
 pub const EVP_PKEY = opaque {};
+/// Opaque BoringSSL `X509_NAME` handle type used in certificate name APIs.
+/// This binding exposes only the type identity; fields are intentionally inaccessible from Zig.
+/// Use it through pointers returned/accepted by related extern functions (for example, X509 subject/issuer name helpers).
+/// Ownership and lifetime are defined by the producing API; this declaration itself allocates, frees, and errors on nothing.
 pub const X509_NAME = opaque {};
 
 // Error codes
+/// OpenSSL SSL error code for "no error" (`0`).
+/// Indicates that the associated SSL operation completed successfully and no SSL-layer error is reported.
+/// Used as the non-error sentinel when comparing values returned by SSL error-query APIs.
 pub const SSL_ERROR_NONE = 0;
+/// Error code value `1`, matching `SSL_ERROR_SSL`.
+/// Indicates a failure in the SSL/TLS layer (protocol or library-level error),
+/// not a transport I/O condition.
+/// Compare against return values from OpenSSL-style error APIs that report these codes.
 pub const SSL_ERROR_SSL = 1;
+/// OpenSSL-style error code `2` for `SSL_ERROR_WANT_READ`.
+/// Indicates an SSL operation cannot currently proceed until more input is readable.
+/// Treat this as a retry condition after waiting for the underlying transport to become readable,
+/// not as a terminal protocol failure.
 pub const SSL_ERROR_WANT_READ = 2;
+/// OpenSSL-style error code indicating a write operation cannot proceed yet.
+/// This value is returned by `SSL_get_error` as `SSL_ERROR_WANT_WRITE` (`3`).
+/// In non-blocking I/O, retry the TLS operation after the underlying transport becomes writable.
+/// Not a fatal TLS failure by itself; it signals a temporary would-block condition.
 pub const SSL_ERROR_WANT_WRITE = 3;
+/// OpenSSL-style `SSL_get_error` code indicating `SSL_ERROR_WANT_X509_LOOKUP` (`4`).
+/// Signals that the operation paused pending an X509 lookup (typically via a callback).
+/// Treat as a non-fatal, retryable condition after the lookup context has progressed.
 pub const SSL_ERROR_WANT_X509_LOOKUP = 4;
+/// OpenSSL `SSL_get_error` result code for `SSL_ERROR_SYSCALL` (value `5`).
+/// Indicates that the TLS operation failed due to an underlying system-call/I/O condition,
+/// rather than a protocol-level SSL error.
+/// Handle by checking platform I/O error state (for example `errno`) and the OpenSSL error queue.
 pub const SSL_ERROR_SYSCALL = 5;
+/// OpenSSL-compatible error code value for `SSL_ERROR_ZERO_RETURN`.
+/// Returned by `SSL_get_error`-style APIs when the TLS/SSL session reached a clean shutdown state.
+/// Numeric value is fixed to `6` for ABI/API compatibility with OpenSSL constants.
 pub const SSL_ERROR_ZERO_RETURN = 6;
+/// OpenSSL-style `SSL_get_error` code indicating the operation could not complete yet
+/// because the transport is still establishing a connection.
+/// This is a non-fatal, retryable condition (commonly with non-blocking I/O).
+/// Treat it as "try again when the socket is connect-ready," not as a hard TLS failure.
 pub const SSL_ERROR_WANT_CONNECT = 7;
+/// `SSL_get_error` code for the `WANT_ACCEPT` condition (`8`).
+/// Indicates the attempted SSL operation could not complete because an accept step must be retried.
+/// Typically treated as a non-fatal, retry-later status rather than a terminal failure.
 pub const SSL_ERROR_WANT_ACCEPT = 8;
 
 // TLS versions
+/// Wire-protocol version identifier for TLS 1.0.
+/// Value is `0x0301` (major `0x03`, minor `0x01`) as encoded in TLS headers.
+/// Use when matching or emitting protocol version fields that require the TLS 1.0 constant.
 pub const TLS1_VERSION = 0x0301;
+/// Wire-level protocol version code for TLS 1.1 (`0x0302`).
+/// Use this constant when encoding or comparing TLS version fields in records/handshakes.
+/// This is a compile-time constant and has no ownership, lifetime, or error behavior.
 pub const TLS1_1_VERSION = 0x0302;
+/// Wire-format protocol version identifier for TLS 1.2 (`0x0303`).
+/// Use this constant when encoding or validating TLS version fields that must match TLS 1.2.
+/// Pure value constant: no ownership, lifetime, or error behavior applies.
 pub const TLS1_2_VERSION = 0x0303;
+/// Numeric protocol version code for TLS 1.3 (`0x0304`).
+/// Use this constant when encoding or validating TLS version fields that
+/// represent TLS 1.3 in protocol messages.
 pub const TLS1_3_VERSION = 0x0304;
 
 // File types for key loading
+/// Identifies PEM-encoded input for SSL/TLS file-loading APIs.
+/// Use this constant when an API expects a file type selector (e.g. cert/key files).
+/// This value is metadata only; validation and parsing errors are reported by the called API.
 pub const SSL_FILETYPE_PEM = 1;
+/// File-type selector value for DER/ASN.1 encoded key or certificate files.
+/// Pass this as the `type_` argument to OpenSSL/BoringSSL file-loading APIs
+/// (for example `SSL_CTX_use_PrivateKey_file`) when the input is not PEM.
+/// This constant is a plain tag (`2`); ownership, I/O, and errors are handled by the called API.
 pub const SSL_FILETYPE_ASN1 = 2;
 
 // Verification modes
+/// Verify-mode bitmask value indicating that no verification flags are set (`0x00`).
+/// Use this as the baseline/disabled value when configuring SSL/TLS peer-certificate verification.
+/// This constant itself performs no checks and has no ownership or lifetime implications.
 pub const SSL_VERIFY_NONE = 0x00;
+/// Verify-mode bit flag with value `0x01`.
+/// Use this constant where SSL verify options are passed as a bitmask.
+/// This symbol is immutable and has no ownership or lifetime implications.
+/// Any error behavior depends on the API that consumes this flag.
 pub const SSL_VERIFY_PEER = 0x01;
+/// Verification-mode bit flag (`0x02`) for TLS peer-certificate enforcement.
+/// Use in an SSL verify-mode bitmask to require a peer certificate during verification.
+/// If this bit is set and no peer certificate is presented, verification must fail.
+/// This constant is a raw flag value and does not own or manage any resources.
 pub const SSL_VERIFY_FAIL_IF_NO_PEER_CERT = 0x02;
 
 // SSL options (for SSL_set_options/SSL_get_options)
 // Note: These are OpenSSL 3.x values. BoringSSL may differ.
+/// OpenSSL option bit that requests Kernel TLS (KTLS) support for an `SSL` connection.
+/// Value is `1 << 3` in the `u64` SSL options bitmask space and is intended for bitwise OR with other `SSL_OP_*` flags.
+/// This constant itself performs no I/O and cannot fail; any enablement/support checks occur in the API that consumes the option.
 pub const SSL_OP_ENABLE_KTLS: u64 = 1 << 3; // Enable kernel TLS (OpenSSL 3.0+)
+/// Option bit for enabling kTLS transmit-path zerocopy `sendfile` behavior.
+/// Use this as a mask in SSL options APIs (e.g. OR into an options bitset).
+/// This declaration only defines the flag value (`1 << 34`); it performs no validation.
+/// Any support checks and resulting errors are handled by the SSL API that consumes this option.
 pub const SSL_OP_ENABLE_KTLS_TX_ZEROCOPY_SENDFILE: u64 = 1 << 34; // Zero-copy sendfile with kTLS
 
 // Library initialization
@@ -72,6 +176,11 @@ pub extern fn SSL_CTX_set_verify(ctx: *SSL_CTX, mode: c_int, callback: ?*anyopaq
 pub extern fn SSL_set_verify(ssl_obj: *SSL, mode: c_int, callback: ?*anyopaque) void;
 pub extern fn SSL_get_verify_mode(ssl_obj: *const SSL) c_int;
 
+/// C ABI callback signature for TLS SNI server-name selection hooks.
+/// `ssl` is the active connection pointer and is only valid under the SSL library's callback lifetime rules.
+/// `alert` points to an alert-code output slot that may be set by the callback for error signaling.
+/// `arg` is opaque user context passed via `SSL_CTRL_SET_TLSEXT_SERVERNAME_ARG` and may be `null`.
+/// Returns a `c_int` status code (typically one of the `SSL_TLSEXT_ERR_*` constants) consumed by the SSL library.
 pub const ServerNameCallback = *const fn (
     ssl: *SSL,
     alert: *c_int,
@@ -81,7 +190,14 @@ pub const ServerNameCallback = *const fn (
 pub extern fn SSL_CTX_ctrl(ctx: *SSL_CTX, cmd: c_int, larg: c_long, parg: ?*anyopaque) c_long;
 pub extern fn SSL_CTX_callback_ctrl(ctx: *SSL_CTX, cmd: c_int, cb: ?*const anyopaque) c_long;
 
+/// OpenSSL `SSL_CTRL_*` opcode for registering the TLS Server Name Indication (SNI) callback.
+/// Use this constant as the `cmd` value in `SSL_CTX_ctrl`-style calls when setting servername-callback behavior.
+/// This is a raw C control ID (`53`); validity and any errors are determined by the underlying OpenSSL API call.
 pub const SSL_CTRL_SET_TLSEXT_SERVERNAME_CB: c_int = 53;
+/// OpenSSL `SSL_ctrl`/`SSL_CTX_ctrl` command identifier for `SET_TLSEXT_SERVERNAME_ARG`.
+/// Use this numeric selector (`54`) when dispatching control calls that configure the
+/// argument associated with TLS Server Name Indication (SNI) handling.
+/// This constant is metadata only; validation and failure behavior are defined by the target control API.
 pub const SSL_CTRL_SET_TLSEXT_SERVERNAME_ARG: c_int = 54;
 
 // SSL functions
@@ -114,7 +230,13 @@ pub extern fn SSL_get_wbio(ssl: *const SSL) ?*BIO;
 pub extern fn BIO_ctrl(bio: *BIO, cmd: c_int, larg: c_long, parg: ?*anyopaque) c_long;
 
 // BIO control commands for kTLS status (OpenSSL 3.0+)
+/// OpenSSL BIO control command ID for querying send-side kTLS status.
+/// Use this with `BIO_ctrl`-style APIs where the command argument is required.
+/// This declaration only exposes the numeric constant (`73`); semantics and return values are defined by OpenSSL.
 pub const BIO_CTRL_GET_KTLS_SEND: c_int = 73;
+/// OpenSSL `BIO_ctrl` command value for querying kernel TLS receive (KTLS RX) state.
+/// Use this as the `cmd` argument when issuing a control call against a BIO.
+/// This constant is just an opcode identifier; it performs no allocation and has no direct error behavior.
 pub const BIO_CTRL_GET_KTLS_RECV: c_int = 76;
 
 /// Check if kTLS is enabled for sending (TX direction)
@@ -131,7 +253,13 @@ pub fn BIO_get_ktls_recv(bio: *BIO) bool {
 pub extern fn SSL_ctrl(ssl: *SSL, cmd: c_int, larg: c_long, parg: ?*anyopaque) c_long;
 
 // SSL_CTRL_SET_TLSEXT_HOSTNAME constant (from openssl/tls1.h)
+/// OpenSSL `SSL_ctrl` operation code for configuring the TLS SNI server name.
+/// Use this selector with `SSL_ctrl` on an `SSL*` before the handshake starts.
+/// This constant itself cannot fail; any validation or failure is reported by the corresponding `SSL_ctrl` call.
 pub const SSL_CTRL_SET_TLSEXT_HOSTNAME = 55;
+/// TLS SNI name type value for a DNS host name (`host_name`).
+/// Use this constant when encoding or validating `ServerName.name_type` in the
+/// TLS `server_name` extension; the wire value is always `0` for host names.
 pub const TLSEXT_NAMETYPE_host_name = 0;
 
 /// Set SNI hostname for TLS connection
@@ -204,6 +332,10 @@ pub extern fn SSL_session_reused(ssl: *const SSL) c_int;
 pub extern fn SSL_CTX_set_alpn_protos(ctx: *SSL_CTX, protos: [*]const u8, protos_len: c_uint) c_int;
 pub extern fn SSL_set_alpn_protos(ssl: *SSL, protos: [*]const u8, protos_len: c_uint) c_int;
 
+/// C ABI callback type used during ALPN protocol selection for an `SSL` handshake.
+/// `in[0..inlen]` contains the peer-offered ALPN protocol list (wire format); `arg` is user context.
+/// On success, write the selected protocol pointer to `out` and its byte length to `outlen`.
+/// The returned `c_int` is the callback status code consumed by the TLS library.
 pub const AlpnSelectCallback = *const fn (
     ssl: *SSL,
     out: *?[*]const u8,
@@ -235,6 +367,10 @@ pub extern fn ERR_error_string_n(err: c_ulong, buf: [*]u8, len: usize) void;
 pub extern fn ERR_clear_error() void;
 
 // High-level wrappers
+/// Initializes process-wide TLS runtime prerequisites for Serval.
+/// Installs `SIGPIPE` ignore handling and then calls `OPENSSL_init_ssl(0, null)`.
+/// This function does not return errors and intentionally ignores OpenSSL's return value.
+/// Effects are global to the process and should be treated as one-time startup initialization.
 pub fn init() void {
     installSigpipeIgnore();
     _ = OPENSSL_init_ssl(0, null);
@@ -250,6 +386,10 @@ fn installSigpipeIgnore() void {
     posix.sigaction(posix.SIG.PIPE, &action, null);
 }
 
+/// Creates a new client-side `SSL_CTX` using `TLS_client_method()`.
+/// Returns `error.NoTlsMethod` if no TLS client method is available.
+/// Returns `error.SslCtxNew` if `SSL_CTX_new` fails to allocate/initialize the context.
+/// On success, the caller owns the returned `*SSL_CTX` and must release it with `SSL_CTX_free`.
 pub fn createClientCtx() !*SSL_CTX {
     const method = TLS_client_method() orelse return error.NoTlsMethod;
     const ctx = SSL_CTX_new(method) orelse return error.SslCtxNew;
@@ -259,6 +399,10 @@ pub fn createClientCtx() !*SSL_CTX {
     return ctx;
 }
 
+/// Creates a server-side `SSL_CTX` using `TLS_server_method()` and `SSL_CTX_new()`.
+/// On success, it applies server ALPN and certificate-selection hook configuration before returning.
+/// Returns `error.NoTlsMethod` if no TLS server method is available, or `error.SslCtxNew` if context allocation fails.
+/// Ownership of the returned context is transferred to the caller, which must release it with `SSL_CTX_free()`.
 pub fn createServerCtx() !*SSL_CTX {
     const method = TLS_server_method() orelse return error.NoTlsMethod;
     const ctx = SSL_CTX_new(method) orelse return error.SslCtxNew;
@@ -317,22 +461,43 @@ pub fn createServerCtxFromPemFiles(
     return ctx;
 }
 
+/// OpenSSL TLS extension callback return code indicating success.
+/// Use this constant when a callback has handled the extension without error.
+/// Numeric value is `0` (`c_int`), matching OpenSSL's `SSL_TLSEXT_ERR_OK`.
 pub const SSL_TLSEXT_ERR_OK: c_int = 0;
+/// OpenSSL TLS extension callback return code for a fatal alert condition.
+/// Use this value to signal that processing must terminate the TLS handshake immediately.
+/// Constant value is `2` (`c_int`); it is a status code, not an error union.
 pub const SSL_TLSEXT_ERR_ALERT_FATAL: c_int = 2;
+/// OpenSSL TLS extension callback return code indicating "no acknowledgment".
+/// Use this value from extension-related callbacks when no extension response should be sent.
+/// Numeric value is `3` and matches the C `SSL_TLSEXT_ERR_NOACK` constant.
 pub const SSL_TLSEXT_ERR_NOACK: c_int = 3;
 
 const alpn_protocol_h2: []const u8 = "h2";
 const alpn_protocol_http11: []const u8 = "http/1.1";
 const alpn_protocol_acme_tls_1: []const u8 = "acme-tls/1";
 
+/// Public re-export of `serval-core.config.AlpnMixedOfferPolicy` for TLS-facing APIs in this module.
+/// Governs ALPN behavior for mixed `h2`/`http/1.1` client offers, including strict `http11_only` deployments.
+/// Variant semantics are defined by the source enum (`prefer_http11`, `prefer_h2`, `http11_only`); this alias does not modify them.
+/// This is a type alias only: no allocation, ownership/lifetime effects, or error behavior.
 pub const AlpnMixedOfferPolicy = config.AlpnMixedOfferPolicy;
 
+/// Decision for server-side ALPN hook handling during TLS negotiation.
+/// `default_policy` applies the normal ALPN selection policy.
+/// `force_acme_tls_1` forces handling as ACME `tls-alpn-01` (`acme-tls/1`).
+/// `reject` rejects the connection during ALPN processing.
 pub const ServerAlpnHookDecision = enum {
     default_policy,
     force_acme_tls_1,
     reject,
 };
 
+/// Input passed to server-side ALPN selection logic for a single TLS handshake.
+/// `sni` is the client-provided Server Name Indication, or `null` when SNI is absent.
+/// The `client_offers_*` flags indicate whether the client advertised each ALPN token (`http/1.1`, `h2`, `acme-tls/1`).
+/// This is read-only handshake metadata and does not transfer ownership of any referenced bytes.
 pub const ServerAlpnHookInput = struct {
     sni: ?[]const u8,
     client_offers_http11: bool,
@@ -340,18 +505,34 @@ pub const ServerAlpnHookInput = struct {
     client_offers_acme_tls_1: bool,
 };
 
+/// Callback type for process-wide server ALPN override logic (set via `setServerAlpnHook`).
+/// Called with a non-null, read-only `input` snapshot of SNI and client-offered ALPN protocols.
+/// `input` is borrowed for the duration of the call only; implementations must not store the pointer.
+/// Returns a `ServerAlpnHookDecision` (`.default_policy`, `.force_acme_tls_1`, or `.reject`) and does not use Zig error returns.
 pub const ServerAlpnHook = *const fn (input: *const ServerAlpnHookInput) ServerAlpnHookDecision;
 
+/// Decision returned by the server-certificate hook to control TLS context selection per connection.
+/// `default_ctx` keeps using the listener/server default `SSL_CTX`.
+/// `reject` declines the connection instead of selecting a certificate context.
+/// `override_ctx` selects the provided `*SSL_CTX` for this connection.
 pub const ServerCertHookDecision = union(enum) {
     default_ctx,
     reject,
     override_ctx: *SSL_CTX,
 };
 
+/// Input passed to the server-certificate selection hook.
+/// `sni` is the hostname from the TLS SNI extension, or `null` when the client did not send SNI.
+/// The hostname slice is read-only (`[]const u8`) and not NUL-terminated.
+/// This struct does not own `sni`; copy it if you need to keep it beyond hook processing.
 pub const ServerCertHookInput = struct {
     sni: ?[]const u8,
 };
 
+/// Process-wide hook signature used during server-name (SNI) certificate selection.
+/// `input` is read-only and call-scoped; its `sni` may be `null` when no usable hostname is available.
+/// The hook must not retain `input` or any slice it references beyond the call.
+/// Return `.default_ctx` to keep the current context, `.reject` to fail the handshake, or `.override_ctx` to request `SSL_set_SSL_CTX` with the provided context.
 pub const ServerCertHook = *const fn (input: *const ServerCertHookInput) ServerCertHookDecision;
 
 /// Global mixed-offer ALPN policy used by all server contexts in this process.
@@ -366,26 +547,46 @@ var server_alpn_hook: ?ServerAlpnHook = null;
 /// Allows dynamic context override without changing server modules.
 var server_cert_hook: ?ServerCertHook = null;
 
+/// Sets the server-side ALPN mixed-offer policy to `policy`.
+/// This updates the module-level policy value used by TLS server ALPN handling.
+/// Does not allocate or return errors; the assignment takes effect immediately.
 pub fn setServerAlpnMixedOfferPolicy(policy: AlpnMixedOfferPolicy) void {
     server_alpn_mixed_offer_policy = policy;
 }
 
+/// Returns the current server ALPN mixed-offer policy configured in this module.
+/// This is a pure accessor with no side effects and no required preconditions.
+/// The policy is returned by value (`AlpnMixedOfferPolicy`) and cannot fail.
 pub fn getServerAlpnMixedOfferPolicy() AlpnMixedOfferPolicy {
     return server_alpn_mixed_offer_policy;
 }
 
+/// Sets the process-wide server ALPN callback used by TLS server handshakes.
+/// Pass a non-null `hook` to install/replace the callback, or `null` to clear it.
+/// The value is stored directly for later use; this function does not take ownership of external state.
+/// This operation cannot fail and reports no errors.
 pub fn setServerAlpnHook(hook: ?ServerAlpnHook) void {
     server_alpn_hook = hook;
 }
 
+/// Returns the currently configured server ALPN selection hook.
+/// The result is `null` when no hook has been registered.
+/// This function does not allocate or transfer ownership; it only exposes the stored hook value.
 pub fn getServerAlpnHook() ?ServerAlpnHook {
     return server_alpn_hook;
 }
 
+/// Sets the global server-certificate hook used by the TLS layer.
+/// Pass a non-null `hook` to install/replace the current callback; pass `null` to clear it.
+/// This function only updates stored state and does not perform validation or return errors.
 pub fn setServerCertHook(hook: ?ServerCertHook) void {
     server_cert_hook = hook;
 }
 
+/// Returns the process-wide server certificate callback currently registered in this module.
+/// The result is `null` when no hook has been configured.
+/// This is a read-only accessor: it does not allocate, transfer ownership, or modify hook state.
+/// This function does not fail and returns immediately.
 pub fn getServerCertHook() ?ServerCertHook {
     return server_cert_hook;
 }
@@ -539,16 +740,28 @@ fn serverNameSelectCb(
     };
 }
 
+/// Configures ALPN selection for a server `SSL_CTX` by installing `serverAlpnSelectCb`.
+/// Uses `server_alpn_mixed_offer_policy` as the callback policy context via `SSL_CTX_set_alpn_select_cb`.
+/// `ctx` must be a valid, initialized SSL context intended for server-side handshakes.
+/// This function returns no error; any ALPN negotiation failures are handled later by the configured callback.
 pub fn configureServerAlpn(ctx: *SSL_CTX) void {
     const policy_ptr: *AlpnMixedOfferPolicy = &server_alpn_mixed_offer_policy;
     SSL_CTX_set_alpn_select_cb(ctx, serverAlpnSelectCb, @ptrCast(policy_ptr));
 }
 
+/// Configures `ctx` to use Serval's TLS Server Name Indication (SNI) certificate-selection hook.
+/// Sets the OpenSSL servername callback to `serverNameSelectCb` and sets the callback argument to `null`.
+/// Preconditions: `ctx` must be a valid, writable `SSL_CTX` initialized by OpenSSL.
+/// This function does not transfer ownership; `ctx` lifetime remains managed by the caller, and OpenSSL return values are ignored (no error is reported on failure).
 pub fn configureServerCertHook(ctx: *SSL_CTX) void {
     _ = SSL_CTX_callback_ctrl(ctx, SSL_CTRL_SET_TLSEXT_SERVERNAME_CB, @ptrCast(&serverNameSelectCb));
     _ = SSL_CTX_ctrl(ctx, SSL_CTRL_SET_TLSEXT_SERVERNAME_ARG, 0, null);
 }
 
+/// Sets a single client ALPN protocol on `ssl_conn` using OpenSSL's length-prefixed wire format.
+/// `protocol` must be non-empty and at most 255 bytes, otherwise `error.InvalidAlpnProtocol` is returned.
+/// The protocol bytes are copied into a temporary buffer for the call; the caller keeps ownership of `protocol`.
+/// Returns `error.SslSetAlpn` if `SSL_set_alpn_protos` reports failure.
 pub fn setClientAlpnProtocol(ssl_conn: *SSL, protocol: []const u8) !void {
     if (protocol.len == 0) return error.InvalidAlpnProtocol;
     if (protocol.len > 255) return error.InvalidAlpnProtocol;
@@ -563,6 +776,9 @@ pub fn setClientAlpnProtocol(ssl_conn: *SSL, protocol: []const u8) !void {
     }
 }
 
+/// Creates a new `SSL` object from the provided `SSL_CTX`.
+/// Requires `ctx` to point to a valid context suitable for `SSL_new`.
+/// Returns a non-null `*SSL` on success; returns `error.SslNew` if allocation/creation fails.
 pub fn createSsl(ctx: *SSL_CTX) !*SSL {
     // S1: precondition - ctx pointer must be valid (enforced by type system)
     const ssl_obj = SSL_new(ctx) orelse return error.SslNew;
@@ -570,6 +786,10 @@ pub fn createSsl(ctx: *SSL_CTX) !*SSL {
     return ssl_obj;
 }
 
+/// Maps an OpenSSL `SSL_get_error`-style code to a human-readable constant name.
+/// Returns string literals like `SSL_ERROR_WANT_READ` for known `SSL_ERROR_*` values.
+/// For unrecognized codes, returns `"SSL_ERROR_UNKNOWN"` instead of failing.
+/// The returned slice is static, requires no allocation, and is valid for the program lifetime.
 pub fn sslErrorName(err: c_int) []const u8 {
     return switch (err) {
         SSL_ERROR_NONE => "SSL_ERROR_NONE",
@@ -585,6 +805,10 @@ pub fn sslErrorName(err: c_int) []const u8 {
     };
 }
 
+/// Drains and logs entries from OpenSSL's per-thread error queue at error level (`"SSL: {s}"`).
+/// Repeatedly calls `ERR_get_error()` until no error remains or `100` entries have been processed.
+/// Formats each code with `ERR_error_string_n` into a zeroed 256-byte stack buffer before logging.
+/// This function does not return errors; it only emits log output and has no ownership or lifetime effects.
 pub fn printErrors() void {
     var err: c_ulong = ERR_get_error(); // S2: explicit type
     var iteration: u32 = 0;

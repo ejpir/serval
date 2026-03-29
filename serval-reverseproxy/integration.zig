@@ -24,6 +24,9 @@ const IntegrationFilter = struct {
     response_chunk_calls: u32 = 0,
     response_end_calls: u32 = 0,
 
+    /// Handles request headers by counting the callback.
+    /// The `ctx` and `headers` parameters are accepted for interface compatibility and are not modified.
+    /// Always returns `.continue_filtering`.
     pub fn onRequestHeaders(self: *@This(), ctx: *sdk.FilterContext, headers: sdk.HeaderSliceView) sdk.Decision {
         _ = ctx;
         _ = headers;
@@ -31,6 +34,9 @@ const IntegrationFilter = struct {
         return .continue_filtering;
     }
 
+    /// Handles a request body chunk by counting the callback and forwarding the chunk bytes to `emit`.
+    /// Returns `.continue_filtering` after a successful write.
+    /// If emitting fails, rejects the request with HTTP 500 and reason `"emit request"`.
     pub fn onRequestChunk(self: *@This(), ctx: *sdk.FilterContext, chunk: sdk.ChunkView, emit: *sdk.EmitWriter) sdk.Decision {
         _ = ctx;
         self.request_chunk_calls += 1;
@@ -38,6 +44,9 @@ const IntegrationFilter = struct {
         return .continue_filtering;
     }
 
+    /// Records that the request stream has ended.
+    /// `ctx` and `emit` are accepted for callback compatibility and are not used here.
+    /// Always returns `.continue_filtering`.
     pub fn onRequestEnd(self: *@This(), ctx: *sdk.FilterContext, emit: *sdk.EmitWriter) sdk.Decision {
         _ = ctx;
         _ = emit;
@@ -45,6 +54,9 @@ const IntegrationFilter = struct {
         return .continue_filtering;
     }
 
+    /// Handles response headers by counting the callback.
+    /// The `ctx` and `headers` parameters are accepted for interface compatibility and are not modified.
+    /// Always returns `.continue_filtering`.
     pub fn onResponseHeaders(self: *@This(), ctx: *sdk.FilterContext, headers: sdk.HeaderSliceView) sdk.Decision {
         _ = ctx;
         _ = headers;
@@ -52,6 +64,9 @@ const IntegrationFilter = struct {
         return .continue_filtering;
     }
 
+    /// Handles a response body chunk by counting the callback and forwarding the chunk bytes to `emit`.
+    /// Returns `.continue_filtering` after a successful write.
+    /// If emitting fails, rejects the response with HTTP 500 and reason `"emit response"`.
     pub fn onResponseChunk(self: *@This(), ctx: *sdk.FilterContext, chunk: sdk.ChunkView, emit: *sdk.EmitWriter) sdk.Decision {
         _ = ctx;
         self.response_chunk_calls += 1;
@@ -59,6 +74,9 @@ const IntegrationFilter = struct {
         return .continue_filtering;
     }
 
+    /// Records that the response stream has ended.
+    /// `ctx` and `emit` are accepted for callback compatibility and are not used here.
+    /// Always returns `.continue_filtering`.
     pub fn onResponseEnd(self: *@This(), ctx: *sdk.FilterContext, emit: *sdk.EmitWriter) sdk.Decision {
         _ = ctx;
         _ = emit;
@@ -199,6 +217,9 @@ test "integration: reverseproxy loads custom filter and executes all hooks" {
         res_chunks: u32 = 0,
         res_end: u32 = 0,
 
+        /// Handles request headers by counting the callback and incrementing the `req_headers` counter in `ctx`.
+        /// The `headers` view is observed for interface compatibility but not modified.
+        /// Always returns `.continue_filtering`.
         pub fn onRequestHeaders(self: *@This(), ctx: *sdk.FilterContext, headers: sdk.HeaderSliceView) sdk.Decision {
             _ = headers;
             self.req_headers += 1;
@@ -206,6 +227,9 @@ test "integration: reverseproxy loads custom filter and executes all hooks" {
             return .continue_filtering;
         }
 
+        /// Handles a request body chunk by counting the callback and forwarding the chunk bytes to `emit`.
+        /// Returns `.continue_filtering` after a successful write.
+        /// If emitting fails, rejects the request with HTTP 500 and reason `"request emit"`.
         pub fn onRequestChunk(self: *@This(), ctx: *sdk.FilterContext, chunk: sdk.ChunkView, emit: *sdk.EmitWriter) sdk.Decision {
             _ = ctx;
             self.req_chunks += 1;
@@ -213,6 +237,10 @@ test "integration: reverseproxy loads custom filter and executes all hooks" {
             return .continue_filtering;
         }
 
+        /// Records that the request has ended.
+        ///
+        /// `ctx` and `emit` are not used by this hook.
+        /// Returns `.continue_filtering` after incrementing the request-end counter.
         pub fn onRequestEnd(self: *@This(), ctx: *sdk.FilterContext, emit: *sdk.EmitWriter) sdk.Decision {
             _ = ctx;
             _ = emit;
@@ -220,6 +248,10 @@ test "integration: reverseproxy loads custom filter and executes all hooks" {
             return .continue_filtering;
         }
 
+        /// Records that response headers have been seen.
+        ///
+        /// `headers` are not inspected by this hook.
+        /// Sets the filter-context tag `phase=response` and then returns `.continue_filtering`.
         pub fn onResponseHeaders(self: *@This(), ctx: *sdk.FilterContext, headers: sdk.HeaderSliceView) sdk.Decision {
             _ = headers;
             self.res_headers += 1;
@@ -227,6 +259,10 @@ test "integration: reverseproxy loads custom filter and executes all hooks" {
             return .continue_filtering;
         }
 
+        /// Records a response body chunk and forwards its bytes to `emit`.
+        ///
+        /// `ctx` is not used by this hook. `chunk.bytes` must remain valid for the duration of the call.
+        /// If `emit.emit` fails, returns `.reject` with status `500` and reason `"response emit"`; otherwise returns `.continue_filtering`.
         pub fn onResponseChunk(self: *@This(), ctx: *sdk.FilterContext, chunk: sdk.ChunkView, emit: *sdk.EmitWriter) sdk.Decision {
             _ = ctx;
             self.res_chunks += 1;
@@ -234,6 +270,10 @@ test "integration: reverseproxy loads custom filter and executes all hooks" {
             return .continue_filtering;
         }
 
+        /// Records that the response has ended.
+        ///
+        /// `ctx` and `emit` are not used by this hook.
+        /// Returns `.continue_filtering` after incrementing the response-end counter.
         pub fn onResponseEnd(self: *@This(), ctx: *sdk.FilterContext, emit: *sdk.EmitWriter) sdk.Decision {
             _ = ctx;
             _ = emit;

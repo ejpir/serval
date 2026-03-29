@@ -7,6 +7,10 @@ const assert = std.debug.assert;
 const c = std.c;
 const Io = std.Io;
 
+/// Errors that can occur while persisting ACME certificate material.
+/// `InvalidStateDir`, `InvalidCert`, and `InvalidKey` report empty inputs.
+/// `PathTooLong` indicates one of the formatted paths did not fit in the supplied buffer.
+/// The remaining errors map to directory creation, atomic write, sync, or rename failures.
 pub const Error = error{
     InvalidStateDir,
     InvalidCert,
@@ -18,11 +22,18 @@ pub const Error = error{
     RenameFailed,
 };
 
+/// Absolute or relative paths to the persisted certificate and key files.
+/// The returned slices refer to the caller-provided output buffers passed to `persistCertificateAndKey`.
+/// The paths remain valid only while those buffers are kept alive and unchanged.
 pub const PersistedPaths = struct {
     cert_path: []const u8,
     key_path: []const u8,
 };
 
+/// Persists a certificate and private key under `state_dir/cert/current`.
+/// Writes `fullchain.pem` and `privkey.pem` atomically into the provided output buffers.
+/// `state_dir`, `cert_pem`, and `key_pem` must be non-empty; the output slices must be large enough for the formatted paths.
+/// Returns `error.InvalidStateDir`, `error.InvalidCert`, `error.InvalidKey`, `error.PathTooLong`, or filesystem errors if directory creation or writes fail.
 pub fn persistCertificateAndKey(
     state_dir: []const u8,
     cert_pem: []const u8,

@@ -17,6 +17,11 @@
 const std = @import("std");
 const otel = @import("serval-otel");
 
+/// Runs the OTLP export example against `http://localhost:4318/v1/traces`.
+/// Initializes a general-purpose allocator, creates an OTLP exporter, and emits a
+/// small trace with a server span and child spans that are exported immediately.
+/// Returns any allocation or exporter initialization error; the exporter is
+/// released with `defer`, and sleep failures are logged but do not abort the run.
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();

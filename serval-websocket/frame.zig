@@ -9,13 +9,19 @@ const assert = std.debug.assert;
 const serval_core = @import("serval-core");
 const config = serval_core.config;
 
+/// Maximum number of bytes needed to represent any header handled by this module.
+/// This covers the base header, extended payload length, and optional 4-byte mask key.
 pub const max_header_size_bytes: u32 = 14;
 
+/// Identifies the peer role used when validating a received frame header.
+/// Clients are expected to receive masked frames; servers are expected to receive unmasked frames.
 pub const PeerRole = enum {
     client,
     server,
 };
 
+/// WebSocket opcodes supported by this module.
+/// `continuation`, `text`, and `binary` are data frames; `close`, `ping`, and `pong` are control frames.
 pub const Opcode = enum(u4) {
     continuation = 0x0,
     text = 0x1,
@@ -25,6 +31,10 @@ pub const Opcode = enum(u4) {
     pong = 0xA,
 };
 
+/// Parsed WebSocket frame header state returned by `parseHeader`.
+/// It records the frame flags, opcode, masking state, payload length, and any 4-byte mask key.
+/// `header_len_bytes` is the number of bytes consumed from the input buffer.
+/// Use `isControl()` to test whether the opcode is a control frame.
 pub const Header = struct {
     fin: bool,
     rsv1: bool,
@@ -36,6 +46,8 @@ pub const Header = struct {
     mask_key: ?[4]u8,
     header_len_bytes: u8,
 
+    /// Reports whether this parsed header carries a control-frame opcode.
+    /// The method asserts that the stored header length is within the supported header-size bounds.
     pub fn isControl(self: Header) bool {
         assert(self.header_len_bytes >= 2);
         assert(self.header_len_bytes <= max_header_size_bytes);
@@ -43,6 +55,10 @@ pub const Header = struct {
     }
 };
 
+/// Describes the fields needed to encode an outbound WebSocket header.
+/// `opcode` and `payload_len` are required; `fin` defaults to `true`.
+/// Set `mask_key` to `null` for an unmasked frame or to a 4-byte key to emit a masked header.
+/// This struct is consumed by `buildHeader` and does not own heap memory.
 pub const OutboundHeader = struct {
     fin: bool = true,
     opcode: Opcode,
@@ -50,6 +66,10 @@ pub const OutboundHeader = struct {
     mask_key: ?[4]u8 = null,
 };
 
+/// Errors that can be returned while parsing or validating a WebSocket frame header.
+/// `IncompleteHeader` and `HeaderTooLarge` describe truncated or oversized header input.
+/// The remaining errors report unsupported opcodes, invalid reserved bits or payload length,
+/// and masking or control-frame rule violations.
 pub const FrameError = error{
     IncompleteHeader,
     UnsupportedOpcode,
@@ -105,6 +125,10 @@ pub fn parseHeader(input: []const u8, role: PeerRole) FrameError!Header {
     return header;
 }
 
+/// Builds a WebSocket frame header into `out` and returns the written prefix.
+/// Returns `null` when `out` is too small or `frame.payload_len` cannot be encoded.
+/// If `frame.mask_key` is set, the mask bit is emitted and the 4-byte key is appended.
+/// The returned slice aliases `out`; no allocation is performed.
 pub fn buildHeader(out: []u8, frame: OutboundHeader) ?[]const u8 {
     assert(out.len > 0);
     assert(out.len <= std.math.maxInt(u32));
@@ -150,6 +174,9 @@ pub fn buildHeader(out: []u8, frame: OutboundHeader) ?[]const u8 {
     return out[0..@intCast(pos_bytes)];
 }
 
+/// Applies the 4-byte WebSocket masking key to `payload` in place.
+/// The key is repeated across the payload bytes; the operation is its own inverse.
+/// No allocation occurs and the slice is modified directly.
 pub fn applyMask(payload: []u8, mask_key: [4]u8) void {
     assert(payload.len <= std.math.maxInt(u32));
     assert(mask_key.len == 4);
@@ -162,6 +189,8 @@ pub fn applyMask(payload: []u8, mask_key: [4]u8) void {
     }
 }
 
+/// Returns `true` when `opcode` is one of the WebSocket control opcodes.
+/// This is a pure classification check with no allocation or error return.
 pub fn isControlOpcode(opcode: Opcode) bool {
     const opcode_bits: u8 = @intFromEnum(opcode);
     assert(opcode_bits <= 0xF);

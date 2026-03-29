@@ -18,6 +18,10 @@ fn apply_optional_openssl_paths(
     }
 }
 
+/// Configures the Serval build graph using the standard target and optimize options.
+/// Registers the Serval modules and any downstream executables/tests, wiring module imports as needed.
+/// Optional `openssl-include-dir` and `openssl-lib-dir` values are forwarded to TLS-related compilation units.
+/// `b` must be a valid build context supplied by Zig's build system; this function mutates the graph and does not return an error.
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});

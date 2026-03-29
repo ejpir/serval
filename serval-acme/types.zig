@@ -13,6 +13,9 @@ const max_contact_email_len = core_config.ACME_MAX_CONTACT_EMAIL_BYTES;
 const max_state_dir_path_len = core_config.ACME_MAX_STATE_DIR_PATH_BYTES;
 const max_domain_label_len: u8 = 63;
 
+/// Errors returned by ACME runtime configuration parsing and domain-name updates.
+/// These cover invalid paths, URLs, contact data, domain counts, domain syntax, and out-of-range timing values.
+/// Callers should treat each case as a hard validation failure rather than a recoverable runtime condition.
 pub const Error = error{
     InvalidDirectoryUrl,
     InvalidContactEmail,
@@ -51,6 +54,9 @@ pub const DomainName = struct {
     len: u16 = 0,
     bytes: [max_domain_name_len]u8 = [_]u8{0} ** max_domain_name_len,
 
+    /// Stores `value` in this domain name after validating it.
+    /// The value must be non-empty and no longer than `max_domain_name_len`; validation failures are returned as errors.
+    /// On success, the previous contents are cleared, the new bytes are copied in, and the stored length is updated.
     pub fn set(self: *DomainName, value: []const u8) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(self.len <= max_domain_name_len);
@@ -65,6 +71,9 @@ pub const DomainName = struct {
         assert(self.len == @as(u16, @intCast(value.len)));
     }
 
+    /// Returns the domain name as a slice.
+    /// The returned slice aliases the internal fixed buffer and must not be mutated by callers.
+    /// The stored length is bounded by `max_domain_name_len`.
     pub fn slice(self: *const DomainName) []const u8 {
         assert(@intFromPtr(self) != 0);
         assert(self.len <= max_domain_name_len);
@@ -128,6 +137,9 @@ pub const RuntimeConfig = struct {
     domains: [max_domains_per_cert]DomainName = [_]DomainName{.{}} ** max_domains_per_cert,
     domain_count: u8 = 0,
 
+    /// Builds a runtime ACME configuration from the validated input config.
+    /// Range checks reject zero polling/backoff values, inverted backoff bounds, and renew-before values outside the supported window.
+    /// When ACME is enabled, this copies the directory URL, contact email, state path, and each domain into fixed internal storage.
     pub fn initFromConfig(cfg: core_config.AcmeConfig) Error!RuntimeConfig {
         assert(max_domains_per_cert > 0);
         assert(max_directory_url_len > 0);
@@ -179,24 +191,36 @@ pub const RuntimeConfig = struct {
         return runtime;
     }
 
+    /// Returns the configured ACME directory URL as a slice.
+    /// The returned slice aliases storage owned by `self` and is valid while `self` is unchanged.
+    /// The stored length is bounded by `max_directory_url_len`.
     pub fn directoryUrl(self: *const RuntimeConfig) []const u8 {
         assert(@intFromPtr(self) != 0);
         assert(self.directory_url_len <= max_directory_url_len);
         return self.directory_url_bytes[0..self.directory_url_len];
     }
 
+    /// Returns the configured contact email as a slice.
+    /// The returned data is backed by `self` and is read-only to callers.
+    /// The slice length is taken from the stored length field and must fit the configured limit.
     pub fn contactEmail(self: *const RuntimeConfig) []const u8 {
         assert(@intFromPtr(self) != 0);
         assert(self.contact_email_len <= max_contact_email_len);
         return self.contact_email_bytes[0..self.contact_email_len];
     }
 
+    /// Returns the configured state directory path as a slice.
+    /// The returned slice aliases storage owned by `self` and must not be freed.
+    /// The slice length is the stored path length and may be empty only if the config is invalid.
     pub fn stateDirPath(self: *const RuntimeConfig) []const u8 {
         assert(@intFromPtr(self) != 0);
         assert(self.state_dir_path_len <= max_state_dir_path_len);
         return self.state_dir_path_bytes[0..self.state_dir_path_len];
     }
 
+    /// Returns the configured domain at `index` when it exists.
+    /// The returned slice aliases storage owned by `self` and remains valid while
+    /// `self` is unchanged and the config object is alive.
     pub fn domainAt(self: *const RuntimeConfig, index: u8) ?[]const u8 {
         assert(@intFromPtr(self) != 0);
         assert(self.domain_count <= max_domains_per_cert);

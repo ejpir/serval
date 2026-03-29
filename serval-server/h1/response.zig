@@ -460,6 +460,9 @@ const MockWriter = struct {
     pos: usize = 0,
     write_count: u32 = 0,
 
+    /// Appends `data` to the buffer and records one write operation.
+    /// Returns `error.BufferOverflow` if the new contents would exceed `BUFFER_SIZE`; otherwise copies the bytes in place.
+    /// On success, advances `pos` by `data.len` and increments `write_count` by one.
     pub fn writeAll(self: *MockWriter, data: []const u8) !void {
         if (self.pos + data.len > BUFFER_SIZE) {
             return error.BufferOverflow;
@@ -469,10 +472,16 @@ const MockWriter = struct {
         self.write_count += 1;
     }
 
+    /// Returns the slice of bytes written so far.
+    /// The returned slice aliases the writer's internal buffer and remains valid until the next mutation.
+    /// Its length is always `self.pos`.
     pub fn written(self: *const MockWriter) []const u8 {
         return self.buffer[0..self.pos];
     }
 
+    /// Resets the mock writer to an empty state and clears its backing buffer.
+    /// After this call, `pos` and `write_count` are zeroed and previously written bytes are removed.
+    /// Call this before reusing the writer in a new test or response capture.
     pub fn reset(self: *MockWriter) void {
         self.pos = 0;
         self.write_count = 0;

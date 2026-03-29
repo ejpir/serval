@@ -18,6 +18,9 @@ const max_problem_document_bytes: u32 = @intCast(
 );
 const problem_parse_scratch_size_bytes = 2048;
 
+/// Errors returned when required ACME URLs or request preconditions are missing.
+/// These failures indicate that the caller cannot continue the requested operation as configured.
+/// `SignedBodyRequired` is raised when a signed request body is needed but unavailable.
 pub const Error = error{
     NonceUnavailable,
     AccountUrlUnavailable,
@@ -26,8 +29,14 @@ pub const Error = error{
     SignedBodyRequired,
 };
 
+/// Error set used by protocol-level helpers in this module.
+/// This aliases errors from the local `Error` set, `client.Error`, and `wire.Error`.
+/// Callers should handle the combined set when propagating failures across protocol boundaries.
 pub const ProtocolError = Error || client.Error || wire.Error;
 
+/// Internal operation kind used to drive request construction and response handling.
+/// The values correspond to nonce fetches, account and order creation, and resource lookups.
+/// `finalize_order` represents the order-finalization step.
 pub const Operation = enum(u8) {
     fetch_nonce,
     new_account,
@@ -37,6 +46,9 @@ pub const Operation = enum(u8) {
     finalize_order,
 };
 
+/// Identifies an ACME endpoint used by this module.
+/// Each tag names a directory or resource endpoint such as account, order, or finalize.
+/// Use these values when routing a request to the corresponding protocol target.
 pub const Endpoint = enum(u8) {
     directory_new_nonce,
     directory_new_account,
@@ -46,6 +58,9 @@ pub const Endpoint = enum(u8) {
     finalize,
 };
 
+/// High-level decision produced after assessing a response.
+/// `success` accepts the result, while the retry variants describe which recovery strategy to apply.
+/// `fatal` indicates the caller should stop retrying this path.
 pub const ResponseOutcome = enum(u8) {
     success,
     retry_with_new_nonce,
@@ -53,6 +68,9 @@ pub const ResponseOutcome = enum(u8) {
     fatal,
 };
 
+/// Classifies why a response was not treated as a clean success.
+/// The values distinguish nonce, rate-limit, server, client, and protocol-shape failures.
+/// `none` indicates that no failure reason has been assigned.
 pub const ResponseReason = enum(u8) {
     none,
     bad_nonce,
@@ -63,11 +81,17 @@ pub const ResponseReason = enum(u8) {
     invalid_problem_document,
 };
 
+/// Captures the outcome of evaluating an ACME response.
+/// `outcome` describes the retry decision, `reason` records the classification, and `http_status` stores the observed status code.
+/// Field defaults represent a successful, unclassified assessment with no HTTP status recorded.
 pub const ResponseAssessment = struct {
     outcome: ResponseOutcome = .success,
     reason: ResponseReason = .none,
     http_status: u16 = 0,
 
+    /// Reports whether the assessment ended in `.success`.
+    /// The pointer must be valid and non-null when called.
+    /// Debug assertions also require `http_status <= 999` before the check runs.
     pub fn isSuccess(self: *const ResponseAssessment) bool {
         assert(@intFromPtr(self) != 0);
         assert(self.http_status <= 999);
@@ -75,23 +99,32 @@ pub const ResponseAssessment = struct {
     }
 };
 
+/// Read-only view of an assessed HTTP response.
+/// `headers` and `body` borrow storage owned elsewhere; this type does not manage lifetime.
+/// `status` carries the HTTP status code associated with the response.
 pub const ResponseView = struct {
     status: u16,
     headers: *const HeaderMap,
     body: []const u8,
 };
 
+/// Parsed response body returned by ACME response handling.
+/// `.none` means no body was decoded; `.account` and `.order` carry the corresponding typed client response.
 pub const ParsedBody = union(enum) {
     none,
     account: client.AccountResponse,
     order: client.OrderResponse,
 };
 
+/// Pairs an HTTP response assessment with an optional parsed ACME body.
+/// `parsed` defaults to `.none` when the response does not carry a successfully decoded account or order body.
 pub const HandledResponse = struct {
     assessment: ResponseAssessment,
     parsed: ParsedBody = .none,
 };
 
+/// High-level handling class for orchestration failures.
+/// The class determines whether a caller should retry immediately, back off, treat the failure as protocol-level, or treat it as input-related.
 pub const ErrorClass = enum(u8) {
     retry_with_new_nonce,
     retry_with_backoff,
@@ -99,6 +132,8 @@ pub const ErrorClass = enum(u8) {
     input,
 };
 
+/// Explains why an orchestration error was classified the way it was.
+/// These reasons are used to distinguish missing endpoints, malformed responses, bad inputs, and other failures.
 pub const ErrorReason = enum(u8) {
     missing_replay_nonce,
     missing_location,
@@ -110,6 +145,8 @@ pub const ErrorReason = enum(u8) {
     other,
 };
 
+/// Describes how an ACME error should be classified for retry and reporting decisions.
+/// The `class` field captures the handling category and `reason` captures the specific failure mode.
 pub const ErrorAssessment = struct {
     class: ErrorClass,
     reason: ErrorReason,
@@ -131,12 +168,18 @@ pub const FlowContext = struct {
     has_finalize_url: bool = false,
     finalize_url: client.Url = .{},
 
+    /// Initializes a flow context from the ACME directory metadata.
+    /// The directory is copied by value into the new context, so the caller retains ownership of the input pointer.
+    /// The directory's new-nonce URL must satisfy the configured maximum length assertion.
     pub fn init(directory: *const client.Directory) FlowContext {
         assert(@intFromPtr(directory) != 0);
         assert(directory.new_nonce_url.len <= config.ACME_MAX_DIRECTORY_URL_BYTES);
         return .{ .directory = directory.* };
     }
 
+    /// Records a replay nonce in the flow context.
+    /// The pointed-to nonce is copied into the context; the caller retains ownership of the input value.
+    /// After this call, `requireNonce` can return the stored nonce.
     pub fn setNonce(self: *FlowContext, nonce: *const client.ReplayNonce) void {
         assert(@intFromPtr(self) != 0);
         assert(@intFromPtr(nonce) != 0);
@@ -145,6 +188,9 @@ pub const FlowContext = struct {
         self.has_nonce = true;
     }
 
+    /// Returns the current replay nonce if one has been recorded in the flow context.
+    /// When no nonce is available, returns `error.NonceUnavailable` instead of fabricating a value.
+    /// The returned nonce is owned by the context and remains valid until the context is updated or discarded.
     pub fn requireNonce(self: *const FlowContext) Error!client.ReplayNonce {
         assert(@intFromPtr(self) != 0);
         assert(!self.has_nonce or self.nonce.len > 0);
@@ -153,6 +199,9 @@ pub const FlowContext = struct {
         return self.nonce;
     }
 
+    /// Stores the account URL for later request construction.
+    /// The pointed-to URL is copied into the flow context; the caller retains ownership of the input value.
+    /// After this call, `.account` becomes available to `selectEndpoint` and request builders.
     pub fn setAccountUrl(self: *FlowContext, account_url: *const client.Url) void {
         assert(@intFromPtr(self) != 0);
         assert(@intFromPtr(account_url) != 0);
@@ -161,6 +210,9 @@ pub const FlowContext = struct {
         self.has_account_url = true;
     }
 
+    /// Stores the order URL for later request construction.
+    /// The pointed-to URL is copied into the flow context; the caller retains ownership of the input value.
+    /// After this call, `.order` becomes available to `selectEndpoint` and request builders.
     pub fn setOrderUrl(self: *FlowContext, order_url: *const client.Url) void {
         assert(@intFromPtr(self) != 0);
         assert(@intFromPtr(order_url) != 0);
@@ -169,6 +221,9 @@ pub const FlowContext = struct {
         self.has_order_url = true;
     }
 
+    /// Stores the finalize URL for later request construction.
+    /// The pointed-to URL is copied into the flow context; the caller retains ownership of the input value.
+    /// After this call, `.finalize` becomes available to `selectEndpoint` and request builders.
     pub fn setFinalizeUrl(self: *FlowContext, finalize_url: *const client.Url) void {
         assert(@intFromPtr(self) != 0);
         assert(@intFromPtr(finalize_url) != 0);
@@ -177,6 +232,9 @@ pub const FlowContext = struct {
         self.has_finalize_url = true;
     }
 
+    /// Selects the URL associated with an endpoint in the current flow context.
+    /// Directory endpoints are always available; account, order, and finalize URLs require their corresponding `has_*` flag to be set.
+    /// Returns an error when the requested endpoint has not been populated yet.
     pub fn selectEndpoint(self: *const FlowContext, endpoint: Endpoint) Error!client.Url {
         assert(@intFromPtr(self) != 0);
         assert(self.directory.new_nonce_url.len <= config.ACME_MAX_DIRECTORY_URL_BYTES);
@@ -191,6 +249,9 @@ pub const FlowContext = struct {
         };
     }
 
+    /// Builds the wire request for an ACME operation from the current flow context.
+    /// `signed_body` is required for every operation except `.fetch_nonce`; passing an empty body for other operations returns `error.SignedBodyRequired`.
+    /// The returned request borrows from `self.directory` and any supplied body slice for request construction.
     pub fn buildRequest(
         self: *const FlowContext,
         operation: Operation,
@@ -213,6 +274,9 @@ pub const FlowContext = struct {
         };
     }
 
+    /// Processes a response for an ACME flow and updates nonce or resource state on success.
+    /// Returns the response assessment together with any parsed body; non-success responses are returned without parsing.
+    /// On successful responses, the replay nonce is extracted from headers before the operation-specific response handler runs.
     pub fn handleResponse(
         self: *FlowContext,
         operation: Operation,
@@ -295,6 +359,9 @@ pub const FlowContext = struct {
     }
 };
 
+/// Assesses an HTTP response for the given ACME operation.
+/// Successful statuses are passed through with `.success`; 400/429/5xx and other 4xx statuses are mapped to retry or fatal outcomes.
+/// `response` must point to a valid `ResponseView` with a bounded HTTP status code and accessible headers/body slices.
 pub fn assessResponse(operation: Operation, response: *const ResponseView) ResponseAssessment {
     assert(@intFromPtr(response) != 0);
     assert(response.status <= 999);
@@ -338,6 +405,9 @@ pub fn assessResponse(operation: Operation, response: *const ResponseView) Respo
     };
 }
 
+/// Classifies a protocol-layer parsing or validation failure for ACME orchestration.
+/// The result separates caller input mistakes from remote protocol defects so retry policy can be chosen correctly.
+/// Unknown errors are treated as protocol issues with the `.other` reason.
 pub fn classifyProtocolError(err: ProtocolError) ErrorAssessment {
     assert(@sizeOf(ErrorAssessment) > 0);
     assert(@sizeOf(@TypeOf(err)) > 0);

@@ -13,6 +13,9 @@ const time = @import("serval-core").time;
 // Metrics Interface Verification
 // =============================================================================
 
+/// Verifies at compile time that `M` provides the required metrics hooks.
+/// Emits a compile error if `requestStart` or `requestEnd` is missing.
+/// This check runs at comptime and does not instantiate or call `M`.
 pub fn verifyMetrics(comptime M: type) void {
     if (!@hasDecl(M, "requestStart")) {
         @compileError("Metrics must implement: pub fn requestStart(self) void");
@@ -26,11 +29,32 @@ pub fn verifyMetrics(comptime M: type) void {
 // NoopMetrics (zero overhead)
 // =============================================================================
 
+/// No-op metrics implementation for callers that do not want to collect data.
+/// Each method satisfies the shared metrics interface but intentionally
+/// performs no work and returns no errors.
 pub const NoopMetrics = struct {
+    /// Records the start of a request without storing any metrics.
+    /// This no-op form exists to satisfy the shared metrics API.
+    /// The call never returns an error.
     pub fn requestStart(_: *@This()) void {}
+    /// Records the end of a request without storing any metrics.
+    /// This no-op form accepts the HTTP status and request duration so it can
+    /// satisfy the shared metrics API.
+    /// The call never returns an error.
     pub fn requestEnd(_: *@This(), _: u16, _: u64) void {}
+    /// Increments the active-connection gauge by one.
+    /// This is a no-op implementation for metrics backends that do not track
+    /// connection state.
+    /// The call never returns an error.
     pub fn connectionOpened(_: *@This()) void {}
+    /// Decrements the active-connection gauge by one.
+    /// This is a no-op implementation for metrics backends that do not track
+    /// connection state.
+    /// The call never returns an error.
     pub fn connectionClosed(_: *@This()) void {}
+    /// Records upstream latency for the public metrics interface.
+    /// This implementation intentionally does nothing.
+    /// Per-upstream latency is tracked by `RealTimeMetrics` instead.
     pub fn upstreamLatency(_: *@This(), _: u32, _: u64) void {}
 };
 
@@ -38,6 +62,9 @@ pub const NoopMetrics = struct {
 // PrometheusMetrics (fixed-size, atomic)
 // =============================================================================
 
+/// Atomic Prometheus-compatible request and connection metrics.
+/// Stores counters, gauges, and fixed histogram buckets initialized to zero.
+/// Updates use monotonic atomic operations and do not allocate or return errors.
 pub const PrometheusMetrics = struct {
     // Counters
     requests_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -49,10 +76,18 @@ pub const PrometheusMetrics = struct {
     // Histograms (buckets: 1ms, 5ms, 10ms, 50ms, 100ms, 500ms, 1s, 5s)
     request_duration_buckets: [8]std.atomic.Value(u64) = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** 8,
 
+    /// Increments the total request counter.
+    /// Uses a monotonic atomic update and does not report an error.
+    /// Call this at request start before any outcome is known.
     pub fn requestStart(self: *@This()) void {
         _ = self.requests_total.fetchAdd(1, .monotonic);
     }
 
+    /// Records the end of a request in the status and duration buckets.
+    /// Status codes are grouped into 1xx-5xx classes, with all other values
+    /// placed into the final `other` bucket.
+    /// Duration is classified by `durationToBucket` and both counters are updated
+    /// with monotonic atomic operations.
     pub fn requestEnd(self: *@This(), status: u16, duration_ns: u64) void {
         // Status bucket (0=1xx, 1=2xx, 2=3xx, 3=4xx, 4=5xx, 5=other)
         // TigerStyle: Use u8 for bucket index (only 6 buckets).
@@ -67,14 +102,23 @@ pub const PrometheusMetrics = struct {
         _ = self.request_duration_buckets[bucket].fetchAdd(1, .monotonic);
     }
 
+    /// Increments the active-connection gauge by one.
+    /// Uses a monotonic atomic update and does not report an error.
+    /// Call this when a connection becomes active.
     pub fn connectionOpened(self: *@This()) void {
         _ = self.connections_active.fetchAdd(1, .monotonic);
     }
 
+    /// Decrements the active-connection gauge by one.
+    /// Uses a monotonic atomic update and does not report an error.
+    /// The caller is responsible for ensuring the counter does not underflow.
     pub fn connectionClosed(self: *@This()) void {
         _ = self.connections_active.fetchSub(1, .monotonic);
     }
 
+    /// Records upstream latency for the public metrics interface.
+    /// This implementation is intentionally a no-op because per-upstream latency
+    /// is tracked by `RealTimeMetrics` instead of this metrics backend.
     pub fn upstreamLatency(_: *@This(), _: u32, _: u64) void {
         // Intentionally empty - per-upstream latency tracked in RealTimeMetrics.
     }

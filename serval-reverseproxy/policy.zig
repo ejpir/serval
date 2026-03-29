@@ -4,18 +4,28 @@ const std = @import("std");
 const assert = std.debug.assert;
 const sdk = @import("serval-filter-sdk");
 
+/// Maximum number of policy filters accepted by the execution helpers.
+/// Callers must keep request and response filter slices at or below this bound.
 pub const MAX_POLICY_FILTERS: usize = 64;
 
+/// Identifies which header phase is being executed.
+/// `request_headers` runs before upstream forwarding; `response_headers` runs after a response is available.
 pub const PolicyPhase = enum(u8) {
     request_headers,
     response_headers,
 };
 
+/// Classifies the last policy error that was observed.
+/// `.none` means no policy error has been recorded; `.rejected_by_policy` marks a filter rejection.
 pub const PolicyErrorClass = enum(u8) {
     none,
     rejected_by_policy,
 };
 
+/// Tracks per-policy execution counts and the most recent error class.
+/// `request_phase_invocations` and `response_phase_invocations` count filter calls by phase.
+/// `rejects` and `bypasses` count terminal and skip decisions, while `last_error_class` records the latest class seen.
+/// Use `init()` to construct a zeroed observation.
 pub const PolicyObservation = struct {
     request_phase_invocations: u32,
     response_phase_invocations: u32,
@@ -23,6 +33,8 @@ pub const PolicyObservation = struct {
     bypasses: u32,
     last_error_class: PolicyErrorClass,
 
+    /// Creates a zeroed `PolicyObservation` with no recorded invocations, rejections, or bypasses.
+    /// The returned value sets `last_error_class` to `.none`.
     pub fn init() PolicyObservation {
         return .{
             .request_phase_invocations = 0,
@@ -34,11 +46,16 @@ pub const PolicyObservation = struct {
     }
 };
 
+/// Result of running a policy phase.
+/// `continue_forwarding` means processing may continue, while `reject` carries the reject response to return upstream.
 pub const PolicyExecutionResult = union(enum) {
     continue_forwarding,
     reject: sdk.RejectResponse,
 };
 
+/// Executes all request-header filters in order and records observation data for each decision.
+/// `filter_ctx` and `observation` must be non-null pointers, and `filters.len` must not exceed `MAX_POLICY_FILTERS`.
+/// A rejection stops iteration immediately; bypass decisions are counted and processing continues.
 pub fn executeRequestHeaders(
     comptime Filter: type,
     filters: []Filter,
@@ -71,6 +88,9 @@ pub fn executeRequestHeaders(
     return .continue_forwarding;
 }
 
+/// Executes all response-header filters in order and records observation data for each decision.
+/// `filter_ctx` and `observation` must be non-null pointers, and `filters.len` must not exceed `MAX_POLICY_FILTERS`.
+/// A rejection stops iteration immediately; bypass decisions are counted and processing continues.
 pub fn executeResponseHeaders(
     comptime Filter: type,
     filters: []Filter,
@@ -103,6 +123,9 @@ pub fn executeResponseHeaders(
     return .continue_forwarding;
 }
 
+/// Executes request-header filters first, then response-header filters if no request filter rejects.
+/// Both filter slices must contain at most `MAX_POLICY_FILTERS` entries.
+/// Returns the first rejection immediately and leaves `observation` updated with the work that ran.
 pub fn executeHeaderPhases(
     comptime Filter: type,
     request_filters: []Filter,
@@ -128,6 +151,9 @@ test "request header reject short-circuits response phase" {
     const Filter = struct {
         reject_request: bool,
 
+        /// Handles request headers and rejects only when this filter is configured to do so.
+        /// `ctx` and `headers` are currently ignored by this implementation.
+        /// Returns a 403 `blocked` rejection when `self.reject_request` is set; otherwise continues filtering.
         pub fn onRequestHeaders(self: *@This(), ctx: *sdk.FilterContext, headers: sdk.HeaderSliceView) sdk.Decision {
             _ = ctx;
             _ = headers;
@@ -137,6 +163,9 @@ test "request header reject short-circuits response phase" {
                 .continue_filtering;
         }
 
+        /// Handles response headers for a policy filter that does not alter the stream.
+        /// The `self`, `ctx`, and `headers` arguments are ignored.
+        /// Always returns `.continue_filtering` so later filters may still run.
         pub fn onResponseHeaders(self: *@This(), ctx: *sdk.FilterContext, headers: sdk.HeaderSliceView) sdk.Decision {
             _ = self;
             _ = ctx;
@@ -178,6 +207,9 @@ test "request header reject short-circuits response phase" {
 
 test "policy execution tracks bypass and continue decisions" {
     const Filter = struct {
+        /// Handles request headers for a policy filter that does not alter the stream.
+        /// The `self`, `ctx`, and `headers` arguments are ignored.
+        /// Always returns `.bypass_plugin`, which skips further work in the current plugin chain.
         pub fn onRequestHeaders(self: *@This(), ctx: *sdk.FilterContext, headers: sdk.HeaderSliceView) sdk.Decision {
             _ = self;
             _ = ctx;
@@ -185,6 +217,9 @@ test "policy execution tracks bypass and continue decisions" {
             return .bypass_plugin;
         }
 
+        /// Handles response headers for a policy filter that does not alter the stream.
+        /// The `self`, `ctx`, and `headers` arguments are ignored.
+        /// Always returns `.continue_filtering` so later filters may still run.
         pub fn onResponseHeaders(self: *@This(), ctx: *sdk.FilterContext, headers: sdk.HeaderSliceView) sdk.Decision {
             _ = self;
             _ = ctx;

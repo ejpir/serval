@@ -266,6 +266,9 @@ pub const PortPool = struct {
     next_port: u16,
     mutex: std.Io.Mutex,
 
+    /// Creates a port pool starting at `BASE_TEST_PORT` with an initialized mutex.
+    /// The returned pool is ready for immediate use by `next`.
+    /// No error is returned because construction only sets local state.
     pub fn init() PortPool {
         return .{
             .next_port = BASE_TEST_PORT,
@@ -273,6 +276,10 @@ pub const PortPool = struct {
         };
     }
 
+    /// Returns the next free port in the test-port range for this pool.
+    /// The mutex is held while scanning, so concurrent callers are serialized.
+    /// The scan advances `next_port`, wraps at overflow, and retries up to `MAX_PORT_SCAN_ATTEMPTS`.
+    /// Panics if no free port is found within the configured scan budget.
     pub fn next(self: *PortPool) u16 {
         self.mutex.lockUncancelable(std.Options.debug_io);
         defer self.mutex.unlock(std.Options.debug_io);
@@ -293,6 +300,9 @@ pub const PortPool = struct {
 
 var global_port_pool: PortPool = PortPool.init();
 
+/// Returns the next available test port from the global port pool.
+/// This is a convenience wrapper around `global_port_pool.next()`.
+/// The returned port is selected from the pool's scan, not allocated permanently.
 pub fn getPort() u16 {
     return global_port_pool.next();
 }
@@ -313,10 +323,17 @@ fn monotonic_now_ns() u64 {
     return @intCast(ts.nanoseconds);
 }
 
+/// Captures a start timestamp and timeout for later expiration checks.
+/// `start_ns` is recorded from the monotonic clock; `timeout_ns` is the caller-provided duration.
+/// `init` can fail with `TimerUnavailable` if the timer cannot be read.
+/// `expired` and `remaining_ns` both use the monotonic clock and do not modify the value.
 pub const Deadline = struct {
     start_ns: u64,
     timeout_ns: u64,
 
+    /// Error returned when the monotonic timer cannot be read.
+    /// Used by `Deadline.init` to report timer failure instead of aborting.
+    /// Callers should handle this if deadline creation is part of startup or test setup.
     pub const InitError = error{TimerUnavailable};
 
     /// Initialize a deadline with the given timeout.
@@ -328,12 +345,18 @@ pub const Deadline = struct {
         };
     }
 
+    /// Report whether this deadline has already expired.
+    /// Expiration is determined by comparing elapsed monotonic time against the configured timeout.
+    /// The result is a pure check and does not mutate the deadline.
     pub fn expired(self: Deadline) bool {
         const now_ns = monotonic_now_ns();
         const elapsed_ns = now_ns -| self.start_ns;
         return elapsed_ns >= self.timeout_ns;
     }
 
+    /// Return the number of nanoseconds remaining before this deadline expires.
+    /// The result is clamped at zero once the deadline has passed.
+    /// The calculation uses a monotonic clock and saturating subtraction to avoid underflow.
     pub fn remaining_ns(self: Deadline) u64 {
         const now_ns = monotonic_now_ns();
         const elapsed_ns = now_ns -| self.start_ns;
@@ -346,6 +369,9 @@ pub const Deadline = struct {
 // Process - Manages a single spawned process (using fork+exec)
 // =============================================================================
 
+/// Record a spawned process and the allocator used to own its metadata.
+/// `kill` attempts to terminate and reap the child, tolerating an already-exited process.
+/// `deinit` only frees owned name memory; it does not terminate the process.
 pub const Process = struct {
     pid: posix.pid_t,
     name: []const u8,
@@ -365,6 +391,9 @@ pub const Process = struct {
         _ = posix.waitpid(self.pid, 0);
     }
 
+    /// Free the owned process name buffer.
+    /// This does not signal or reap the process itself; use `kill` for termination first if needed.
+    /// The process value becomes unusable for name access after deinitialization.
     pub fn deinit(self: *Process) void {
         self.allocator.free(self.name);
     }
@@ -438,10 +467,16 @@ pub const ReverseproxyRuntimeConfig = struct {
     debug: bool = false,
 };
 
+/// Manage the lifetime of child processes started by the integration harness.
+/// The manager owns the list storage used to track spawned processes and their cleanup state.
+/// Call `deinit` to terminate tracked processes and release the list storage.
 pub const ProcessManager = struct {
     allocator: std.mem.Allocator,
     processes: std.ArrayList(Process),
 
+    /// Create an empty process manager that uses `allocator` for internal storage.
+    /// The returned manager starts with no tracked processes.
+    /// No child processes are started by this call.
     pub fn init(allocator: std.mem.Allocator) ProcessManager {
         return .{
             .allocator = allocator,
@@ -449,6 +484,9 @@ pub const ProcessManager = struct {
         };
     }
 
+    /// Stop all tracked processes and release the process list storage.
+    /// This is the public teardown entry point for `ProcessManager`.
+    /// After this call, the manager should not be used unless it is reinitialized.
     pub fn deinit(self: *ProcessManager) void {
         self.stopAll();
         self.processes.deinit(self.allocator);
@@ -897,6 +935,9 @@ pub const ProcessManager = struct {
         posix.nanosleep(0, READY_POLL_INTERVAL_MS * std.time.ns_per_ms);
     }
 
+    /// Stop every tracked process, killing them in reverse start order.
+    /// Each process is killed and then deinitialized before the next entry is removed.
+    /// This drains the manager's process list and is intended for teardown paths.
     pub fn stopAll(self: *ProcessManager) void {
         // Stop in reverse order (LB first, then backends)
         while (self.processes.pop()) |*proc| {
@@ -1014,11 +1055,17 @@ fn spawnProcess(allocator: std.mem.Allocator, argv: []const []const u8) SpawnErr
 // Port waiting
 // =============================================================================
 
+/// Errors that can occur while waiting for a port to become ready.
+/// `TimerUnavailable` indicates the monotonic clock could not be queried.
+/// `PortTimeout` indicates the port did not accept a connection before the deadline.
 pub const WaitError = error{
     TimerUnavailable,
     PortTimeout,
 };
 
+/// Poll until `port` accepts connections or `timeout_ms` elapses.
+/// The wait is bounded by both a deadline and a maximum iteration count to avoid unbounded loops.
+/// Returns `error.PortTimeout` if the port never becomes reachable; other errors come from the connection or timer helpers.
 pub fn waitForPort(port: u16, timeout_ms: u64) WaitError!void {
     // Precondition
     assert(port > 0);
@@ -1063,6 +1110,9 @@ fn tryConnect(port: u16) bool {
 // TestClient - HTTP client for tests
 // =============================================================================
 
+/// Test HTTP client used by integration harnesses.
+/// Instances store an allocator for owned response buffers and headers returned by requests.
+/// Responses returned by this client carry owned memory and must be deinitialized by the caller.
 pub const TestClient = struct {
     allocator: std.mem.Allocator,
 
@@ -1087,10 +1137,16 @@ pub const TestClient = struct {
         }
     };
 
+    /// Create a test client that uses `allocator` for any owned response data it returns.
+    /// The allocator is stored for later use and is not consumed by this call.
+    /// No allocations are performed during initialization.
     pub fn init(allocator: std.mem.Allocator) TestClient {
         return .{ .allocator = allocator };
     }
 
+    /// Release any resources held by this test client.
+    /// This type does not own global resources, so deinitialization is currently a no-op.
+    /// Callers remain responsible for freeing any per-response allocations returned by `get`.
     pub fn deinit(self: *TestClient) void {
         _ = self;
         // No cleanup needed - responses are freed individually
@@ -1208,6 +1264,9 @@ pub const TestClient = struct {
         };
     }
 
+    /// Parse an HTTP status code from the start of a response status line.
+    /// The input must begin with an `HTTP/1.x` prefix and contain a three-digit code after the first space.
+    /// Returns `null` for malformed or too-short input, or when the code is not a valid base-10 `u16`.
     pub fn parseStatusCode(data: []const u8) ?u16 {
         if (data.len < 12) return null;
         if (!std.mem.startsWith(u8, data, "HTTP/1.")) return null;
@@ -1217,12 +1276,18 @@ pub const TestClient = struct {
         return std.fmt.parseInt(u16, code_str, 10) catch null;
     }
 
+    /// Return the HTTP message body that follows the first empty CRLF separator.
+    /// Returns `null` when the input does not contain a `\r\n\r\n` boundary.
+    /// The returned slice aliases `data`; it is not copied or owned by this function.
     pub fn findBody(data: []const u8) ?[]const u8 {
         const sep = "\r\n\r\n";
         const idx = std.mem.indexOf(u8, data, sep) orelse return null;
         return data[idx + sep.len ..];
     }
 
+    /// Search a CRLF-delimited HTTP header block for the first header with `name`.
+    /// Header names are matched case-insensitively after trimming surrounding spaces.
+    /// Returns the trimmed header value slice from the input, or `null` if no matching header is present.
     pub fn findHeader(data: []const u8, name: []const u8) ?[]const u8 {
         var iter = std.mem.splitSequence(u8, data, "\r\n");
         while (iter.next()) |line| {

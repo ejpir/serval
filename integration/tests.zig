@@ -961,6 +961,9 @@ const NativeWebSocketHandler = struct {
     selected_subprotocol: ?[]const u8 = null,
     upstream: ?serval.Upstream = null,
 
+    /// Returns the configured upstream for this selector when one is set.
+    /// If no upstream has been configured, returns a fallback upstream at
+    /// `127.0.0.1:1` with index `0`. `ctx` and `request` are currently unused.
     pub fn selectUpstream(
         self: *@This(),
         ctx: *serval.Context,
@@ -971,6 +974,9 @@ const NativeWebSocketHandler = struct {
         return self.upstream orelse .{ .host = "127.0.0.1", .port = 1, .idx = 0 };
     }
 
+    /// Selects the WebSocket route only when the request path matches `native_path`.
+    /// Returns `.decline` for non-matching paths; otherwise returns `.accept` with
+    /// the configured `selected_subprotocol`. `ctx` is currently unused.
     pub fn selectWebSocket(
         self: *@This(),
         ctx: *serval.Context,
@@ -987,6 +993,10 @@ const NativeWebSocketHandler = struct {
         } };
     }
 
+    /// Echoes WebSocket messages back to the session until the peer closes the stream.
+    /// Text messages are sent back as text and binary messages are sent back as binary.
+    /// Requires the session to supply messages that fit in the provided buffer.
+    /// Returns any read or write error from the WebSocket session.
     pub fn handleWebSocket(
         self: *@This(),
         ctx: *serval.Context,
@@ -1679,20 +1689,29 @@ const H2MainServerTelemetryShared = struct {
 const H2MainServerTelemetryMetrics = struct {
     shared: *H2MainServerTelemetryShared,
 
+    /// Records the start of a request in the shared telemetry state.
+    /// Increments the request-start counter and does not otherwise mutate request state.
     pub fn requestStart(self: *@This()) void {
         _ = self.shared.request_starts.fetchAdd(1, .monotonic);
     }
 
+    /// Records the end of a request with its final status code.
+    /// Stores the last status and increments the request-end counter.
+    /// `duration_ns` is accepted for interface compatibility and is not used by this helper.
     pub fn requestEnd(self: *@This(), status: u16, duration_ns: u64) void {
         _ = duration_ns;
         self.shared.last_status.store(status, .monotonic);
         _ = self.shared.request_ends.fetchAdd(1, .monotonic);
     }
 
+    /// Test hook for a connection open event.
+    /// This implementation is a no-op and does not retain any connection state.
     pub fn connectionOpened(self: *@This()) void {
         _ = self;
     }
 
+    /// Test hook for a connection close event.
+    /// This implementation is a no-op and does not retain any connection state.
     pub fn connectionClosed(self: *@This()) void {
         _ = self;
     }
@@ -1701,6 +1720,9 @@ const H2MainServerTelemetryMetrics = struct {
 const H2MainServerTelemetryTracer = struct {
     shared: *H2MainServerTelemetryShared,
 
+    /// Creates a synthetic span handle for telemetry tests.
+    /// Increments the started-span counter and returns a handle with fixed trace and span identifiers set.
+    /// `name` and `parent` are accepted for interface compatibility and are otherwise ignored.
     pub fn startSpan(self: *@This(), name: []const u8, parent: ?serval.SpanHandle) serval.SpanHandle {
         _ = name;
         _ = parent;
@@ -1712,6 +1734,9 @@ const H2MainServerTelemetryTracer = struct {
         return span;
     }
 
+    /// Marks a span as ended and optionally records an error occurrence.
+    /// Always increments the ended-span counter.
+    /// If `err` is non-null, increments the shared span error counter as well.
     pub fn endSpan(self: *@This(), handle: serval.SpanHandle, err: ?[]const u8) void {
         _ = handle;
         _ = self.shared.spans_ended.fetchAdd(1, .monotonic);
@@ -1720,6 +1745,9 @@ const H2MainServerTelemetryTracer = struct {
         }
     }
 
+    /// Accepts string span attributes without recording them.
+    /// This test hook intentionally ignores the handle, key, and value parameters.
+    /// It never fails and performs no ownership transfer.
     pub fn setStringAttribute(self: *@This(), handle: serval.SpanHandle, key: []const u8, value: []const u8) void {
         _ = self;
         _ = handle;
@@ -1727,6 +1755,9 @@ const H2MainServerTelemetryTracer = struct {
         _ = value;
     }
 
+    /// Records integer attributes for a span-related test hook.
+    /// Counts `http.response.status_code` assignments in the shared telemetry state.
+    /// Other keys are ignored and the `handle` and `value` arguments are not used by this test helper.
     pub fn setIntAttribute(self: *@This(), handle: serval.SpanHandle, key: []const u8, value: i64) void {
         _ = handle;
         _ = value;
@@ -2971,6 +3002,9 @@ const TerminatedH2UnaryHandler = struct {
     stream_close_count: u32 = 0,
     last_stream_summary: ?serval.server.H2StreamSummary = null,
 
+    /// Selects an upstream for the terminated HTTP/2 handler.
+    /// This handler should not route through upstream selection, so calling it panics.
+    /// `ctx` and `request` are intentionally ignored because upstream selection is not part of this path.
     pub fn selectUpstream(
         self: *@This(),
         ctx: *serval.Context,
@@ -2982,6 +3016,9 @@ const TerminatedH2UnaryHandler = struct {
         @panic("terminated h2 handler should not select an upstream");
     }
 
+    /// Validates an incoming gRPC request headers frame and records the active stream.
+    /// Requires the request path to match `expected_path` and the request to pass gRPC validation.
+    /// Expects `end_stream` to be false; the response writer is accepted but not used here.
     pub fn handleH2Headers(
         self: *@This(),
         stream_id: u32,
@@ -2996,6 +3033,10 @@ const TerminatedH2UnaryHandler = struct {
         self.active_stream_id = stream_id;
     }
 
+    /// Validates an incoming gRPC DATA frame and writes the test response.
+    /// Expects the payload to match `expected_request_payload` and the stream to be the active one.
+    /// Requires `end_stream` to be true and returns a test failure if the payload cannot be parsed.
+    /// Sends response headers, a gRPC response message, and a `grpc-status: 0` trailer.
     pub fn handleH2Data(
         self: *@This(),
         stream_id: u32,
@@ -3016,17 +3057,27 @@ const TerminatedH2UnaryHandler = struct {
         try writer.sendTrailers(&.{.{ .name = "grpc-status", .value = "0" }});
     }
 
+    /// Marks a stream as opened and remembers its stream ID for later checks.
+    /// Increments the open counter each time it is called.
+    /// The `request` parameter is accepted for interface compatibility and is otherwise unused.
     pub fn handleH2StreamOpen(self: *@This(), stream_id: u32, request: *const serval.Request) void {
         _ = request;
         self.stream_open_count += 1;
         self.active_stream_id = stream_id;
     }
 
+    /// Updates per-test state when an HTTP/2 stream closes.
+    /// Increments the close counter and stores the provided stream summary for later assertions.
+    /// This function does not allocate and does not fail.
     pub fn handleH2StreamClose(self: *@This(), summary: serval.server.H2StreamSummary) void {
         self.stream_close_count += 1;
         self.last_stream_summary = summary;
     }
 
+    /// Records a log entry into the shared telemetry counters when telemetry is enabled.
+    /// Increments the total stream log count for every entry and the 2xx count for 2xx statuses.
+    /// Stores the last seen status code and request number using monotonic atomics.
+    /// `ctx` is currently unused by this test helper.
     pub fn onLog(self: *@This(), ctx: *serval.Context, entry: serval.LogEntry) void {
         _ = ctx;
         if (self.telemetry_shared) |shared| {
@@ -3069,6 +3120,9 @@ const TerminatedH2ResetHandler = struct {
     reset_stream_summary: ?serval.server.H2StreamSummary = null,
     next_stream_summary: ?serval.server.H2StreamSummary = null,
 
+    /// Selects an upstream for the terminated HTTP/2 reset handler.
+    /// This handler is not expected to route requests, so it always panics if called.
+    /// `ctx` and `request` are unused because the handler should never reach upstream selection.
     pub fn selectUpstream(
         self: *@This(),
         ctx: *serval.Context,
@@ -3080,6 +3134,10 @@ const TerminatedH2ResetHandler = struct {
         @panic("terminated h2 reset handler should not select an upstream");
     }
 
+    /// Validates an H2 request and records either the reset stream or the active stream.
+    /// `end_stream` must be false; the handler only expects request headers here.
+    /// Requests for `reset_path` capture `reset_stream_id`, while `next_path` becomes the active stream.
+    /// `writer` is unused by this handler.
     pub fn handleH2Headers(
         self: *@This(),
         stream_id: u32,
@@ -3099,6 +3157,10 @@ const TerminatedH2ResetHandler = struct {
         self.active_stream_id = stream_id;
     }
 
+    /// Validates and parses the final H2 data frame for the active stream.
+    /// `stream_id` must match `active_stream_id`, and `end_stream` must be true.
+    /// On success, it builds a gRPC response message and sends headers, data, and trailers.
+    /// Parsing, message building, and writer calls may return errors directly.
     pub fn handleH2Data(
         self: *@This(),
         stream_id: u32,
@@ -3119,11 +3181,19 @@ const TerminatedH2ResetHandler = struct {
         try writer.sendTrailers(&.{.{ .name = "grpc-status", .value = "0" }});
     }
 
+    /// Records the stream ID that was reset by this test handler.
+    /// The reset error code must be `cancel`; any other code triggers an assertion failure.
+    /// This function does not return an error and performs no additional work.
+    /// The stored stream ID is later matched against the close summary.
     pub fn handleH2StreamReset(self: *@This(), stream_id: u32, error_code_raw: u32) void {
         assert(error_code_raw == @intFromEnum(serval_h2.ErrorCode.cancel));
         self.reset_stream_id = stream_id;
     }
 
+    /// Records that an H2 stream has closed and increments the close counter.
+    /// If the closed stream matches `reset_stream_id` or `active_stream_id`, the full summary is saved.
+    /// Other stream IDs only affect the counter.
+    /// `summary` is copied by value and no ownership is transferred.
     pub fn handleH2StreamClose(self: *@This(), summary: serval.server.H2StreamSummary) void {
         self.stream_close_count += 1;
         if (summary.stream_id == self.reset_stream_id) {
@@ -3146,6 +3216,10 @@ const TerminatedH2MultiHandler = struct {
     first_stream_id: u32 = 0,
     second_stream_id: u32 = 0,
 
+    /// This handler never selects an upstream.
+    /// It ignores `self`, `ctx`, and `request` and aborts immediately if called.
+    /// The terminated H2 multi handler should not reach upstream selection.
+    /// Always panics instead of returning a value.
     pub fn selectUpstream(
         self: *@This(),
         ctx: *serval.Context,
@@ -3157,6 +3231,10 @@ const TerminatedH2MultiHandler = struct {
         @panic("terminated h2 multi handler should not select an upstream");
     }
 
+    /// Validates an H2 request and records the first or second stream ID by path.
+    /// `end_stream` must be false; the request is expected to carry only headers here.
+    /// Returns `error.InvalidPath` when the path does not match either configured test path.
+    /// `writer` is unused by this handler.
     pub fn handleH2Headers(
         self: *@This(),
         stream_id: u32,
@@ -3180,6 +3258,9 @@ const TerminatedH2MultiHandler = struct {
         return error.InvalidPath;
     }
 
+    /// Parses a completed gRPC request and returns one of two configured responses based on the stream id.
+    /// `end_stream` must be `true`; the payload is parsed as a single gRPC message.
+    /// Returns `error.InvalidStreamId` when `stream_id` is neither `first_stream_id` nor `second_stream_id`.
     pub fn handleH2Data(
         self: *@This(),
         stream_id: u32,
@@ -3226,6 +3307,9 @@ const TerminatedH2ChurnHandler = struct {
     completed_stream_count: u8 = 0,
     stream_ids: [serval.config.H2_MAX_CONCURRENT_STREAMS]u32 = [_]u32{0} ** serval.config.H2_MAX_CONCURRENT_STREAMS,
 
+    /// Panics because this churn handler is expected to terminate requests without proxying.
+    /// It never selects an upstream.
+    /// The `ctx` and `request` parameters are intentionally unused.
     pub fn selectUpstream(
         self: *@This(),
         ctx: *serval.Context,
@@ -3237,6 +3321,9 @@ const TerminatedH2ChurnHandler = struct {
         @panic("terminated h2 churn handler should not select an upstream");
     }
 
+    /// Records incoming HTTP/2 gRPC streams up to the configured concurrency limit.
+    /// The request path must match `self.path`, `end_stream` must be `false`, and the request must satisfy gRPC validation.
+    /// Returns `error.TooManyStreams` once `serval.config.H2_MAX_CONCURRENT_STREAMS` is reached.
     pub fn handleH2Headers(
         self: *@This(),
         stream_id: u32,
@@ -3254,6 +3341,9 @@ const TerminatedH2ChurnHandler = struct {
         self.seen_stream_count += 1;
     }
 
+    /// Handles one completed gRPC request for a known stream id and returns the configured response.
+    /// `end_stream` must be `true`, and `stream_id` must match one of the stream ids recorded in `self.stream_ids`.
+    /// Returns `error.InvalidStreamId` for unknown streams and propagates parse or writer failures.
     pub fn handleH2Data(
         self: *@This(),
         stream_id: u32,
@@ -3297,6 +3387,9 @@ const TerminatedH2FlowControlHandler = struct {
     stream_id: u32 = 0,
     total_bytes: usize = 0,
 
+    /// Panics because this handler only participates in terminated HTTP/2 flow-control testing.
+    /// It does not route traffic to an upstream.
+    /// The `ctx`, `request`, and `self` parameters are intentionally unused.
     pub fn selectUpstream(
         self: *@This(),
         ctx: *serval.Context,
@@ -3308,6 +3401,9 @@ const TerminatedH2FlowControlHandler = struct {
         @panic("terminated h2 flow-control handler should not select an upstream");
     }
 
+    /// Verifies the request path for a single expected stream and records its stream id.
+    /// The request path must match `self.path`, and `end_stream` must be `false`.
+    /// The response writer is unused because this handler only records request metadata.
     pub fn handleH2Headers(
         self: *@This(),
         stream_id: u32,
@@ -3321,6 +3417,9 @@ const TerminatedH2FlowControlHandler = struct {
         self.stream_id = stream_id;
     }
 
+    /// Aggregates request body bytes for a single stream and responds when the stream ends.
+    /// `stream_id` must match `self.stream_id`; payload length is accumulated across calls.
+    /// On the final frame it verifies the total byte count and sends a plain-text `received=<n>` response.
     pub fn handleH2Data(
         self: *@This(),
         stream_id: u32,
@@ -4888,6 +4987,9 @@ fn startGrpcH2CancelPropagationBackend(config: GrpcH2CancelPropagationBackendCon
 const GrpcH2ProxyHandler = struct {
     upstream: serval.Upstream,
 
+    /// Returns the configured upstream for this handler.
+    /// The `ctx` and `request` parameters are unused.
+    /// This is a simple pass-through selector and performs no request inspection.
     pub fn selectUpstream(
         self: *@This(),
         ctx: *serval.Context,
@@ -5199,6 +5301,9 @@ const NetbirdDualBackendHandler = struct {
         return error.UnknownStreamId;
     }
 
+    /// Panics because this backend is expected to terminate requests directly.
+    /// This function should never be called in a valid test flow.
+    /// The `ctx` and `request` parameters are intentionally unused.
     pub fn selectUpstream(
         self: *@This(),
         ctx: *serval.Context,
@@ -5210,6 +5315,9 @@ const NetbirdDualBackendHandler = struct {
         @panic("netbird backend should terminate requests directly");
     }
 
+    /// Serves Netbird HTTP test routes or lets WebSocket requests continue to the upgrade path.
+    /// WebSocket paths return `.continue_request`; other paths are resolved to a static HTTP response.
+    /// If no response spec exists, returns a 500 rejection with reason `netbird test route missing`.
     pub fn onRequest(
         self: *@This(),
         ctx: *serval.Context,
@@ -5238,6 +5346,9 @@ const NetbirdDualBackendHandler = struct {
         } };
     }
 
+    /// Determines whether a WebSocket upgrade should be accepted for the given request path.
+    /// Returns `.accept` for paths recognized by `netbirdIsWebSocketPath` and `.decline` otherwise.
+    /// The `ctx` parameter is unused.
     pub fn selectWebSocket(
         self: *@This(),
         ctx: *serval.Context,
@@ -5253,6 +5364,9 @@ const NetbirdDualBackendHandler = struct {
         return .decline;
     }
 
+    /// Echoes WebSocket messages back to the caller until the session closes.
+    /// The `ctx` and `request` parameters are unused by this test handler.
+    /// Text frames are sent back with `sendText`, and binary frames are sent back with `sendBinary`.
     pub fn handleWebSocket(
         self: *@This(),
         ctx: *serval.Context,
@@ -5272,6 +5386,9 @@ const NetbirdDualBackendHandler = struct {
         }
     }
 
+    /// Validates and records an HTTP/2 gRPC stream before its DATA frames arrive.
+    /// The request path must classify as a supported Netbird gRPC route, and `end_stream` must be `false`.
+    /// Returns `error.InvalidPath` for non-gRPC paths and propagates request validation or stream-tracking failures.
     pub fn handleH2Headers(
         self: *@This(),
         stream_id: u32,
@@ -5287,6 +5404,9 @@ const NetbirdDualBackendHandler = struct {
         try self.trackStreamRoute(stream_id, route);
     }
 
+    /// Handles a complete HTTP/2 gRPC request body and writes the matching response.
+    /// `end_stream` must be `true`; this function expects the request body to arrive in a single DATA frame sequence.
+    /// Returns `error.InvalidStreamRoute` when no route was recorded for `stream_id`, and propagates parsing or writer errors.
     pub fn handleH2Data(
         self: *@This(),
         stream_id: u32,
@@ -5415,6 +5535,9 @@ const NetbirdRouteProxyHandler = struct {
     management_upstream: serval.Upstream,
     http_upstream: serval.Upstream,
 
+    /// Selects the upstream used for Netbird gRPC requests based on the request path.
+    /// The `ctx` parameter is currently unused.
+    /// Returns `.signal`, `.management`, or `.http_upstream` depending on `netbirdClassifyGrpcPath(request.path)`.
     pub fn selectUpstream(
         self: *@This(),
         ctx: *serval.Context,
@@ -13196,6 +13319,9 @@ pub const CurlResponse = struct {
     backend_id: ?[]const u8,
     allocator: std.mem.Allocator,
 
+    /// Releases any heap-backed fields owned by this response.
+    /// Call this exactly once on an initialized `CurlResponse`; it does not invalidate the struct itself.
+    /// `body` is freed when non-empty, and `backend_id` is freed when present.
     pub fn deinit(self: *const CurlResponse) void {
         if (self.body.len > 0) self.allocator.free(self.body);
         if (self.backend_id) |id| self.allocator.free(id);

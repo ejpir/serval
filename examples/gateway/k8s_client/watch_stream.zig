@@ -202,6 +202,9 @@ pub const LazyWatchStream = struct {
 
     const Self = @This();
 
+    /// Initializes a watch stream handle without allocating or opening the remote stream.
+    /// The `client` and `path` references are stored as borrowed values and must remain valid for the lifetime of the stream.
+    /// The returned value starts with no open stream and no internal buffer; those are created lazily by `readEvent`.
     pub fn init(client: *Client, path: []const u8, allocator: std.mem.Allocator) Self {
         return Self{
             .client = client,
@@ -212,6 +215,10 @@ pub const LazyWatchStream = struct {
         };
     }
 
+    /// Reads the next watch event from the Kubernetes watch stream.
+    /// On the first call, allocates an internal buffer of `MAX_WATCH_EVENT_SIZE` bytes and opens the stream lazily.
+    /// Returns `ClientError.OutOfMemory` if the internal buffer allocation fails, or any error returned by the client or stream.
+    /// The `buffer` slice is forwarded to the underlying stream reader; callers must provide valid writable storage.
     pub fn readEvent(self: *Self, buffer: []u8, io: Io) ClientError!?[]const u8 {
         // Allocate internal buffer on first call if needed.
         if (self.internal_buffer == null) {
@@ -230,6 +237,9 @@ pub const LazyWatchStream = struct {
         return self.stream.?.readEvent(buffer, io);
     }
 
+    /// Closes the underlying watch stream, if one has been opened.
+    /// If an internal buffer was allocated by `readEvent`, it is freed and cleared.
+    /// Safe to call multiple times on the same value; only owned resources are released.
     pub fn close(self: *Self) void {
         if (self.stream) |*s| {
             s.close();

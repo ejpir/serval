@@ -3,6 +3,11 @@ const log = @import("serval-core").log.scoped(.tls_experiment);
 const ssl = @import("ssl.zig");
 const posix = std.posix;
 
+/// Runs a TLS client handshake test against `127.0.0.1:8443` (SNI host `"localhost"`) and logs negotiated protocol/cipher details.
+/// Initializes BoringSSL, creates a client `SSL_CTX`, and explicitly disables certificate verification (`SSL_VERIFY_NONE`) for local self-signed testing.
+/// Requires a listening TLS server on port `8443`; otherwise TCP connect or `SSL_connect` will fail.
+/// Owns all temporary resources (allocator, IO thread/runtime, socket stream, `SSL_CTX`, and `SSL*`) and releases them via `defer` on all exit paths.
+/// Returns allocator/network/SSL setup errors via `try`, plus `error.SslSetFd`, `error.SslSetHostname`, or `error.SslConnect` on those explicit failure checks.
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();

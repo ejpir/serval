@@ -10,6 +10,10 @@ const config = @import("serval-core").config;
 
 const capacity: usize = config.H2_MAX_CONCURRENT_STREAMS;
 
+/// Errors returned by binding table insert and removal operations.
+/// `DuplicateDownstreamStream` and `DuplicateUpstreamStream` reject conflicting
+/// inserts, `BindingTableFull` reports capacity exhaustion, and
+/// `BindingNotFound` reports a missing binding during removal.
 pub const Error = error{
     DuplicateDownstreamStream,
     DuplicateUpstreamStream,
@@ -17,6 +21,10 @@ pub const Error = error{
     BindingNotFound,
 };
 
+/// A single HTTP/2 stream binding between downstream and upstream streams.
+/// The table stores copies of this struct by value; it does not own external
+/// resources. `upstream_session_generation` identifies the upstream session that
+/// produced the binding.
 pub const Binding = struct {
     downstream_stream_id: u32,
     upstream_stream_id: u32,
@@ -34,14 +42,25 @@ const Slot = struct {
     },
 };
 
+/// Fixed-capacity table of HTTP/2 stream bindings stored by value.
+/// Lookups and removals scan the slot array linearly and keep `count` in sync.
+/// Use `put` to insert entries and the `get*`/`remove*` helpers to query or
+/// clear them.
 pub const BindingTable = struct {
     slots: [capacity]Slot = [_]Slot{.{}} ** capacity,
     count: u16 = 0,
 
+    /// Returns an empty binding table with all slots cleared.
+    /// This is a zero-allocation constructor equivalent to `.{};`.
     pub fn init() BindingTable {
         return .{};
     }
 
+    /// Inserts `binding` into the table if both stream keys are unique.
+    /// The downstream stream id must not already exist, and the upstream stream id
+    /// must be unique within the same upstream session generation. Returns
+    /// `error.DuplicateDownstreamStream`, `error.DuplicateUpstreamStream`, or
+    /// `error.BindingTableFull` on failure.
     pub fn put(self: *BindingTable, binding: Binding) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(binding.downstream_stream_id > 0);
@@ -60,6 +79,9 @@ pub const BindingTable = struct {
         self.count += 1;
     }
 
+    /// Looks up a binding by downstream stream id.
+    /// Returns a copy of the first matching `Binding`, or `null` if no entry in the
+    /// table uses that downstream stream id.
     pub fn getByDownstream(self: *const BindingTable, stream_id: u32) ?Binding {
         assert(@intFromPtr(self) != 0);
         assert(self.count <= config.H2_MAX_CONCURRENT_STREAMS);
@@ -71,6 +93,9 @@ pub const BindingTable = struct {
         return null;
     }
 
+    /// Looks up a binding by upstream stream id.
+    /// Returns a copy of the first matching `Binding`, or `null` if no entry in the
+    /// table uses that upstream stream id.
     pub fn getByUpstream(self: *const BindingTable, stream_id: u32) ?Binding {
         assert(@intFromPtr(self) != 0);
         assert(self.count <= config.H2_MAX_CONCURRENT_STREAMS);
@@ -82,6 +107,9 @@ pub const BindingTable = struct {
         return null;
     }
 
+    /// Looks up a binding by upstream index and upstream stream id.
+    /// Returns a copy of the stored `Binding` when both fields match, or `null` when
+    /// the table has no matching entry.
     pub fn getByUpstreamForIndex(
         self: *const BindingTable,
         upstream_index: config.UpstreamIndex,
@@ -99,6 +127,10 @@ pub const BindingTable = struct {
         return null;
     }
 
+    /// Looks up a binding by upstream index, upstream session generation, and
+    /// upstream stream id.
+    /// Returns a copy of the stored `Binding` when all three fields match, or `null`
+    /// when the table has no matching entry.
     pub fn getByUpstreamForSession(
         self: *const BindingTable,
         upstream_index: config.UpstreamIndex,
@@ -119,6 +151,10 @@ pub const BindingTable = struct {
         return null;
     }
 
+    /// Removes and returns the binding whose downstream stream id is `stream_id`.
+    /// The table is scanned linearly; the first matching slot is cleared and the
+    /// stored binding is returned by value. Returns `error.BindingNotFound` if
+    /// nothing matches.
     pub fn removeByDownstream(self: *BindingTable, stream_id: u32) Error!Binding {
         assert(@intFromPtr(self) != 0);
         assert(stream_id > 0);
@@ -137,6 +173,10 @@ pub const BindingTable = struct {
         return error.BindingNotFound;
     }
 
+    /// Removes the binding whose upstream stream id is `stream_id`.
+    /// The matching entry is located by upstream stream id, then removed through the
+    /// downstream index stored in that binding. Returns `error.BindingNotFound` if no
+    /// matching upstream binding exists.
     pub fn removeByUpstream(self: *BindingTable, stream_id: u32) Error!Binding {
         assert(@intFromPtr(self) != 0);
         assert(stream_id > 0);
@@ -145,6 +185,9 @@ pub const BindingTable = struct {
         return self.removeByDownstream(binding.downstream_stream_id);
     }
 
+    /// Removes every binding associated with `upstream_index`.
+    /// Matching slots are cleared in place and the number of removed entries is
+    /// returned. If no slots match, the result is zero.
     pub fn removeAllForUpstream(self: *BindingTable, upstream_index: config.UpstreamIndex) u16 {
         assert(@intFromPtr(self) != 0);
 
@@ -162,6 +205,9 @@ pub const BindingTable = struct {
         return removed_count;
     }
 
+    /// Removes every binding for the given upstream session.
+    /// A binding matches when both `upstream_index` and `upstream_session_generation`
+    /// match; all matching slots are cleared and the number removed is returned.
     pub fn removeAllForUpstreamSession(
         self: *BindingTable,
         upstream_index: config.UpstreamIndex,
@@ -185,6 +231,10 @@ pub const BindingTable = struct {
         return removed_count;
     }
 
+    /// Removes every binding for `upstream_index` and `upstream_session_generation`
+    /// whose upstream stream id is greater than `last_stream_id`.
+    /// Matching slots are cleared in place, `count` is decremented, and the number
+    /// of removed entries is returned.
     pub fn removeAllForUpstreamSessionAboveLastStreamId(
         self: *BindingTable,
         upstream_index: config.UpstreamIndex,

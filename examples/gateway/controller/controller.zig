@@ -42,6 +42,10 @@ const evaluateGateway = mod.evaluator.evaluateGateway;
 // Controller
 // ============================================================================
 
+/// Coordinates gateway config pushes, readiness probes, shutdown state, and Kubernetes status updates for the example gateway controller.
+/// It owns the heap-allocated router client, resolver, and status manager, and keeps a borrowed reference to the K8s client for discovery/status work.
+/// The current gateway config is published through an atomic pointer for lock-free reads.
+/// Use `create` to allocate and initialize an instance; callers must provide valid ports and keep borrowed inputs alive for the controller's lifetime.
 pub const Controller = struct {
     const Self = @This();
 

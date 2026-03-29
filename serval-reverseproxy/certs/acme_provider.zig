@@ -9,6 +9,9 @@ const selfsigned_provider = @import("selfsigned_provider.zig");
 const cert_path_buf_size_bytes: u16 = 1024;
 const key_path_buf_size_bytes: u16 = 1024;
 
+/// Errors returned by the ACME TLS provider lifecycle.
+/// `InvalidConfig` covers missing required configuration, `InitFailed` covers setup and bootstrap failures, and `RunFailed` covers renew-loop execution failures.
+/// `HookInstallFailed` and `HookUninstallFailed` describe TLS-ALPN hook management errors.
 pub const Error = error{
     InvalidConfig,
     InitFailed,
@@ -17,6 +20,9 @@ pub const Error = error{
     RunFailed,
 };
 
+/// Provider state for ACME certificate loading and renewal.
+/// The struct stores configured ACME parameters plus fixed-size buffers for the current certificate path and any bootstrap certificate material.
+/// Its public API is `init`, `loadInitial`, `run`, and `deinit`; borrowed slices in `cfg` and `listener_id` must outlive the provider.
 pub const Provider = struct {
     cfg: ir.AcmeTlsConfig,
     listener_id: []const u8,
@@ -33,6 +39,9 @@ pub const Provider = struct {
     bootstrap_key_path_len: u16,
     bootstrap_key_path_bytes: [key_path_buf_size_bytes]u8,
 
+    /// Construct a provider for the configured ACME state directory and listener.
+    /// `cfg` and `listener_id` are borrowed by value or slice reference, so their backing storage must remain valid for the returned provider.
+    /// Returns `error.InvalidConfig` when required ACME fields are empty, or `error.InitFailed` if the current certificate or key path cannot be formatted into the internal buffers.
     pub fn init(cfg: ir.AcmeTlsConfig, listener_id: []const u8) Error!Provider {
         assert(listener_id.len > 0);
         if (cfg.directory_url.len == 0 or cfg.contact_email.len == 0 or cfg.state_dir_path.len == 0 or cfg.domain.len == 0) {
@@ -64,6 +73,9 @@ pub const Provider = struct {
         return service;
     }
 
+    /// Release provider state.
+    /// This implementation does not free heap memory; it only checks internal length invariants in debug builds.
+    /// Callers should still treat this as the teardown point for the provider lifecycle.
     pub fn deinit(self: *Provider) void {
         assert(@intFromPtr(self) != 0);
         assert(self.cert_current_path_len <= cert_path_buf_size_bytes);
@@ -71,6 +83,9 @@ pub const Provider = struct {
         assert(self.bootstrap_key_path_len <= key_path_buf_size_bytes);
     }
 
+    /// Load the initial certificate material for this provider.
+    /// If the current certificate and key already exist, returns those paths directly; otherwise it bootstraps a listener-scoped self-signed certificate and stores the generated paths in `self`.
+    /// The returned paths borrow storage owned by `self` and remain valid until the provider is mutated or deinitialized; bootstrap failures and path-copy bounds checks return `error.InitFailed`.
     pub fn loadInitial(self: *Provider, io: std.Io) Error!provider.CertMaterial {
         assert(@intFromPtr(self) != 0);
         assert(self.key_current_path_len <= key_path_buf_size_bytes);
@@ -100,6 +115,9 @@ pub const Provider = struct {
         return .{ .cert_path = self.bootstrapCertPath(), .key_path = self.bootstrapKeyPath() };
     }
 
+    /// Run the ACME renewer loop until `shutdown` is signaled or an error occurs.
+    /// Installs the TLS-ALPN hook before starting and always attempts to uninstall it on exit; uninstall failures are logged.
+    /// Returns `error.HookInstallFailed`, `error.InitFailed`, or `error.RunFailed` when hook setup, renewer creation, or the renew loop fails.
     pub fn run(
         self: *Provider,
         shutdown: *std.atomic.Value(bool),

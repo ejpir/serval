@@ -228,6 +228,10 @@ pub const BodyReadError = error{
     ChunkedNotSupported,
 };
 
+/// Per-request and per-connection state shared across Serval components.
+/// Fields use explicit defaults so a freshly constructed context starts in a known zeroed state.
+/// Some fields store borrowed slices or pointers and must remain valid for the lifetime of the request.
+/// The struct itself does not allocate or free any owned resources.
 pub const Context = struct {
     // Timing - i128 matches std.time.Instant.timestamp/realtimeNanos() return type,
     // which can represent nanoseconds since epoch including pre-1970 dates.
@@ -284,6 +288,10 @@ pub const Context = struct {
     // TigerStyle: Optional pointer - null means body reading not available.
     _body_reader: ?*BodyReader = null,
 
+    /// Initializes a `Context` with the current realtime timestamp.
+    /// The returned value has `start_time_ns` set and all other fields left at their default values.
+    /// This function does not allocate and cannot fail.
+    /// A debug assertion verifies that the captured time is positive.
     pub fn init() Context {
         const ctx = Context{
             .start_time_ns = time.realtimeNanos(),

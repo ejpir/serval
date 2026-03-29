@@ -73,6 +73,10 @@ const LlmHandler = struct {
     /// can be active at a time. For production, use per-context state.
     token_idx: u32 = 0,
 
+    /// Creates a new `LlmHandler` for the given port and debug mode.
+    /// `port` must be nonzero; this is enforced with an assertion.
+    /// The returned handler starts with `token_idx` set to `0` and performs no allocation.
+    /// The caller owns the value and may use it directly with `serval.Server`.
     pub fn init(port: u16, debug: bool) LlmHandler {
         // S1: Preconditions
         assert(port > 0);
@@ -269,6 +273,10 @@ const LlmHandler = struct {
     }
 };
 
+/// Parses CLI arguments, initializes the demo LLM streaming server, and starts the HTTP loop.
+/// Returns early for `--help` and `--version`; invalid arguments are printed and reported as `error.InvalidArgs`.
+/// This function creates its runtime components on the stack and shuts down the threaded I/O runtime with `defer`.
+/// If `server.run` fails, the error is logged and not returned to the caller.
 pub fn main(process_init: std.process.Init) !void {
     // Parse command-line arguments
     // Note: cli.Args expects a struct for extra options, use NoExtra for none

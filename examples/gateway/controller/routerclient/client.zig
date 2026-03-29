@@ -44,6 +44,11 @@ const PushResult = @import("types.zig").PushResult;
 // Router Client (TigerStyle: No allocation after init)
 // ============================================================================
 
+/// Stateful client for pushing gateway/router config to the router admin API.
+/// Allocate instances with `create` and release them with `destroy`; this type is intentionally heap-owned because it is large.
+/// The `admin_host` slice is borrowed, not copied, so it must remain valid for the lifetime of the client.
+/// The client keeps bounded internal buffers and tracks the last pushed config hash plus discovered endpoints to avoid redundant pushes.
+/// In single-endpoint mode it targets `admin_host:admin_port`; in multi-endpoint mode it uses the discovered router endpoints.
 pub const RouterClient = struct {
     const Self = @This();
 

@@ -129,6 +129,10 @@ pub const Listener = struct {
     /// TLS configuration (required if protocol is HTTPS).
     tls: ?TLSConfig = null,
 
+    /// Upstream protocol identifier used by gateway configuration.
+    /// `fromString` accepts `HTTP` and `HTTPS` in any ASCII case; unknown names return `null`.
+    /// `toString` returns the canonical protocol name as a static string slice and does not allocate.
+    /// The returned slice is borrowed from internal compile-time data and remains valid for the program lifetime.
     pub const Protocol = enum {
         HTTP,
         HTTPS,
@@ -163,6 +167,10 @@ pub const TLSConfig = struct {
     /// References to TLS certificates (Secrets).
     certificate_refs: []const CertificateRef,
 
+    /// TLS handling mode for the gateway listener.
+    /// `Terminate` means TLS is ended at the gateway and backend traffic is forwarded in plaintext.
+    /// `Passthrough` means TLS connections are forwarded to backends without termination or inspection.
+    /// `fromString` is case-insensitive and returns `null` for unknown values; `toString` returns a static serialized name.
     pub const Mode = enum {
         /// Terminate TLS at the gateway, forward plaintext to backends.
         Terminate,
@@ -244,6 +252,10 @@ pub const PathMatch = struct {
     /// Path value to match against.
     value: []const u8,
 
+    /// Path match type used to select requests by exact path or by prefix.
+    /// `fromString` accepts `Exact` and `PathPrefix` in any ASCII case; unknown names return `null`.
+    /// `toString` returns a static string slice for the matching enum value and does not allocate.
+    /// The returned slice is borrowed from internal compile-time data and has program-long lifetime.
     pub const Type = enum {
         /// Exact path match (e.g., "/api/v1/users").
         Exact,
@@ -295,6 +307,10 @@ pub const HTTPRouteFilter = struct {
     /// URL rewrite configuration (when type is URLRewrite).
     url_rewrite: ?URLRewrite = null,
 
+    /// HTTP route filter type used by this gateway config.
+    /// `fromString` accepts `URLRewrite` in any ASCII case; unknown names return `null`.
+    /// `toString` returns the canonical serialized name as a static string slice and does not allocate.
+    /// Only the enum values declared here are supported by the parser and serializer.
     pub const Type = enum {
         /// Rewrite the request URL.
         URLRewrite,
@@ -336,6 +352,10 @@ pub const PathRewrite = struct {
     /// Replacement value.
     value: []const u8,
 
+    /// Rewrite action used by gateway path rewrites.
+    /// `fromString` accepts `ReplacePrefixMatch` and `ReplaceFullPath` in any ASCII case; unknown names return `null`.
+    /// `toString` returns a stable, static string slice for serialization and does not allocate.
+    /// The returned slice is borrowed from internal compile-time data and remains valid for the program lifetime.
     pub const Type = enum {
         /// Replace the matched prefix with the value.
         ReplacePrefixMatch,

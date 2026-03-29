@@ -7,19 +7,31 @@ const config = core.config;
 const ordering = @import("ordering.zig");
 const composition = @import("composition.zig");
 
+/// Maximum number of validation diagnostics that may be reported.
+/// This cap bounds diagnostic growth during validation and keeps output predictable.
+/// The value is a small unsigned integer constant and is intended for fixed-size limits.
 pub const MAX_VALIDATION_DIAGNOSTICS: u8 = 16;
 
+/// Controls how the reverse proxy behaves when a failure is encountered.
+/// The policy is encoded as a compact `u8` enum for configuration and serialization use.
+/// Choose `fail_open` to continue past failures, or `fail_closed` to stop on failures.
 pub const FailurePolicy = enum(u8) {
     fail_open,
     fail_closed,
 };
 
+/// Runtime limits that control state size, output size, expansion ratio, and CPU time per chunk.
+/// The fields are plain numeric limits; callers are responsible for choosing values that satisfy
+/// `isValid` before using the budget in validation or admission logic.
 pub const RuntimeBudget = struct {
     max_state_bytes: u32,
     max_output_bytes: u64,
     max_expansion_ratio_milli: u32,
     max_cpu_micros_per_chunk: u32,
 
+    /// Returns whether this runtime budget satisfies the configured bounds.
+    /// The check requires all budget fields to be non-zero and within the limits from `config`.
+    /// This function does not allocate or report detailed errors; it returns `false` on any invalid field.
     pub fn isValid(self: RuntimeBudget) bool {
         assert(config.MAX_ADMIN_REQUEST_BYTES > 0);
         assert(config.MAX_BODY_SIZE_BYTES > 0);
@@ -33,23 +45,35 @@ pub const RuntimeBudget = struct {
     }
 };
 
+/// Selects which TLS certificate source the reverse proxy should use.
+/// The discriminants are stable `u8` values so the enum can be serialized or stored compactly.
+/// Use the variant that matches the configured certificate management mode.
 pub const TlsProvider = enum(u8) {
     static,
     selfsigned,
     acme,
 };
 
+/// Configuration for serving TLS from pre-existing certificate files.
+/// `cert_path` and `key_path` are borrowed path slices; this type does not take ownership of the
+/// underlying storage and expects both files to be readable when the config is used.
 pub const StaticTlsConfig = struct {
     cert_path: []const u8,
     key_path: []const u8,
 };
 
+/// Configuration for generating or reusing a self-signed TLS setup.
+/// `state_dir_path` points to the directory used to persist generator state, and `domain` is the
+/// DNS name the certificate should cover. `rotate_on_boot` defaults to `false` when omitted.
 pub const SelfSignedTlsConfig = struct {
     state_dir_path: []const u8,
     domain: []const u8,
     rotate_on_boot: bool = false,
 };
 
+/// ACME TLS configuration for listener certificate management.
+/// The URL, contact email, state directory, and domain are borrowed strings required by the ACME flow.
+/// The timeout and backoff fields default from `serval-core.config`, and validation requires the interval and backoff values to be positive and ordered.
 pub const AcmeTlsConfig = struct {
     directory_url: []const u8,
     contact_email: []const u8,
@@ -61,6 +85,9 @@ pub const AcmeTlsConfig = struct {
     fail_backoff_max_ms: u32 = config.ACME_DEFAULT_FAIL_BACKOFF_MAX_MS,
 };
 
+/// TLS configuration for a listener.
+/// `provider` selects which optional provider-specific block must be populated for validation to succeed.
+/// Validation rejects missing or malformed provider data, so only the matching config field should be set for the chosen provider.
 pub const ListenerTls = struct {
     provider: TlsProvider,
     static: ?StaticTlsConfig = null,
@@ -68,22 +95,34 @@ pub const ListenerTls = struct {
     acme: ?AcmeTlsConfig = null,
 };
 
+/// An inbound listener definition.
+/// `bind` names the address or socket to listen on, and `tls` optionally enables one of the supported TLS provider modes.
+/// The listener `id` is the stable reference used by routes and validation diagnostics.
 pub const Listener = struct {
     id: []const u8,
     bind: []const u8,
     tls: ?ListenerTls = null,
 };
 
+/// A backend pool referenced by routes.
+/// `upstream_spec` is optional; when present it carries the pool's upstream definition as borrowed text.
+/// The pool `id` is the stable identifier used by route references and duplicate-id checks.
 pub const Pool = struct {
     id: []const u8,
     upstream_spec: ?[]const u8 = null,
 };
 
+/// A route waiver binding a plugin id to a waiver identifier.
+/// The plugin id selects the plugin being waived, and the waiver id carries the external waiver reference.
+/// Both fields are borrowed strings and must remain valid while the route is used.
 pub const RouteWaiver = struct {
     plugin_id: []const u8,
     waiver_id: []const u8,
 };
 
+/// Canonical route definition used by validation and composition.
+/// `listener_id` may be left empty in source data, but validation requires a referenced listener before admission succeeds.
+/// The plugin-id lists and waiver set are borrowed slices that drive route-level policy composition.
 pub const Route = struct {
     id: []const u8,
     listener_id: []const u8 = "",
@@ -96,6 +135,9 @@ pub const Route = struct {
     waivers: []const RouteWaiver,
 };
 
+/// A plugin catalog entry available to routes and chains.
+/// `enabled` indicates the initial availability state, while `mandatory` and `disable_requires_waiver` influence validation and composition.
+/// The `id` and `version` slices are borrowed metadata and are not owned by the struct.
 pub const PluginCatalogEntry = struct {
     id: []const u8,
     version: []const u8,
@@ -104,6 +146,9 @@ pub const PluginCatalogEntry = struct {
     disable_requires_waiver: bool,
 };
 
+/// One plugin entry within a chain plan.
+/// `plugin_id` selects the catalog entry, `failure_policy` controls failure handling, and `budget` must pass `RuntimeBudget.isValid`.
+/// `before` and `after` express ordering constraints that are resolved when the chain is validated.
 pub const ChainEntry = struct {
     plugin_id: []const u8,
     failure_policy: FailurePolicy,
@@ -113,11 +158,17 @@ pub const ChainEntry = struct {
     after: []const []const u8,
 };
 
+/// A named chain of policy entries.
+/// `id` is the chain identifier referenced by routes, and `entries` holds the ordered plugin definitions for that chain.
+/// The chain must not be empty when validated.
 pub const ChainPlan = struct {
     id: []const u8,
     entries: []const ChainEntry,
 };
 
+/// Canonical reverse-proxy IR input for validation and runtime admission.
+/// All slices are borrowed; the caller owns the backing storage and must keep it alive for the duration of use.
+/// Validation reads these collections directly and does not allocate or copy the IR graph.
 pub const CanonicalIr = struct {
     listeners: []const Listener,
     pools: []const Pool,
@@ -127,12 +178,18 @@ pub const CanonicalIr = struct {
     global_plugin_ids: []const []const u8,
 };
 
+/// Validation phase that produced a diagnostic.
+/// Structure checks cover shape and local constraints, references check cross-links, and invariants cover semantic consistency.
+/// Callers can use the stage to decide whether a failure is a parsing issue, a missing dependency, or a deeper policy error.
 pub const ValidationStage = enum(u8) {
     structure,
     references,
     invariants,
 };
 
+/// Kind of object associated with a validation diagnostic.
+/// Use this to distinguish which IR collection or entry produced the failure.
+/// `chain_entry` is used for per-plugin entries inside a chain.
 pub const ValidationObjectKind = enum(u8) {
     listener,
     pool,
@@ -142,6 +199,9 @@ pub const ValidationObjectKind = enum(u8) {
     chain_entry,
 };
 
+/// Machine-readable reasons emitted by the validator.
+/// The enum mirrors `ValidationError` so callers can match failures without parsing text.
+/// Values cover size limits, duplicate ids, missing references, ordering failures, TLS misconfiguration, and diagnostic overflow.
 pub const ValidationReason = enum(u8) {
     too_many_listeners,
     too_many_pools,
@@ -175,6 +235,9 @@ pub const ValidationReason = enum(u8) {
     too_many_diagnostics,
 };
 
+/// One validation failure captured from canonical IR checking.
+/// `object_id` is borrowed text and does not transfer ownership; it should identify the offending item or named reference.
+/// Diagnostics are emitted in validation order and pair a stage, object kind, and machine-readable reason.
 pub const ValidationDiagnostic = struct {
     stage: ValidationStage,
     object_kind: ValidationObjectKind,
@@ -182,6 +245,9 @@ pub const ValidationDiagnostic = struct {
     reason: ValidationReason,
 };
 
+/// Errors returned when canonical IR validation fails.
+/// Each case maps to a specific structural, reference, or invariant violation recorded in `ValidationDiagnostic.reason`.
+/// `TooManyDiagnostics` is raised when validation cannot append another diagnostic to the caller-provided buffer.
 pub const ValidationError = error{
     TooManyListeners,
     TooManyPools,
@@ -215,6 +281,9 @@ pub const ValidationError = error{
     TooManyDiagnostics,
 };
 
+/// Validate a canonical reverse-proxy IR snapshot.
+/// The caller must provide a diagnostics buffer with capacity for `MAX_VALIDATION_DIAGNOSTICS` entries and a count pointer within bounds on entry.
+/// `diagnostics_count` is reset to zero before validation starts; the first failure appends one diagnostic, then returns the matching `ValidationError`.
 pub fn validateCanonicalIr(
     candidate: *const CanonicalIr,
     diagnostics: *[MAX_VALIDATION_DIAGNOSTICS]ValidationDiagnostic,

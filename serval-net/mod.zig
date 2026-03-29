@@ -16,16 +16,48 @@ pub const tcp = @import("tcp.zig");
 pub const dns = @import("dns.zig");
 
 // Re-export DNS types for convenience.
+/// Re-export of `dns.DnsResolver`.
+/// Thread-safe DNS resolver with a fixed-size TTL cache and no runtime allocation after initialization.
+/// Call `init(&resolver, config)` before use; the instance owns its internal cache storage and must remain alive for the duration of lookups.
+/// Resolution methods return `DnsError` on lookup, timeout, invalid-hostname, or overflow failures.
 pub const DnsResolver = dns.DnsResolver;
+/// Re-export of `dns.DnsConfig`.
+/// Configuration for `DnsResolver`.
+/// `ttl_ns` controls how long cached answers remain valid and defaults to `config.DNS_DEFAULT_TTL_NS`.
+/// This is a small value type and does not own any resources.
 pub const DnsConfig = dns.DnsConfig;
+/// Re-export of `dns.DnsError`.
+/// Error set returned by DNS resolution APIs in `serval-net`.
+/// Includes lookup failure, timeout, invalid hostname, cache exhaustion, and address-buffer overflow.
+/// Callers should handle `InvalidHostname` and `AddressOverflow` explicitly when validating inputs or limiting result counts.
 pub const DnsError = dns.DnsError;
+/// Re-export of `dns.ResolveResult`.
+/// Result of resolving a single hostname to one `Io.net.IpAddress`.
+/// `address` includes the requested port, `from_cache` reports whether the answer was cached, and `resolution_ns` is `0` for cache hits.
+/// This is a plain value type with no ownership or cleanup requirements.
 pub const ResolveResult = dns.ResolveResult;
 
 // Re-export common TCP utilities for convenience.
 // TigerStyle: Explicit exports, no wildcard imports.
+/// Re-export of `tcp.set_tcp_no_delay`.
+/// Disables Nagle's algorithm on a TCP socket to reduce latency for small packets.
+/// The `-1` file-descriptor sentinel is accepted as a no-op success.
+/// Returns `false` if enabling `TCP_NODELAY` fails on a real socket.
 pub const set_tcp_no_delay = tcp.set_tcp_no_delay;
+/// Re-export of `tcp.set_tcp_keep_alive`.
+/// Enables TCP keepalive and configures the idle, interval, and probe-count timers.
+/// Requires a valid file descriptor and positive timing values.
+/// Returns `false` if any keepalive-related `setsockopt` call fails.
 pub const set_tcp_keep_alive = tcp.set_tcp_keep_alive;
+/// Re-export of `tcp.set_tcp_quick_ack`.
+/// Disables delayed ACK behavior on Linux TCP sockets to reduce latency for small writes.
+/// On non-Linux platforms this is treated as a no-op success.
+/// Returns `false` only if the underlying socket option call fails.
 pub const set_tcp_quick_ack = tcp.set_tcp_quick_ack;
+/// Re-export of `tcp.set_so_linger`.
+/// Configures `SO_LINGER` on a TCP socket.
+/// A timeout of `0` makes `close()` return immediately with an RST; a positive timeout lets `close()` block while queued data drains.
+/// Returns `false` if the underlying `setsockopt` call fails.
 pub const set_so_linger = tcp.set_so_linger;
 
 // =============================================================================

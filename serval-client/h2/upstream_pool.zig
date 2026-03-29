@@ -32,11 +32,20 @@ const Socket = socket_mod.Socket;
 
 const slot_count: usize = config.MAX_UPSTREAMS;
 
+/// Error set returned by HTTP/2 upstream pool operations (`acquireOrConnect` and session I/O helpers).
+/// `UnsupportedProtocol` is returned when the upstream is not HTTP/2-compatible for this pool
+/// (only `.h2c` without TLS or `.h2` with TLS are accepted).
+/// `UpstreamSessionPoolExhausted` is returned when a slot cannot open/rotate sessions because both active and draining sessions are still in use; this set also includes `ClientError` and `connection_mod.Error`.
 pub const Error = error{
     UnsupportedProtocol,
     UpstreamSessionPoolExhausted,
 } || client_mod.ClientError || connection_mod.Error;
 
+/// Per-attempt connection telemetry returned by upstream connect operations.
+/// `reused` is true when an existing connection was reused instead of creating a new one.
+/// Duration fields are measured in nanoseconds for DNS resolution, TCP connect, and TLS handshake phases.
+/// `local_port` records the local ephemeral port bound for the connection.
+/// This struct is value data (no owned resources) and does not encode errors itself.
 pub const ConnectStats = struct {
     reused: bool,
     dns_duration_ns: u64,
@@ -45,11 +54,22 @@ pub const ConnectStats = struct {
     local_port: u16,
 };
 
+/// Result returned by `UpstreamSessionPool.acquireOrConnect`, pairing the selected session with connection metadata.
+/// `session` is pool-owned and not caller-owned; it remains valid while that generation stays in the pool (until closed/rotated/deinit).
+/// `connect.reused` reports whether an existing session was reused vs a fresh outbound connection was established.
+/// When `reused == true`, connect timing fields and `local_port` are `0`; otherwise they contain values from `Client.connect`.
+/// This value carries no error state itself; acquisition/connect failures are returned by the enclosing `Error!AcquireResult` API.
 pub const AcquireResult = struct {
     session: *UpstreamSession,
     connect: ConnectStats,
 };
 
+/// Represents one pooled HTTP/2 client session to a specific upstream (`upstream_idx`, `generation`),
+/// owning the transport `connection` and protocol state in `h2` for the session lifetime.
+/// Public send/receive APIs require a valid `self`; stream-oriented calls require `stream_id > 0`,
+/// and request-header submission requires a non-empty `request.path` (asserted by the methods).
+/// On successful I/O actions, `last_used_ns` is refreshed from `time.monotonicNanos()`.
+/// Any transport/protocol failures are returned as `Error` from the underlying `h2` operations.
 pub const UpstreamSession = struct {
     upstream_idx: config.UpstreamIndex,
     generation: u32,
@@ -57,6 +77,10 @@ pub const UpstreamSession = struct {
     h2: connection_mod.ClientConnection,
     last_used_ns: u64,
 
+    /// Sends HTTP/2 request headers on this upstream session and returns the created stream ID.
+    /// Preconditions: `self` must be valid and non-null, and `request.path.len > 0` (asserted).
+    /// Forwards `request`, `effective_path`, and `end_stream` to `self.h2.sendRequestHeaders` unchanged.
+    /// On success, updates `last_used_ns` with `time.monotonicNanos()`; on failure, propagates the underlying `Error` and does not update usage time.
     pub fn sendRequestHeaders(
         self: *UpstreamSession,
         request: *const types.Request,
@@ -71,6 +95,10 @@ pub const UpstreamSession = struct {
         return stream_id;
     }
 
+    /// Sends `payload` as request DATA on `stream_id`, optionally setting END_STREAM via `end_stream`.
+    /// Preconditions: `self` must be valid and non-null, and `stream_id` must be greater than 0 (asserted).
+    /// `payload` is read-only and borrowed for the duration of this call; ownership is not transferred.
+    /// Returns any error from `h2.sendRequestData`; on success, updates `last_used_ns` to current monotonic time.
     pub fn sendRequestData(
         self: *UpstreamSession,
         stream_id: u32,
@@ -84,6 +112,10 @@ pub const UpstreamSession = struct {
         self.last_used_ns = time.monotonicNanos();
     }
 
+    /// Sends an HTTP/2 `RST_STREAM` for `stream_id` with the provided raw error code.
+    /// Preconditions: `self` must be a valid pointer and `stream_id` must be non-zero.
+    /// On success, updates `last_used_ns` to the current monotonic time for session activity tracking.
+    /// Returns any error from `self.h2.sendStreamReset`; when an error is returned, `last_used_ns` is not updated.
     pub fn sendStreamReset(self: *UpstreamSession, stream_id: u32, error_code_raw: u32) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(stream_id > 0);
@@ -92,6 +124,10 @@ pub const UpstreamSession = struct {
         self.last_used_ns = time.monotonicNanos();
     }
 
+    /// Replenishes HTTP/2 receive windows for `stream_id` by `consumed_bytes` via the underlying H2 session.
+    /// Preconditions: `self` must be a valid pointer and `stream_id` must be non-zero (enforced by assertions).
+    /// Propagates any `Error` returned by `self.h2.replenishReceiveWindows`.
+    /// On success, updates `last_used_ns` to the current monotonic time; on error, `last_used_ns` is unchanged.
     pub fn replenishReceiveWindows(self: *UpstreamSession, stream_id: u32, consumed_bytes: u32) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(stream_id > 0);
@@ -100,6 +136,10 @@ pub const UpstreamSession = struct {
         self.last_used_ns = time.monotonicNanos();
     }
 
+    /// Receives the next HTTP/2 runtime action from this upstream session.
+    /// Preconditions: `self` must be non-null and its socket file descriptor must be valid (`>= 0`).
+    /// On success, updates `last_used_ns` to the current monotonic timestamp and returns the action unchanged.
+    /// Propagates any `Error` returned by `self.h2.receiveAction()`; in that case `last_used_ns` is not updated.
     pub fn receiveAction(self: *UpstreamSession) Error!runtime_mod.ReceiveAction {
         assert(@intFromPtr(self) != 0);
         assert(self.connection.socket.get_fd() >= 0);
@@ -109,6 +149,10 @@ pub const UpstreamSession = struct {
         return action;
     }
 
+    /// Receives the next HTTP/2 runtime action from this upstream session, waiting up to `timeout`.
+    /// Preconditions: `self` must be a valid `UpstreamSession` pointer and its socket file descriptor must be non-negative (enforced by assertions).
+    /// On success, returns the action from `self.h2.receiveActionTimeout(io, timeout)` and refreshes `self.last_used_ns` to current monotonic time.
+    /// Errors from the underlying H2 receive call are propagated unchanged, and `last_used_ns` is not updated on error.
     pub fn receiveActionTimeout(self: *UpstreamSession, io: Io, timeout: Io.Timeout) Error!runtime_mod.ReceiveAction {
         assert(@intFromPtr(self) != 0);
         assert(self.connection.socket.get_fd() >= 0);
@@ -118,6 +162,10 @@ pub const UpstreamSession = struct {
         return action;
     }
 
+    /// Receives the next HTTP/2 runtime action while handling connection-level control frames.
+    /// Preconditions: `self` must be a valid pointer and `self.connection.socket.get_fd()` must be non-negative.
+    /// On success, returns the action from `self.h2.receiveActionHandlingControl()` and refreshes `self.last_used_ns` with `time.monotonicNanos()`.
+    /// Propagates any `Error` returned by `self.h2.receiveActionHandlingControl()`; in that case `last_used_ns` is not updated.
     pub fn receiveActionHandlingControl(self: *UpstreamSession) Error!runtime_mod.ReceiveAction {
         assert(@intFromPtr(self) != 0);
         assert(self.connection.socket.get_fd() >= 0);
@@ -127,6 +175,10 @@ pub const UpstreamSession = struct {
         return action;
     }
 
+    /// Receives the next HTTP/2 action while handling control frames, bounded by `timeout`.
+    /// Preconditions: `self` must be a valid non-null session and its socket file descriptor must be open (`>= 0`).
+    /// On success, forwards the action from `self.h2.receiveActionHandlingControlTimeout` and refreshes `self.last_used_ns` to current monotonic time.
+    /// Returns any `Error` produced by the underlying receive operation; in that case `last_used_ns` is not updated.
     pub fn receiveActionHandlingControlTimeout(self: *UpstreamSession, io: Io, timeout: Io.Timeout) Error!runtime_mod.ReceiveAction {
         assert(@intFromPtr(self) != 0);
         assert(self.connection.socket.get_fd() >= 0);
@@ -136,6 +188,10 @@ pub const UpstreamSession = struct {
         return action;
     }
 
+    /// Closes the underlying connection for this upstream HTTP/2 session.
+    /// Preconditions: `self` must be a valid non-null pointer, and the socket fd must be either open (`>= 0`) or already closed (`-1`).
+    /// This function delegates to `self.connection.close()` and does not return an error value.
+    /// In assertion-enabled builds, invalid pointer/fd state triggers an assertion failure.
     pub fn close(self: *UpstreamSession) void {
         assert(@intFromPtr(self) != 0);
         const fd = self.connection.socket.get_fd();
@@ -153,9 +209,18 @@ const Slot = struct {
     draining_session: ?UpstreamSession = null,
 };
 
+/// Pools at most one active HTTP/2 upstream session per `Upstream.idx` slot and tracks reusable sessions.
+/// `init()` returns a zeroed pool; `deinit()` requires a valid pool pointer and closes all managed sessions.
+/// `acquireOrConnect()` requires non-null `self`/`client`, `upstream.port > 0`, and a valid `upstream` (via `validateUpstream`).
+/// On reuse it returns an existing session; otherwise it connects, initializes H2 preface/settings, and records timing metadata.
+/// Session/connection ownership is retained by the pool slot; callers receive a borrowed session pointer valid until pool lifecycle actions replace or close it.
 pub const UpstreamSessionPool = struct {
     slots: [slot_count]Slot = [_]Slot{.{}} ** slot_count,
 
+    /// Initializes and returns a default `UpstreamSessionPool` value.
+    /// Preconditions: compile-time/runtime `slot_count` must be greater than 0.
+    /// Verifies the pool is constructed with exactly `slot_count` slots via assertions.
+    /// This function does not allocate or return errors; ownership is by-value to the caller.
     pub fn init() UpstreamSessionPool {
         assert(slot_count > 0);
         const pool: UpstreamSessionPool = .{};
@@ -163,12 +228,21 @@ pub const UpstreamSessionPool = struct {
         return pool;
     }
 
+    /// Shuts down this `UpstreamSessionPool` by closing all pooled upstream sessions via `closeAll()`.
+    /// Preconditions: `self` must be a valid non-null pointer and `self.slots.len` must equal `slot_count` (asserted).
+    /// This function does not return errors; invariant violations trigger assertions in debug/safe builds.
+    /// After calling `deinit`, the pool should be considered torn down and not reused.
     pub fn deinit(self: *UpstreamSessionPool) void {
         assert(@intFromPtr(self) != 0);
         assert(self.slots.len == slot_count);
         self.closeAll();
     }
 
+    /// Acquires an active HTTP/2 session for `upstream`, reusing an eligible pooled session when available, otherwise opening a new connection.
+    /// Preconditions: `self` and `client` are valid pointers, `upstream.port > 0`, and `upstream` passes `validateUpstream` (including a valid slot index).
+    /// On a fresh connect, this records upstream metadata in the slot, initializes `ClientConnection` over `io`, and sends the client preface + SETTINGS before returning.
+    /// The returned `session` points to pool-owned slot state (`self.slots[...]`) and is borrowed; its lifetime is managed by the pool, not the caller.
+    /// Returns `Error` from upstream validation, pool capacity checks, connect/handshake, H2 initialization, or preface/settings send; partial fresh sessions are closed and cleared on failure.
     pub fn acquireOrConnect(
         self: *UpstreamSessionPool,
         client: *Client,
@@ -227,6 +301,9 @@ pub const UpstreamSessionPool = struct {
         };
     }
 
+    /// Returns the active session for `upstream_idx`, or the draining session if no active session exists.
+    /// This does not transfer ownership; the returned pointer aliases storage owned by the pool.
+    /// Returns `null` when the slot has no session at all.
     pub fn get(self: *UpstreamSessionPool, upstream_idx: config.UpstreamIndex) ?*UpstreamSession {
         assert(@intFromPtr(self) != 0);
 
@@ -239,6 +316,9 @@ pub const UpstreamSessionPool = struct {
         return null;
     }
 
+    /// Returns the session in `upstream_idx` whose generation matches `generation`, if present.
+    /// The active session is checked first, then the draining session.
+    /// Returns `null` when no session in the slot has the requested generation.
     pub fn getByGeneration(
         self: *UpstreamSessionPool,
         upstream_idx: config.UpstreamIndex,
@@ -260,6 +340,9 @@ pub const UpstreamSessionPool = struct {
         return null;
     }
 
+    /// Closes all sessions in the selected upstream slot.
+    /// This is a slot-wide shutdown and affects both active and draining sessions if present.
+    /// `upstream_idx` must refer to a valid slot index.
     pub fn close(self: *UpstreamSessionPool, upstream_idx: config.UpstreamIndex) void {
         assert(@intFromPtr(self) != 0);
 
@@ -268,6 +351,9 @@ pub const UpstreamSessionPool = struct {
         closeSlot(&self.slots[slot_index]);
     }
 
+    /// Closes sessions in the selected upstream slot whose generation matches `generation`.
+    /// Both the active and draining session are checked independently; non-matching sessions are left open.
+    /// `generation` must be non-zero, and `upstream_idx` must refer to a valid slot index.
     pub fn closeGeneration(self: *UpstreamSessionPool, upstream_idx: config.UpstreamIndex, generation: u32) void {
         assert(@intFromPtr(self) != 0);
         assert(generation > 0);
@@ -288,6 +374,9 @@ pub const UpstreamSessionPool = struct {
         }
     }
 
+    /// Closes every session tracked by this pool.
+    /// This walks all upstream slots and releases both active and draining sessions in each one.
+    /// The pool must already be initialized with `slot_count` slots.
     pub fn closeAll(self: *UpstreamSessionPool) void {
         assert(@intFromPtr(self) != 0);
         assert(self.slots.len == slot_count);

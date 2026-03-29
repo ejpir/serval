@@ -21,6 +21,13 @@ const serval_core = @import("serval-core");
 const config = serval_core.config;
 const time = serval_core.time;
 
+/// Runs the DNS test example from the command line.
+///
+/// Expects `args[1]` to be a hostname and `args[2]` to be an optional port; if the port cannot be parsed, it falls back to `80`.
+/// Allocates process arguments with the provided allocator and frees them before returning.
+///
+/// Prints usage and resolver diagnostics to stdout/stderr, then performs DNS resolution attempts.
+/// Propagates allocation and other setup/runtime errors via `!void`.
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();

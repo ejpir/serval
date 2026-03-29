@@ -10,6 +10,10 @@ const posix = std.posix;
 const serval_core = @import("serval-core");
 const closeFd = serval_core.closeFd;
 
+/// Re-export of the TLS socket wrapper module from `tls_socket.zig`.
+/// Use this namespace for TLS client/server socket creation, encrypted reads and writes, and shutdown.
+/// The returned `Socket` values own the underlying fd; `close()` releases both the TLS session and fd.
+/// Errors are reported through `SocketError`, matching the unified socket error set in `socket.zig`.
 pub const tls_socket = @import("tls_socket.zig");
 
 // =============================================================================

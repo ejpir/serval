@@ -19,10 +19,25 @@ const gw_config = gateway.config;
 /// K8s API paths for Gateway API resources.
 /// TigerStyle: Named constants, not magic strings.
 pub const GATEWAY_CLASS_PATH = "/apis/gateway.networking.k8s.io/v1/gatewayclasses";
+/// Kubernetes Gateway API path for Gateway resources.
+/// Watcher code uses this endpoint when querying Gateway objects in the v1 gateway API.
+/// This constant is a static string literal and has no runtime error behavior.
 pub const GATEWAY_PATH = "/apis/gateway.networking.k8s.io/v1/gateways";
+/// Kubernetes Gateway API path for HTTPRoute resources.
+/// Use this endpoint when watching or listing HTTPRoute objects in the v1 gateway API.
+/// This is a static string literal; it carries no allocation or ownership burden.
 pub const HTTP_ROUTE_PATH = "/apis/gateway.networking.k8s.io/v1/httproutes";
+/// Kubernetes API path for the Services resource list.
+/// Watcher code uses this literal when reading service objects from the API server.
+/// This is a compile-time string constant and requires no cleanup.
 pub const SERVICES_PATH = "/api/v1/services";
+/// Kubernetes API path for the Endpoints resource list.
+/// Watchers use this path to query endpoint updates from the API server.
+/// This is an immutable string literal with static lifetime.
 pub const ENDPOINTS_PATH = "/api/v1/endpoints";
+/// Kubernetes API path for the Secrets resource list.
+/// Watcher code uses this literal when constructing requests against the API server.
+/// This is a compile-time string constant; it does not allocate or transfer ownership.
 pub const SECRETS_PATH = "/api/v1/secrets";
 
 /// Maximum line buffer size for parsing watch events.
@@ -41,9 +56,21 @@ pub const MAX_RECONNECT_ATTEMPTS: u32 = 100;
 /// Maximum number of resources to track per type.
 /// TigerStyle: Bounded storage prevents unbounded growth.
 pub const MAX_GATEWAYS: u32 = gw_config.MAX_GATEWAYS;
+/// Maximum number of HTTP routes the watcher will track.
+/// This is a direct alias of `gw_config.MAX_HTTP_ROUTES` so the watcher stays aligned with gateway config.
+/// Use this bound when sizing fixed-capacity collections or validating route counts.
 pub const MAX_HTTP_ROUTES: u32 = gw_config.MAX_HTTP_ROUTES;
+/// Maximum number of services the watcher tracks at once.
+/// Callers must keep resource counts within this limit to avoid overflow errors.
+/// The constant is `256`.
 pub const MAX_SERVICES: u32 = 256;
+/// Maximum number of endpoints the watcher tracks at once.
+/// Callers must keep resource counts within this limit to avoid overflow errors.
+/// The constant is `256`.
 pub const MAX_ENDPOINTS: u32 = 256;
+/// Maximum number of secrets the watcher tracks at once.
+/// Callers must keep resource counts within this limit to avoid overflow errors.
+/// The constant is `16`.
 pub const MAX_SECRETS: u32 = 16; // Reduced: 16 × 1MB = 16MB for TLS certs
 
 /// Maximum string length for names/namespaces in parsed gw_config.
@@ -63,13 +90,22 @@ pub const MAX_JSON_ARRAY_ITERATIONS: u32 = 1000;
 /// Reconnection backoff configuration (milliseconds).
 /// TigerStyle: Named constants with units in names.
 pub const INITIAL_BACKOFF_MS: u32 = 1000;
+/// Upper bound on watcher backoff delay in milliseconds.
+/// Retry logic must not grow the delay beyond this cap.
+/// The constant is `30000`.
 pub const MAX_BACKOFF_MS: u32 = 30000;
+/// Multiplier used when increasing watcher reconnect backoff.
+/// This value is applied by retry logic to grow the delay between attempts.
+/// The constant is `2`.
 pub const BACKOFF_MULTIPLIER: u32 = 2;
 
 // =============================================================================
 // Error Types (TigerStyle: Explicit error sets)
 // =============================================================================
 
+/// Errors that can be returned while parsing or processing watcher responses.
+/// The set covers JSON parsing, stream lifecycle, request, and capacity failures.
+/// Individual tags document the specific failure mode for the caller.
 pub const WatcherError = error{
     /// Failed to parse watch event JSON
     ParseError,
@@ -420,6 +456,9 @@ pub const NameStorage = struct {
     data: [MAX_NAME_LEN]u8,
     len: u8,
 
+    /// Returns a zeroed name storage value with no bytes set.
+    /// The logical length is initialized to `0` and the backing buffer is cleared.
+    /// Use this before calling `set` or reading the slice view.
     pub fn init() NameStorage {
         return .{
             .data = std.mem.zeroes([MAX_NAME_LEN]u8),
@@ -427,6 +466,9 @@ pub const NameStorage = struct {
         };
     }
 
+    /// Copies `value` into the fixed-size name buffer and updates `len`.
+    /// `value.len` must be at most `MAX_NAME_LEN`; the debug assertion enforces this precondition.
+    /// No allocation occurs, and the returned logical value is a view over the internal storage.
     pub fn set(self: *NameStorage, value: []const u8) void {
         assert(value.len <= MAX_NAME_LEN); // S1: precondition
         const copy_len: u8 = @intCast(@min(value.len, MAX_NAME_LEN));
@@ -434,6 +476,9 @@ pub const NameStorage = struct {
         self.len = copy_len;
     }
 
+    /// Returns the initialized name bytes as a read-only slice.
+    /// The slice is limited to the current logical length stored in `len`.
+    /// The returned view aliases the storage and remains valid until the next mutation.
     pub fn slice(self: *const NameStorage) []const u8 {
         return self.data[0..self.len];
     }
@@ -444,6 +489,9 @@ pub const HostnameStorage = struct {
     data: [MAX_HOSTNAME_LEN]u8,
     len: u8,
 
+    /// Returns a zeroed hostname storage value with no bytes set.
+    /// The logical length is initialized to `0` and the backing buffer is cleared.
+    /// Use this before calling `set` or reading the slice view.
     pub fn init() HostnameStorage {
         return .{
             .data = std.mem.zeroes([MAX_HOSTNAME_LEN]u8),
@@ -451,6 +499,9 @@ pub const HostnameStorage = struct {
         };
     }
 
+    /// Copies `value` into the fixed-size hostname buffer and updates `len`.
+    /// `value.len` must be at most `MAX_HOSTNAME_LEN`; the debug assertion enforces this precondition.
+    /// No allocation occurs, and the returned logical value is a view over the internal storage.
     pub fn set(self: *HostnameStorage, value: []const u8) void {
         assert(value.len <= MAX_HOSTNAME_LEN); // S1: precondition
         const copy_len: u8 = @intCast(@min(value.len, MAX_HOSTNAME_LEN));
@@ -458,6 +509,9 @@ pub const HostnameStorage = struct {
         self.len = copy_len;
     }
 
+    /// Returns the initialized hostname bytes as a read-only slice.
+    /// The slice is limited to the current logical length stored in `len`.
+    /// The returned view aliases the storage and remains valid until the next mutation.
     pub fn slice(self: *const HostnameStorage) []const u8 {
         return self.data[0..self.len];
     }
@@ -468,6 +522,9 @@ pub const PathStorage = struct {
     data: [MAX_PATH_VALUE_LEN]u8,
     len: u16,
 
+    /// Returns a zeroed path storage value with no bytes set.
+    /// The logical length is initialized to `0` and the backing buffer is cleared.
+    /// Use this before calling `set` or reading the slice view.
     pub fn init() PathStorage {
         return .{
             .data = std.mem.zeroes([MAX_PATH_VALUE_LEN]u8),
@@ -475,6 +532,9 @@ pub const PathStorage = struct {
         };
     }
 
+    /// Copies `value` into the fixed-size path buffer and updates `len`.
+    /// `value.len` must be at most `MAX_PATH_VALUE_LEN`; the debug assertion enforces this precondition.
+    /// No allocation occurs, and any previously stored bytes beyond the new length are no longer part of the logical value.
     pub fn set(self: *PathStorage, value: []const u8) void {
         assert(value.len <= MAX_PATH_VALUE_LEN); // S1: precondition
         const copy_len: u16 = @intCast(@min(value.len, MAX_PATH_VALUE_LEN));
@@ -482,6 +542,9 @@ pub const PathStorage = struct {
         self.len = copy_len;
     }
 
+    /// Returns the initialized path bytes as a read-only slice.
+    /// The slice is limited to the current logical length stored in `len`.
+    /// The returned view aliases the storage and remains valid until the next mutation.
     pub fn slice(self: *const PathStorage) []const u8 {
         return self.data[0..self.len];
     }
@@ -493,6 +556,9 @@ pub const StoredPathMatch = struct {
     value: PathStorage,
     active: bool,
 
+    /// Returns a new path match with a prefix match type.
+    /// The stored path is initialized empty and the match starts inactive.
+    /// No allocation occurs and the returned value is ready for direct use.
     pub fn init() StoredPathMatch {
         return .{
             .match_type = .PathPrefix,
@@ -520,6 +586,9 @@ pub const StoredPathRewrite = struct {
     value: PathStorage,
     active: bool,
 
+    /// Initializes a `StoredPathRewrite` for `.ReplacePrefixMatch` rewrites.
+    /// The rewrite value storage is preinitialized and the rewrite starts inactive.
+    /// The returned value is ready to be filled with a prefix replacement path.
     pub fn init() StoredPathRewrite {
         return .{
             .rewrite_type = .ReplacePrefixMatch,
@@ -546,6 +615,9 @@ pub const StoredURLRewrite = struct {
     path: StoredPathRewrite,
     has_path: bool,
 
+    /// Initializes a `StoredURLRewrite` with an empty path rewrite payload.
+    /// The rewrite path storage is preinitialized, but `has_path` starts as `false`.
+    /// The returned value does not carry a rewrite path until one is assigned.
     pub fn init() StoredURLRewrite {
         return .{
             .path = StoredPathRewrite.init(),
@@ -560,6 +632,9 @@ pub const StoredHTTPRouteFilter = struct {
     url_rewrite: StoredURLRewrite,
     active: bool,
 
+    /// Initializes a `StoredHTTPRouteFilter` with the default filter type `.URLRewrite`.
+    /// The embedded URL rewrite state is preinitialized and the filter starts inactive.
+    /// The returned value is ready to be populated before it is marked active.
     pub fn init() StoredHTTPRouteFilter {
         return .{
             .filter_type = .URLRewrite,
@@ -575,6 +650,9 @@ pub const StoredHTTPRouteMatch = struct {
     has_path: bool,
     active: bool,
 
+    /// Initializes a `StoredHTTPRouteMatch` with an empty path match.
+    /// The path match storage is preinitialized, but `has_path` starts as `false`.
+    /// The returned value is inactive until a path is explicitly provided.
     pub fn init() StoredHTTPRouteMatch {
         return .{
             .path = StoredPathMatch.init(),
@@ -592,6 +670,9 @@ pub const StoredBackendRef = struct {
     weight: u16,
     active: bool,
 
+    /// Initializes a `StoredBackendRef` with empty name and namespace storage.
+    /// The backend reference starts on port `0` with default weight `1`.
+    /// The returned value is inactive until a concrete backend target is assigned.
     pub fn init() StoredBackendRef {
         return .{
             .name = NameStorage.init(),
@@ -613,6 +694,9 @@ pub const StoredHTTPRouteRule = struct {
     backend_refs_count: u8,
     active: bool,
 
+    /// Initializes a `StoredHTTPRouteRule` with empty match, filter, and backend slots.
+    /// All contained arrays are preinitialized, while the corresponding counts start at `0`.
+    /// The returned value is inactive until rule content is filled in by the watcher.
     pub fn init() StoredHTTPRouteRule {
         var rule = StoredHTTPRouteRule{
             .matches = undefined,
@@ -644,6 +728,9 @@ pub const StoredHTTPRoute = struct {
     rules_count: u8,
     active: bool,
 
+    /// Initializes a `StoredHTTPRoute` with empty name and namespace storage.
+    /// All hostname and rule slots are preinitialized, while both counts start at `0`.
+    /// The returned value is inactive until route data is attached and activated.
     pub fn init() StoredHTTPRoute {
         var route = StoredHTTPRoute{
             .name = NameStorage.init(),
@@ -672,6 +759,9 @@ pub const StoredListener = struct {
     has_hostname: bool,
     active: bool,
 
+    /// Initializes a `StoredListener` with empty name and hostname storage.
+    /// The listener starts on port `0` with protocol `.HTTP` and no hostname set.
+    /// The returned value is inactive until it is populated from source data.
     pub fn init() StoredListener {
         return .{
             .name = NameStorage.init(),
@@ -694,6 +784,9 @@ pub const StoredGateway = struct {
     listeners_count: u8,
     active: bool,
 
+    /// Initializes a `StoredGateway` with empty name and namespace storage.
+    /// All listener slots are preinitialized, but `listeners_count` starts at `0`.
+    /// The returned value is inactive until later watcher logic populates it.
     pub fn init() StoredGateway {
         var gw = StoredGateway{
             .name = NameStorage.init(),

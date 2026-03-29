@@ -7,6 +7,10 @@ const builtin = @import("builtin");
 
 const BORDER = "=" ** 80;
 
+/// Runs every function in `builtin.test_functions` and reports per-test progress, status, and a final summary.
+/// Resets `std.testing.allocator_instance` before each test and treats a leak reported by `deinit()` as a failure.
+/// A test that returns `error.SkipZigTest` is counted as skipped; any other error is counted as a failure and its stack trace is printed when available.
+/// On success this function exits the process with status `0`; otherwise it exits with status `1`.
 pub fn main() !void {
     var pass: usize = 0;
     var fail: usize = 0;

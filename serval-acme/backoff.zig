@@ -9,14 +9,26 @@ const core = @import("serval-core");
 const config = core.config;
 const time = core.time;
 
+/// Errors returned when a backoff range is invalid.
+/// `InvalidRange` indicates that `min_ms` was zero or greater than `max_ms`.
+/// This error set is used by the public constructor and has no other variants.
 pub const Error = error{
     InvalidRange,
 };
 
+/// Bounded exponential backoff configuration expressed in milliseconds.
+/// Use `init` to validate the range before constructing a value.
+/// `delayMs` computes the delay for a failure count, and `nextRetryDeadlineNs`
+/// converts that delay into an absolute retry deadline.
+/// The type owns no resources and carries no lifetime-managed state.
 pub const BoundedBackoff = struct {
     min_ms: u32,
     max_ms: u32,
 
+    /// Construct a bounded backoff policy with the given minimum and maximum delays.
+    /// Returns `error.InvalidRange` when `min_ms` is zero or when `min_ms > max_ms`.
+    /// The resulting value is a plain configuration object and does not allocate.
+    /// Callers are responsible for choosing bounds that fit their retry policy.
     pub fn init(min_ms: u32, max_ms: u32) Error!BoundedBackoff {
         assert(config.ACME_DEFAULT_FAIL_BACKOFF_MIN_MS > 0);
         assert(config.ACME_DEFAULT_FAIL_BACKOFF_MIN_MS <= config.ACME_DEFAULT_FAIL_BACKOFF_MAX_MS);
@@ -51,6 +63,11 @@ pub const BoundedBackoff = struct {
         return @intCast(final_capped);
     }
 
+    /// Compute the next retry deadline in nanoseconds from `now_ns`.
+    /// Returns `now_ns` when the backoff delay is zero; otherwise adds the bounded delay
+    /// returned by `delayMs` after converting milliseconds to nanoseconds.
+    /// `self` must point to a valid `BoundedBackoff`, and `now_ns` must be nonzero.
+    /// This function does not allocate and cannot fail.
     pub fn nextRetryDeadlineNs(
         self: *const BoundedBackoff,
         now_ns: u64,

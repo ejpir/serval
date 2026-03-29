@@ -38,9 +38,28 @@ const PathMatch = types.PathMatch;
 const PoolConfig = types.PoolConfig;
 
 // Re-export routing limits from config (single source of truth).
+/// Maximum number of upstream pools the router supports.
+/// Upper bound on backend pools a `Router` instance may initialize.
+/// Aliases `serval-core`'s `config.MAX_POOLS` (single source of truth for pool capacity).
+/// `Router.init` enforces this limit and returns `error.TooManyPools` when `pool_configs.len` exceeds it.
+/// This is a direct alias of `serval-core`'s `config.MAX_POOLS` so router limits
+/// stay consistent with global build-time configuration.
+/// Maximum number of routes the router may hold.
+/// This is a direct alias of `serval-core.config.MAX_ROUTES` (single source of truth).
+/// Use this bound for route-capacity checks; `Router.init` returns `error.TooManyRoutes` when `routes.len > MAX_ROUTES`.
 pub const MAX_POOLS = config.MAX_POOLS;
+/// Maximum number of routes the router can hold.
+/// This is a direct alias of `config.MAX_ROUTES`, so its value is defined centrally in configuration.
+/// Use this constant for route-capacity bounds to keep limits consistent across router code paths.
 pub const MAX_ROUTES = config.MAX_ROUTES;
+/// Maximum number of host entries the router may accept.
+/// This constant aliases `serval-core` configuration (`config.MAX_ALLOWED_HOSTS`)
+/// so router limits stay consistent with global Serval limits.
+/// Callers should treat values above this bound as invalid before constructing host lists.
 pub const MAX_ALLOWED_HOSTS = config.MAX_ALLOWED_HOSTS;
+/// Maximum hostname length used by router hostname validation.
+/// This aliases [`serval-core.config.MAX_HOSTNAME_LEN`] to keep limits consistent across layers.
+/// Hostname inputs passed to router APIs are expected to fit within this bound.
 pub const MAX_HOSTNAME_LEN = config.MAX_HOSTNAME_LEN;
 
 /// Content-based router with per-pool load balancing.

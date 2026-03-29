@@ -21,8 +21,19 @@ const verifyTracer = serval_tracing.verifyTracer;
 const pool_mod = @import("serval-pool").pool;
 
 const proxy_types = @import("types.zig");
+/// Public alias of [`proxy_types.ForwardError`], the canonical error set for forwarding operations.
+/// Use this type in proxy-facing APIs so callers can handle forwarder failures consistently.
+/// This declaration adds no new variants; semantics and handling are defined by `proxy_types.ForwardError`.
 pub const ForwardError = proxy_types.ForwardError;
+/// Public alias of `proxy_types.ForwardResult`, returned by forwarder APIs on successful upstream forwarding.
+/// Carries response metadata (`status`, `response_bytes`, `connection_reused`) and per-phase timing metrics in nanoseconds.
+/// Timing fields and `upstream_local_port` may be `0` when a phase is not measured or not populated.
+/// This declaration is a pure type alias: it performs no allocation, ownership transfer, lifetime coupling, or error-producing work.
 pub const ForwardResult = proxy_types.ForwardResult;
+/// Alias of [`proxy_types.BodyInfo`] used by forwarder APIs for request-body streaming metadata.
+/// Encodes body framing (`content_length`, `chunked`, or `none`), bytes already consumed, and any initial body bytes.
+/// `initial_body` is a borrowed `[]const u8` (typically a parser-buffer slice), so callers must keep backing memory valid while forwarding uses it.
+/// This declaration adds no behavior or errors; helper methods and semantics come from `proxy_types.BodyInfo`.
 pub const BodyInfo = proxy_types.BodyInfo;
 const Protocol = proxy_types.Protocol;
 
@@ -67,6 +78,11 @@ const Connection = pool_mod.Connection;
 // Forwarder
 // =============================================================================
 
+/// Returns a concrete forwarder type parameterized by `Pool` and `Tracer`.
+/// At comptime, validates `Pool` (`pool_mod.verifyPool`) and `Tracer` (`verifyTracer`);
+/// invalid component types fail compilation.
+/// Instances of the returned type hold pointers to the caller-owned pool and tracer,
+/// optional caller-owned upstream `ssl.SSL_CTX`, and an internal DNS resolver state.
 pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
     pool_mod.verifyPool(Pool);
     verifyTracer(Tracer);
@@ -85,6 +101,11 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
         /// TigerStyle: Fixed-size cache, thread-safe, no runtime allocation.
         dns_resolver: DnsResolver,
 
+        /// Initializes a `Self` forwarder with the provided pool, tracer, TLS settings, and DNS configuration.
+        /// Preconditions: `p` and `t` must be valid non-null pointers (enforced with `assert`).
+        /// The returned value stores `p`, `t`, and `client_ctx` by pointer; those pointed-to objects must remain alive for the forwarder lifetime.
+        /// `dns_resolver` is initialized via `DnsResolver.init(&dns_resolver, dns_config)` before being embedded in the result.
+        /// This initializer does not return errors; violated preconditions terminate via assertion.
         pub fn init(
             p: *Pool,
             t: *Tracer,

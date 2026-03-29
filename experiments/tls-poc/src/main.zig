@@ -3,6 +3,10 @@ const log = @import("serval-core").log.scoped(.tls_experiment);
 const ssl = @import("ssl.zig");
 const posix = std.posix;
 
+/// Runs the TLS proof-of-concept client against `www.google.com:443`.
+/// Initializes a general-purpose allocator, a threaded `Io` instance, and a BoringSSL client context,
+/// then connects, sets the socket fd and SNI hostname, and performs the TLS handshake.
+/// Returns any allocation, network, or SSL setup/handshake error encountered; acquired resources are released with `defer`.
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();

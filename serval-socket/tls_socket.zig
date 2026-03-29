@@ -20,7 +20,13 @@ const TLSStream = tls.TLSStream;
 const ssl = tls.ssl;
 
 const socket_mod = @import("socket.zig");
+/// Re-export of the unified socket error set from `socket.zig`.
+/// Returned by plain and TLS socket operations when reads, writes, or handshakes fail.
+/// Covers connection state errors, TLS-specific failures, timeouts, and unexpected syscall or SSL errors.
 pub const SocketError = socket_mod.SocketError;
+/// Re-export of the unified socket tagged union from `socket.zig`.
+/// Use this type for plain TCP or TLS connections at higher layers.
+/// Ownership, lifecycle, and method behavior are defined by the underlying socket implementation.
 pub const Socket = socket_mod.Socket;
 
 /// Maximum hostname length for SNI (RFC 6066 limit).

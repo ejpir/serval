@@ -23,6 +23,9 @@ const Extra = struct {
 const h1_fallback_message: []const u8 = "h2 conformance target (h1 fallback)\n";
 
 const Handler = struct {
+    /// Selects an upstream for forwarding, but this conformance handler never forwards requests.
+    /// Panics unconditionally with `"conformance handler should not forward upstream"` and does not return.
+    /// `self`, `ctx`, and `request` are currently unused; callers must not invoke this in forwarding paths.
     pub fn selectUpstream(self: *@This(), ctx: *serval.Context, request: *const serval.Request) serval.Upstream {
         _ = self;
         _ = ctx;
@@ -30,6 +33,10 @@ const Handler = struct {
         @panic("conformance handler should not forward upstream");
     }
 
+    /// Handles any request by returning a fixed plain-text fallback body with HTTP `200`.
+    /// Preconditions: `response_buf.len >= h1_fallback_message.len` (enforced via `assert`).
+    /// Copies `h1_fallback_message` into `response_buf` and returns a body slice over that copied region.
+    /// `self`, `ctx`, and `request` are currently ignored; this function does not return an error union.
     pub fn onRequest(
         self: *@This(),
         ctx: *serval.Context,
@@ -51,6 +58,11 @@ const Handler = struct {
         } };
     }
 
+    /// Handles incoming HTTP/2 request headers for a single stream and immediately attempts a conformance `OK` response via `send_h2_ok`.
+    /// Preconditions: `stream_id` must be non-zero (asserted); `writer` must reference an open response context for that stream.
+    /// `request` and `end_stream` are currently ignored, so behavior is the same for header-only and continued (DATA/trailers) requests.
+    /// Treats `error.HeadersAlreadySent` and `error.ResponseClosed` from `send_h2_ok` as non-fatal and returns success.
+    /// Propagates any other writer/response error to the caller.
     pub fn handleH2Headers(
         self: *@This(),
         stream_id: u32,
@@ -71,6 +83,10 @@ const Handler = struct {
         };
     }
 
+    /// Handles incoming HTTP/2 DATA for the conformance response path.
+    /// `stream_id` must be non-zero; this is enforced with an assertion before any response is sent.
+    /// The request payload and `end_stream` flag are ignored here because this target always sends the same final response.
+    /// If the response is already finalized or the stream is closed, those conditions are treated as success; other send errors are returned.
     pub fn handleH2Data(
         self: *@This(),
         stream_id: u32,
@@ -100,6 +116,10 @@ fn send_h2_ok(writer: *serval.server.H2ResponseWriter) !void {
     try writer.sendData("hello", true);
 }
 
+/// Parses command-line arguments and starts the HTTP/2 conformance server.
+/// Requires `--cert` and `--key` to be provided together; returns `error.MissingTlsKey` or `error.MissingTlsCert` for mismatched TLS inputs.
+/// On invalid CLI input, prints the parse error and returns `error.InvalidArgs`; `help` and `version` exit successfully.
+/// Initializes the handler, pool, metrics, tracer, and threaded I/O runtime, then runs the server until it stops or returns an error.
 pub fn main(process_init: std.process.Init) !void {
     var args = cli.Args(Extra).init("h2_conformance_server", VERSION, process_init.minimal.args);
     switch (args.parse()) {

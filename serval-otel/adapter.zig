@@ -285,6 +285,9 @@ test "OtelTracer implements serval-tracing interface" {
     const TestProcessor = struct {
         ended_count: u32 = 0,
 
+        /// Returns a `SpanProcessor` wrapper for this adapter.
+        /// The returned processor stores `self` and installs the `onEnd` callback in its vtable.
+        /// The adapter must outlive any use of the returned processor.
         pub fn asSpanProcessor(self: *@This()) SpanProcessor {
             return .{
                 .ptr = self,
@@ -338,6 +341,9 @@ test "OtelTracer handles error spans" {
     const TestProcessor = struct {
         last_status_code: ?span_mod.Status.Code = null,
 
+        /// Returns a `SpanProcessor` wrapper for this adapter.
+        /// The returned processor stores `self` and installs the `onEnd` callback in its vtable.
+        /// The adapter must outlive any use of the returned processor.
         pub fn asSpanProcessor(self: *@This()) SpanProcessor {
             return .{
                 .ptr = self,
@@ -365,6 +371,9 @@ test "OtelTracer handles error spans" {
 
 test "OtelTracer pool exhaustion returns invalid handle" {
     const NoopProcessor = struct {
+        /// Returns a `SpanProcessor` wrapper for this adapter.
+        /// The returned processor installs the `onEnd` callback in its vtable.
+        /// Callers must keep the adapter and any referenced state alive for as long as the processor is used.
         pub fn asSpanProcessor(_: *@This()) SpanProcessor {
             return .{
                 .ptr = undefined,

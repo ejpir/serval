@@ -11,29 +11,68 @@ const config = core.config;
 const types = @import("types.zig");
 
 // Re-export types for convenience
+/// Re-export of `types.SpanContext`, the immutable trace context carried with a span.
+/// It bundles trace and span identifiers, flags, trace state, and remote or local origin.
+/// Validate the underlying IDs before treating a context as usable.
 pub const SpanContext = types.SpanContext;
+/// Re-export of `types.SpanKind`, the span role enum used by OpenTelemetry.
+/// Values map directly to OTLP span kinds such as internal, server, client, producer, and consumer.
+/// No extra wrapper behavior is added here.
 pub const SpanKind = types.SpanKind;
+/// Re-export of `types.Status`, the span completion status type.
+/// The underlying type stores the code and an optional fixed-size error description buffer.
+/// Use the underlying helpers to construct `unset`, `ok`, or error statuses.
 pub const Status = types.Status;
+/// Re-export of `types.TraceID`, the 128-bit trace identifier type.
+/// It is a fixed-size value type with zero, validity, and hex conversion helpers on the underlying type.
+/// Use the underlying type's validity rules when accepting external input.
 pub const TraceID = types.TraceID;
+/// Re-export of `types.SpanID`, the 64-bit span identifier type.
+/// It is a fixed-size value type with zero and hex conversion helpers on the underlying type.
+/// Use the underlying type's validity rules when accepting external input.
 pub const SpanID = types.SpanID;
+/// Re-export of `types.TraceFlags`, the OpenTelemetry trace-flags bitset.
+/// Use it to read or update sampling state via the underlying type's methods.
+/// This alias adds no wrapper behavior or ownership rules.
 pub const TraceFlags = types.TraceFlags;
+/// Re-export of `types.InstrumentationScope` for span-related APIs.
+/// The underlying type stores the instrumentation library name and version in fixed-size buffers.
+/// Follow the underlying type's length and truncation behavior when constructing values.
 pub const InstrumentationScope = types.InstrumentationScope;
 
 // =============================================================================
 // Constants (from serval-core/config.zig)
 // =============================================================================
 
+/// Maximum number of attributes a span can store.
+/// This value is sourced from `config.OTEL_MAX_ATTRIBUTES` and is a fixed compile-time limit.
+/// Use it when sizing or validating span attribute storage.
 pub const MAX_ATTRIBUTES = config.OTEL_MAX_ATTRIBUTES;
+/// Maximum number of events a span can store.
+/// This value is sourced from `config.OTEL_MAX_EVENTS` and is a fixed compile-time limit.
+/// Use it when sizing or validating span event storage.
 pub const MAX_EVENTS = config.OTEL_MAX_EVENTS;
+/// Maximum number of span links stored inline on a span.
+/// The span's fixed-size link buffer is sized to this limit.
 pub const MAX_LINKS = config.OTEL_MAX_LINKS;
+/// Maximum number of bytes stored inline for attribute and event keys.
+/// Callers should keep keys within this bound before copying them in.
 pub const MAX_KEY_LEN = config.OTEL_MAX_KEY_LEN;
+/// Maximum number of bytes stored inline for span names.
+/// `Span.init` asserts that the provided name does not exceed this limit.
 pub const MAX_NAME_LEN = config.OTEL_MAX_NAME_LEN;
+/// Maximum number of bytes stored inline for attribute string values.
+/// Longer inputs passed to `fromString` are truncated to this size.
 pub const MAX_STRING_VALUE_LEN = config.OTEL_MAX_STRING_VALUE_LEN;
 
 // =============================================================================
 // Attribute Value - discriminated union for attribute types
 // =============================================================================
 
+/// Fixed-size OpenTelemetry attribute value stored inline.
+/// String values are copied into the internal buffer; longer inputs are
+/// truncated to `MAX_STRING_VALUE_LEN` bytes.
+/// The helper constructors return tagged union values without allocation.
 pub const AttributeValue = union(enum) {
     bool_val: bool,
     int_val: i64,
@@ -45,18 +84,30 @@ pub const AttributeValue = union(enum) {
 
     const Self = @This();
 
+    /// Constructs an `AttributeValue` containing a boolean value.
+/// The value is stored directly in the union.
+/// No allocation or validation is performed.
     pub fn fromBool(val: bool) Self {
         return .{ .bool_val = val };
     }
 
+    /// Constructs an `AttributeValue` containing an integer value.
+/// The value is stored directly in the union.
+/// No allocation or validation is performed.
     pub fn fromInt(val: i64) Self {
         return .{ .int_val = val };
     }
 
+    /// Constructs an `AttributeValue` containing a floating-point value.
+/// The value is stored directly in the union.
+/// No allocation or validation is performed.
     pub fn fromDouble(val: f64) Self {
         return .{ .double_val = val };
     }
 
+    /// Copies `val` into the inline string buffer and returns a string variant.
+/// Inputs longer than `MAX_STRING_VALUE_LEN` bytes are truncated.
+/// No allocation or error is performed.
     pub fn fromString(val: []const u8) Self {
         var result = Self{ .string_val = .{ .data = undefined, .len = 0 } };
         const copy_len = @min(val.len, MAX_STRING_VALUE_LEN);
@@ -65,6 +116,10 @@ pub const AttributeValue = union(enum) {
         return result;
     }
 
+    /// Returns the stored string value when this union holds `.string_val`.
+/// Non-string variants return `null`.
+/// The returned slice aliases the union's inline string buffer, so the union
+/// value must stay alive for as long as the slice is used.
     pub fn getString(self: Self) ?[]const u8 {
         return switch (self) {
             .string_val => |s| s.data[0..s.len],
@@ -77,6 +132,9 @@ pub const AttributeValue = union(enum) {
 // Fixed-Size Attribute
 // =============================================================================
 
+/// A key/value attribute stored inline with no heap allocation.
+/// The key is copied into the fixed-size buffer and read back with `getKey()`.
+/// `value` may hold a bool, integer, floating-point number, or string.
 pub const Attribute = struct {
     key: [MAX_KEY_LEN]u8,
     key_len: u8,
@@ -85,6 +143,10 @@ pub const Attribute = struct {
     const Self = @This();
 
     // TigerStyle: use pointer to avoid copying and dangling slice
+    /// Returns the stored key as a slice of the inline buffer.
+/// The returned slice aliases storage owned by `self` and remains valid while
+/// that object is alive and the key length is unchanged.
+/// No allocation or copying is performed.
     pub fn getKey(self: *const Self) []const u8 {
         return self.key[0..self.key_len];
     }
@@ -94,6 +156,9 @@ pub const Attribute = struct {
 // Fixed-Size Event
 // =============================================================================
 
+/// A span event stored entirely in fixed-size inline storage.
+/// The event name is copied into `name` and exposed through `getName()`.
+/// `timestamp_ns` records the event time in nanoseconds.
 pub const Event = struct {
     name: [MAX_KEY_LEN]u8,
     name_len: u8,
@@ -102,6 +167,10 @@ pub const Event = struct {
     const Self = @This();
 
     // TigerStyle: use pointer to avoid copying and dangling slice
+    /// Returns the stored name as a slice of the inline buffer.
+/// The returned slice aliases storage owned by `self` and remains valid while
+/// that object is alive and the name length is unchanged.
+/// No allocation or copying is performed.
     pub fn getName(self: *const Self) []const u8 {
         return self.name[0..self.name_len];
     }
@@ -111,6 +180,10 @@ pub const Event = struct {
 // Fixed-Size Link (reference to another span)
 // =============================================================================
 
+/// A link to another span context.
+/// The context is stored by value and copied into the parent span's fixed
+/// link storage.
+/// No ownership or lifetime management is involved beyond the embedded data.
 pub const Link = struct {
     span_context: SpanContext,
 };
@@ -119,6 +192,11 @@ pub const Link = struct {
 // Span - The main tracing unit
 // =============================================================================
 
+/// In-memory OpenTelemetry span with fixed-size storage for metadata,
+/// attributes, events, and links.
+/// Use `init` to create a recording span or `disabled` for a no-op span.
+/// Inline name storage is bounded by `MAX_NAME_LEN`, and collection fields
+/// are capped by the corresponding `MAX_*` constants.
 pub const Span = struct {
     // Identity
     span_context: SpanContext,

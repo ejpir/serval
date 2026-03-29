@@ -23,6 +23,10 @@ const Socket = serval_socket.Socket;
 // Pool Interface Verification
 // =============================================================================
 
+/// Compile-time contract check for pool types used by this module.
+/// Verifies that `Pool` declares `acquire`, `release`, and `drain` with the expected pool-facing API.
+/// Fails compilation with `@compileError` if any required declaration is missing.
+/// Performs no runtime work and does not validate declaration signatures beyond presence.
 pub fn verifyPool(comptime Pool: type) void {
     if (!@hasDecl(Pool, "acquire")) {
         @compileError("Pool must implement: pub fn acquire(self, upstream_idx: UpstreamIndex) ?Connection");
@@ -68,6 +72,11 @@ pub const MetricsCallback = *const fn (upstream_idx: UpstreamIndex, event: PoolE
 const STALE_CONNECTION_FLAGS = std.posix.POLL.IN | std.posix.POLL.HUP |
     std.posix.POLL.ERR | std.posix.POLL.NVAL;
 
+/// Pool-managed connection that wraps a unified plain-TCP or TLS `Socket`.
+/// Stores monotonic-nanosecond lifecycle metadata (`created_ns`, `last_used_ns`) used by pool reuse/eviction logic.
+/// `pool_sentinel` and `from_pool` are internal integrity/accounting flags for correct acquire/release behavior.
+/// Treat an acquired `Connection` as exclusively owned while in use; call `close()` to retire the underlying socket.
+/// `get_fd()` asserts the descriptor is valid, and `isUnusable()` conservatively returns `true` on invalid fd or poll-detected error/closure.
 pub const Connection = struct {
     /// Unified socket (plain TCP or TLS).
     /// TigerStyle: Single type handles both encrypted and unencrypted connections.
@@ -144,11 +153,22 @@ pub const Connection = struct {
 // NoPool (fresh connection per request)
 // =============================================================================
 
+/// A stateless pool implementation that never retains reusable connections.
+/// `acquire` always returns `null`, so callers must establish a fresh connection when needed.
+/// `release` unconditionally closes the provided `Connection`; ownership is consumed and it must not be used afterward.
+/// `drain` is a no-op because `NoPool` stores no connections and reports no errors.
 pub const NoPool = struct {
+    /// Attempts to acquire a `Connection` for the given `UpstreamIndex`.
+    /// Currently this implementation is a no-op and always returns `null`.
+    /// No allocation or ownership transfer occurs, and there is no error path beyond the nullable result.
     pub fn acquire(_: *@This(), _: UpstreamIndex) ?Connection {
         return null;
     }
 
+    /// Releases a connection by closing it immediately and unconditionally.
+    /// This implementation does not pool or reuse connections; `UpstreamIndex` and the boolean flag are ignored.
+    /// Preconditions: `conn` should reference a valid connection object that can be closed.
+    /// Error behavior: none (`void`); closure is performed via `Connection.close()`.
     pub fn release(_: *@This(), _: UpstreamIndex, conn: Connection, _: bool) void {
         var c = conn;
         c.close();
@@ -162,6 +182,10 @@ pub const NoPool = struct {
 // SimplePool (fixed-size, no allocation, thread-safe)
 // =============================================================================
 
+/// Fixed-capacity connection pool with independent slots per upstream, sized by centralized config limits.
+/// Internally synchronized with a mutex so pooled state (connections/counters) is safe under concurrent access.
+/// Supports optional `PoolEvent` emission through a callback for observability with zero overhead when disabled.
+/// Stale pooled entries are evicted using idle-time and max-age policies during acquisition.
 pub const SimplePool = struct {
     // Pool sizing from centralized config
     const MAX_CONNS_PER_UPSTREAM = config.MAX_CONNS_PER_UPSTREAM;
@@ -193,6 +217,10 @@ pub const SimplePool = struct {
     /// TigerStyle: Null by default, opt-in for overhead.
     metrics_callback: ?MetricsCallback = null,
 
+    /// Creates a new `SimplePool` in its default, empty state.
+    /// This function has no preconditions and performs no heap allocation.
+    /// Ownership of the returned value is transferred to the caller, who manages its lifetime.
+    /// This initializer is infallible and does not return an error.
     pub fn init() SimplePool {
         return .{};
     }

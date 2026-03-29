@@ -263,6 +263,9 @@ pub fn hasHook(comptime Handler: type, comptime name: []const u8) bool {
 const TestHandler = struct {
     counter: u32 = 0,
 
+    /// Selects the upstream target for a request.
+    /// `request` is read-only, and `ctx` provides the current request context.
+    /// Returns a fixed upstream at `127.0.0.1:8080` with index `0`.
     pub fn selectUpstream(self: *@This(), ctx: *Context, request: *const Request) Upstream {
         _ = self;
         _ = ctx;
@@ -270,6 +273,9 @@ const TestHandler = struct {
         return .{ .host = "127.0.0.1", .port = 8080, .idx = 0 };
     }
 
+    /// Called when a request is received and a response buffer is available.
+    /// `response_buf` is writable scratch space for preparing a response.
+    /// Returns the request handling action; the default is `.continue_request`.
     pub fn onRequest(self: *@This(), ctx: *Context, request: *Request, response_buf: []u8) Action {
         _ = self;
         _ = ctx;
@@ -295,6 +301,9 @@ const TestHandlerWithConnectionHooks = struct {
     connections_opened: u32 = 0,
     connections_closed: u32 = 0,
 
+    /// Selects the upstream target for a request.
+    /// `request` is read-only, and `ctx` provides the current request context.
+    /// Returns a fixed upstream at `127.0.0.1:8080` with index `0`.
     pub fn selectUpstream(self: *@This(), ctx: *Context, request: *const Request) Upstream {
         _ = self;
         _ = ctx;
@@ -302,11 +311,17 @@ const TestHandlerWithConnectionHooks = struct {
         return .{ .host = "127.0.0.1", .port = 8080, .idx = 0 };
     }
 
+    /// Called when a new connection is opened.
+    /// `info` points to connection metadata that remains valid for the duration of the call.
+    /// This implementation records the open by incrementing `connections_opened`.
     pub fn onConnectionOpen(self: *@This(), info: *const ConnectionInfo) void {
         _ = info;
         self.connections_opened += 1;
     }
 
+    /// Called when a connection is closed.
+    /// `connection_id` identifies the connection, `request_count` reports how many requests it handled, and `duration_ns` is the connection lifetime in nanoseconds.
+    /// This implementation records the close by incrementing `connections_closed`.
     pub fn onConnectionClose(self: *@This(), connection_id: u64, request_count: u32, duration_ns: u64) void {
         _ = connection_id;
         _ = request_count;
@@ -332,6 +347,9 @@ test "hasHook detects connection lifecycle hooks" {
 const TestHandlerWithAllHooks = struct {
     counter: u32 = 0,
 
+    /// Selects the upstream target for a request.
+    /// `request` is read-only, and `ctx` provides the current request context.
+    /// Returns a fixed upstream at `127.0.0.1:8080` with index `0`.
     pub fn selectUpstream(self: *@This(), ctx: *Context, request: *const Request) Upstream {
         _ = self;
         _ = ctx;
@@ -339,6 +357,9 @@ const TestHandlerWithAllHooks = struct {
         return .{ .host = "127.0.0.1", .port = 8080, .idx = 0 };
     }
 
+    /// Called when a request is received and a response buffer is available.
+    /// `response_buf` is writable scratch space for preparing a response.
+    /// Returns the request handling action; the default is `.continue_request`.
     pub fn onRequest(self: *@This(), ctx: *Context, request: *Request, response_buf: []u8) Action {
         _ = self;
         _ = ctx;
@@ -347,6 +368,9 @@ const TestHandlerWithAllHooks = struct {
         return .continue_request;
     }
 
+    /// Called with a chunk of request body data as it is received.
+    /// `chunk` references the current body slice, and `is_last` marks the final chunk.
+    /// Returns the body handling action; the default is `.continue_body`.
     pub fn onRequestBody(self: *@This(), ctx: *Context, chunk: []const u8, is_last: bool) BodyAction {
         _ = self;
         _ = ctx;
@@ -355,18 +379,27 @@ const TestHandlerWithAllHooks = struct {
         return .continue_body;
     }
 
+    /// Called when an upstream request is about to be sent.
+    /// `request` points to the mutable upstream request object for the current context.
+    /// The default implementation ignores the request and performs no work.
     pub fn onUpstreamRequest(self: *@This(), ctx: *Context, request: *Request) void {
         _ = self;
         _ = ctx;
         _ = request;
     }
 
+    /// Called when an upstream connection is about to be established.
+    /// `info` points to immutable upstream connection metadata.
+    /// The default implementation ignores the event and performs no work.
     pub fn onUpstreamConnect(self: *@This(), ctx: *Context, info: *const UpstreamConnectInfo) void {
         _ = self;
         _ = ctx;
         _ = info;
     }
 
+    /// Called when a response is available for inspection or modification.
+    /// `response` points to the mutable response object for the current request.
+    /// Returns the request handling action; the default is `.continue_request`.
     pub fn onResponse(self: *@This(), ctx: *Context, response: *Response) Action {
         _ = self;
         _ = ctx;
@@ -374,6 +407,9 @@ const TestHandlerWithAllHooks = struct {
         return .continue_request;
     }
 
+    /// Called with a chunk of response body data as it is produced.
+    /// `chunk` references the current body slice, and `is_last` marks the final chunk.
+    /// Returns the body handling action; the default is `.continue_body`.
     pub fn onResponseBody(self: *@This(), ctx: *Context, chunk: []const u8, is_last: bool) BodyAction {
         _ = self;
         _ = ctx;
@@ -382,6 +418,9 @@ const TestHandlerWithAllHooks = struct {
         return .continue_body;
     }
 
+    /// Called when a request-level error is observed.
+    /// `err_ctx` describes the error, and `ctx` provides the active request context.
+    /// Returns the error handling action; the default is `.default`.
     pub fn onError(self: *@This(), ctx: *Context, err_ctx: *const ErrorContext) ErrorAction {
         _ = self;
         _ = ctx;
@@ -389,17 +428,26 @@ const TestHandlerWithAllHooks = struct {
         return .default;
     }
 
+    /// Called when a log entry is available for the current request context.
+    /// `ctx` is the live request context associated with the log entry.
+    /// The default implementation ignores the entry and performs no work.
     pub fn onLog(self: *@This(), ctx: *Context, entry: LogEntry) void {
         _ = self;
         _ = ctx;
         _ = entry;
     }
 
+    /// Called when a new connection is opened.
+    /// `info` points to connection metadata that remains valid for the duration of the call.
+    /// The default implementation ignores the event.
     pub fn onConnectionOpen(self: *@This(), info: *const ConnectionInfo) void {
         _ = self;
         _ = info;
     }
 
+    /// Called when a connection is closed.
+    /// `connection_id` identifies the connection, `request_count` reports how many requests it handled, and `duration_ns` is the connection lifetime in nanoseconds.
+    /// The default implementation ignores all inputs and performs no work.
     pub fn onConnectionClose(self: *@This(), connection_id: u64, request_count: u32, duration_ns: u64) void {
         _ = self;
         _ = connection_id;

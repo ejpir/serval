@@ -12,11 +12,20 @@ const config = @import("serval-core").config;
 const types = @import("serval-core").types;
 const h2 = @import("serval-h2");
 
+/// Number of SETTINGS parameters included in the initial server SETTINGS frame.
+/// Keep this value in sync with the settings payload written by the runtime.
+/// It is used to compute `initial_settings_frame_buffer_size_bytes`.
 pub const initial_settings_count: usize = 5;
+/// Total buffer space needed to encode the initial server SETTINGS frame.
+/// Includes the HTTP/2 frame header plus `initial_settings_count` serialized SETTINGS entries.
+/// Use this value when sizing a fixed output buffer before calling `writeInitialSettingsFrame`.
 pub const initial_settings_frame_buffer_size_bytes: usize =
     h2.frame_header_size_bytes + (initial_settings_count * h2.setting_size_bytes);
 const connection = @import("connection.zig");
 
+/// Errors returned by the runtime's frame-receive and control-frame write APIs.
+/// The set covers protocol and state violations, flow-control failures, and unsupported frame handling.
+/// It also includes errors propagated from `connection.Error` and other `serval-h2` helpers.
 pub const Error = error{
     PrefaceNotReceived,
     MissingInitialSettings,
@@ -34,23 +43,35 @@ pub const Error = error{
     ConnectionStreamClosedError,
 } || connection.Error || h2.InitialRequestError || h2.ControlError || h2.FlowControlError || h2.FrameError;
 
+/// Request metadata produced when a HEADERS block decodes into a new inbound request.
+/// `request` is the parsed zero-copy request object; its slices reference runtime-managed storage.
+/// `end_stream` reflects the peer's END_STREAM flag on the opening HEADERS frame.
 pub const RequestHeadersAction = struct {
     stream_id: u32,
     end_stream: bool,
     request: types.Request,
 };
 
+/// Request body data produced for a `DATA` frame on an open stream.
+/// `payload` is a borrowed slice of the frame payload after any padding has been removed.
+/// `end_stream` reflects the peer's END_STREAM flag for that frame, and `stream_id` identifies the stream.
 pub const RequestDataAction = struct {
     stream_id: u32,
     end_stream: bool,
     payload: []const u8,
 };
 
+/// Stream-reset metadata used when emitting or reporting a reset for a specific stream.
+/// `stream_id` identifies the stream to reset.
+/// `error_code_raw` preserves the wire-format HTTP/2 error code without interpretation.
 pub const StreamResetAction = struct {
     stream_id: u32,
     error_code_raw: u32,
 };
 
+/// Tagged union describing the immediate action requested after a frame is processed.
+/// Variants either update internal state only or carry zero-copy data for the caller to forward.
+/// `none` means no external action is required for that frame.
 pub const ReceiveAction = union(enum) {
     none,
     send_settings_ack,
@@ -81,6 +102,9 @@ const RequestBodyTracker = struct {
 
 const priority_field_size_bytes: usize = 5;
 
+/// Fixed-capacity HTTP/2 server runtime state used to validate inbound frames and build outbound control frames.
+/// The struct owns no sockets or heap allocations; it reuses internal buffers for request decoding and body tracking.
+/// Create it with `init()` before calling the frame-processing or frame-writing methods.
 pub const Runtime = struct {
     state: connection.ConnectionState,
     header_decoder: h2.HpackDecoder = h2.HpackDecoder.init(),
@@ -89,6 +113,9 @@ pub const Runtime = struct {
     request_body_trackers: [request_body_tracker_capacity]RequestBodyTracker = [_]RequestBodyTracker{.{}} ** request_body_tracker_capacity,
     last_peer_reset_stream_id: u32 = 0,
 
+    /// Construct a fresh HTTP/2 server runtime with a new connection state and HPACK decoder.
+/// Fixed-capacity request-header storage and request-body trackers start in their default internal state.
+/// Returns initialization errors from the underlying connection state constructor.
     pub fn init() Error!Runtime {
         assert(request_body_tracker_capacity > 0);
         assert(h2.request_stable_storage_size_bytes > 0);
@@ -98,12 +125,18 @@ pub const Runtime = struct {
         };
     }
 
+    /// Record that the HTTP/2 client connection preface has been received.
+/// This must be called before normal frame processing; duplicate calls are rejected by the connection state.
+/// No bytes are consumed and no output is produced.
     pub fn receiveClientPreface(self: *Runtime) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(!self.state.preface_received);
         try self.state.markPrefaceReceived();
     }
 
+    /// Encode the server's initial SETTINGS frame into `out` and return the written slice.
+/// The caller must provide enough space for the frame header and the encoded local SETTINGS payload.
+/// On success, the runtime records that local settings were sent and that an ACK is now expected from the peer.
     pub fn writeInitialSettingsFrame(self: *Runtime, out: []u8) Error![]const u8 {
         assert(@intFromPtr(self) != 0);
         assert(out.len >= h2.frame_header_size_bytes);
@@ -119,6 +152,9 @@ pub const Runtime = struct {
         return out[0 .. header.len + payload.len];
     }
 
+    /// Encode the pending peer SETTINGS acknowledgement into `out` and return the written slice.
+/// The runtime asserts that a peer SETTINGS ACK is actually pending before encoding.
+/// On success, the pending-ACK flag is cleared so the ACK is not emitted twice.
     pub fn writePendingSettingsAck(self: *Runtime, out: []u8) Error![]const u8 {
         assert(@intFromPtr(self) != 0);
         assert(self.state.peer_settings_ack_pending);
@@ -128,12 +164,18 @@ pub const Runtime = struct {
         return frame;
     }
 
+    /// Encode a PING frame with the ACK flag set and return the written slice.
+/// `opaque_data` is copied verbatim into the 8-byte ping payload.
+/// `out` must be large enough for the HTTP/2 frame header plus the ping payload; this helper does not touch runtime state.
     pub fn writePingAckFrame(out: []u8, opaque_data: [h2.control.ping_payload_size_bytes]u8) Error![]const u8 {
         assert(out.len >= h2.frame_header_size_bytes + h2.control.ping_payload_size_bytes);
         assert(h2.control.ping_payload_size_bytes == 8);
         return try h2.buildPingFrame(out, h2.flags_ack, opaque_data);
     }
 
+    /// Encode an outbound `GOAWAY` frame into `out` and return the written slice.
+/// `goaway.last_stream_id` must fit the HTTP/2 31-bit stream-id range, and `goaway.debug_data` is copied into the frame buffer.
+/// The runtime marks GOAWAY as sent using the provided last-stream bound before returning.
     pub fn writeGoAwayFrame(self: *Runtime, out: []u8, goaway: h2.GoAway) Error![]const u8 {
         assert(@intFromPtr(self) != 0);
         assert(goaway.last_stream_id <= 0x7fff_ffff);
@@ -143,6 +185,9 @@ pub const Runtime = struct {
         return frame;
     }
 
+    /// Encode an outbound `RST_STREAM` frame into `out` and return the written slice.
+/// `reset.stream_id` must be non-zero; the runtime also clears local bookkeeping for that stream when possible.
+/// If the stream is already gone, cleanup is skipped; encoding and state-update errors still propagate.
     pub fn writeRstStreamFrame(self: *Runtime, out: []u8, reset: StreamResetAction) Error![]const u8 {
         assert(@intFromPtr(self) != 0);
         assert(reset.stream_id > 0);
@@ -155,6 +200,9 @@ pub const Runtime = struct {
         return frame;
     }
 
+    /// Process one inbound HTTP/2 frame after the client preface and peer SETTINGS have been seen.
+/// `header.length` must match `payload.len`, and the frame must not exceed the runtime's configured max frame size.
+/// Returns a `ReceiveAction` for the caller to act on, or a protocol/state error such as missing preface, unsupported continuation, or unsupported push promise.
     pub fn receiveFrame(self: *Runtime, header: h2.FrameHeader, payload: []const u8) Error!ReceiveAction {
         assert(@intFromPtr(self) != 0);
         assert(header.length == payload.len);

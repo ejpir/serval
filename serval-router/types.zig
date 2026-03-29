@@ -11,8 +11,18 @@ const assert = std.debug.assert;
 const core = @import("serval-core");
 const lb = @import("serval-lb");
 
+/// Re-export of [`lb.LbHandler`] for router-facing APIs.
+/// This is a type alias, so it has identical behavior, ownership/lifetime rules,
+/// and error semantics as `serval-lb`’s `LbHandler` definition.
 pub const LbHandler = lb.LbHandler;
+/// Re-export of [`lb.LbConfig`] for router-facing APIs.
+/// This is a type alias, not a wrapper: fields, validation rules, defaults, and
+/// error behavior are exactly those defined by `lb.LbConfig`.
 pub const LbConfig = lb.LbConfig;
+/// Re-export of [`core.Upstream`], the router-facing upstream endpoint type.
+/// Includes backend address/config fields: `host`, `port`, connection-pool `idx`, `tls`, and `http_protocol`.
+/// `host` is a borrowed `[]const u8`; ownership stays with the caller, and backing memory must outlive use.
+/// This alias adds no behavior or error paths; initialization and validation semantics come from `core.Upstream`.
 pub const Upstream = core.Upstream;
 
 /// Strip port from hostname, handling IPv6 bracket notation.

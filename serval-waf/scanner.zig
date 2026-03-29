@@ -4,14 +4,38 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const types = @import("types.zig");
+/// Re-exports the `serval-waf/burst.zig` module under `scanner.burst`.
+/// Use this namespace for bounded per-client burst tracking (`burst.Tracker`) and related update types.
+/// Tracker APIs are non-throwing and report lock/contention degradation via `tracker_degraded` fields in returned values.
+/// This constant is a compile-time module alias and does not own runtime resources by itself.
 pub const burst = @import("burst.zig");
+/// Public re-export of [`burst.Tracker`] for scanner-facing APIs.
+/// This is a direct type alias, so behavior, invariants, and storage semantics are exactly those defined in `burst.zig`.
+/// Call `init` before `snapshot`/`commit*`; operations are non-throwing and report lock/contention degradation via returned fields (for example `tracker_degraded`).
 pub const Tracker = burst.Tracker;
 
+/// Canonical signal name for a detected request-burst behavior.
+/// Use this exact value when emitting or matching the corresponding WAF behavior signal.
+/// Lifetime is static (`[]const u8` string literal) and does not require allocation or cleanup.
 pub const signal_request_burst = "behavior-request-burst";
+/// Canonical identifier for the WAF scanner's path-diversity behavior signal.
+/// Use this constant when emitting or matching that signal to avoid string drift.
+/// Value is stable, compile-time static data with no ownership or lifetime management required.
 pub const signal_path_diversity = "behavior-path-diversity";
+/// Stable signal identifier for the "namespace diversity" behavior check.
+/// This constant is immutable and has static lifetime for the entire process.
+/// No preconditions or error paths apply when reading this value.
 pub const signal_namespace_diversity = "behavior-namespace-diversity";
+/// Canonical behavior-signal identifier for the "miss -> reject burst" mode.
+/// This constant is an immutable UTF-8 string literal and can be referenced for exact
+/// comparisons, logging, or configuration key matching without allocation or ownership transfer.
+/// Accessing this value is infallible and has static lifetime for the program duration.
 pub const signal_miss_reject_burst = "behavior-miss-reject-burst";
 
+/// Built-in baseline `ScannerRule` set for common automated scanner fingerprints in `user_agent`, `path`, and `query`.
+/// Each rule uses `.contains_ascii_ci` matching against the listed needle and carries a fixed weight and disposition (`.block` or `.score`).
+/// Intended as a static default policy; callers should treat this array as read-only and layer custom rules separately when needed.
+/// This declaration performs no I/O and returns no errors by itself; any enforcement behavior occurs in the consumer.
 pub const default_scanner_rules = [_]types.ScannerRule{
     types.ScannerRule.init("ua-sqlmap", .user_agent, .contains_ascii_ci, "sqlmap", 120, .block),
     types.ScannerRule.init("ua-nikto", .user_agent, .contains_ascii_ci, "nikto", 120, .block),
@@ -23,10 +47,19 @@ pub const default_scanner_rules = [_]types.ScannerRule{
     types.ScannerRule.init("query-xdebug", .query, .contains_ascii_ci, "xdebug_session_start", 50, .score),
 };
 
+/// Evaluates `input` against the WAF `config` and returns a `types.Decision`.
+/// This is a convenience wrapper that calls `evaluateWithBehavior(config, input, .{})`.
+/// `config` and `input` must point to valid, initialized values for the duration of the call.
+/// This function does not return an error; any failure handling is delegated to `evaluateWithBehavior`.
 pub fn evaluate(config: *const types.Config, input: *const types.InspectionInput) types.Decision {
     return evaluateWithBehavior(config, input, .{});
 }
 
+/// Evaluates `input` against all configured rules and produces a `types.Decision` seeded from `config.enforcement_mode` and `snapshot.tracker_degraded`.
+/// Preconditions: `config.rules.len` must be in `1..=types.MAX_SCANNER_RULES` (enforced via `assert`).
+/// For each matching rule, records the rule ID, tracks whether any `.block` disposition matched, and accumulates score using saturating addition (`+|=`).
+/// Applies behavioral signals from `snapshot`, then computes final `action` via `selectAction` using score, effective match count, block-match presence, and `config.block_threshold`.
+/// This function is non-allocating and non-fallible; precondition violations trigger assertion failure in assertion-enabled builds.
 pub fn evaluateWithBehavior(
     config: *const types.Config,
     input: *const types.InspectionInput,
@@ -54,6 +87,10 @@ pub fn evaluateWithBehavior(
     return decision;
 }
 
+/// Builds a `types.Decision` for scanner failure handling.
+/// Sets `.action` to `.block` when `failure_mode` is `.fail_closed`; otherwise sets `.allow`.
+/// Propagates `enforcement_mode` and `failure_reason` into the returned decision unchanged.
+/// This function is pure, does not allocate, and cannot fail.
 pub fn buildFailureDecision(
     enforcement_mode: types.EnforcementMode,
     failure_reason: types.FailureReason,

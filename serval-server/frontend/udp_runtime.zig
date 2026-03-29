@@ -60,6 +60,9 @@ const Session = struct {
     closed: std.atomic.Value(bool),
 };
 
+/// Errors returned by UDP runtime initialization and execution.
+/// `InvalidConfig` covers malformed or unsupported transport configuration.
+/// `InvalidAddress` and `BindFailed` report listener setup failures, and `DnsResolutionFailed` reports upstream resolution failure.
 pub const RuntimeError = error{
     InvalidConfig,
     InvalidAddress,
@@ -67,6 +70,9 @@ pub const RuntimeError = error{
     DnsResolutionFailed,
 };
 
+/// Runtime state for the UDP frontend.
+/// Stores the configured transport, upstream storage, DNS resolver, session map, and all runtime counters.
+/// The upstream and address arrays are owned by the runtime instance and are populated during initialization.
 pub const Runtime = struct {
     transport_cfg: UdpTransportConfig,
     upstream_storage: [core_config.MAX_UPSTREAMS]Upstream,
@@ -90,6 +96,10 @@ pub const Runtime = struct {
 
     const Self = @This();
 
+    /// Initializes the UDP runtime from transport and DNS configuration.
+    /// The configuration must enable the transport and provide a non-empty listener address, at least one upstream, and a non-zero session limit.
+    /// Returns `error.InvalidConfig` when the configuration is incomplete, malformed, or exceeds the upstream capacity bound.
+    /// The runtime copies upstream definitions into internal storage and initializes counters, resolver state, and load-balancing strategy.
     pub fn init(self: *Self, transport_cfg: UdpTransportConfig, dns_cfg: DnsConfig) RuntimeError!void {
         assert(@intFromPtr(self) != 0);
         assert(transport_cfg.enabled);
@@ -138,6 +148,10 @@ pub const Runtime = struct {
         });
     }
 
+    /// Runs the UDP runtime event loop for the configured listener and upstreams.
+    /// The listener address is parsed and bound before entering the receive loop; invalid addresses or bind failures are reported as errors.
+    /// If `listener_fd_out` is provided, the bound socket handle is stored there while the runtime is running and reset on exit.
+    /// `shutdown` must remain valid for the duration of the call, and the runtime requires `transport_cfg.enabled` to be true.
     pub fn run(self: *Self, io: Io, shutdown: *std.atomic.Value(bool), listener_fd_out: ?*std.atomic.Value(i32)) RuntimeError!void {
         assert(@intFromPtr(self) != 0);
         assert(@intFromPtr(shutdown) != 0);
@@ -210,62 +224,98 @@ pub const Runtime = struct {
         }
     }
 
+    /// Returns the total number of packets received on the UDP listener.
+    /// The count is read with acquire ordering and does not mutate runtime state.
+    /// `self` must be a valid runtime pointer.
     pub fn packetsReceived(self: *const Self) u64 {
         assert(@intFromPtr(self) != 0);
         return self.packets_received.load(.acquire);
     }
 
+    /// Returns the total number of packets forwarded from downstream handling back upstream.
+    /// The count is read with acquire ordering and does not mutate runtime state.
+    /// `self` must be a valid runtime pointer.
     pub fn packetsForwardedUpstream(self: *const Self) u64 {
         assert(@intFromPtr(self) != 0);
         return self.packets_forwarded_upstream.load(.acquire);
     }
 
+    /// Returns the total number of packets forwarded from the listener toward downstream handling.
+    /// The count is read with acquire ordering and does not mutate runtime state.
+    /// `self` must be a valid runtime pointer.
     pub fn packetsForwardedDownstream(self: *const Self) u64 {
         assert(@intFromPtr(self) != 0);
         return self.packets_forwarded_downstream.load(.acquire);
     }
 
+    /// Returns the total number of packets dropped by the UDP runtime.
+    /// The count is read with acquire ordering and does not mutate runtime state.
+    /// `self` must be a valid runtime pointer.
     pub fn packetsDropped(self: *const Self) u64 {
         assert(@intFromPtr(self) != 0);
         return self.packets_dropped.load(.acquire);
     }
 
+    /// Returns the current number of active sessions tracked by the runtime.
+    /// The value is derived from the session map size and is cast to `u32` after asserting it fits.
+    /// `self` must be a valid runtime pointer.
     pub fn activeSessionCount(self: *const Self) u32 {
         assert(@intFromPtr(self) != 0);
         assert(self.sessions.count() <= std.math.maxInt(u32));
         return @intCast(self.sessions.count());
     }
 
+    /// Returns the number of sessions that have been created by the runtime.
+    /// The count is read with acquire ordering and does not mutate runtime state.
+    /// `self` must be a valid runtime pointer.
     pub fn sessionCreationCount(self: *const Self) u64 {
         assert(@intFromPtr(self) != 0);
         return self.session_creations.load(.acquire);
     }
 
+    /// Returns the number of sessions that have expired due to idle timeout.
+    /// The count is read with acquire ordering and does not mutate runtime state.
+    /// `self` must be a valid runtime pointer.
     pub fn sessionExpirationCount(self: *const Self) u64 {
         assert(@intFromPtr(self) != 0);
         return self.session_expirations.load(.acquire);
     }
 
+    /// Returns the number of upstream forwarding errors observed by the runtime.
+    /// The count is read with acquire ordering and does not mutate runtime state.
+    /// `self` must be a valid runtime pointer.
     pub fn upstreamForwardErrorCount(self: *const Self) u64 {
         assert(@intFromPtr(self) != 0);
         return self.upstream_forward_errors.load(.acquire);
     }
 
+    /// Returns the number of packets dropped because the runtime was at session capacity.
+    /// The count is read with acquire ordering and does not mutate runtime state.
+    /// `self` must be a valid runtime pointer.
     pub fn droppedAtSessionCapacity(self: *const Self) u64 {
         assert(@intFromPtr(self) != 0);
         return self.drop_session_capacity.load(.acquire);
     }
 
+    /// Returns the number of packets dropped because the egress datagram was truncated.
+    /// The count is read with acquire ordering and does not mutate runtime state.
+    /// `self` must be a valid runtime pointer.
     pub fn droppedIngressTruncated(self: *const Self) u64 {
         assert(@intFromPtr(self) != 0);
         return self.drop_ingress_truncated.load(.acquire);
     }
 
+    /// Returns the number of packets dropped because the ingress datagram was truncated.
+    /// The count is read with acquire ordering and does not mutate runtime state.
+    /// `self` must be a valid runtime pointer.
     pub fn droppedEgressTruncated(self: *const Self) u64 {
         assert(@intFromPtr(self) != 0);
         return self.drop_egress_truncated.load(.acquire);
     }
 
+    /// Returns the number of sessions that were dropped because session creation failed.
+    /// The count is read with acquire ordering and does not mutate runtime state.
+    /// `self` must be a valid runtime pointer.
     pub fn droppedSessionCreateFailed(self: *const Self) u64 {
         assert(@intFromPtr(self) != 0);
         return self.drop_session_create_failed.load(.acquire);

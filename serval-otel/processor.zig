@@ -18,8 +18,18 @@ const Span = span_mod.Span;
 const SpanProcessor = tracer_mod.SpanProcessor;
 
 // Constants from serval-core/config.zig (single source of truth)
+/// Maximum queue capacity used by the OTEL processor.
+/// This constant aliases `config.OTEL_MAX_QUEUE_SIZE`, so its value is defined centrally in `serval-core` config.
+/// It is a compile-time constant and does not allocate, own resources, or return errors.
 pub const MAX_QUEUE_SIZE = config.OTEL_MAX_QUEUE_SIZE;
+/// Maximum number of spans a `BatchingProcessor` export operation may include.
+/// Mirrors `serval-core.config.OTEL_MAX_EXPORT_BATCH_SIZE` as this module's public limit.
+/// Used as a fixed compile-time array bound (`export_buffer`) and as the upper bound for `Config.max_export_batch_size`.
+/// This declaration has no runtime behavior or errors; enforcement occurs in `BatchingProcessor.init` assertions.
 pub const MAX_EXPORT_BATCH_SIZE = config.OTEL_MAX_EXPORT_BATCH_SIZE;
+/// Default OpenTelemetry batch delay, in milliseconds, used by the processor.
+/// This constant is an alias of `config.OTEL_BATCH_DELAY_MS`, so its value is defined centrally in config.
+/// Affects timing defaults only; reading this constant has no ownership, lifetime, or error behavior.
 pub const DEFAULT_BATCH_DELAY_MS = config.OTEL_BATCH_DELAY_MS;
 
 // =============================================================================
@@ -36,10 +46,17 @@ pub const SpanExporter = struct {
         shutdownFn: *const fn (ptr: *anyopaque) void,
     };
 
+    /// Exports a batch of spans using this exporter’s vtable implementation.
+    /// `self` must reference a valid `SpanExporter` instance with an initialized `vtable` and `ptr`.
+    /// `spans` is passed through as-is; the caller retains ownership of the slice.
+    /// Returns any error produced by the underlying `exportFn` implementation.
     pub fn exportSpans(self: SpanExporter, spans: []const Span) !void {
         return self.vtable.exportFn(self.ptr, spans);
     }
 
+    /// Shuts down this exporter by dispatching to the implementation-specific `shutdownFn`.
+    /// Preconditions: `self` must reference a valid exporter instance with an initialized vtable.
+    /// This call does not return errors; any shutdown failures must be handled internally by the implementation.
     pub fn shutdown(self: SpanExporter) void {
         self.vtable.shutdownFn(self.ptr);
     }
@@ -57,6 +74,10 @@ pub const SimpleProcessor = struct {
 
     const Self = @This();
 
+    /// Initializes a processor instance with the provided `SpanExporter`.
+    /// The `exporter` value is stored directly in the returned `Self`.
+    /// Initializes `mutex` to its default `.init` state for synchronization.
+    /// This function performs no allocation and cannot fail.
     pub fn init(exporter: SpanExporter) Self {
         return .{
             .exporter = exporter,
@@ -64,6 +85,10 @@ pub const SimpleProcessor = struct {
         };
     }
 
+    /// Returns a `SpanProcessor` adapter that forwards callbacks to this `Self` via a vtable.
+    /// The returned value stores `self` as an opaque pointer and sets only `.onEndFn = onEnd`.
+    /// `self` must remain valid for the entire lifetime of any use of the returned processor.
+    /// This function does not allocate and cannot fail.
     pub fn asSpanProcessor(self: *Self) SpanProcessor {
         return .{
             .ptr = self,
@@ -87,6 +112,9 @@ pub const SimpleProcessor = struct {
         };
     }
 
+    /// Forwards shutdown to the wrapped exporter.
+    /// This does not deallocate the processor or join the background thread; it only propagates shutdown to the exporter interface.
+    /// Call this during teardown before destroying the processor instance.
     pub fn shutdown(self: *Self) void {
         self.exporter.shutdown();
     }
@@ -102,6 +130,9 @@ pub const SimpleProcessor = struct {
 pub const BatchingProcessor = struct {
     // Configuration (TigerStyle: explicit u32, _ms suffix)
     // Uses module-level constants from config.zig as defaults
+    /// Runtime configuration for the batch processor.
+    /// `scheduled_delay_ms` controls the export wake-up delay in milliseconds, and `max_export_batch_size` limits the number of spans per batch.
+    /// `init` validates both fields before use; the defaults are chosen from the module's batch timing and size constants.
     pub const Config = struct {
         scheduled_delay_ms: u32 = DEFAULT_BATCH_DELAY_MS,
         max_export_batch_size: u32 = MAX_EXPORT_BATCH_SIZE,
@@ -128,6 +159,10 @@ pub const BatchingProcessor = struct {
 
     const Self = @This();
 
+    /// Allocates and initializes a new processor instance.
+    /// `cfg.max_export_batch_size` must be in `1..=MAX_EXPORT_BATCH_SIZE`, and `cfg.scheduled_delay_ms` must be non-zero.
+    /// On success, the processor starts its background export thread and returns an owning pointer that must later be shut down and destroyed.
+    /// Fails if allocation or thread creation fails.
     pub fn init(allocator: std.mem.Allocator, exporter: SpanExporter, cfg: Config) !*Self {
         // TigerStyle: assertions on config values
         assert(cfg.max_export_batch_size > 0);
@@ -154,12 +189,18 @@ pub const BatchingProcessor = struct {
         return self;
     }
 
+    /// Destroys `self` after shutdown has completed.
+    /// This asserts that the background export thread has already been cleared; call shutdown and wait for teardown before deinitializing.
+    /// After this returns, the pointer must not be used again.
     pub fn deinit(self: *Self) void {
         // Shutdown should have been called first
         assert(self.export_thread == null);
         self.allocator.destroy(self);
     }
 
+    /// Returns a `SpanProcessor` adapter backed by `self`.
+    /// The returned processor does not own `self`; it is only valid while `self` remains alive.
+    /// Use this view when a caller needs the processor interface for the processor's `onEnd` callback.
     pub fn asSpanProcessor(self: *Self) SpanProcessor {
         return .{
             .ptr = self,
@@ -292,6 +333,9 @@ pub const BatchingProcessor = struct {
 pub const ConsoleExporter = struct {
     const Self = @This();
 
+    /// Returns a `SpanExporter` adapter backed by `self`.
+    /// The returned exporter does not own `self`; it is only valid while `self` remains alive.
+    /// Use this view when a caller needs the exporter interface instead of `Self` directly.
     pub fn asSpanExporter(self: *Self) SpanExporter {
         return .{
             .ptr = self,
@@ -330,6 +374,9 @@ test "SimpleProcessor exports immediately" {
     const TestExporter = struct {
         exported_count: u32 = 0,
 
+        /// Returns a `SpanExporter` adapter backed by `self`.
+        /// The returned exporter does not own `self`; it is only valid while `self` remains alive.
+        /// Use this view when a caller needs the exporter interface instead of `Self` directly.
         pub fn asSpanExporter(self: *@This()) SpanExporter {
             return .{
                 .ptr = self,
@@ -376,6 +423,9 @@ test "BatchingProcessor batches spans" {
         export_calls: u32 = 0,
         total_spans: u32 = 0,
 
+        /// Returns a `SpanExporter` adapter backed by `self`.
+        /// The returned exporter does not own `self`; it is only valid while `self` remains alive.
+        /// Use this view when a caller needs the exporter interface instead of `Self` directly.
         pub fn asSpanExporter(self: *@This()) SpanExporter {
             return .{
                 .ptr = self,

@@ -46,6 +46,10 @@ pub const MAX_PORTS_PER_SUBSET: u8 = 8;
 // Error Types
 // ============================================================================
 
+/// Errors returned by the gateway resolver when registering services/secrets, parsing
+/// Endpoints or Secret JSON, validating TLS secret contents, or looking up ready backends.
+/// These cases cover limit enforcement, name/IP size checks, base64 decoding, and output
+/// buffer sizing. `ServiceNotFound` and `NoEndpoints` indicate lookup failure at runtime.
 pub const ResolverError = error{
     /// Too many services registered (exceeds MAX_SERVICES).
     ServiceLimitExceeded,

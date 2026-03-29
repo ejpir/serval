@@ -38,12 +38,18 @@ const capacity_rejection_log_sample_interval: u64 = 32;
 const connect_failure_log_sample_interval: u64 = 16;
 const timeout_closure_log_sample_interval: u64 = 16;
 
+/// Errors returned by TCP runtime initialization and startup.
+/// `InvalidConfig` covers malformed listener, upstream, or capacity settings; `InvalidAddress` covers listener parse failures.
+/// `ListenFailed` is returned when the listener socket cannot be created.
 pub const RuntimeError = error{
     InvalidConfig,
     InvalidAddress,
     ListenFailed,
 };
 
+/// Runtime state for the TCP frontend.
+/// The `upstreams` slice aliases `upstream_storage` and stays valid for the lifetime of the initialized struct.
+/// Call `init` before `run`; the stored configuration borrows any referenced input memory rather than copying it.
 pub const Runtime = struct {
     transport_cfg: TcpTransportConfig,
     upstream_storage: [core_config.MAX_UPSTREAMS]Upstream,
@@ -62,6 +68,10 @@ pub const Runtime = struct {
 
     const Self = @This();
 
+    /// Initializes the TCP runtime from the provided transport and DNS configuration.
+    /// Rejects disabled or malformed listener settings, an empty upstream list, too many upstreams, or a zero connection limit.
+    /// Copies the transport config by value, builds internal upstream state, and initializes the DNS resolver and strategy.
+    /// The caller retains ownership of any memory referenced by the input config values.
     pub fn init(
         self: *Self,
         transport_cfg: TcpTransportConfig,
@@ -111,6 +121,10 @@ pub const Runtime = struct {
         });
     }
 
+    /// Runs the accept loop for the configured TCP listener.
+    /// If `listener_fd_out` is provided, the opened socket handle is published there and reset to `-1` during shutdown.
+    /// Accepted connections are dispatched to the worker group until `shutdown` becomes true; connections are closed immediately when the runtime is at capacity.
+    /// Returns `InvalidAddress` if the listener address cannot be parsed and `ListenFailed` if the socket cannot be opened.
     pub fn run(self: *Self, io: Io, shutdown: *std.atomic.Value(bool), listener_fd_out: ?*std.atomic.Value(i32)) RuntimeError!void {
         assert(@intFromPtr(self) != 0);
         assert(@intFromPtr(shutdown) != 0);
@@ -158,36 +172,57 @@ pub const Runtime = struct {
         }
     }
 
+    /// Returns the total number of connections rejected because the runtime was at capacity.
+    /// The value is read atomically with acquire ordering.
+    /// This method does not mutate the runtime.
     pub fn rejectedCount(self: *const Self) u64 {
         assert(@intFromPtr(self) != 0);
         return self.rejected_at_capacity.load(.acquire);
     }
 
+    /// Returns the total number of accepted connections.
+    /// The value is read atomically with acquire ordering.
+    /// This method does not mutate the runtime.
     pub fn acceptedCount(self: *const Self) u64 {
         assert(@intFromPtr(self) != 0);
         return self.accepted_connections.load(.acquire);
     }
 
+    /// Returns the number of upstream connection failures observed so far.
+    /// The value is read atomically with acquire ordering.
+    /// This method does not mutate the runtime.
     pub fn connectFailureCount(self: *const Self) u64 {
         assert(@intFromPtr(self) != 0);
         return self.connect_failures.load(.acquire);
     }
 
+    /// Returns the number of connections closed because of timeout.
+    /// The value is read atomically with sequentially consistent ordering.
+    /// This method does not mutate the runtime.
     pub fn timeoutClosureCount(self: *const Self) u64 {
         assert(@intFromPtr(self) != 0);
         return self.timeout_closures.load(.seq_cst);
     }
 
+    /// Returns the number of bytes forwarded from downstream to upstream.
+    /// The value is read atomically with acquire ordering.
+    /// This method does not mutate the runtime.
     pub fn upstreamBytes(self: *const Self) u64 {
         assert(@intFromPtr(self) != 0);
         return self.upstream_bytes.load(.acquire);
     }
 
+    /// Returns the number of bytes forwarded from upstream to downstream.
+    /// The value is read atomically with acquire ordering.
+    /// This method does not mutate the runtime.
     pub fn downstreamBytes(self: *const Self) u64 {
         assert(@intFromPtr(self) != 0);
         return self.downstream_bytes.load(.acquire);
     }
 
+    /// Returns the current number of active downstream connections.
+    /// The value is read atomically with acquire ordering.
+    /// This method does not mutate the runtime.
     pub fn activeCount(self: *const Self) u32 {
         assert(@intFromPtr(self) != 0);
         return self.active_connections.load(.acquire);

@@ -9,24 +9,55 @@ const assert = std.debug.assert;
 const serval_core = @import("serval-core");
 const config = serval_core.config;
 
+/// WebSocket close code `1000`, indicating a normal, graceful shutdown.
+/// Use this when the connection is ending without error and no further frames are expected.
+/// This is a constant status code value; it does not allocate or fail.
 pub const normal_closure: u16 = 1000;
+/// WebSocket close code `1001` (`going_away`).
+/// Use this when the endpoint is shutting down or otherwise leaving the connection.
 pub const going_away: u16 = 1001;
+/// WebSocket close code `1002` (`protocol_error`).
+/// Use this when the connection must be closed because the peer violated the WebSocket protocol.
 pub const protocol_error: u16 = 1002;
+/// WebSocket close code `1003` (`unsupported_data`).
+/// Use this when the peer sent a data type that this endpoint does not support.
 pub const unsupported_data: u16 = 1003;
+/// WebSocket close code `1007` (`invalid_frame_payload_data`).
+/// Use this when the peer sent payload data that is not valid for the negotiated message type.
 pub const invalid_frame_payload_data: u16 = 1007;
+/// WebSocket close code `1008` (`policy_violation`).
+/// Use this when the endpoint is closing the connection because a policy rule was violated.
 pub const policy_violation: u16 = 1008;
+/// WebSocket close code `1009` (`message_too_big`).
+/// Use this when the received message exceeds the implementation's supported size.
 pub const message_too_big: u16 = 1009;
+/// WebSocket close code `1010` (`mandatory_extension`).
+/// Use this when the peer did not negotiate an extension that is required for the connection.
 pub const mandatory_extension: u16 = 1010;
+/// WebSocket close code `1011` (`internal_error`).
+/// Use this when the endpoint is terminating the connection because of an unexpected internal failure.
 pub const internal_error: u16 = 1011;
+/// WebSocket close code `1012` (`service_restart`).
+/// Use this when the service is restarting and the connection should be re-established later.
 pub const service_restart: u16 = 1012;
+/// WebSocket close code `1013` (`try_again_later`).
+/// Use this to signal that the peer should retry the operation later.
 pub const try_again_later: u16 = 1013;
+/// WebSocket close code `1014` (`bad_gateway`).
+/// Use this when a gateway or proxy received an invalid response from an upstream peer.
 pub const bad_gateway: u16 = 1014;
 
+/// Parsed WebSocket close information.
+/// `code` is `null` when the close frame carried no code, and `reason` aliases the original payload bytes.
+/// The `reason` slice is only valid while the source payload remains alive.
 pub const CloseInfo = struct {
     code: ?u16,
     reason: []const u8,
 };
 
+/// Errors returned by close-payload parsing, validation, and encoding helpers.
+/// `InvalidClosePayload` covers structurally malformed payloads, while `InvalidCloseCode` and `InvalidCloseReason` cover semantic validation failures.
+/// `PayloadTooLarge` is returned when the control-frame size limit would be exceeded, and `BufferTooSmall` indicates the destination buffer cannot hold the payload.
 pub const CloseError = error{
     InvalidClosePayload,
     InvalidCloseCode,
@@ -35,6 +66,10 @@ pub const CloseError = error{
     BufferTooSmall,
 };
 
+/// Validates that `code` is an acceptable WebSocket close code.
+/// Accepts the standard registered close codes and any private-use code in the `3000..=4999` range.
+/// Rejects reserved codes such as `1004`, `1005`, `1006`, and `1015`, as well as values below `1000`.
+/// Returns `error.InvalidCloseCode` when the code cannot be used in a close frame.
 pub fn validateCloseCode(code: u16) CloseError!void {
     const is_reserved = switch (code) {
         1004, 1005, 1006, 1015 => true,
@@ -56,6 +91,10 @@ pub fn validateCloseCode(code: u16) CloseError!void {
     }
 }
 
+/// Parses a WebSocket close control payload into a `CloseInfo` value.
+/// Returns a null code and empty reason for an empty payload; a 1-byte payload is rejected as invalid.
+/// The returned reason slice aliases the input payload, so the payload must remain alive for as long as the result is used.
+/// Fails with `error.InvalidClosePayload`, `error.InvalidCloseCode`, `error.InvalidCloseReason`, or `error.PayloadTooLarge`.
 pub fn parseClosePayload(payload: []const u8) CloseError!CloseInfo {
     assert(payload.len <= std.math.maxInt(u32));
 
@@ -79,6 +118,10 @@ pub fn parseClosePayload(payload: []const u8) CloseError!CloseInfo {
     return .{ .code = code, .reason = reason };
 }
 
+/// Builds a WebSocket close control payload into `out`.
+/// Writes the 2-byte close code followed by the UTF-8 reason, and returns the initialized slice.
+/// The returned slice aliases `out`; the caller owns the buffer and must keep it alive for the result's lifetime.
+/// Fails with `error.InvalidCloseCode`, `error.InvalidCloseReason`, `error.PayloadTooLarge`, or `error.BufferTooSmall`.
 pub fn buildClosePayload(out: []u8, code: u16, reason: []const u8) CloseError![]const u8 {
     assert(out.len > 0);
     assert(out.len <= std.math.maxInt(u32));

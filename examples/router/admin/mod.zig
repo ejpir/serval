@@ -29,8 +29,17 @@ const json = @import("../json/mod.zig");
 const config_storage = @import("../config_storage.zig");
 
 // Import CRUD handlers
+/// Admin route management APIs.
+/// This namespace exposes the routes submodule for the router admin surface.
+/// Import it to access route-related admin declarations and helpers.
 pub const routes = @import("routes.zig");
+/// Admin pool management APIs.
+/// This namespace exposes the pools submodule for the router admin surface.
+/// Import it to access pool-related admin declarations and helpers.
 pub const pools = @import("pools.zig");
+/// Admin upstream management APIs.
+/// This namespace exposes the upstreams submodule for the router admin surface.
+/// Import it to access upstream-related admin declarations and helpers.
 pub const upstreams = @import("upstreams.zig");
 
 const MAX_JSON_BODY_SIZE = json.MAX_JSON_BODY_SIZE;

@@ -32,6 +32,9 @@ const log = serval_core.log.scoped(.server);
 const Request = types.Request;
 const Context = context.Context;
 
+/// Builds the stateful generic TLS HTTP/2 frontend adapter type.
+/// The returned type routes gRPC, WebSocket, and generic HTTP requests while preserving the caller's handler contract.
+/// Built-in WebSocket and generic request tracking tables are bounded by `config.H2_MAX_CONCURRENT_STREAMS`.
 pub fn GenericTlsH2FrontendHandler(
     comptime Handler: type,
     comptime Pool: type,
@@ -67,6 +70,9 @@ pub fn GenericTlsH2FrontendHandler(
             upstream_conn: Connection = undefined,
         };
 
+        /// Error set returned by generic h2 frontend operations.
+        /// Includes stream tracking limits, request validation failures, upstream forwarding failures, WebSocket validation failures, and bridge or h2 server errors.
+        /// Callers should treat these as operational failures from header, body, or connection setup paths.
         pub const Error = error{
             TooManyTrackedGrpcStreams,
             TooManyTrackedWebSocketStreams,
@@ -105,6 +111,9 @@ pub fn GenericTlsH2FrontendHandler(
         generic_request_streams: [generic_request_stream_capacity]GenericRequestStreamState = [_]GenericRequestStreamState{.{}} ** generic_request_stream_capacity,
         tracked_generic_request_stream_count: u16 = 0,
 
+        /// Initializes a generic h2 frontend handler around an existing handler and bridge handler.
+        /// Stores the provided pointers and I/O handle without taking ownership of them.
+        /// The referenced handler, forwarder, and connection context must outlive the returned value.
         pub fn init(
             inner: *Handler,
             io: Io,
@@ -125,12 +134,17 @@ pub fn GenericTlsH2FrontendHandler(
             };
         }
 
+        /// Releases all background-task state and then deinitializes the embedded bridge handler.
+        /// Callers should not use the handler after this returns.
         pub fn deinit(self: *Self) void {
             assert(@intFromPtr(self) != 0);
             self.stopH2BackgroundTasks();
             self.grpc_handler.deinit();
         }
 
+        /// Stores the shared response writer template and connection mutex used by background tasks.
+        /// Also starts the bridge handler's background tasks with the same shared state.
+        /// The supplied pointers must remain valid until `stopH2BackgroundTasks` or `deinit` clears them.
         pub fn startH2BackgroundTasks(
             self: *Self,
             writer_template: *h2_server.ResponseWriter,
@@ -147,6 +161,9 @@ pub fn GenericTlsH2FrontendHandler(
             log.debug("generic h2: started grpc bridge background tasks", .{});
         }
 
+        /// Stops background work associated with the generic h2 frontend.
+        /// Cancels the WebSocket reader group, stops the gRPC bridge tasks, clears stored writer and mutex pointers, and closes all tracked upstream connections.
+        /// After this call, tracked WebSocket and generic request slots are reset and their counters are cleared.
         pub fn stopH2BackgroundTasks(self: *Self) void {
             assert(@intFromPtr(self) != 0);
 
@@ -180,6 +197,10 @@ pub fn GenericTlsH2FrontendHandler(
             self.tracked_generic_request_stream_count = 0;
         }
 
+        /// Processes HEADERS for a new HTTP/2 stream and routes it by request type.
+        /// gRPC requests are tracked and delegated to the bridge handler; extended CONNECT WebSocket requests use the WebSocket path.
+        /// Generic requests may be handled directly by `onRequest`, rejected with a response, or forwarded to an upstream selected from the request context.
+        /// Errors from tracking, upstream setup, or forwarding are returned unless they are translated into an HTTP response.
         pub fn handleH2Headers(
             self: *Self,
             stream_id: u32,
@@ -273,6 +294,10 @@ pub fn GenericTlsH2FrontendHandler(
             };
         }
 
+        /// Processes DATA frames for tracked gRPC, bridge, WebSocket, and generic request streams.
+        /// gRPC and bridge streams delegate to the bridge handler; WebSocket data is forwarded upstream; generic request bodies are streamed to the selected upstream.
+        /// When no stream state is tracked, a `413` text response is sent for the unexpected body.
+        /// Errors from downstream forwarding or response writing are returned to the caller.
         pub fn handleH2Data(
             self: *Self,
             stream_id: u32,
@@ -312,6 +337,9 @@ pub fn GenericTlsH2FrontendHandler(
             try sendSimpleTextResponse(writer, 413, "request body over generic h2 frontend not supported");
         }
 
+        /// Handles an HTTP/2 stream reset by clearing any tracked state for the stream.
+        /// For tracked gRPC or h2-bridge streams, the reset is forwarded to the bridge handler after untracking.
+        /// WebSocket and generic request state is marked closed or removed without returning an error.
         pub fn handleH2StreamReset(self: *Self, stream_id: u32, error_code_raw: u32) void {
             assert(@intFromPtr(self) != 0);
 
@@ -327,11 +355,17 @@ pub fn GenericTlsH2FrontendHandler(
             self.removeGenericRequestStream(stream_id);
         }
 
+        /// Receives the connection-level GOAWAY notification for this frontend.
+        /// The current implementation intentionally ignores the frame payload and leaves state unchanged.
+        /// This hook exists so connection-close handling can be extended without changing callers.
         pub fn handleH2ConnectionClose(self: *Self, goaway: @import("serval-h2").GoAway) void {
             assert(@intFromPtr(self) != 0);
             _ = goaway;
         }
 
+        /// Updates per-stream tracking after an HTTP/2 stream closes.
+        /// Removes the stream from gRPC and h2-bridge tracking, marks WebSocket streams as closing, and drops generic request state.
+        /// This is a best-effort cleanup hook and does not report errors.
         pub fn handleH2StreamClose(self: *Self, summary: h2_server.StreamSummary) void {
             assert(@intFromPtr(self) != 0);
             self.untrackGrpcStream(summary.stream_id);
@@ -1060,6 +1094,10 @@ fn sendChunkedBodyTerminator(conn: *Connection, io: Io) WebSocketIoError!void {
     try writeAllConnection(conn, io, "0\r\n\r\n");
 }
 
+/// Attempts to dispatch a TLS connection with negotiated ALPN `h2` to the generic HTTP/2 frontend.
+/// Returns `false` when no TLS stream is present, the peer did not negotiate `h2`, or the handler type already owns explicit `handleH2Headers`/`handleH2Data` termination.
+/// When a bridge session pool is needed, it is allocated from the page allocator and released before return.
+/// Logs and returns `false` on bridge pool allocation failure; otherwise serves the connection through `h2_server.serveTlsConnection`.
 pub fn tryServeTlsAlpnConnection(
     comptime Handler: type,
     comptime Pool: type,

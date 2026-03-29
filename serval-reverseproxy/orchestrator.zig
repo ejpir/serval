@@ -4,6 +4,11 @@ const std = @import("std");
 const assert = std.debug.assert;
 const ir = @import("ir.zig");
 
+/// Represents the orchestrator's apply lifecycle.
+/// `idle` is the quiescent state, `build` and `admit` cover candidate preparation and validation, and `activate` installs a new generation.
+/// `drain` and `retire` cover retirement of the previous generation.
+/// `safe_mode` is the fallback state entered when rollback cannot recover a last known good snapshot.
+/// The orchestrator enforces valid transitions between these states; callers do not mutate this directly.
 pub const ApplyStage = enum(u8) {
     idle,
     build,
@@ -14,6 +19,10 @@ pub const ApplyStage = enum(u8) {
     safe_mode,
 };
 
+/// Classifies the last orchestrator event for logging and diagnostics.
+/// `stage_transition` records a successful lifecycle step, and the remaining variants record apply, drain, rollback, or safe-mode outcomes.
+/// The orchestrator stores one of these values in `OrchestratorEvent.kind` when it updates `last_event`.
+/// Use this together with the event stage and generation to understand the most recent state change.
 pub const EventKind = enum(u8) {
     stage_transition,
     apply_failure,
@@ -25,6 +34,10 @@ pub const EventKind = enum(u8) {
     safe_mode_entered,
 };
 
+/// Describes the most recent state-machine event emitted by the orchestrator.
+/// `kind` identifies the event family, while `stage` captures the lifecycle stage reached.
+/// `generation_id` names the candidate or snapshot generation associated with the event.
+/// `reason` is populated when the event carries a validation reason; otherwise it is null.
 pub const OrchestratorEvent = struct {
     kind: EventKind,
     stage: ApplyStage,
@@ -32,6 +45,10 @@ pub const OrchestratorEvent = struct {
     reason: ?ir.ValidationReason,
 };
 
+/// Immutable runtime view of a validated configuration generation.
+/// The fields are borrowed slice views, so the underlying canonical IR storage must remain valid for as long as the snapshot is referenced.
+/// `generation_id` identifies the configuration version and `created_at_ns` records when the snapshot was created.
+/// Use `fromCanonicalIr` to construct a snapshot from validated IR without copying.
 pub const RuntimeSnapshot = struct {
     generation_id: u64,
     listeners: []const ir.Listener,
@@ -41,6 +58,10 @@ pub const RuntimeSnapshot = struct {
     chains: []const ir.ChainPlan,
     created_at_ns: u64,
 
+    /// Builds a runtime snapshot by borrowing slice views from a canonical IR instance.
+/// The returned snapshot does not copy the underlying arrays; the caller must keep `candidate` alive while the snapshot is in use.
+/// `generation_id` and `created_at_ns` must both be non-zero.
+/// This helper preserves the candidate's listeners, pools, routes, plugins, and chains verbatim.
     pub fn fromCanonicalIr(candidate: *const ir.CanonicalIr, generation_id: u64, created_at_ns: u64) RuntimeSnapshot {
         assert(generation_id > 0);
         assert(created_at_ns > 0);
@@ -62,12 +83,19 @@ const DrainingSnapshot = struct {
     deadline_ns: u64,
 };
 
+/// Errors returned by orchestrator lifecycle operations.
+/// Includes canonical IR validation failures plus state-machine errors such as invalid transitions and missing rollback targets.
+/// `DrainTimeoutExceeded` is reported when draining has to be forced past its deadline.
 pub const OrchestratorError = ir.ValidationError || error{
     InvalidStateTransition,
     NoLastKnownGood,
     DrainTimeoutExceeded,
 };
 
+/// Coordinates snapshot admission, activation, draining, and rollback state.
+/// `active_snapshot_ptr` is the published snapshot pointer; the remaining fields track the current lifecycle and diagnostics.
+/// The struct stores borrowed snapshot references and slice views, so referenced data must outlive any active use.
+/// Public methods enforce stage transitions and record the most recent event for observability.
 pub const Orchestrator = struct {
     active_snapshot_ptr: std.atomic.Value(usize),
     last_known_good: ?*const RuntimeSnapshot,
@@ -78,6 +106,10 @@ pub const Orchestrator = struct {
     last_diagnostics: [ir.MAX_VALIDATION_DIAGNOSTICS]ir.ValidationDiagnostic,
     last_diagnostics_count: u32,
 
+    /// Creates a new orchestrator with no active snapshot and idle stage.
+/// `max_drain_ns` must be non-zero and is used as the deadline for draining retired snapshots.
+/// The diagnostics buffer is left uninitialized until a validation attempt fills it.
+/// The returned value owns its internal atomic state and can be used immediately.
     pub fn init(max_drain_ns: u64) Orchestrator {
         assert(max_drain_ns > 0);
 
@@ -93,6 +125,10 @@ pub const Orchestrator = struct {
         };
     }
 
+    /// Returns the currently active runtime snapshot, if one has been published.
+/// The returned pointer aliases orchestrator-owned state and must only be used while the snapshot remains active.
+/// Returns `null` when no active snapshot pointer has been stored yet.
+/// The pointer is loaded with acquire ordering to pair with the release store used on activation.
     pub fn getActiveSnapshot(self: *const Orchestrator) ?*const RuntimeSnapshot {
         const ptr_int = self.active_snapshot_ptr.load(.acquire);
         if (ptr_int == 0) return null;
@@ -100,11 +136,18 @@ pub const Orchestrator = struct {
         return @ptrFromInt(ptr_int);
     }
 
+    /// Returns the orchestrator's current apply stage.
+/// The stored stage is expected to remain within the `ApplyStage` range through `.safe_mode`.
+/// This is a read-only accessor and does not mutate orchestrator state.
     pub fn getStage(self: *const Orchestrator) ApplyStage {
         assert(@intFromEnum(self.stage) <= @intFromEnum(ApplyStage.safe_mode));
         return self.stage;
     }
 
+    /// Validates and activates a candidate snapshot for the provided generation.
+/// On validation failure, this records an `apply_failure` event, resets the stage to `.idle`, and returns the validation error.
+/// When a previous active snapshot exists, it becomes `last_known_good` and is moved into drain state.
+/// `candidate_snapshot.generation_id` and `now_ns` must both be non-zero.
     pub fn admitAndActivate(
         self: *Orchestrator,
         candidate_ir: *const ir.CanonicalIr,
@@ -156,6 +199,10 @@ pub const Orchestrator = struct {
         };
     }
 
+    /// Advances a drain cycle based on the number of in-flight references and the current time.
+/// Returns `true` when draining is finished, including the no-drain case where nothing is pending.
+/// When references reach zero, or when the deadline is exceeded, the old snapshot is retired and the stage is moved to `.idle`.
+/// Exceeds the drain deadline with `error.DrainTimeoutExceeded` after forcing retirement.
     pub fn progressDrain(self: *Orchestrator, in_flight_refs: u32, now_ns: u64) OrchestratorError!bool {
         assert(now_ns > 0);
         assert(self.stage == .drain or self.draining == null);
@@ -191,6 +238,10 @@ pub const Orchestrator = struct {
         return false;
     }
 
+    /// Restores the active snapshot to `last_known_good` and updates rollback state.
+/// Returns `error.NoLastKnownGood` when no previous snapshot has been recorded.
+/// If a different snapshot is currently active, it begins draining that snapshot before switching.
+/// `now_ns` must be non-zero and this method must not be called while already in `.safe_mode`.
     pub fn rollbackToLastKnownGood(self: *Orchestrator, now_ns: u64) OrchestratorError!void {
         assert(now_ns > 0);
         assert(self.stage != .safe_mode);
@@ -216,6 +267,10 @@ pub const Orchestrator = struct {
         };
     }
 
+    /// Rolls back to the last known good snapshot, or enters safe mode if rollback fails.
+/// On rollback failure, this method suppresses the error, records a `safe_mode_entered` event,
+/// and forces `stage` to `.safe_mode`.
+/// `now_ns` must be non-zero and the orchestrator must not already be in `.build`.
     pub fn rollbackOrEnterSafeMode(self: *Orchestrator, now_ns: u64) void {
         assert(now_ns > 0);
         assert(self.stage != .build);

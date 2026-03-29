@@ -5,6 +5,9 @@ const assert = std.debug.assert;
 const core = @import("serval-core");
 const ir = @import("ir.zig");
 
+/// Identifies how far request or response processing had progressed when a failure occurred.
+/// The phases are ordered from request headers through response body so classification can tell whether the exchange is still safe to rewrite or bypass.
+/// `request_headers` is the earliest phase, and `response_body` is the latest.
 pub const FailurePhase = enum(u8) {
     request_headers,
     request_body,
@@ -12,6 +15,9 @@ pub const FailurePhase = enum(u8) {
     response_body,
 };
 
+/// Describes the immediate source of a failure used by reverse-proxy policy.
+/// These values distinguish plugin, upstream, downstream, and timeout paths so classification can choose the correct terminal behavior.
+/// The enum is used as a compact discriminator and owns no data.
 pub const FailureSource = enum(u8) {
     plugin_error,
     upstream_read_error,
@@ -19,6 +25,9 @@ pub const FailureSource = enum(u8) {
     backpressure_timeout,
 };
 
+/// Terminal action to take after a failure has been classified.
+/// `send_error_response` and `sticky_bypass_plugin` are used before an exchange is committed; the remaining variants close or reset the active HTTP transport.
+/// The selected action depends on the protocol and failure state, not on any owned data.
 pub const TerminalAction = enum(u8) {
     send_error_response,
     close_h1_connection,
@@ -26,11 +35,17 @@ pub const TerminalAction = enum(u8) {
     sticky_bypass_plugin,
 };
 
+/// Result of failure classification.
+/// `action` selects the terminal handling path, and `sticky_bypass_active` records whether sticky bypass remains enabled for the exchange.
+/// This type is returned by value and does not own any resources.
 pub const FailureDecision = struct {
     action: TerminalAction,
     sticky_bypass_active: bool,
 };
 
+/// Classifies a reverse-proxy failure into the terminal action the connection or stream should take.
+/// A fail-open plugin error can select sticky bypass when the failure is still safe for bypass; otherwise an early plugin or upstream read failure sends an error response before headers are committed.
+/// For all other cases, the action is derived from the HTTP protocol and sticky bypass is disabled in the result.
 pub fn classifyFailure(
     protocol: core.HttpProtocol,
     phase: FailurePhase,
@@ -56,6 +71,9 @@ pub fn classifyFailure(
     };
 }
 
+/// Returns whether sticky bypass may still be used after a failure at the given phase.
+/// When `headers_sent` is true, only failures during `request_headers` are considered safe for bypass.
+/// `phase` must be a valid `FailurePhase` value.
 pub fn isStickyBypassSafe(phase: FailurePhase, headers_sent: bool) bool {
     assert(@intFromEnum(phase) <= @intFromEnum(FailurePhase.response_body));
 

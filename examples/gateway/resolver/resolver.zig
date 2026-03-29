@@ -35,7 +35,13 @@ const parseSecretJson = resolver_parsing.parseSecretJson;
 
 // Import resolved types
 const resolved_types = @import("resolved_types.zig");
+/// Alias for the resolver's resolved service view type.
+/// The returned value is a borrowed view over resolver storage, including the service name, namespace, and endpoint list.
+/// It does not allocate or copy endpoint data, so the resolver must remain alive while the view is in use.
 pub const ResolvedService = resolved_types.ResolvedService;
+/// Alias for the resolver's resolved secret view type.
+/// The returned value does not own the certificate or key bytes; it references data stored inside the resolver.
+/// Keep the resolver alive and unchanged while using values derived from this type.
 pub const ResolvedSecret = resolved_types.ResolvedSecret;
 
 // ============================================================================

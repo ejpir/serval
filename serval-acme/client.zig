@@ -23,6 +23,8 @@ const output_cursor_max: u32 = max_jws_body_bytes;
 
 const json_parse_scratch_size_bytes = 8192;
 
+/// Error set used by the ACME client for parsing, validation, and output sizing failures.
+/// It includes JSON decode failures, missing required fields, invalid status and type values, and length limits for URLs, nonces, identifiers, authorizations, challenges, and output buffers.
 pub const Error = error{
     EmptyInput,
     ResponseTooLarge,
@@ -55,6 +57,9 @@ pub const Url = struct {
     len: u16 = 0,
     bytes: [max_url_bytes]u8 = [_]u8{0} ** max_url_bytes,
 
+    /// Stores a URL after validating size, whitespace, and scheme constraints.
+    /// Empty values, values longer than `max_url_bytes`, values containing space, newline, or carriage return, or values without an `http://` or `https://` prefix return an error.
+    /// On success, the URL buffer is cleared and the new bytes are copied into place.
     pub fn set(self: *Url, value: []const u8) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(self.len <= max_url_bytes);
@@ -75,6 +80,9 @@ pub const Url = struct {
         assert(self.len == @as(u16, @intCast(value.len)));
     }
 
+    /// Returns the stored URL as a byte slice.
+    /// The returned slice aliases the internal buffer and is valid until the URL is replaced or the struct is discarded.
+    /// `len` must not exceed `max_url_bytes`.
     pub fn slice(self: *const Url) []const u8 {
         assert(@intFromPtr(self) != 0);
         assert(self.len <= max_url_bytes);
@@ -87,6 +95,9 @@ pub const ReplayNonce = struct {
     len: u16 = 0,
     bytes: [max_nonce_bytes]u8 = [_]u8{0} ** max_nonce_bytes,
 
+    /// Stores a replay nonce after validating size and whitespace constraints.
+    /// Empty values, values longer than `max_nonce_bytes`, or values containing space, newline, or carriage return return an error.
+    /// On success, the nonce buffer is cleared and the new bytes are copied into place.
     pub fn set(self: *ReplayNonce, value: []const u8) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(self.len <= max_nonce_bytes);
@@ -103,6 +114,9 @@ pub const ReplayNonce = struct {
         assert(self.len == @as(u16, @intCast(value.len)));
     }
 
+    /// Returns the current replay nonce as a slice of bytes.
+    /// The returned slice aliases the internal buffer and is valid until the nonce is replaced or the struct is discarded.
+    /// `len` must not exceed `max_nonce_bytes`.
     pub fn slice(self: *const ReplayNonce) []const u8 {
         assert(@intFromPtr(self) != 0);
         assert(self.len <= max_nonce_bytes);
@@ -110,18 +124,25 @@ pub const ReplayNonce = struct {
     }
 };
 
+/// ACME directory endpoints discovered from the server's directory response.
+/// Each field is stored inline as a `Url` and defaults to an empty value until populated.
+/// Use these endpoints for nonce, account, and order creation requests.
 pub const Directory = struct {
     new_nonce_url: Url = .{},
     new_account_url: Url = .{},
     new_order_url: Url = .{},
 };
 
+/// ACME account status values as represented by the client.
+/// These variants reflect the server-reported state of an account.
 pub const AccountStatus = enum(u8) {
     valid,
     deactivated,
     revoked,
 };
 
+/// ACME order status values as represented by the client.
+/// These variants cover the order lifecycle returned by ACME servers.
 pub const OrderStatus = enum(u8) {
     pending,
     ready,
@@ -130,6 +151,8 @@ pub const OrderStatus = enum(u8) {
     invalid,
 };
 
+/// ACME authorization status values as represented by the client.
+/// These variants cover the authorization lifecycle returned by ACME servers.
 pub const AuthorizationStatus = enum(u8) {
     pending,
     valid,
@@ -139,6 +162,8 @@ pub const AuthorizationStatus = enum(u8) {
     revoked,
 };
 
+/// ACME challenge status values as represented by the client.
+/// These variants track the server-reported lifecycle of an authorization challenge.
 pub const ChallengeStatus = enum(u8) {
     pending,
     processing,
@@ -146,10 +171,15 @@ pub const ChallengeStatus = enum(u8) {
     invalid,
 };
 
+/// Identifies the supported ACME challenge type.
+/// This client currently models only `tls_alpn01`.
 pub const ChallengeType = enum(u8) {
     tls_alpn01,
 };
 
+/// ACME challenge state for an authorization.
+/// `challenge_type`, `status`, and `url` describe the challenge, while `token_len` and `token_bytes` store the challenge token inline.
+/// Use `setToken` to validate and store a token, and `token` to read the currently stored slice.
 pub const AuthorizationChallenge = struct {
     challenge_type: ChallengeType,
     status: ChallengeStatus,
@@ -157,6 +187,9 @@ pub const AuthorizationChallenge = struct {
     token_len: u16 = 0,
     token_bytes: [max_challenge_token_bytes]u8 = [_]u8{0} ** max_challenge_token_bytes,
 
+    /// Sets the challenge token to `token_value` after validating length and allowed characters.
+    /// Empty tokens, tokens longer than `max_challenge_token_bytes`, or tokens containing non-alphanumeric, non-`-`, non-`_` bytes return `error.InvalidChallengeToken`.
+    /// On success, the previous token bytes are cleared and the new token is copied into the fixed buffer.
     pub fn setToken(self: *AuthorizationChallenge, token_value: []const u8) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(self.token_len <= max_challenge_token_bytes);
@@ -182,6 +215,9 @@ pub const AuthorizationChallenge = struct {
         assert(self.token_len == token_len);
     }
 
+    /// Returns the active token bytes for this challenge.
+    /// The slice aliases `self.token_bytes` and is limited to the current `token_len` value.
+    /// `token_len` must not exceed `max_challenge_token_bytes`.
     pub fn token(self: *const AuthorizationChallenge) []const u8 {
         assert(@intFromPtr(self) != 0);
         assert(self.token_len <= max_challenge_token_bytes);
@@ -189,6 +225,9 @@ pub const AuthorizationChallenge = struct {
     }
 };
 
+/// ACME authorization response state returned by the client.
+/// `identifier_dns` and `challenges` are stored inline; `challenge_count` controls how many entries in `challenges` are considered valid.
+/// Use `firstTlsAlpn01Challenge` to locate the first `tls_alpn01` challenge when one is present.
 pub const AuthorizationResponse = struct {
     status: AuthorizationStatus,
     identifier_dns: acme_types.DomainName = .{},
@@ -199,6 +238,9 @@ pub const AuthorizationResponse = struct {
     }} ** max_challenges_per_authorization,
     challenge_count: u8 = 0,
 
+    /// Returns the first `tls_alpn01` challenge stored on this authorization, or `null` if none exists.
+    /// The returned pointer aliases `self.challenges` and stays valid only while `self` remains alive and unchanged.
+    /// `self.challenge_count` must not exceed `max_challenges_per_authorization`.
     pub fn firstTlsAlpn01Challenge(self: *const AuthorizationResponse) ?*const AuthorizationChallenge {
         assert(@intFromPtr(self) != 0);
         assert(self.challenge_count <= max_challenges_per_authorization);
@@ -212,16 +254,25 @@ pub const AuthorizationResponse = struct {
     }
 };
 
+/// Parsed ACME account response data.
+/// `status` is required; `orders_url` is optional and only valid when `has_orders_url` is set.
+/// The URL field is copied into the struct, so the returned value does not borrow from the source JSON.
 pub const AccountResponse = struct {
     status: AccountStatus,
     has_orders_url: bool = false,
     orders_url: Url = .{},
 };
 
+/// Mutable builder for an ACME new-order request.
+/// The request stores up to `max_identifiers_per_order` DNS identifiers and tracks the number of populated entries explicitly.
+/// Use `init`, `addIdentifier`, and `initFromRuntimeConfig` to construct a request before passing it to the serializer.
 pub const NewOrderRequest = struct {
     identifiers: [max_identifiers_per_order]acme_types.DomainName = [_]acme_types.DomainName{.{}} ** max_identifiers_per_order,
     identifier_count: u8 = 0,
 
+    /// Creates an empty `NewOrderRequest`.
+    /// The returned value has `identifier_count == 0` and all identifier slots zero-initialized.
+    /// Call `addIdentifier` to populate the request before serialization.
     pub fn init() NewOrderRequest {
         assert(max_identifiers_per_order > 0);
         const request = NewOrderRequest{};
@@ -229,6 +280,9 @@ pub const NewOrderRequest = struct {
         return request;
     }
 
+    /// Appends one identifier to a new-order request.
+    /// The request must have remaining capacity in `identifiers`, and the domain is validated before being stored.
+    /// Returns `error.TooManyIdentifiers` when the request is full, or `error.InvalidDomainName` if the domain cannot be represented.
     pub fn addIdentifier(self: *NewOrderRequest, domain: []const u8) Error!void {
         assert(@intFromPtr(self) != 0);
 
@@ -243,6 +297,9 @@ pub const NewOrderRequest = struct {
         assert(self.identifier_count <= max_identifiers_per_order);
     }
 
+    /// Builds a `NewOrderRequest` from a runtime configuration.
+    /// The runtime must not be null, and `runtime.domain_count` must not exceed `max_identifiers_per_order`.
+    /// Returns `error.InvalidIdentifierCount` for an empty domain list and `error.InvalidDomainName` if any runtime domain is missing or invalid.
     pub fn initFromRuntimeConfig(runtime: *const acme_types.RuntimeConfig) Error!NewOrderRequest {
         assert(@intFromPtr(runtime) != 0);
         assert(runtime.domain_count <= max_identifiers_per_order);
@@ -261,6 +318,9 @@ pub const NewOrderRequest = struct {
     }
 };
 
+/// Parsed ACME order response data.
+/// `finalize_url` is always required; `authorization_urls` stores up to `max_authorization_urls_per_order` entries.
+/// `authorization_count` tracks how many entries are valid, and `has_certificate_url` indicates whether `certificate_url` was present.
 pub const OrderResponse = struct {
     status: OrderStatus,
     finalize_url: Url,
@@ -270,12 +330,18 @@ pub const OrderResponse = struct {
     certificate_url: Url = .{},
 };
 
+/// Payload used to create a new ACME account.
+/// `contact_email` is the caller-provided address string; the serializer wraps it as a `mailto:` contact entry.
+/// `terms_of_service_agreed` and `only_return_existing` default to the ACME-friendly values used by the serializer.
 pub const NewAccountPayload = struct {
     contact_email: []const u8,
     terms_of_service_agreed: bool = true,
     only_return_existing: bool = false,
 };
 
+/// Parses the ACME directory response from JSON.
+/// Requires `newNonce`, `newAccount`, and `newOrder`, and rejects bodies larger than `max_directory_response_bytes`.
+/// Unknown fields are ignored; JSON parse failures are mapped through `mapJsonParseError`, and the returned `Directory` owns copied URL values.
 pub fn parseDirectoryResponseJson(json_body: []const u8) Error!Directory {
     assert(max_directory_response_bytes > 0);
     assert(json_parse_scratch_size_bytes > 0);
@@ -311,6 +377,9 @@ pub fn parseDirectoryResponseJson(json_body: []const u8) Error!Directory {
     return directory;
 }
 
+/// Parses and stores a replay-nonce header value.
+/// The input is copied into the returned `ReplayNonce`, so the result does not borrow from `replay_nonce_value`.
+/// Returns any validation error reported by `ReplayNonce.set`.
 pub fn parseReplayNonceHeader(replay_nonce_value: []const u8) Error!ReplayNonce {
     assert(max_nonce_bytes > 0);
     var nonce = ReplayNonce{};
@@ -319,6 +388,9 @@ pub fn parseReplayNonceHeader(replay_nonce_value: []const u8) Error!ReplayNonce 
     return nonce;
 }
 
+/// Parses and stores a `Location` header value as a URL.
+/// The input is copied into the returned `Url`, so the result does not borrow from `location_header_value`.
+/// Returns any validation error reported by `Url.set`.
 pub fn parseLocationHeader(location_header_value: []const u8) Error!Url {
     assert(max_url_bytes > 0);
     var location = Url{};
@@ -327,6 +399,9 @@ pub fn parseLocationHeader(location_header_value: []const u8) Error!Url {
     return location;
 }
 
+/// Parses an ACME account response from JSON.
+/// Requires a non-empty body within `max_account_response_bytes` and a `status` field; `orders` is optional.
+/// Unknown fields are ignored; JSON parse failures are mapped through `mapJsonParseError`, and any present orders URL is copied into the returned response.
 pub fn parseAccountResponseJson(json_body: []const u8) Error!AccountResponse {
     assert(max_account_response_bytes > 0);
     assert(json_parse_scratch_size_bytes > 0);
@@ -364,6 +439,9 @@ pub fn parseAccountResponseJson(json_body: []const u8) Error!AccountResponse {
     return response;
 }
 
+/// Parses an ACME order response from JSON.
+/// Requires `status`, `finalize`, and `authorizations`, with the authorization URL count capped by `max_authorization_urls_per_order`.
+/// Unknown fields are ignored; JSON parse failures are mapped through `mapJsonParseError`, and any parsed URLs are copied into the returned response.
 pub fn parseOrderResponseJson(json_body: []const u8) Error!OrderResponse {
     assert(max_order_response_bytes > 0);
     assert(max_authorization_urls_per_order > 0);
@@ -419,6 +497,9 @@ pub fn parseOrderResponseJson(json_body: []const u8) Error!OrderResponse {
     return response;
 }
 
+/// Parses an ACME authorization response from JSON.
+/// Requires a non-empty body within `max_order_response_bytes`, and expects `status`, `identifier`, and `challenges` fields.
+/// The identifier must be `dns`, challenge count is bounded by `max_challenges_per_authorization`, and JSON parse failures are mapped through `mapJsonParseError`.
 pub fn parseAuthorizationResponseJson(json_body: []const u8) Error!AuthorizationResponse {
     assert(max_order_response_bytes > 0);
     assert(max_challenges_per_authorization > 0);
@@ -490,6 +571,9 @@ pub fn parseAuthorizationResponseJson(json_body: []const u8) Error!Authorization
     return response;
 }
 
+/// Serializes a finalize payload containing a DER CSR into ACME JSON.
+/// The CSR must be non-empty; the function base64url-encodes it into `out` and returns a slice of the rendered body.
+/// Returns `error.OutputTooSmall` if the encoded payload does not fit in `out` or would exceed `max_jws_body_bytes`.
 pub fn serializeFinalizePayload(out: []u8, csr_der: []const u8) Error![]const u8 {
     assert(max_jws_body_bytes > 0);
     assert(csr_der.len <= std.math.maxInt(u32));
@@ -513,6 +597,9 @@ pub fn serializeFinalizePayload(out: []u8, csr_der: []const u8) Error![]const u8
     return out[0..@intCast(cursor)];
 }
 
+/// Serializes a new-account payload into `out` as ACME JSON.
+/// The contact email must be non-empty, fit within `max_contact_email_bytes`, and pass JSON-string validation.
+/// Returns a slice of `out`, or `error.OutputTooSmall` when the buffer cannot hold the rendered payload or the JWS body limit would be exceeded.
 pub fn serializeNewAccountPayload(
     out: []u8,
     payload: NewAccountPayload,
@@ -537,6 +624,9 @@ pub fn serializeNewAccountPayload(
     return rendered;
 }
 
+/// Serializes a new-order payload into `out` as ACME JSON.
+/// Returns a slice of `out` containing the rendered body, or `error.OutputTooSmall` if the buffer or JWS body limit is exceeded.
+/// Rejects empty identifier lists, empty domain names, and domain strings that fail JSON-string validation.
 pub fn serializeNewOrderPayload(out: []u8, request: *const NewOrderRequest) Error![]const u8 {
     assert(@intFromPtr(request) != 0);
     assert(request.identifier_count <= max_identifiers_per_order);

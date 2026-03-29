@@ -27,6 +27,10 @@ const Socket = serval_socket.Socket;
 const SocketError = serval_socket.SocketError;
 
 const pool_mod = @import("serval-pool");
+/// Re-export of `serval-pool`'s connection handle used by the HTTP client.
+/// Wraps a unified `Socket` (plain TCP or TLS) plus pool bookkeeping metadata.
+/// Ownership is transferred to the caller when returned in client results; the caller must return it to the owning pool or call `close()`.
+/// This alias introduces no additional behavior or error surface beyond `pool.Connection`.
 pub const Connection = pool_mod.pool.Connection;
 
 const tls = @import("serval-tls");
