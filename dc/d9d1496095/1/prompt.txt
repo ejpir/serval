@@ -1,0 +1,317 @@
+• Findings (ordered by severity)
+
+  1. Critical: kTLS key derivation is not using negotiated traffic secrets (likely protocol breakage).
+     The implementation explicitly derives exporter material instead of actual record-layer traffic keys, which is not equivalent for kTLS data path. Shipping this as “complete kTLS” is unsafe.
+     serval-tls/ktls.zig:347
+  2. Critical: partial kTLS enable can leave TX configured while returning userspace fallback.
+     If TX setup succeeds and RX fails, code returns userspace_fallback without undoing TX. That can cause invalid behavior (userspace TLS with kernel TX state still attached).
+     serval-tls/ktls.zig:629
+  3. High: TLS version floor is not enforced (TODO left in production path).
+     createClientCtx/createServerCtx do not set min protocol version; TODOs remain where policy should be explicit. This is not enterprise-hardening ready.
+     serval-tls/ssl.zig:253
+     serval-tls/ssl.zig:262
+  4. High: incorrect/non-uniform nonblocking error mapping in stream I/O.
+     kTLS write maps WouldBlock to WantRead (wrong direction). Userspace write collapses WANT_READ/WANT_WRITE to WouldBlock, while read keeps direction-specific errors. This makes readiness handling
+     inconsistent and can stall pollers.
+     serval-tls/stream.zig:345
+     serval-tls/stream.zig:362
+     serval-tls/stream.zig:293
+  5. Medium: kTLS read path treats WouldBlock as hard KtlsRead error.
+     This violates nonblocking semantics and differs from userspace path behavior.
+     serval-tls/stream.zig:266
+  6. Medium: production panic on mutex contention timeout in context reloader.
+     lockMutex panics after spin attempts. For enterprise infra, availability-oriented behavior should return explicit error/telemetry rather than process abort on contention path.
+     serval-tls/reloadable_ctx.zig:217
+  7. Medium: global mutable ALPN/cert hooks are unsynchronized.
+     Process-wide vars are read/written without atomic/lock coordination; concurrent runtime updates are data-race prone.
+     serval-tls/ssl.zig:357
+  8. Low: README status/claims are internally inconsistent and overstate readiness.
+     It says kTLS deferred to Phase 2, then marks Phase 2 complete; also claims internal dependencies “None” while importing serval-core. This hurts operational trust for enterprise release docs.
+     serval-tls/README.md:7
+     serval-tls/README.md:23
+     serval-tls/README.md:67
+
+---
+
+Base directory for this skill: /home/nick/.claude/plugins/cache/superpowers-marketplace/superpowers/4.0.3/skills/writing-plans
+
+# Writing Plans
+
+## Overview
+
+Write comprehensive implementation plans assuming the engineer has zero context for our codebase and questionable taste. Document everything they need to know: which files to touch for each task, code, testing, docs they might need to check, how to test it. Give them the whole plan as bite-sized tasks. DRY. YAGNI. TDD. Frequent commits.
+
+Assume they are a skilled developer, but know almost nothing about our toolset or problem domain. Assume they don't know good test design very well.
+
+**Announce at start:** "I'm using the writing-plans skill to create the implementation plan."
+
+**Context:** This should be run in a dedicated worktree (created by brainstorming skill).
+
+**Save plans to:** `docs/plans/YYYY-MM-DD-<feature-name>.md`
+
+## Bite-Sized Task Granularity
+
+**Each step is one action (2-5 minutes):**
+- "Write the failing test" - step
+- "Run it to make sure it fails" - step
+- "Implement the minimal code to make the test pass" - step
+- "Run the tests and make sure they pass" - step
+- "Commit" - step
+
+## Plan Document Header
+
+**Every plan MUST start with this header:**
+
+```markdown
+# [Feature Name] Implementation Plan
+
+> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+
+**Goal:** [One sentence describing what this builds]
+
+**Architecture:** [2-3 sentences about approach]
+
+**Tech Stack:** [Key technologies/libraries]
+
+---
+```
+
+## Task Structure
+
+```markdown
+### Task N: [Component Name]
+
+**Files:**
+- Create: `exact/path/to/file.py`
+- Modify: `exact/path/to/existing.py:123-145`
+- Test: `tests/exact/path/to/test.py`
+
+**Step 1: Write the failing test**
+
+```python
+def test_specific_behavior():
+    result = function(input)
+    assert result == expected
+```
+
+**Step 2: Run test to verify it fails**
+
+Run: `pytest tests/path/test.py::test_name -v`
+Expected: FAIL with "function not defined"
+
+**Step 3: Write minimal implementation**
+
+```python
+def function(input):
+    return expected
+```
+
+**Step 4: Run test to verify it passes**
+
+Run: `pytest tests/path/test.py::test_name -v`
+Expected: PASS
+
+**Step 5: Commit**
+
+```bash
+git add tests/path/test.py src/path/file.py
+git commit -m "feat: add specific feature"
+```
+```
+
+## Remember
+- Exact file paths always
+- Complete code in plan (not "add validation")
+- Exact commands with expected output
+- Reference relevant skills with @ syntax
+- DRY, YAGNI, TDD, frequent commits
+
+## Execution Handoff
+
+After saving the plan, offer execution choice:
+
+**"Plan complete and saved to `docs/plans/<filename>.md`. Two execution options:**
+
+**1. Subagent-Driven (this session)** - I dispatch fresh subagent per task, review between tasks, fast iteration
+
+**2. Parallel Session (separate)** - Open new session with executing-plans, batch execution with checkpoints
+
+**Which approach?"**
+
+**If Subagent-Driven chosen:**
+- **REQUIRED SUB-SKILL:** Use superpowers:subagent-driven-development
+- Stay in this session
+- Fresh subagent per task + code review
+
+**If Parallel Session chosen:**
+- Guide them to open new session in worktree
+- **REQUIRED SUB-SKILL:** New session uses superpowers:executing-plans
+
+---
+
+• 1. High: Plan assumes SSL_OP_ENABLE_KTLS constant is reliable across OpenSSL/BoringSSL, but your own bindings say it may differ.
+     This can silently set wrong option bits on BoringSSL or no-op unpredictably.
+     docs/plans/2026-03-28-tls-findings-fixes.md:94
+     docs/plans/2026-03-28-tls-findings-fixes.md:122
+  2. High: Task 1 ignores return value of SSL_CTX_set_min_proto_version, so policy enforcement can fail silently.
+     For enterprise hardening, this should be checked and converted to explicit error.
+     docs/plans/2026-03-28-tls-findings-fixes.md:42
+     docs/plans/2026-03-28-tls-findings-fixes.md:68
+  3. High: Task 2 changes kTLS architecture but leaves a stale API contract (tryEnableKtls returns enabled based only on cipher/version compatibility).
+     That makes observability misleading: reported “enabled” may not mean kernel TLS is active.
+     docs/plans/2026-03-28-tls-findings-fixes.md:251
+  4. Medium: Task 3 is a breaking behavior change for callers that currently handle error.WouldBlock only.
+     Plan doesn’t include required caller updates or compatibility shim.
+     docs/plans/2026-03-28-tls-findings-fixes.md:352
+  5. Medium: Task 4 “log and return” on mutex timeout in release/deinit knowingly leaks refs/contexts.
+     That preserves process uptime but can degrade over time; plan should include remediation path/metrics/alert threshold.
+     docs/plans/2026-03-28-tls-findings-fixes.md:521
+     docs/plans/2026-03-28-tls-findings-fixes.md:548
+  6. Medium: Verification scope is too narrow (test-tls tail checks).
+     Given architecture changes, plan should require at least full zig build test and targeted integration for handshake/kTLS runtime behavior.
+     docs/plans/2026-03-28-tls-findings-fixes.md:77
+     docs/plans/2026-03-28-tls-findings-fixes.md:264
+
+---
+
+• 1. High: Portability note is technically incorrect and could mislead implementation decisions.
+     The plan says isKtlsRuntimeAvailable() is “never true in BoringSSL environments,” but that function only checks OS/kernel/env and has no TLS-library awareness. On Linux with tls ULP available, it can
+     be true regardless of OpenSSL vs BoringSSL.
+     docs/plans/2026-03-28-tls-findings-fixes.md:104
+  2. High: Verification is still mostly compile/unit-level and does not prove native kTLS behavior.
+     You validate with zig build test/test-tls, but there is no runtime integration check that BIO_get_ktls_send/recv actually flips true on supported hosts and remains false on unsupported hosts. This
+     leaves the core architectural switch unproven.
+     docs/plans/2026-03-28-tls-findings-fixes.md:264
+     docs/plans/2026-03-28-tls-findings-fixes.md:860
+  3. Medium: Error mapping task changes interface behavior but caller updates are partial by construction.
+     You updated 3 known call sites, but the plan doesn’t require a repo-wide search for TLSStream.write error handling patterns. That risks latent regressions where other callers still assume only
+     WouldBlock.
+     docs/plans/2026-03-28-tls-findings-fixes.md:364
+  4. Medium: Mutex-timeout “log and leak” policy needs explicit SLO/limit, not just future-work note.
+     Current plan accepts leaks on contention timeout; for enterprise readiness this needs a concrete threshold/escalation policy in this same plan (for example, fail-fast after N consecutive timeouts, or
+     controlled restart trigger).
+     docs/plans/2026-03-28-tls-findings-fixes.md:549
+     docs/plans/2026-03-28-tls-findings-fixes.md:599
+
+---
+
+• 1. High: test commands can report success even when build/tests fail due to pipeline exit-code masking.
+     Using zig build ... | tail ... (and | grep ...) without set -o pipefail means the pipeline exit code is from tail/grep, not zig. This weakens the plan’s verification gate.
+     docs/plans/2026-03-28-tls-findings-fixes.md:85
+     docs/plans/2026-03-28-tls-findings-fixes.md:264
+     docs/plans/2026-03-28-tls-findings-fixes.md:918
+  2. High: Task 4 introduces a new data race in timeout tracking.
+     consecutive_mutex_timeouts is a module-global u32 incremented/reset from lockMutex across threads with no atomic/lock protection. This is a concurrency regression in a section intended to improve
+     robustness.
+     docs/plans/2026-03-28-tls-findings-fixes.md:493
+     docs/plans/2026-03-28-tls-findings-fixes.md:505
+     docs/plans/2026-03-28-tls-findings-fixes.md:511
+  3. Medium: “kTLS runtime integration test” snippet does not validate the critical enabled path.
+     The proposed test never performs a TLS handshake and may not even have BIOs attached, so it only proves “pre-handshake false” (a trivial condition), not native kTLS activation correctness.
+     docs/plans/2026-03-28-tls-findings-fixes.md:935
+     docs/plans/2026-03-28-tls-findings-fixes.md:949
+  4. Low: internal inconsistency in Task 3 commit summary.
+     Task lists 4 caller updates (4a..4d) but commit message still says “Updated 3 callers.”
+     docs/plans/2026-03-28-tls-findings-fixes.md:374
+     docs/plans/2026-03-28-tls-findings-fixes.md:435
+
+  Open question:
+
+  - Should mutex-timeout telemetry be per-instance (ReloadableServerCtx field) instead of global process-wide, to avoid cross-instance interference and simplify synchronization?
+
+---
+
+• 1. High: Final verification grep is inconsistent with the implementation steps and can fail even after correct fixes.
+     You require no matches for SSL_export_keying_material, but Task 2 never says to remove the extern binding declaration in ssl.zig; that declaration alone would trip this check.
+     docs/plans/2026-03-28-tls-findings-fixes.md:917
+     docs/plans/2026-03-28-tls-findings-fixes.md:258
+  2. High: Proposed handshake test uses unbounded busy loops and ignores error states.
+     while (SSL_do_handshake(...) != 1) {} can spin forever or deadlock, and it violates your bounded-loop/safe-error-handling standards.
+     docs/plans/2026-03-28-tls-findings-fixes.md:962
+     docs/plans/2026-03-28-tls-findings-fixes.md:963
+  3. Medium: Mutex-timeout counter is still race-prone under contention.
+     consecutive_mutex_timeouts is mutated in lockMutex before holding self.mutex; concurrent callers on the same instance can read/write it simultaneously.
+     docs/plans/2026-03-28-tls-findings-fixes.md:499
+     docs/plans/2026-03-28-tls-findings-fixes.md:505
+     docs/plans/2026-03-28-tls-findings-fixes.md:627
+  4. Low: Integration log-check command is malformed/incomplete.
+     You grep /tmp/serval-test.log but the preceding command does not write that file, so this verification step is non-deterministic.
+     docs/plans/2026-03-28-tls-findings-fixes.md:990
+
+---
+
+• 1. High: Task 4 has an internal type mismatch that will produce incorrect implementation.
+     consecutive_mutex_timeouts is later defined as std.atomic.Value(u32), but the lock code snippet still uses plain integer ops/assignment (= 0, += 1, compare directly). That is inconsistent and not
+     valid as written.
+     docs/plans/2026-03-28-tls-findings-fixes.md:499
+     docs/plans/2026-03-28-tls-findings-fixes.md:505
+     docs/plans/2026-03-28-tls-findings-fixes.md:631
+  2. Medium: kTLS handshake test assertion is too strong for the chosen runtime probe and can fail on valid environments.
+     The test assumes ktls.isKtlsRuntimeAvailable() implies native OpenSSL kTLS TX should be enabled, but that probe only checks kernel/runtime conditions, not SSL library kTLS support or negotiated-cipher
+     support.
+     docs/plans/2026-03-28-tls-findings-fixes.md:989
+     docs/plans/2026-03-28-tls-findings-fixes.md:993
+  3. Low: Task 3 text still says “Three callers need updating” while the plan now updates four.
+     This is minor, but it creates ambiguity during execution/review.
+     docs/plans/2026-03-28-tls-findings-fixes.md:366
+     docs/plans/2026-03-28-tls-findings-fixes.md:374
+     docs/plans/2026-03-28-tls-findings-fixes.md:407
+
+---
+
+• 1. High: Final verification still allows false-pass outcomes.
+     zig build test | tail -30 can hide test failure (pipeline exit from tail). Also, test ... || echo "FAIL" only prints text and does not fail the run.
+     docs/plans/2026-03-28-tls-findings-fixes.md:905
+     docs/plans/2026-03-28-tls-findings-fixes.md:909
+     docs/plans/2026-03-28-tls-findings-fixes.md:1018
+     docs/plans/2026-03-28-tls-findings-fixes.md:1028
+  2. Medium: The kTLS runtime test’s “available” branch is non-assertive, so success does not prove native kTLS works.
+     When ktls_available == true, the test only logs TX/RX and does not assert behavior. That contradicts the claim that it validates the critical path.
+     docs/plans/2026-03-28-tls-findings-fixes.md:993
+     docs/plans/2026-03-28-tls-findings-fixes.md:1003
+     docs/plans/2026-03-28-tls-findings-fixes.md:1008
+  3. Low: Verification wording says “Expected” outcomes, but commands don’t enforce them programmatically.
+     For enterprise gating, these checks should exit non-zero on mismatch, not rely on log inspection/echo messages.
+     docs/plans/2026-03-28-tls-findings-fixes.md:1019
+     docs/plans/2026-03-28-tls-findings-fixes.md:1023
+
+---
+
+• 1. High: TX == RX is too strict and can false-fail on valid environments.
+     The plan currently hard-asserts no partial enable (expectEqual(server_tx, server_rx)), but earlier versions correctly acknowledged environments where TX may activate while RX does not (kernel/cipher/
+     runtime differences). This can fail even when behavior is acceptable fallback/partial capability.
+     docs/plans/2026-03-28-tls-findings-fixes.md:987
+  2. Low: Invariant/comment mismatch in the test spec.
+     Invariant 3 says “option bit must have been set,” but the assertion only checks ktls_available, not the option bit. That wording can mislead implementers/reviewers.
+     docs/plans/2026-03-28-tls-findings-fixes.md:996
+     docs/plans/2026-03-28-tls-findings-fixes.md:999
+  3. Low: Integration verification is still not fully machine-enforced.
+     Step 6 uses manual log inspection guidance for ktls= lines; enterprise gating would be stronger with explicit pass/fail assertions (for example scripted grep checks tied to exit codes).
+     docs/plans/2026-03-28-tls-findings-fixes.md:1023
+
+---
+
+• 1. High: Proposed loopback handshake test can deadlock because sockets are blocking.
+     The test drives SSL_do_handshake() in one thread over a blocking socketpair; first call can block waiting for peer progress before control returns, so the alternating loop may never advance.
+     docs/plans/2026-03-28-tls-findings-fixes.md:936
+     docs/plans/2026-03-28-tls-findings-fixes.md:962
+  2. Medium: Integration log assertions assume handshake logs are always emitted in this test environment.
+     The script hard-fails if no ktls= lines are present. If logger config/filtering suppresses those info logs during CI, verification fails despite functional correctness.
+     docs/plans/2026-03-28-tls-findings-fixes.md:1029
+  3. Low: Invariant wording overstates what is proven.
+     “server_tx == true proves the full critical path” is too strong for this test; it proves this path in the tested environment/config, not universally.
+     docs/plans/2026-03-28-tls-findings-fixes.md:1013
+
+---
+
+• 1. Medium: The proposed socketpair call shape in the test snippet likely does not match the repo’s actual API usage and may not compile as written.
+     Plan uses std.posix.socketpair(.{ .FAMILY = .LOCAL }, .{ .TYPE = .STREAM, .NONBLOCK = true }, null), but existing code consistently uses std.posix.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM,
+     0) or std.c.socketpair(...).
+     docs/plans/2026-03-28-tls-findings-fixes.md:936
+  2. Low: Step 6 says “validate kTLS log output” but currently makes no hard log assertions.
+     The text now treats log checks as best-effort and allows pass with no ktls= lines, which weakens that stated validation goal.
+     docs/plans/2026-03-28-tls-findings-fixes.md:1019
+     docs/plans/2026-03-28-tls-findings-fixes.md:1030
+  3. Low: Final claim “all assertions are exit-code-gated” is slightly overstated for Step 6.
+     Exit-code gating is strict for test commands, but log-consistency checks are optional by design in that section.
+     docs/plans/2026-03-28-tls-findings-fixes.md:1050
