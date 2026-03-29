@@ -1,0 +1,32 @@
+{
+  "cli_version": "0.4.3",
+  "checkpoint_id": "dcd9d1496095",
+  "session_id": "646a4f49-bebb-4328-acf0-8f573ea592f5",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-29T17:43:00.295435055Z",
+  "branch": "main",
+  "checkpoints_count": 4,
+  "files_touched": [
+    "docs/plans/2026-03-29-lb-health-findings-fixes.md",
+    "experiments/tls-poc/boringssl"
+  ],
+  "agent": "Claude Code",
+  "transcript_identifier_at_start": "e8b6b835-1335-4f30-b438-735b81ec32fb",
+  "token_usage": {
+    "input_tokens": 1924,
+    "cache_creation_tokens": 96050,
+    "cache_read_tokens": 3287501,
+    "output_tokens": 24406,
+    "api_call_count": 43
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-29T17:43:00.101993584Z",
+    "agent_lines": 0,
+    "human_added": 14106573,
+    "human_modified": 584,
+    "human_removed": 0,
+    "total_committed": 14107123,
+    "agent_percentage": 0
+  },
+  "transcript_path": ".claude/projects/-home-nick-repos-serval/646a4f49-bebb-4328-acf0-8f573ea592f5.jsonl"
+}
