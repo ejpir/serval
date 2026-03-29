@@ -35,6 +35,10 @@ pub const HealthState = struct {
     /// Consecutive successes required to mark healthy.
     healthy_threshold: u8,
 
+    /// Per-backend mutexes protect counter read-modify-write updates.
+    /// Updates to different backends proceed independently.
+    counter_mutexes: [MAX_UPSTREAMS]std.Io.Mutex,
+
     // Compile-time verification
     comptime {
         assert(@alignOf(HealthState) == CACHE_LINE_BYTES);
@@ -64,6 +68,7 @@ pub const HealthState = struct {
             .backend_count = backend_count,
             .unhealthy_threshold = unhealthy_threshold,
             .healthy_threshold = healthy_threshold,
+            .counter_mutexes = [_]std.Io.Mutex{std.Io.Mutex.init} ** MAX_UPSTREAMS,
         };
     }
 
@@ -72,6 +77,9 @@ pub const HealthState = struct {
     /// Transitions to healthy when success threshold is reached.
     pub inline fn recordSuccess(self: *HealthState, idx: UpstreamIndex) void {
         assert(idx < self.backend_count);
+
+        self.counter_mutexes[idx].lockUncancelable(std.Options.debug_io);
+        defer self.counter_mutexes[idx].unlock(std.Options.debug_io);
 
         // Reset failure counter on any success
         self.failure_counts[idx] = 0;
@@ -95,6 +103,9 @@ pub const HealthState = struct {
     /// Transitions to unhealthy when failure threshold is reached.
     pub inline fn recordFailure(self: *HealthState, idx: UpstreamIndex) void {
         assert(idx < self.backend_count);
+
+        self.counter_mutexes[idx].lockUncancelable(std.Options.debug_io);
+        defer self.counter_mutexes[idx].unlock(std.Options.debug_io);
 
         // Reset success counter on any failure
         self.success_counts[idx] = 0;
@@ -186,9 +197,30 @@ pub const HealthState = struct {
 
     /// Reset all backends to healthy and clear counters.
     pub fn reset(self: *HealthState) void {
+        self.lockAllCounterMutexes();
+        defer self.unlockAllCounterMutexes();
+
         self.health_bitmap.store(backendMask(self.backend_count), .release);
         self.failure_counts = std.mem.zeroes([MAX_UPSTREAMS]u8);
         self.success_counts = std.mem.zeroes([MAX_UPSTREAMS]u8);
+    }
+
+    fn lockAllCounterMutexes(self: *HealthState) void {
+        assert(self.backend_count <= MAX_UPSTREAMS);
+
+        var idx: u8 = 0;
+        while (idx < self.backend_count) : (idx += 1) {
+            self.counter_mutexes[idx].lockUncancelable(std.Options.debug_io);
+        }
+    }
+
+    fn unlockAllCounterMutexes(self: *HealthState) void {
+        assert(self.backend_count <= MAX_UPSTREAMS);
+
+        var idx: u8 = 0;
+        while (idx < self.backend_count) : (idx += 1) {
+            self.counter_mutexes[idx].unlock(std.Options.debug_io);
+        }
     }
 };
 

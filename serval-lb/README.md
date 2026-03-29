@@ -33,6 +33,8 @@ serval-router: client → [Router] → /api/* → pool1 → backend1, backend2
 ```zig
 const serval_lb = @import("serval-lb");
 const serval = @import("serval");
+const tls = @import("serval-tls");
+const net = @import("serval-net");
 
 const upstreams = [_]serval.Upstream{
     .{ .host = "127.0.0.1", .port = 8001, .idx = 0 },
@@ -41,13 +43,19 @@ const upstreams = [_]serval.Upstream{
 };
 
 var handler: serval_lb.LbHandler = undefined;
+const client_ctx = try tls.ssl.createClientCtx();
+defer tls.ssl.SSL_CTX_free(client_ctx);
+
+var dns_resolver: net.DnsResolver = undefined;
+net.DnsResolver.init(&dns_resolver, .{});
+
 try handler.init(&upstreams, .{
     .unhealthy_threshold = 3,    // 3 failures -> unhealthy
     .healthy_threshold = 2,       // 2 successes -> healthy
     .probe_interval_ms = 5000,    // Probe every 5 seconds
     .probe_timeout_ms = 2000,     // 2 second probe timeout
     .health_path = "/health",     // Health check endpoint
-});
+}, client_ctx, &dns_resolver);
 defer handler.deinit();
 ```
 
@@ -56,14 +64,13 @@ defer handler.deinit();
 ```zig
 pub const LbHandler = struct {
     upstreams: []const Upstream,
-    health: HealthState,
-    next_idx: std.atomic.Value(u32),
+    strategy: RoundRobinStrategy,
     probe_running: std.atomic.Value(bool),
     probe_thread: ?std.Thread,
     lb_config: LbConfig,
 
     // TigerStyle C3: Out-pointer for large struct
-    pub fn init(self: *Self, upstreams: []const Upstream, lb_config: LbConfig) !void
+    pub fn init(self: *Self, upstreams: []const Upstream, lb_config: LbConfig, client_ctx: ?*tls.ssl.SSL_CTX, dns_resolver: ?*net.DnsResolver) !void
     pub fn deinit(self: *Self) void
     pub fn selectUpstream(self: *Self, ctx: *Context, request: *const Request) Upstream
     pub fn onLog(self: *Self, ctx: *Context, entry: LogEntry) void

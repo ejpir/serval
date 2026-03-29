@@ -1134,6 +1134,21 @@ pub fn build(b: *std.Build) void {
     );
     integration_test_34_step.dependOn(&run_integration_test_34.step);
 
+    const integration_test_22 = b.addTest(.{
+        .name = "integration_test_22",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: reverseproxy runtime binary uses first-match route semantics"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_22);
+    const run_integration_test_22 = b.addRunArtifact(integration_test_22);
+
+    const integration_test_22_step = b.step(
+        "test-integration-22",
+        "Run integration test 22 (reverseproxy runtime binary uses first-match route semantics)",
+    );
+    integration_test_22_step.dependOn(&run_integration_test_22.step);
+
     const integration_test_5 = b.addTest(.{
         .name = "integration_test_5",
         .root_module = integration_tests_mod,
@@ -1915,6 +1930,7 @@ pub fn build(b: *std.Build) void {
     run_integration_test_2.step.dependOn(&build_echo_backend.step);
     run_integration_test_32.step.dependOn(&build_echo_backend.step);
     run_integration_test_34.step.dependOn(&build_echo_backend.step);
+    run_integration_test_22.step.dependOn(&build_echo_backend.step);
     run_integration_test_5.step.dependOn(&build_echo_backend.step);
     run_integration_test_64.step.dependOn(&build_echo_backend.step);
     run_integration_test_perf_throughput_h1.step.dependOn(&build_echo_backend.step);
@@ -1950,6 +1966,7 @@ pub fn build(b: *std.Build) void {
     run_integration_test_h2c_mixed_grpc_nongrpc_same_conn.step.dependOn(&build_echo_backend.step);
     run_integration_test_reverseproxy.step.dependOn(&build_echo_backend.step);
     run_integration_test_reverseproxy.step.dependOn(&build_reverseproxy_runtime.step);
+    run_integration_test_22.step.dependOn(&build_reverseproxy_runtime.step);
     run_integration_test_netbird.step.dependOn(&build_echo_backend.step);
     run_integration_test_netbird.step.dependOn(&build_netbird_proxy.step);
     run_integration_test_netbird.step.dependOn(&build_reverseproxy_runtime.step);

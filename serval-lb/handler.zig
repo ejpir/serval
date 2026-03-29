@@ -84,6 +84,13 @@ pub const LbHandler = struct {
         // S1: if probing enabled, dns_resolver must be provided
         assert(!lb_config.enable_probing or dns_resolver != null);
 
+        // Reject probing misconfiguration that would permanently fail TLS probes.
+        if (lb_config.enable_probing and client_ctx == null) {
+            for (upstreams) |upstream| {
+                if (upstream.tls) return error.TlsContextRequired;
+            }
+        }
+
         self.* = .{
             .upstreams = upstreams,
             .strategy = undefined,
@@ -144,7 +151,23 @@ pub const LbHandler = struct {
         const upstream = entry.upstream orelse return;
 
         assert(upstream.idx < MAX_UPSTREAMS);
-        const idx: UpstreamIndex = @intCast(upstream.idx);
+
+        // Prefer fast local-index path when idx already matches local pool index.
+        var idx_opt: ?UpstreamIndex = null;
+        if (upstream.idx < self.upstreams.len) {
+            idx_opt = @intCast(upstream.idx);
+        } else {
+            // Router/reverseproxy may propagate global or sparse idx values.
+            // Fall back to host+port match to resolve local health index.
+            for (self.upstreams, 0..) |candidate, candidate_idx_usize| {
+                if (candidate.port == upstream.port and std.mem.eql(u8, candidate.host, upstream.host)) {
+                    idx_opt = @intCast(candidate_idx_usize);
+                    break;
+                }
+            }
+        }
+
+        const idx = idx_opt orelse return;
 
         if (entry.status >= 500) {
             self.strategy.recordFailure(idx);
@@ -201,6 +224,30 @@ test "LbHandler init and deinit" {
 
     try std.testing.expect(!handler.probe_running.load(.acquire));
     try std.testing.expect(handler.probe_thread == null);
+}
+
+test "LbHandler init accepts sparse upstream idx" {
+    const upstreams = [_]Upstream{
+        .{ .host = "127.0.0.1", .port = 8001, .idx = 3 },
+        .{ .host = "127.0.0.1", .port = 8002, .idx = 5 },
+    };
+
+    var handler: LbHandler = undefined;
+    try handler.init(&upstreams, .{ .enable_probing = false }, null, null);
+    defer handler.deinit();
+}
+
+test "LbHandler init rejects null client_ctx when tls probing is enabled" {
+    const upstreams = [_]Upstream{
+        .{ .host = "127.0.0.1", .port = 8001, .idx = 0, .tls = true },
+    };
+
+    var dns_resolver: DnsResolver = undefined;
+    DnsResolver.init(&dns_resolver, .{});
+
+    var handler: LbHandler = undefined;
+    const result = handler.init(&upstreams, .{ .enable_probing = true }, null, &dns_resolver);
+    try std.testing.expectError(error.TlsContextRequired, result);
 }
 
 test "LbHandler selectUpstream round-robin" {

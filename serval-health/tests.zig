@@ -71,6 +71,58 @@ test "concurrent reads are thread-safe" {
     try testing.expectEqual(@as(u32, MAX_UPSTREAMS), hs.countHealthy());
 }
 
+test "concurrent writes are thread-safe" {
+    // Simulates request-path failures racing with prober recovery updates.
+    var hs = HealthState.init(MAX_UPSTREAMS, 3, 2);
+
+    const Context = struct {
+        hs: *HealthState,
+    };
+
+    const failure_worker = struct {
+        fn run(ctx: *Context) void {
+            var iteration: u32 = 0;
+            while (iteration < ITERATIONS_PER_THREAD) : (iteration += 1) {
+                const idx: UpstreamIndex = @intCast(iteration % MAX_UPSTREAMS);
+                ctx.hs.recordFailure(idx);
+            }
+        }
+    }.run;
+
+    const success_worker = struct {
+        fn run(ctx: *Context) void {
+            var iteration: u32 = 0;
+            while (iteration < ITERATIONS_PER_THREAD) : (iteration += 1) {
+                const idx: UpstreamIndex = @intCast(iteration % MAX_UPSTREAMS);
+                ctx.hs.recordSuccess(idx);
+            }
+        }
+    }.run;
+
+    var ctx = Context{ .hs = &hs };
+
+    var threads: [CONCURRENT_THREAD_COUNT]Thread = undefined;
+    var spawned: u32 = 0;
+    while (spawned < CONCURRENT_THREAD_COUNT) : (spawned += 1) {
+        if ((spawned % 2) == 0) {
+            threads[spawned] = Thread.spawn(.{}, failure_worker, .{&ctx}) catch unreachable;
+        } else {
+            threads[spawned] = Thread.spawn(.{}, success_worker, .{&ctx}) catch unreachable;
+        }
+    }
+
+    var joined: u32 = 0;
+    while (joined < CONCURRENT_THREAD_COUNT) : (joined += 1) {
+        threads[joined].join();
+    }
+
+    // Invariants: no crash/UB and health API remains callable.
+    var idx: u8 = 0;
+    while (idx < MAX_UPSTREAMS) : (idx += 1) {
+        _ = hs.isHealthy(@intCast(idx));
+    }
+}
+
 // =============================================================================
 // Boundary Tests
 // =============================================================================
