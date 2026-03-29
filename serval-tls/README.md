@@ -4,7 +4,7 @@ TLS termination (client-side) and origination (upstream-side) using OpenSSL/Bori
 
 ## Purpose
 
-Provides TLS support for both incoming client connections (termination) and outgoing upstream connections (origination). Handles handshakes, encryption/decryption, and certificate validation. Phase 1 uses userspace crypto; kTLS kernel offload deferred to Phase 2.
+Provides TLS support for both incoming client connections (termination) and outgoing upstream connections (origination). Handles handshakes, encryption/decryption, and certificate validation. kTLS enablement is negotiated through OpenSSL/BoringSSL BIO support when available at runtime.
 
 ## Layer
 
@@ -21,7 +21,7 @@ No business logic, only protocol implementation. Sits alongside serval-http and 
 - Manual SSL bindings (avoids @cImport macro issues)
 
 **Phase 2 - Complete**
-- kTLS kernel offload (manual key extraction path with deterministic fallback)
+- kTLS kernel offload via OpenSSL/BoringSSL BIO path (`SSL_OP_ENABLE_KTLS`)
 - Automatic runtime detection and fallback to userspace (module missing/non-Linux/disabled)
 - Zero-copy sendfile() support when kTLS active
 
@@ -51,8 +51,7 @@ No business logic, only protocol implementation. Sits alongside serval-http and 
   - `activateFromPemFiles(cert_path, key_path)` - Build + activate new generation from PEM paths
 
 - `ktls` - kTLS kernel offload module
-  - `tryEnableKtls()` - Attempt kTLS setup after handshake (BoringSSL path)
-  - `KtlsResult` - Result enum (ktls_enabled, userspace_fallback)
+  - Runtime capability checks and Linux kTLS constants
   - Linux kernel constants and crypto info structs
 
 ## Dependencies
@@ -81,8 +80,7 @@ No business logic, only protocol implementation. Sits alongside serval-http and 
 - [x] Read-side diagnostics for `close_notify`, peer resets, and TLS protocol failures
 
 ### Phase 2 (Complete)
-- [x] kTLS kernel offload (manual key extraction + kernel crypto setup)
-- [x] kTLS manual key extraction (BoringSSL fallback path)
+- [x] kTLS kernel offload via OpenSSL/BoringSSL BIO enablement
 - [x] Automatic kTLS runtime detection and userspace fallback
 - [x] HandshakeInfo.ktls_enabled status tracking
 - [x] TLSStream.isKtls() / queryKtlsStatus() for runtime checks
@@ -148,14 +146,13 @@ pub const Upstream = struct {
 - Easier to maintain and understand
 - POC confirmed this approach works
 
-### kTLS with Deterministic Manual Path
+### kTLS via OpenSSL/BIO
 
-**Decision:** Use manual kTLS setup path consistently after handshake, with explicit runtime checks and userspace fallback.
+**Decision:** Enable `SSL_OP_ENABLE_KTLS` before handshake and keep TLS I/O on the SSL/BIO path, with explicit runtime checks and userspace fallback.
 
 **Rationale:**
-- Manual key extraction via `SSL_export_keying_material` enables one consistent path across OpenSSL/BoringSSL
 - Runtime checks gate kTLS setup (platform, module presence, optional env disable)
-- Deterministic fallback: any setup failure stays on userspace TLS without failing handshakes
+- Deterministic fallback: if BIO kTLS is unavailable, TLS stays in userspace without handshake failure
 - Transparent to users - TLSStream API unchanged, `isKtls()` for status
 
 **kTLS Benefits:**
@@ -165,7 +162,7 @@ pub const Upstream = struct {
 
 **Requirements (for kTLS offload mode):**
 - Linux kernel with `tls` module (`modprobe tls`)
-- OpenSSL/BoringSSL with `SSL_export_keying_material` support for key extraction
+- OpenSSL/BoringSSL build with kTLS BIO support
 - Supported ciphers: AES-GCM-128, AES-GCM-256, CHACHA20-POLY1305
 
 If any requirement is missing, TLS continues in userspace mode (no handshake failure).
@@ -241,7 +238,7 @@ zig build test-tls-integ    # Requires test certs in /tmp/test-certs/
 | SNI support | Complete | stream.zig |
 | Config types | Complete | serval-core |
 | kTLS kernel offload | Complete | ktls.zig, stream.zig |
-| kTLS manual key extraction | Complete | ktls.zig + stream.zig |
+| kTLS BIO enablement | Complete | stream.zig |
 | HandshakeInfo | Complete | handshake_info.zig |
 
 ## Build Integration

@@ -10,6 +10,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const Io = std.Io;
+const posix = std.posix;
 
 const serval_core = @import("serval-core");
 const config = serval_core.config;
@@ -2339,7 +2340,7 @@ fn readSome(
             var retry_count: u32 = 0;
             while (retry_count < read_max_retry_count) : (retry_count += 1) {
                 if (!tls_stream.hasPendingRead()) {
-                    try waitUntilReadable(tls_stream.fd, io, readiness_timeout);
+                    try waitUntilReadableTls(tls_stream.fd, io, readiness_timeout);
                 }
 
                 const n: u32 = tls_stream.read(out) catch |err| switch (err) {
@@ -2383,6 +2384,45 @@ fn waitUntilReadable(fd: i32, io: Io, timeout: Io.Timeout) Error!void {
         => return error.ConnectionClosed,
         else => return error.ReadFailed,
     };
+}
+
+const tls_readiness_poll_sleep_ms: i64 = 1;
+const tls_readiness_max_poll_iterations: u32 = 120_000;
+
+fn waitUntilReadableTls(fd: i32, io: Io, timeout: Io.Timeout) Error!void {
+    assert(fd >= 0);
+    assert(tls_readiness_max_poll_iterations > 0);
+
+    var poll_fds = [_]posix.pollfd{
+        .{
+            .fd = fd,
+            .events = posix.POLL.IN,
+            .revents = 0,
+        },
+    };
+    const maybe_deadline = timeout.toTimestamp(io);
+    var iterations: u32 = 0;
+    while (iterations < tls_readiness_max_poll_iterations) : (iterations += 1) {
+        poll_fds[0].revents = 0;
+        const polled = posix.poll(&poll_fds, 0) catch return error.ReadFailed;
+        if (polled > 0) {
+            const revents = poll_fds[0].revents;
+            if ((revents & (posix.POLL.ERR | posix.POLL.NVAL)) != 0) return error.ReadFailed;
+            if ((revents & posix.POLL.HUP) != 0) return error.ConnectionClosed;
+            if ((revents & posix.POLL.IN) != 0) return;
+        }
+
+        if (maybe_deadline) |deadline| {
+            const remaining = deadline.durationFromNow(io);
+            if (remaining.raw.toNanoseconds() <= 0) return error.ConnectionClosed;
+        }
+
+        std.Io.sleep(io, Io.Duration.fromMilliseconds(tls_readiness_poll_sleep_ms), .awake) catch {
+            return error.ReadFailed;
+        };
+    }
+
+    return error.ReadFailed;
 }
 
 fn writeSome(io_conn: *ConnectionIo, io: Io, out: []const u8) Error!usize {

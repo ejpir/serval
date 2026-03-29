@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const log = @import("serval-core").log.scoped(.tls);
+const closeFd = @import("serval-core").closeFd;
 const assert = std.debug.assert;
 const posix = std.posix;
 const ssl = @import("ssl.zig");
@@ -96,24 +97,18 @@ pub const TLSStream = struct {
         };
     }
 
-    /// Setup kTLS after successful handshake.
-    /// Uses manual kTLS setup for deterministic fallback behavior across runtimes.
-    /// Returns the appropriate mode and updates info.ktls_enabled.
-    fn setupKtlsAfterHandshake(ssl_conn: *ssl.SSL, fd: c_int, info: *HandshakeInfo, enable_ktls: bool) Mode {
+    /// Check native kTLS status after successful handshake.
+    /// OpenSSL handles kernel TLS setup internally when SSL_OP_ENABLE_KTLS is set.
+    /// Returns userspace mode always; OpenSSL BIO transparently uses kTLS when active.
+    fn setupKtlsAfterHandshake(ssl_conn: *ssl.SSL, info: *HandshakeInfo, enable_ktls: bool) Mode {
         if (!enable_ktls) {
             info.ktls_enabled = false;
             return .{ .userspace = ssl_conn };
         }
 
-        const ktls_result = ktls.tryEnableKtls(ssl_conn, fd);
-        const manual_ktls = ktls_result.isKtls();
-        info.ktls_enabled = manual_ktls;
-
-        if (manual_ktls) {
-            ssl.SSL_free(ssl_conn);
-            return .ktls;
-        }
-
+        const tx_ktls = if (ssl.SSL_get_wbio(ssl_conn)) |wbio| ssl.BIO_get_ktls_send(wbio) else false;
+        const rx_ktls = if (ssl.SSL_get_rbio(ssl_conn)) |rbio| ssl.BIO_get_ktls_recv(rbio) else false;
+        info.ktls_enabled = tx_ktls or rx_ktls;
         return .{ .userspace = ssl_conn };
     }
 
@@ -141,6 +136,9 @@ pub const TLSStream = struct {
         if (ssl.SSL_set_fd(ssl_conn, fd) != 1) return error.SslSetFd;
 
         const enable_ktls: bool = ktls.isKtlsRuntimeAvailable();
+        if (enable_ktls) {
+            _ = ssl.SSL_set_options(ssl_conn, ssl.SSL_OP_ENABLE_KTLS);
+        }
         ssl.SSL_set_accept_state(ssl_conn);
 
         // Capture handshake timing
@@ -165,7 +163,7 @@ pub const TLSStream = struct {
         populateHandshakeInfo(ssl_conn, &info);
 
         // Setup kTLS and get appropriate mode
-        const mode = setupKtlsAfterHandshake(ssl_conn, fd, &info, enable_ktls);
+        const mode = setupKtlsAfterHandshake(ssl_conn, &info, enable_ktls);
         logKtlsStatus(&info, true);
 
         return .{
@@ -198,6 +196,9 @@ pub const TLSStream = struct {
         if (ssl.SSL_set_fd(ssl_conn, fd) != 1) return error.SslSetFd;
 
         const should_enable_ktls: bool = enable_ktls and ktls.isKtlsRuntimeAvailable();
+        if (should_enable_ktls) {
+            _ = ssl.SSL_set_options(ssl_conn, ssl.SSL_OP_ENABLE_KTLS);
+        }
         // Set SNI (caller provides null-terminated string - no allocation)
         if (ssl.SSL_set_tlsext_host_name(ssl_conn, sni_z) != 1) return error.SslSetSni;
 
@@ -235,7 +236,7 @@ pub const TLSStream = struct {
 
         // Setup kTLS and get appropriate mode (only if enabled and runtime support exists)
         const mode: Mode = if (should_enable_ktls) blk: {
-            const m = setupKtlsAfterHandshake(ssl_conn, fd, &info, true);
+            const m = setupKtlsAfterHandshake(ssl_conn, &info, true);
             logKtlsStatus(&info, false);
             break :blk m;
         } else .{ .userspace = ssl_conn };
@@ -459,6 +460,103 @@ fn populateHandshakeInfo(ssl_conn: *ssl.SSL, info: *HandshakeInfo) void {
 }
 
 // Tests
+test "native kTLS BIO status after loopback handshake" {
+    const builtin = @import("builtin");
+
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    ssl.init();
+
+    // Skip when TLS test fixtures are unavailable in this checkout.
+    const cert_path = "experiments/tls-poc/cert.pem";
+    const key_path = "experiments/tls-poc/key.pem";
+    const cert_fd = posix.openat(posix.AT.FDCWD, cert_path, .{ .ACCMODE = .RDONLY }, 0) catch |err| switch (err) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    closeFd(cert_fd);
+    const key_fd = posix.openat(posix.AT.FDCWD, key_path, .{ .ACCMODE = .RDONLY }, 0) catch |err| switch (err) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    closeFd(key_fd);
+
+    const server_ctx = try ssl.createServerCtxFromPemFiles(cert_path, key_path);
+    defer ssl.SSL_CTX_free(server_ctx);
+
+    const client_ctx = try ssl.createClientCtx();
+    defer ssl.SSL_CTX_free(client_ctx);
+
+    // Nonblocking socketpair prevents single-threaded handshake deadlocks.
+    const linux = std.os.linux;
+    var fds: [2]i32 = undefined;
+    const rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.NONBLOCK, 0, &fds);
+    if (posix.errno(rc) != .SUCCESS) return error.SocketPairFailed;
+    defer closeFd(fds[0]);
+    defer closeFd(fds[1]);
+
+    const server_ssl = ssl.SSL_new(server_ctx) orelse return error.SslNew;
+    defer ssl.SSL_free(server_ssl);
+    _ = ssl.SSL_set_options(server_ssl, ssl.SSL_OP_ENABLE_KTLS);
+    if (ssl.SSL_set_fd(server_ssl, fds[0]) != 1) return error.SslSetFd;
+    ssl.SSL_set_accept_state(server_ssl);
+
+    const client_ssl = ssl.SSL_new(client_ctx) orelse return error.SslNew;
+    defer ssl.SSL_free(client_ssl);
+    ssl.SSL_set_verify(client_ssl, ssl.SSL_VERIFY_NONE, null);
+    _ = ssl.SSL_set_options(client_ssl, ssl.SSL_OP_ENABLE_KTLS);
+    if (ssl.SSL_set_fd(client_ssl, fds[1]) != 1) return error.SslSetFd;
+    ssl.SSL_set_connect_state(client_ssl);
+
+    const max_handshake_rounds: u32 = 200;
+    var rounds: u32 = 0;
+    var client_done = false;
+    var server_done = false;
+    while (rounds < max_handshake_rounds and (!client_done or !server_done)) : (rounds += 1) {
+        if (!client_done) {
+            const client_rc = ssl.SSL_do_handshake(client_ssl);
+            if (client_rc == 1) {
+                client_done = true;
+            } else {
+                const client_err = ssl.SSL_get_error(client_ssl, client_rc);
+                if (client_err != ssl.SSL_ERROR_WANT_READ and client_err != ssl.SSL_ERROR_WANT_WRITE) {
+                    return error.HandshakeFailed;
+                }
+            }
+        }
+
+        if (!server_done) {
+            const server_rc = ssl.SSL_do_handshake(server_ssl);
+            if (server_rc == 1) {
+                server_done = true;
+            } else {
+                const server_err = ssl.SSL_get_error(server_ssl, server_rc);
+                if (server_err != ssl.SSL_ERROR_WANT_READ and server_err != ssl.SSL_ERROR_WANT_WRITE) {
+                    return error.HandshakeFailed;
+                }
+            }
+        }
+    }
+    if (!client_done or !server_done) return error.HandshakeFailed;
+
+    const ktls_available = ktls.isKtlsRuntimeAvailable();
+    const server_tx = if (ssl.SSL_get_wbio(server_ssl)) |wbio| ssl.BIO_get_ktls_send(wbio) else false;
+    const server_rx = if (ssl.SSL_get_rbio(server_ssl)) |rbio| ssl.BIO_get_ktls_recv(rbio) else false;
+
+    if (server_rx) {
+        try std.testing.expect(server_tx);
+    }
+
+    if (!ktls_available) {
+        try std.testing.expect(!server_tx);
+        try std.testing.expect(!server_rx);
+    }
+
+    if (server_tx or server_rx) {
+        try std.testing.expect(ktls_available);
+    }
+}
+
 test "TLSStream compiles" {
     // Basic compilation test
     _ = TLSStream;

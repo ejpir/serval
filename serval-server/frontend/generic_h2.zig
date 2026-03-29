@@ -6,6 +6,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const Io = std.Io;
+const posix = std.posix;
 
 const serval_core = @import("serval-core");
 const config = serval_core.config;
@@ -1174,7 +1175,7 @@ fn readSomeConnection(conn: *Connection, io: Io, timeout: Io.Timeout, out: []u8)
             break :blk n;
         },
         .tls => |*tls_socket| blk: {
-            if (!tls_socket.has_pending_read()) try waitUntilReadable(tls_socket.fd, io, timeout);
+            if (!tls_socket.has_pending_read()) try waitUntilReadableTls(tls_socket.fd, io, timeout);
             const n = tls_socket.stream.read(out) catch |err| switch (err) {
                 error.WantRead, error.WantWrite => return error.Timeout,
                 error.ConnectionReset => return error.ConnectionClosed,
@@ -1233,6 +1234,45 @@ fn waitUntilReadable(fd: i32, io: Io, timeout: Io.Timeout) WebSocketIoError!void
         error.ConnectionResetByPeer => return error.ConnectionClosed,
         else => return error.ReadFailed,
     };
+}
+
+const tls_readiness_poll_sleep_ms: i64 = 1;
+const tls_readiness_max_poll_iterations: u32 = 120_000;
+
+fn waitUntilReadableTls(fd: i32, io: Io, timeout: Io.Timeout) WebSocketIoError!void {
+    assert(fd >= 0);
+    assert(tls_readiness_max_poll_iterations > 0);
+
+    var poll_fds = [_]posix.pollfd{
+        .{
+            .fd = fd,
+            .events = posix.POLL.IN,
+            .revents = 0,
+        },
+    };
+    const maybe_deadline = timeout.toTimestamp(io);
+    var iterations: u32 = 0;
+    while (iterations < tls_readiness_max_poll_iterations) : (iterations += 1) {
+        poll_fds[0].revents = 0;
+        const polled = posix.poll(&poll_fds, 0) catch return error.ReadFailed;
+        if (polled > 0) {
+            const revents = poll_fds[0].revents;
+            if ((revents & (posix.POLL.ERR | posix.POLL.NVAL)) != 0) return error.ReadFailed;
+            if ((revents & posix.POLL.HUP) != 0) return error.ConnectionClosed;
+            if ((revents & posix.POLL.IN) != 0) return;
+        }
+
+        if (maybe_deadline) |deadline| {
+            const remaining = deadline.durationFromNow(io);
+            if (remaining.raw.toNanoseconds() <= 0) return error.Timeout;
+        }
+
+        std.Io.sleep(io, Io.Duration.fromMilliseconds(tls_readiness_poll_sleep_ms), .awake) catch {
+            return error.ReadFailed;
+        };
+    }
+
+    return error.ReadFailed;
 }
 
 fn rawStreamForFd(fd: i32) Io.net.Stream {
