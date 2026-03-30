@@ -4852,8 +4852,14 @@ const GrpcH2CancelPropagationBackendConfig = struct {
     await_survivor_on_same_session: bool = true,
 };
 
-fn waitForProxyRstStream(conn: posix.socket_t, stream_id: u32) !u32 {
+const ProxyRstObservation = struct {
+    error_code_raw: u32,
+    carry_len: u32,
+};
+
+fn waitForProxyRstStream(conn: posix.socket_t, stream_id: u32, carry_out: []u8) !ProxyRstObservation {
     assert(stream_id > 0);
+    assert(carry_out.len > 0);
 
     var recv_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
     var total: usize = 0;
@@ -4874,7 +4880,15 @@ fn waitForProxyRstStream(conn: posix.socket_t, stream_id: u32) !u32 {
             const payload = recv_buf[payload_start..payload_end];
             if (header.frame_type == .rst_stream and header.stream_id == stream_id) {
                 const error_code_raw = try serval_h2.parseRstStreamFrame(header, payload);
-                return error_code_raw;
+                const remaining = total - payload_end;
+                if (remaining > carry_out.len) return error.BufferTooSmall;
+                if (remaining > 0) {
+                    @memcpy(carry_out[0..remaining], recv_buf[payload_end..total]);
+                }
+                return .{
+                    .error_code_raw = error_code_raw,
+                    .carry_len = @intCast(remaining),
+                };
             }
 
             cursor = payload_end;
@@ -4954,29 +4968,31 @@ fn grpcH2CancelPropagationBackendMain(config: GrpcH2CancelPropagationBackendConf
 
     try sendAllTcp(conn, send_buf[0..pos]);
 
-    const reset_error_code_raw = try waitForProxyRstStream(conn, parsed.stream_id);
-    try testing.expectEqual(@as(u32, @intFromEnum(serval_h2.ErrorCode.cancel)), reset_error_code_raw);
+    var second_request_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    var second_payload_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
+    const rst_observation = try waitForProxyRstStream(conn, parsed.stream_id, &second_request_buf);
+    try testing.expectEqual(@as(u32, @intFromEnum(serval_h2.ErrorCode.cancel)), rst_observation.error_code_raw);
 
     if (!config.await_survivor_on_same_session) return;
 
-    var second_request_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
-    var second_payload_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
-    var second_total: usize = 0;
+    var second_total: usize = @intCast(rst_observation.carry_len);
 
     while (true) {
+        if (second_total > 0) {
+            const parsed_second = parseGrpcStreamRequestFrames(second_request_buf[0..second_total], &second_payload_buf) catch |err| switch (err) {
+                error.NeedMoreData => null,
+                else => return err,
+            };
+            if (parsed_second) |second| {
+                try testing.expectEqualStrings(config.survivor_path, second.path);
+                try sendGrpcUnaryResponse(conn, second.stream_id, config.survivor_payload);
+                return;
+            }
+        }
+
         const n = try posix.recv(conn, second_request_buf[second_total..], 0);
         if (n == 0) return error.ConnectionClosed;
         second_total += n;
-
-        const parsed_second = parseGrpcStreamRequestFrames(second_request_buf[0..second_total], &second_payload_buf) catch |err| switch (err) {
-            error.NeedMoreData => null,
-            else => return err,
-        };
-        if (parsed_second) |second| {
-            try testing.expectEqualStrings(config.survivor_path, second.path);
-            try sendGrpcUnaryResponse(conn, second.stream_id, config.survivor_payload);
-            return;
-        }
     }
 }
 
