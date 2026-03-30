@@ -86,7 +86,16 @@ pub const ParsedDsl = struct {
         assert(self.pool_count <= self.pools.len);
         assert(self.plugin_count <= self.plugins.len);
         assert(self.chain_count <= self.chains.len);
+        assert(self.chain_count <= self.chain_entries.len);
         assert(self.route_count <= self.routes.len);
+
+        // Chain entry slices are written during parsing on a stack-local ParsedDsl.
+        // Rebind them here to this instance's storage to avoid stale pointers after return-by-value.
+        const parsed: *ParsedDsl = @constCast(self);
+        var chain_index: usize = 0;
+        while (chain_index < parsed.chain_count) : (chain_index += 1) {
+            parsed.chains[chain_index].entries = parsed.chain_entries[chain_index .. chain_index + 1];
+        }
 
         return .{
             .listeners = self.listeners[0..self.listener_count],
