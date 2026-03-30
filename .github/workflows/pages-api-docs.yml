@@ -4,13 +4,6 @@ on:
   push:
     branches:
       - main
-    paths:
-      - ".github/workflows/pages-api-docs.yml"
-      - "scripts/generate_module_api_docs.sh"
-      - "build.zig"
-      - "build.zig.zon"
-      - "serval/**/*.zig"
-      - "serval-*/**/*.zig"
   workflow_dispatch:
 
 permissions:
