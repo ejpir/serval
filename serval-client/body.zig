@@ -721,7 +721,7 @@ test "BodyReader.init content_length" {
     defer posix.close(fds[1]);
 
     var socket = Socket.Plain.init_client(fds[0]);
-    var reader = BodyReader.init(&socket, .{ .content_length = 100 });
+    const reader = BodyReader.init(&socket, .{ .content_length = 100 });
 
     try std.testing.expect(!reader.done);
     try std.testing.expectEqual(@as(?u64, 100), reader.bytes_remaining);
@@ -734,7 +734,7 @@ test "BodyReader.init content_length zero" {
     defer posix.close(fds[1]);
 
     var socket = Socket.Plain.init_client(fds[0]);
-    var reader = BodyReader.init(&socket, .{ .content_length = 0 });
+    const reader = BodyReader.init(&socket, .{ .content_length = 0 });
 
     // Zero content-length means body already done
     try std.testing.expect(reader.done);
@@ -747,7 +747,7 @@ test "BodyReader.init chunked" {
     defer posix.close(fds[1]);
 
     var socket = Socket.Plain.init_client(fds[0]);
-    var reader = BodyReader.init(&socket, .chunked);
+    const reader = BodyReader.init(&socket, .chunked);
 
     try std.testing.expect(!reader.done);
     try std.testing.expect(reader.bytes_remaining == null);
@@ -759,7 +759,7 @@ test "BodyReader.init none" {
     defer posix.close(fds[1]);
 
     var socket = Socket.Plain.init_client(fds[0]);
-    var reader = BodyReader.init(&socket, .none);
+    const reader = BodyReader.init(&socket, .none);
 
     // No body means already done
     try std.testing.expect(reader.done);
@@ -771,7 +771,7 @@ test "BodyReader.preloadChunkedBytes decodes fully buffered chunked body" {
     defer posix.close(fds[1]);
 
     var socket = Socket.Plain.init_client(fds[0]);
-    var reader = BodyReader.init(&socket, .chunked);
+    const reader = BodyReader.init(&socket, .chunked);
 
     const preloaded = "5\r\nHello\r\n6\r\n World\r\n0\r\n\r\n";
     try reader.preloadChunkedBytes(preloaded);
@@ -792,7 +792,7 @@ test "BodyReader.readAll content_length" {
     _ = posix.write(fds[1], body) catch return;
 
     var socket = Socket.Plain.init_client(fds[0]);
-    var reader = BodyReader.init(&socket, .{ .content_length = body.len });
+    const reader = BodyReader.init(&socket, .{ .content_length = body.len });
 
     var buf: [64]u8 = undefined;
     const result = try reader.readAll(&buf);
@@ -807,7 +807,7 @@ test "BodyReader.readAll content_length buffer too small" {
     defer posix.close(fds[1]);
 
     var socket = Socket.Plain.init_client(fds[0]);
-    var reader = BodyReader.init(&socket, .{ .content_length = 100 });
+    const reader = BodyReader.init(&socket, .{ .content_length = 100 });
 
     var buf: [10]u8 = undefined; // Too small for 100 bytes
     const result = reader.readAll(&buf);
@@ -824,7 +824,7 @@ test "BodyReader.readChunk content_length" {
     _ = posix.write(fds[1], body) catch return;
 
     var socket = Socket.Plain.init_client(fds[0]);
-    var reader = BodyReader.init(&socket, .{ .content_length = body.len });
+    const reader = BodyReader.init(&socket, .{ .content_length = body.len });
 
     var buf: [5]u8 = undefined; // Small buffer to force multiple chunks
     var total: usize = 0;
@@ -845,7 +845,7 @@ test "BodyReader.readAll none returns empty" {
     defer posix.close(fds[1]);
 
     var socket = Socket.Plain.init_client(fds[0]);
-    var reader = BodyReader.init(&socket, .none);
+    const reader = BodyReader.init(&socket, .none);
 
     var buf: [64]u8 = undefined;
     const result = try reader.readAll(&buf);
@@ -859,7 +859,7 @@ test "BodyReader.readChunk none returns null" {
     defer posix.close(fds[1]);
 
     var socket = Socket.Plain.init_client(fds[0]);
-    var reader = BodyReader.init(&socket, .none);
+    const reader = BodyReader.init(&socket, .none);
 
     var buf: [64]u8 = undefined;
     const result = try reader.readChunk(&buf);
@@ -924,7 +924,7 @@ test "BodyReader.readAll chunked single chunk" {
     try std.testing.expectEqual(chunked_body.len, written);
 
     var socket = Socket.Plain.init_client(fds[0]);
-    var reader = BodyReader.init(&socket, .chunked);
+    const reader = BodyReader.init(&socket, .chunked);
 
     // Precondition: reader not done initially
     try std.testing.expect(!reader.done);
@@ -956,7 +956,7 @@ test "BodyReader.readAll chunked multiple chunks" {
     try std.testing.expectEqual(chunked_body.len, written);
 
     var socket = Socket.Plain.init_client(fds[0]);
-    var reader = BodyReader.init(&socket, .chunked);
+    const reader = BodyReader.init(&socket, .chunked);
 
     var buf: [64]u8 = undefined;
     const result = try reader.readAll(&buf);
@@ -985,7 +985,7 @@ test "BodyReader.readChunk chunked streaming" {
     try std.testing.expectEqual(chunked_body.len, written);
 
     var socket = Socket.Plain.init_client(fds[0]);
-    var reader = BodyReader.init(&socket, .chunked);
+    const reader = BodyReader.init(&socket, .chunked);
 
     // Use a 4-byte buffer - large enough for first chunk but smaller than second
     var buf: [4]u8 = undefined;
@@ -1030,7 +1030,7 @@ test "BodyReader.readAll chunked with extensions" {
     try std.testing.expectEqual(chunked_body.len, written);
 
     var socket = Socket.Plain.init_client(fds[0]);
-    var reader = BodyReader.init(&socket, .chunked);
+    const reader = BodyReader.init(&socket, .chunked);
 
     var buf: [64]u8 = undefined;
     const result = try reader.readAll(&buf);

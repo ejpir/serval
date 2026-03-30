@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ZIG_BIN_DEFAULT="/usr/local/zig-x86_64-linux-0.16.0-dev.2821+3edaef9e0/zig"
+ZIG_BIN_DEFAULT="/usr/local/zig-x86_64-linux-0.16.0-dev.3039+b490412cd/zig"
 OUTPUT_DIR="zig-out/api-docs"
 LOCAL_CACHE_DIR="/tmp/serval-docs-zig-cache"
 GLOBAL_CACHE_DIR="/tmp/serval-docs-zig-global-cache"

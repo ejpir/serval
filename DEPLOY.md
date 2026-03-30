@@ -31,7 +31,7 @@ Deploy to specific router:
 ### Environment
 
 Hardcoded for this development environment:
-- **Zig**: `/usr/local/zig-x86_64-linux-0.16.0-dev.2821+3edaef9e0/zig`
+- **Zig**: `/usr/local/zig-x86_64-linux-0.16.0-dev.3039+b490412cd/zig`
 - **OpenWrt SDK**: `/home/nick/repos/openwrt-suricata-build/openwrt-sdk-rockchip-armv8_gcc-14.3.0_musl.Linux-x86_64`
 - **Target**: aarch64-linux-musl (for Rockchip ARMv8 OpenWrt)
 - **Config**: `/etc/serval/netbird.conf`
@@ -53,7 +53,7 @@ The script prints the exact rollback command on success.
 
 **"Zig not found"**
 - Update `ZIG_VERSION` in script or pass as argument
-- Current: `0.16.0-dev.2821+3edaef9e0`
+- Current: `0.16.0-dev.3039+b490412cd`
 
 **"OpenWrt staging dir not found"**
 - Install OpenWrt SDK: `/home/nick/repos/openwrt-suricata-build/`

@@ -29,7 +29,7 @@ const time = serval_core.time;
 /// Prints usage and resolver diagnostics to stdout/stderr, then performs DNS resolution attempts.
 /// Propagates allocation and other setup/runtime errors via `!void`.
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

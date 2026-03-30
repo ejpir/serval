@@ -1,16 +1,14 @@
---- zig-x86_64-linux-0.16.0-dev.2821+3edaef9e0/lib/std/Io/Threaded.zig
-+++ zig-x86_64-linux-0.16.0-dev.2821+3edaef9e0/lib/std/Io/Threaded.zig
-@@ -12206,9 +12206,7 @@
+--- zig-x86_64-linux-0.16.0-dev.3039+b490412cd/lib/std/Io/Threaded.zig
++++ zig-x86_64-linux-0.16.0-dev.3039+b490412cd/lib/std/Io/Threaded.zig
+@@ -12069,19 +12069,170 @@
      options: IpAddress.ConnectOptions,
- ) IpAddress.ConnectError!net.Stream {
+ ) IpAddress.ConnectError!net.Socket {
      if (!have_networking) return error.NetworkDown;
 -    if (options.timeout != .none) @panic("TODO implement netConnectIpPosix with timeout");
      const t: *Threaded = @ptrCast(@alignCast(userdata));
 -    _ = t;
      const family = posixAddressFamily(address);
-     const socket_fd = try openSocketPosix(family, .{
-         .mode = options.mode,
-@@ -12217,7 +12215,11 @@
+     const socket_fd = try openSocketPosix(family, .{ .mode = options.mode, .protocol = options.protocol });
      errdefer closeFd(socket_fd);
      var storage: PosixAddress = undefined;
      var addr_len = addressToPosix(address, &storage);
@@ -21,10 +19,7 @@
 +        try posixConnectWithTimeout(t, socket_fd, &storage.any, addr_len, options.timeout);
 +    }
      try posixGetSockName(socket_fd, &storage.any, &addr_len);
-     return .{ .socket = .{
-         .handle = socket_fd,
-@@ -12225,6 +12227,155 @@
-     } };
+     return .{ .handle = socket_fd, .address = addressFromPosix(&storage) };
  }
  
 +fn posixConnectWithTimeout(
@@ -179,7 +174,7 @@
  fn netConnectIpWindows(
      userdata: ?*anyopaque,
      address: *const IpAddress,
-@@ -13392,34 +13543,40 @@
+@@ -13034,34 +13185,40 @@
          .flags = 0,
      };
      addBuf(&iovecs, &msg.iovlen, header);
@@ -244,9 +239,9 @@
      const flags = posix.MSG.NOSIGNAL;
  
      const syscall: Syscall = try .start();
---- zig-x86_64-linux-0.16.0-dev.2821+3edaef9e0/lib/std/Io/Uring.zig
-+++ zig-x86_64-linux-0.16.0-dev.2821+3edaef9e0/lib/std/Io/Uring.zig
-@@ -769,16 +769,16 @@
+--- zig-x86_64-linux-0.16.0-dev.3039+b490412cd/lib/std/Io/Uring.zig
++++ zig-x86_64-linux-0.16.0-dev.3039+b490412cd/lib/std/Io/Uring.zig
+@@ -771,16 +771,16 @@
              .random = random,
              .randomSecure = randomSecure,
  
@@ -269,7 +264,7 @@
              .netWriteFile = netWriteFileUnavailable,
              .netClose = netClose,
              .netShutdown = netShutdown,
-@@ -2306,6 +2306,13 @@
+@@ -2308,6 +2308,13 @@
      }
  }
  
@@ -283,7 +278,7 @@
  /// If `concurrency` is false, `error.ConcurrencyUnavailable` is unreachable.
  fn batchDrainSubmitted(
      ev: *Evented,
-@@ -2387,8 +2394,62 @@
+@@ -2389,8 +2396,62 @@
              else
                  .{ .device_io_control = try ev.deviceIoControl(try maybe_sync.enterSync(ev), o) },
              .net_receive => |o| {
@@ -348,7 +343,7 @@
              },
          })) |result| {
              switch (batch.completed.tail) {
-@@ -2490,7 +2551,51 @@
+@@ -2492,7 +2553,51 @@
                      },
                  },
                  .device_io_control => unreachable,
@@ -401,31 +396,22 @@
              })) |result| {
                  switch (batch.completed.tail) {
                      .none => batch.completed.head = index,
-@@ -4199,7 +4304,7 @@
-     const dir_path_posix = try pathToPosix(dir_path, &path_buffer);
-     var sync: CancelRegion.Sync = try .init(ev);
-     defer sync.deinit(ev);
--    return ev.chdir(&sync, dir_path_posix);
-+    return chdir(&sync, dir_path_posix);
- }
- 
- fn processReplace(userdata: ?*anyopaque, options: process.ReplaceOptions) process.ReplaceError {
-@@ -4950,26 +5055,92 @@
+@@ -4953,28 +5058,88 @@
      };
  }
  
 -fn netListenIpUnavailable(
 +fn netListenIp(
      userdata: ?*anyopaque,
-     address: net.IpAddress,
+     address: *const net.IpAddress,
      options: net.IpAddress.ListenOptions,
- ) net.IpAddress.ListenError!net.Server {
+ ) net.IpAddress.ListenError!net.Socket {
      const ev: *Evented = @ptrCast(@alignCast(userdata));
 -    _ = ev;
 -    _ = address;
 -    _ = options;
 -    return error.NetworkDown;
-+    const family = posixAddressFamily(&address);
++    const family = posixAddressFamily(address);
 +    var maybe_sync: CancelRegion.Sync.Maybe = .{ .cancel_region = .init() };
 +    defer maybe_sync.deinit(ev);
 +    const socket_fd = try ev.socket(&maybe_sync.cancel_region, family, .{
@@ -442,24 +428,23 @@
 +    }
 +
 +    var storage: PosixAddress = undefined;
-+    var addr_len = addressToPosix(&address, &storage);
++    var addr_len = addressToPosix(address, &storage);
 +    try ev.bind(&maybe_sync.cancel_region, socket_fd, &storage.any, addr_len);
 +    try ev.listen(&maybe_sync.cancel_region, socket_fd, options.kernel_backlog);
 +    try ev.getsockname(try maybe_sync.enterSync(ev), socket_fd, &storage.any, &addr_len);
-+    return .{ .socket = .{
-+        .handle = socket_fd,
-+        .address = addressFromPosix(&storage),
-+    } };
++    return .{ .handle = socket_fd, .address = addressFromPosix(&storage) };
  }
  
 -fn netAcceptUnavailable(
 +fn netAccept(
      userdata: ?*anyopaque,
      listen_handle: net.Socket.Handle,
- ) net.Server.AcceptError!net.Stream {
+     options: net.Server.AcceptOptions,
+ ) net.Server.AcceptError!net.Socket {
      const ev: *Evented = @ptrCast(@alignCast(userdata));
 -    _ = ev;
 -    _ = listen_handle;
+     _ = options;
 -    return error.NetworkDown;
 +    var cancel_region: CancelRegion = .init();
 +    defer cancel_region.deinit();
@@ -487,12 +472,9 @@
 +        ev.yield(null, .nothing);
 +        const completion = cancel_region.completion();
 +        switch (completion.errno()) {
-+            .SUCCESS => return .{ .socket = .{
-+                .handle = completion.result,
-+                .address = addressFromPosix(&storage),
-+            } },
++            .SUCCESS => return .{ .handle = completion.result, .address = addressFromPosix(&storage) },
 +            .INTR, .CANCELED => {},
-+            .AGAIN => |err| return errnoBug(err),
++            .AGAIN => return error.WouldBlock,
 +            .BADF => |err| return errnoBug(err),
 +            .CONNABORTED => return error.ConnectionAborted,
 +            .FAULT => |err| return errnoBug(err),
@@ -512,8 +494,8 @@
  }
  
  fn netBindIp(
-@@ -4993,16 +5164,30 @@
-     };
+@@ -4996,16 +5161,27 @@
+     return .{ .handle = socket_fd, .address = addressFromPosix(&storage) };
  }
  
 -fn netConnectIpUnavailable(
@@ -521,7 +503,7 @@
      userdata: ?*anyopaque,
      address: *const net.IpAddress,
      options: net.IpAddress.ConnectOptions,
- ) net.IpAddress.ConnectError!net.Stream {
+ ) net.IpAddress.ConnectError!net.Socket {
 +    if (options.timeout != .none) return error.OptionUnsupported;
      const ev: *Evented = @ptrCast(@alignCast(userdata));
 -    _ = ev;
@@ -541,14 +523,11 @@
 +    var addr_len = addressToPosix(address, &storage);
 +    try ev.connect(&maybe_sync.cancel_region, socket_fd, &storage.any, addr_len);
 +    try ev.getsockname(try maybe_sync.enterSync(ev), socket_fd, &storage.any, &addr_len);
-+    return .{ .socket = .{
-+        .handle = socket_fd,
-+        .address = addressFromPosix(&storage),
-+    } };
++    return .{ .handle = socket_fd, .address = addressFromPosix(&storage) };
  }
  
  fn netListenUnixUnavailable(
-@@ -5036,18 +5221,98 @@
+@@ -5039,18 +5215,98 @@
      return error.OperationUnsupported;
  }
  
@@ -653,7 +632,7 @@
  }
  
  fn netReceive(
-@@ -5139,19 +5404,97 @@
+@@ -5142,19 +5398,97 @@
      }
  }
  
@@ -757,7 +736,7 @@
      userdata: ?*anyopaque,
      handle: net.Socket.Handle,
      header: []const u8,
-@@ -5159,12 +5502,68 @@
+@@ -5162,12 +5496,68 @@
      splat: usize,
  ) net.Stream.Writer.Error!usize {
      const ev: *Evented = @ptrCast(@alignCast(userdata));
@@ -832,7 +811,7 @@
  }
  
  fn netWriteFileUnavailable(
-@@ -5305,6 +5704,59 @@
+@@ -5308,6 +5698,59 @@
      }
  }
  
@@ -892,7 +871,7 @@
  fn chdir(sync: *CancelRegion.Sync, path: [*:0]const u8) ChdirError!void {
      while (true) {
          try sync.cancel_region.await(.nothing);
-@@ -5530,6 +5982,43 @@
+@@ -5533,6 +5976,43 @@
      }
  }
  
@@ -936,7 +915,7 @@
  fn linkat(
      ev: *Evented,
      cancel_region: *CancelRegion,
-@@ -5683,6 +6172,8 @@
+@@ -5688,6 +6168,8 @@
  ) File.Reader.Error!usize {
      if (iov.len == 0) return 0;
      const gather = iov.len > 1 or iov[0].len > 0xfffff000;
@@ -945,7 +924,7 @@
      while (true) {
          const thread = try cancel_region.awaitIoUring();
          thread.enqueue().* = .{
-@@ -5704,12 +6195,15 @@
+@@ -5709,12 +6191,15 @@
          ev.yield(null, .nothing);
          const completion = cancel_region.completion();
          switch (completion.errno()) {

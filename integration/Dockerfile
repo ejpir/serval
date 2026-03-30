@@ -2,8 +2,8 @@ FROM ubuntu:24.04
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG GO_VERSION=1.26.1
-ARG ZIG_VERSION=0.16.0-dev.2821+3edaef9e0
-ARG ZIG_ARCHIVE=integration/toolchains/zig-x86_64-linux-0.16.0-dev.2821+3edaef9e0.tar.xz
+ARG ZIG_VERSION=0.16.0-dev.3039+b490412cd
+ARG ZIG_ARCHIVE=integration/toolchains/zig-x86_64-linux-0.16.0-dev.3039+b490412cd.tar.xz
 ARG HEY_VERSION=v0.1.4
 ARG H2SPEC_VERSION=v2.2.1+incompatible
 ARG GRPCURL_VERSION=latest
@@ -35,7 +35,7 @@ RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go
     rm /tmp/go.tar.gz
 
 COPY ${ZIG_ARCHIVE} /tmp/zig.tar.xz
-COPY integration/toolchains/zig-0.16.0-dev.2821+3edaef9e0-uring.patch /tmp/zig-uring.patch
+COPY integration/toolchains/zig-0.16.0-dev.3039+b490412cd-uring.patch /tmp/zig-uring.patch
 
 RUN tar -C /usr/local -xf /tmp/zig.tar.xz && \
     if ! grep -q "const BatchNetReceivePending" "/usr/local/zig-x86_64-linux-${ZIG_VERSION}/lib/std/Io/Uring.zig"; then \

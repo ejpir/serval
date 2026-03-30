@@ -36,7 +36,7 @@ integration image at [integration/Dockerfile](/home/nick/repos/serval/integratio
 The image installs the toolchain and external helpers required by the current
 integration and conformance suites:
 
-- your local custom Zig `0.16.0-dev.2821+3edaef9e0` build, bundled from the
+- your local custom Zig `0.16.0-dev.3039+b490412cd` build, bundled from the
   host tarball so container runs use the same modified stdlib as local runs
 - Go `1.26.x`
 - `grpcurl`
@@ -47,7 +47,7 @@ integration and conformance suites:
 
 The repository also carries the required stdlib patch for
 `lib/std/Io/Uring.zig` at
-[zig-0.16.0-dev.2821+3edaef9e0-uring.patch](/home/nick/repos/serval/integration/toolchains/zig-0.16.0-dev.2821+3edaef9e0-uring.patch).
+[zig-0.16.0-dev.3039+b490412cd-uring.patch](/home/nick/repos/serval/integration/toolchains/zig-0.16.0-dev.3039+b490412cd-uring.patch).
 The Docker image build applies that patch if the bundled Zig archive does not
 already contain it, so the pipeline does not depend on an accidentally
 pre-patched host install.
@@ -80,14 +80,14 @@ seccomp or by low memlock allowance.
 By default it expects the custom Zig archive at:
 
 ```bash
-/usr/local/zig-x86_64-linux-0.16.0-dev.2821+3edaef9e0.tar.xz
+/usr/local/zig-x86_64-linux-0.16.0-dev.3039+b490412cd.tar.xz
 ```
 
 But if the installed toolchain directory exists, the wrapper now prefers
 repacking the live directory tree:
 
 ```bash
-/usr/local/zig-x86_64-linux-0.16.0-dev.2821+3edaef9e0
+/usr/local/zig-x86_64-linux-0.16.0-dev.3039+b490412cd
 ```
 
 That avoids stale-archive drift when the local Zig stdlib has been patched after

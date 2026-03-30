@@ -173,7 +173,7 @@ fn printUsage() void {
 /// TigerStyle Y1: Under 70 lines with extracted helpers.
 pub fn main(process_init: std.process.Init) !void {
     log.info("=== MAIN STARTING ===", .{});
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

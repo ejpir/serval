@@ -85,7 +85,7 @@ pub const Tracker = struct {
 
         const key_hash = hashClient(input.client_addr);
         const idx = self.findEntryIndex(key_hash) orelse return .{};
-        var entry = &self.slots[idx];
+        const entry = &self.slots[idx];
         self.resetWindowIfExpired(entry, now_ns);
 
         return .{

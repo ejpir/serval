@@ -281,7 +281,7 @@ pub fn main(process_init: std.process.Init) !void {
     // Run servers with appropriate tracer type.
     if (args.extra.trace) {
         // OpenTelemetry tracing enabled
-        var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+        var gpa = std.heap.DebugAllocator(.{}){};
         defer _ = gpa.deinit();
         const allocator = gpa.allocator();
 

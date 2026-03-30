@@ -23,7 +23,7 @@ const otel = @import("serval-otel");
 /// Returns any allocation or exporter initialization error; the exporter is
 /// released with `defer`, and sleep failures are logged but do not abort the run.
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

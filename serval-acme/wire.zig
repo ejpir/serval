@@ -194,7 +194,7 @@ pub fn parseAbsoluteUrlSlice(value: []const u8) Error!ParsedUrl {
 /// The returned request borrows the directory URL data; the caller must keep `directory` valid.
 pub fn buildNewNonceRequest(directory: *const client.Directory) Error!WireRequest {
     assert(@intFromPtr(directory) != 0);
-    var request = WireRequest{
+    const request = WireRequest{
         .method = .HEAD,
         .target = try parseAbsoluteUrl(&directory.new_nonce_url),
         .body = &.{},
@@ -211,7 +211,7 @@ pub fn buildNewAccountRequest(directory: *const client.Directory, body: []const 
     assert(@intFromPtr(directory) != 0);
 
     if (body.len > max_body_bytes) return error.BodyTooLarge;
-    var request = WireRequest{
+    const request = WireRequest{
         .method = .POST,
         .target = try parseAbsoluteUrl(&directory.new_account_url),
         .body = body,
@@ -228,7 +228,7 @@ pub fn buildNewOrderRequest(directory: *const client.Directory, body: []const u8
     assert(@intFromPtr(directory) != 0);
 
     if (body.len > max_body_bytes) return error.BodyTooLarge;
-    var request = WireRequest{
+    const request = WireRequest{
         .method = .POST,
         .target = try parseAbsoluteUrl(&directory.new_order_url),
         .body = body,
@@ -245,7 +245,7 @@ pub fn buildSignedPostRequest(target_url: *const client.Url, body: []const u8) E
     assert(@intFromPtr(target_url) != 0);
 
     if (body.len > max_body_bytes) return error.BodyTooLarge;
-    var request = WireRequest{
+    const request = WireRequest{
         .method = .POST,
         .target = try parseAbsoluteUrl(target_url),
         .body = body,

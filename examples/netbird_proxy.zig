@@ -853,7 +853,7 @@ pub fn main(process_init: std.process.Init) !void {
     var cfg = NetbirdProxyConfig{};
     var saw_listen_port_in_file = false;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
