@@ -1,3 +1,249 @@
+--- zig-x86_64-linux-0.16.0-dev.2821+3edaef9e0/lib/std/Io/Threaded.zig
++++ zig-x86_64-linux-0.16.0-dev.2821+3edaef9e0/lib/std/Io/Threaded.zig
+@@ -12206,9 +12206,7 @@
+     options: IpAddress.ConnectOptions,
+ ) IpAddress.ConnectError!net.Stream {
+     if (!have_networking) return error.NetworkDown;
+-    if (options.timeout != .none) @panic("TODO implement netConnectIpPosix with timeout");
+     const t: *Threaded = @ptrCast(@alignCast(userdata));
+-    _ = t;
+     const family = posixAddressFamily(address);
+     const socket_fd = try openSocketPosix(family, .{
+         .mode = options.mode,
+@@ -12217,7 +12215,11 @@
+     errdefer closeFd(socket_fd);
+     var storage: PosixAddress = undefined;
+     var addr_len = addressToPosix(address, &storage);
+-    try posixConnect(socket_fd, &storage.any, addr_len);
++    if (options.timeout == .none) {
++        try posixConnect(socket_fd, &storage.any, addr_len);
++    } else {
++        try posixConnectWithTimeout(t, socket_fd, &storage.any, addr_len, options.timeout);
++    }
+     try posixGetSockName(socket_fd, &storage.any, &addr_len);
+     return .{ .socket = .{
+         .handle = socket_fd,
+@@ -12225,6 +12227,155 @@
+     } };
+ }
+ 
++fn posixConnectWithTimeout(
++    t: *Threaded,
++    socket_fd: posix.socket_t,
++    addr: *const posix.sockaddr,
++    addr_len: posix.socklen_t,
++    timeout: Io.Timeout,
++) IpAddress.ConnectError!void {
++    const original_flags = try posixGetStatusFlags(socket_fd);
++    var nonblocking_flags = original_flags;
++    nonblocking_flags |= @as(usize, 1 << @bitOffsetOf(posix.O, "NONBLOCK"));
++    if (nonblocking_flags != original_flags) try posixSetStatusFlags(socket_fd, nonblocking_flags);
++    defer if (nonblocking_flags != original_flags) posixSetStatusFlags(socket_fd, original_flags) catch {};
++
++    posixConnect(socket_fd, addr, addr_len) catch |err| switch (err) {
++        error.WouldBlock, error.ConnectionPending => {},
++        else => |e| return e,
++    };
++
++    const t_io = io(t);
++    const deadline = timeout.toTimestamp(t_io);
++    var poll_fd: [1]posix.pollfd = .{.{
++        .fd = socket_fd,
++        .events = posix.POLL.OUT | posix.POLL.ERR,
++        .revents = 0,
++    }};
++
++    while (true) {
++        const timeout_ms: i32 = t: {
++            const d = deadline orelse break :t -1;
++            const duration = d.durationFromNow(t_io);
++            break :t @min(@max(0, duration.raw.toMilliseconds()), std.math.maxInt(i32));
++        };
++        const syscall = try Syscall.start();
++        const rc = posix.system.poll(&poll_fd, 1, timeout_ms);
++        switch (posix.errno(rc)) {
++            .SUCCESS => {
++                syscall.finish();
++                if (rc == 0) {
++                    if (deadline == null) continue;
++                    return error.Timeout;
++                }
++                posixConnectCheckSoError(socket_fd) catch |err| switch (err) {
++                    error.WouldBlock, error.ConnectionPending => continue,
++                    else => |e| return e,
++                };
++                return;
++            },
++            .INTR => {
++                try syscall.checkCancel();
++                continue;
++            },
++            .BADF => return syscall.errnoBug(.BADF),
++            .FAULT => return syscall.errnoBug(.FAULT),
++            .INVAL => return syscall.errnoBug(.INVAL),
++            else => |e| return syscall.unexpectedErrno(e),
++        }
++    }
++}
++
++fn posixConnectCheckSoError(socket_fd: posix.socket_t) IpAddress.ConnectError!void {
++    var so_error: c_int = 0;
++    var opt_len: posix.socklen_t = @sizeOf(c_int);
++    const syscall: Syscall = try .start();
++    while (true) {
++        switch (posix.errno(posix.system.getsockopt(
++            socket_fd,
++            posix.SOL.SOCKET,
++            posix.SO.ERROR,
++            @ptrCast(&so_error),
++            &opt_len,
++        ))) {
++            .SUCCESS => {
++                syscall.finish();
++                if (so_error == 0) return;
++                const connect_errno: posix.E = @enumFromInt(so_error);
++                return switch (connect_errno) {
++                    .ADDRNOTAVAIL => error.AddressUnavailable,
++                    .AFNOSUPPORT => error.AddressFamilyUnsupported,
++                    .AGAIN, .INPROGRESS => error.WouldBlock,
++                    .ALREADY => error.ConnectionPending,
++                    .CONNREFUSED => error.ConnectionRefused,
++                    .CONNRESET => error.ConnectionResetByPeer,
++                    .HOSTUNREACH => error.HostUnreachable,
++                    .NETUNREACH => error.NetworkUnreachable,
++                    .TIMEDOUT => error.Timeout,
++                    .ACCES => error.AccessDenied,
++                    .NETDOWN => error.NetworkDown,
++                    .BADF => |err| errnoBug(err),
++                    .CONNABORTED => |err| errnoBug(err),
++                    .FAULT => |err| errnoBug(err),
++                    .ISCONN => |err| errnoBug(err),
++                    .NOENT => |err| errnoBug(err),
++                    .NOTSOCK => |err| errnoBug(err),
++                    .PERM => |err| errnoBug(err),
++                    .PROTOTYPE => |err| errnoBug(err),
++                    else => |err| posix.unexpectedErrno(err),
++                };
++            },
++            .INTR => {
++                try syscall.checkCancel();
++                continue;
++            },
++            .BADF => |err| return syscall.errnoBug(err),
++            .FAULT => |err| return syscall.errnoBug(err),
++            .INVAL => |err| return syscall.errnoBug(err),
++            .NOTSOCK => |err| return syscall.errnoBug(err),
++            else => |err| return syscall.unexpectedErrno(err),
++        }
++    }
++}
++
++fn posixGetStatusFlags(fd: posix.fd_t) IpAddress.ConnectError!usize {
++    const syscall: Syscall = try .start();
++    while (true) {
++        const rc = posix.system.fcntl(fd, posix.F.GETFL, @as(usize, 0));
++        switch (posix.errno(rc)) {
++            .SUCCESS => {
++                syscall.finish();
++                return @intCast(rc);
++            },
++            .INTR => {
++                try syscall.checkCancel();
++                continue;
++            },
++            .BADF => |err| return syscall.errnoBug(err),
++            else => |err| return syscall.unexpectedErrno(err),
++        }
++    }
++}
++
++fn posixSetStatusFlags(fd: posix.fd_t, flags: usize) IpAddress.ConnectError!void {
++    const syscall: Syscall = try .start();
++    while (true) {
++        switch (posix.errno(posix.system.fcntl(fd, posix.F.SETFL, flags))) {
++            .SUCCESS => {
++                syscall.finish();
++                return;
++            },
++            .INTR => {
++                try syscall.checkCancel();
++                continue;
++            },
++            .BADF => |err| return syscall.errnoBug(err),
++            .INVAL => |err| return syscall.errnoBug(err),
++            else => |err| return syscall.unexpectedErrno(err),
++        }
++    }
++}
++
+ fn netConnectIpWindows(
+     userdata: ?*anyopaque,
+     address: *const IpAddress,
+@@ -13392,34 +13543,40 @@
+         .flags = 0,
+     };
+     addBuf(&iovecs, &msg.iovlen, header);
+-    for (data[0 .. data.len - 1]) |bytes| addBuf(&iovecs, &msg.iovlen, bytes);
+-    const pattern = data[data.len - 1];
++    if (data.len > 0) {
++        for (data[0 .. data.len - 1]) |bytes| addBuf(&iovecs, &msg.iovlen, bytes);
++    } else {
++        assert(splat == 0);
++    }
+ 
+     var splat_backup_buffer: [splat_buffer_size]u8 = undefined;
+-    if (iovecs.len - msg.iovlen != 0) switch (splat) {
+-        0 => {},
+-        1 => addBuf(&iovecs, &msg.iovlen, pattern),
+-        else => switch (pattern.len) {
++    if (data.len > 0 and iovecs.len - msg.iovlen != 0) {
++        const pattern = data[data.len - 1];
++        switch (splat) {
+             0 => {},
+-            1 => {
+-                const splat_buffer = &splat_backup_buffer;
+-                const memset_len = @min(splat_buffer.len, splat);
+-                const buf = splat_buffer[0..memset_len];
+-                @memset(buf, pattern[0]);
+-                addBuf(&iovecs, &msg.iovlen, buf);
+-                var remaining_splat = splat - buf.len;
+-                while (remaining_splat > splat_buffer.len and iovecs.len - msg.iovlen != 0) {
+-                    assert(buf.len == splat_buffer.len);
+-                    addBuf(&iovecs, &msg.iovlen, splat_buffer);
+-                    remaining_splat -= splat_buffer.len;
+-                }
+-                addBuf(&iovecs, &msg.iovlen, splat_buffer[0..@min(remaining_splat, splat_buffer.len)]);
+-            },
+-            else => for (0..@min(splat, iovecs.len - msg.iovlen)) |_| {
+-                addBuf(&iovecs, &msg.iovlen, pattern);
++            1 => addBuf(&iovecs, &msg.iovlen, pattern),
++            else => switch (pattern.len) {
++                0 => {},
++                1 => {
++                    const splat_buffer = &splat_backup_buffer;
++                    const memset_len = @min(splat_buffer.len, splat);
++                    const buf = splat_buffer[0..memset_len];
++                    @memset(buf, pattern[0]);
++                    addBuf(&iovecs, &msg.iovlen, buf);
++                    var remaining_splat = splat - buf.len;
++                    while (remaining_splat > splat_buffer.len and iovecs.len - msg.iovlen != 0) {
++                        assert(buf.len == splat_buffer.len);
++                        addBuf(&iovecs, &msg.iovlen, splat_buffer);
++                        remaining_splat -= splat_buffer.len;
++                    }
++                    addBuf(&iovecs, &msg.iovlen, splat_buffer[0..@min(remaining_splat, splat_buffer.len)]);
++                },
++                else => for (0..@min(splat, iovecs.len - msg.iovlen)) |_| {
++                    addBuf(&iovecs, &msg.iovlen, pattern);
++                },
+             },
+-        },
+-    };
++        }
++    }
+     const flags = posix.MSG.NOSIGNAL;
+ 
+     const syscall: Syscall = try .start();
 --- zig-x86_64-linux-0.16.0-dev.2821+3edaef9e0/lib/std/Io/Uring.zig
 +++ zig-x86_64-linux-0.16.0-dev.2821+3edaef9e0/lib/std/Io/Uring.zig
 @@ -769,16 +769,16 @@
@@ -134,18 +380,18 @@
 +                            },
 +                            .INTR => .{ null, 0 },
 +                            .CANCELED => break :net_receive_result null,
-+                            .BADF => .{ errnoBug(.BADF), 0 }, // File descriptor used after closed.
++                            .BADF => .{ errnoBug(.BADF), 0 },
 +                            .NFILE => .{ error.SystemFdQuotaExceeded, 0 },
 +                            .MFILE => .{ error.ProcessFdQuotaExceeded, 0 },
-+                            .FAULT => .{ errnoBug(.FAULT), 0 }, // Invalid pointer.
-+                            .INVAL => .{ errnoBug(.INVAL), 0 }, // Invalid argument.
++                            .FAULT => .{ errnoBug(.FAULT), 0 },
++                            .INVAL => .{ errnoBug(.INVAL), 0 },
 +                            .NOBUFS => .{ error.SystemResources, 0 },
 +                            .NOMEM => .{ error.SystemResources, 0 },
 +                            .NOTCONN => .{ error.SocketUnconnected, 0 },
-+                            .NOTSOCK => .{ errnoBug(.NOTSOCK), 0 }, // Handle is not a socket.
++                            .NOTSOCK => .{ errnoBug(.NOTSOCK), 0 },
 +                            .MSGSIZE => .{ error.MessageOversize, 0 },
 +                            .PIPE => .{ error.SocketUnconnected, 0 },
-+                            .OPNOTSUPP => .{ errnoBug(.OPNOTSUPP), 0 }, // Flags not supported by socket type.
++                            .OPNOTSUPP => .{ errnoBug(.OPNOTSUPP), 0 },
 +                            .CONNRESET => .{ error.ConnectionResetByPeer, 0 },
 +                            .NETDOWN => .{ error.NetworkDown, 0 },
 +                            else => |err| .{ unexpectedErrno(err), 0 },
@@ -246,17 +492,17 @@
 +                .address = addressFromPosix(&storage),
 +            } },
 +            .INTR, .CANCELED => {},
-+            .AGAIN => |err| return errnoBug(err), // io_uring handles EAGAIN internally.
-+            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
++            .AGAIN => |err| return errnoBug(err),
++            .BADF => |err| return errnoBug(err),
 +            .CONNABORTED => return error.ConnectionAborted,
-+            .FAULT => |err| return errnoBug(err), // Invalid `addr` pointer.
++            .FAULT => |err| return errnoBug(err),
 +            .INVAL => return error.SocketNotListening,
-+            .NOTSOCK => |err| return errnoBug(err), // `listen_handle` is not a socket.
++            .NOTSOCK => |err| return errnoBug(err),
 +            .MFILE => return error.ProcessFdQuotaExceeded,
 +            .NFILE => return error.SystemFdQuotaExceeded,
 +            .NOBUFS => return error.SystemResources,
 +            .NOMEM => return error.SystemResources,
-+            .OPNOTSUPP => |err| return errnoBug(err), // Socket type does not support accept.
++            .OPNOTSUPP => |err| return errnoBug(err),
 +            .PROTO => return error.ProtocolFailure,
 +            .PERM => return error.BlockedByFirewall,
 +            .NETDOWN => return error.NetworkDown,
@@ -383,17 +629,17 @@
 +            .INTR, .CANCELED => {},
 +            .ACCES => return error.AccessDenied,
 +            .ALREADY => return error.FastOpenAlreadyInProgress,
-+            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
++            .BADF => |err| return errnoBug(err),
 +            .CONNRESET => return error.ConnectionResetByPeer,
-+            .DESTADDRREQ => |err| return errnoBug(err), // Address is always provided in msghdr.
-+            .FAULT => |err| return errnoBug(err), // Invalid pointer.
-+            .INVAL => |err| return errnoBug(err), // Invalid argument.
-+            .ISCONN => |err| return errnoBug(err), // Connected socket with destination address.
++            .DESTADDRREQ => |err| return errnoBug(err),
++            .FAULT => |err| return errnoBug(err),
++            .INVAL => |err| return errnoBug(err),
++            .ISCONN => |err| return errnoBug(err),
 +            .MSGSIZE => return error.MessageOversize,
 +            .NOBUFS => return error.SystemResources,
 +            .NOMEM => return error.SystemResources,
-+            .NOTSOCK => |err| return errnoBug(err), // `handle` is not a socket.
-+            .OPNOTSUPP => |err| return errnoBug(err), // Flags not supported by socket type.
++            .NOTSOCK => |err| return errnoBug(err),
++            .OPNOTSUPP => |err| return errnoBug(err),
 +            .PIPE => return error.SocketUnconnected,
 +            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
 +            .HOSTUNREACH => return error.HostUnreachable,
@@ -442,20 +688,20 @@
 +        switch (completion.errno()) {
 +            .SUCCESS => return @intCast(completion.result),
 +            .INTR, .CANCELED => {},
-+            .ACCES => |err| return errnoBug(err), // Connected stream socket, no permission check.
-+            .AGAIN => |err| return errnoBug(err), // io_uring handles EAGAIN internally.
++            .ACCES => |err| return errnoBug(err),
++            .AGAIN => |err| return errnoBug(err),
 +            .ALREADY => return error.FastOpenAlreadyInProgress,
-+            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
++            .BADF => |err| return errnoBug(err),
 +            .CONNRESET => return error.ConnectionResetByPeer,
 +            .DESTADDRREQ => |err| return errnoBug(err), // Stream socket is already connected.
-+            .FAULT => |err| return errnoBug(err), // Invalid pointer.
-+            .INVAL => |err| return errnoBug(err), // Invalid argument.
-+            .ISCONN => |err| return errnoBug(err), // Already connected.
-+            .MSGSIZE => |err| return errnoBug(err), // Stream socket has no message size limit.
++            .FAULT => |err| return errnoBug(err),
++            .INVAL => |err| return errnoBug(err),
++            .ISCONN => |err| return errnoBug(err),
++            .MSGSIZE => |err| return errnoBug(err),
 +            .NOBUFS => return error.SystemResources,
 +            .NOMEM => return error.SystemResources,
-+            .NOTSOCK => |err| return errnoBug(err), // `handle` is not a socket.
-+            .OPNOTSUPP => |err| return errnoBug(err), // Flags not supported by socket type.
++            .NOTSOCK => |err| return errnoBug(err),
++            .OPNOTSUPP => |err| return errnoBug(err),
 +            .PIPE => return error.SocketUnconnected,
 +            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
 +            .HOSTUNREACH => return error.HostUnreachable,
@@ -511,7 +757,7 @@
      userdata: ?*anyopaque,
      handle: net.Socket.Handle,
      header: []const u8,
-@@ -5159,12 +5502,62 @@
+@@ -5159,12 +5502,68 @@
      splat: usize,
  ) net.Stream.Writer.Error!usize {
      const ev: *Evented = @ptrCast(@alignCast(userdata));
@@ -586,7 +832,7 @@
  }
  
  fn netWriteFileUnavailable(
-@@ -5305,6 +5698,59 @@
+@@ -5305,6 +5704,59 @@
      }
  }
  
@@ -630,14 +876,14 @@
 +            .TIMEDOUT => return error.Timeout,
 +            .ACCES => return error.AccessDenied,
 +            .NETDOWN => return error.NetworkDown,
-+            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
-+            .CONNABORTED => |err| return errnoBug(err), // Connection aborted during connect.
-+            .FAULT => |err| return errnoBug(err), // Invalid `addr` pointer.
-+            .ISCONN => |err| return errnoBug(err), // Socket is already connected.
-+            .NOENT => |err| return errnoBug(err), // Invalid address path.
-+            .NOTSOCK => |err| return errnoBug(err), // `socket_fd` is not a socket.
-+            .PERM => |err| return errnoBug(err), // Firewall rules prevent connection.
-+            .PROTOTYPE => |err| return errnoBug(err), // Socket type mismatch.
++            .BADF => |err| return errnoBug(err),
++            .CONNABORTED => |err| return errnoBug(err),
++            .FAULT => |err| return errnoBug(err),
++            .ISCONN => |err| return errnoBug(err),
++            .NOENT => |err| return errnoBug(err),
++            .NOTSOCK => |err| return errnoBug(err),
++            .PERM => |err| return errnoBug(err),
++            .PROTOTYPE => |err| return errnoBug(err),
 +            else => |err| return unexpectedErrno(err),
 +        }
 +    }
@@ -646,12 +892,10 @@
  fn chdir(sync: *CancelRegion.Sync, path: [*:0]const u8) ChdirError!void {
      while (true) {
          try sync.cancel_region.await(.nothing);
-@@ -5528,6 +5974,43 @@
-             else => |err| return unexpectedErrno(err),
-         }
+@@ -5530,6 +5982,43 @@
      }
-+}
-+
+ }
+ 
 +fn listen(
 +    ev: *Evented,
 +    cancel_region: *CancelRegion,
@@ -681,12 +925,41 @@
 +            .SUCCESS => return,
 +            .INTR, .CANCELED => {},
 +            .ADDRINUSE => return error.AddressInUse,
-+            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
-+            .NOTSOCK => |err| return errnoBug(err), // `socket_fd` is not a socket.
-+            .OPNOTSUPP => |err| return errnoBug(err), // Socket type does not support listen.
++            .BADF => |err| return errnoBug(err),
++            .NOTSOCK => |err| return errnoBug(err),
++            .OPNOTSUPP => |err| return errnoBug(err),
 +            else => |err| return unexpectedErrno(err),
 +        }
 +    }
- }
- 
++}
++
  fn linkat(
+     ev: *Evented,
+     cancel_region: *CancelRegion,
+@@ -5683,6 +6172,8 @@
+ ) File.Reader.Error!usize {
+     if (iov.len == 0) return 0;
+     const gather = iov.len > 1 or iov[0].len > 0xfffff000;
++    var requested_bytes: usize = 0;
++    for (iov) |v| requested_bytes += v.len;
+     while (true) {
+         const thread = try cancel_region.awaitIoUring();
+         thread.enqueue().* = .{
+@@ -5704,12 +6195,15 @@
+         ev.yield(null, .nothing);
+         const completion = cancel_region.completion();
+         switch (completion.errno()) {
+-            .SUCCESS => return @as(u32, @bitCast(completion.result)),
++            .SUCCESS => {
++                const result: u32 = @bitCast(completion.result);
++                return result;
++            },
+             .INTR, .CANCELED => {},
+             .INVAL => |err| return errnoBug(err),
+             .FAULT => |err| return errnoBug(err),
+             .AGAIN => return error.WouldBlock,
+-            .BADF => |err| return errnoBug(err), // File descriptor used after closed
++            .BADF => |err| return errnoBug(err),
+             .IO => return error.InputOutput,
+             .ISDIR => return error.IsDir,
+             .NOBUFS => return error.SystemResources,
