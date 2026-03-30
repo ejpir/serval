@@ -4384,12 +4384,14 @@ fn parseGrpcStreamRequestFrames(input: []const u8, payload_out: []u8) !ParsedGrp
 
         switch (header.frame_type) {
             .settings => {
-                if ((header.flags & serval_h2.flags_ack) == 0) return error.InvalidFrame;
+                if (header.stream_id != 0) return error.InvalidFrame;
+                if ((header.flags & serval_h2.flags_ack) != 0 and header.length != 0) return error.InvalidFrame;
             },
-            .window_update => {},
+            .window_update, .ping, .priority, .goaway, .rst_stream => {},
             .headers => {
                 if (saw_headers) return error.InvalidFrame;
                 if ((header.flags & serval_h2.flags_end_headers) == 0) return error.InvalidFrame;
+                if (header.stream_id == 0) return error.InvalidFrame;
                 stream_id = header.stream_id;
                 var fields_buf: [H2_MAX_HEADER_FIELDS]serval_h2.HeaderField = undefined;
                 const fields = try decodeH2Fields(payload, &fields_buf);
@@ -4412,7 +4414,7 @@ fn parseGrpcStreamRequestFrames(input: []const u8, payload_out: []u8) !ParsedGrp
             },
             .data => {
                 if (!saw_headers) {
-                    if (header.stream_id == 1) {
+                    if (header.stream_id != 0) {
                         cursor = payload_end;
                         continue;
                     }
@@ -4429,7 +4431,7 @@ fn parseGrpcStreamRequestFrames(input: []const u8, payload_out: []u8) !ParsedGrp
                     .payload = grpc_payload,
                 };
             },
-            else => return error.InvalidFrame,
+            else => {},
         }
 
         cursor = payload_end;
@@ -11740,7 +11742,10 @@ fn waitForGrpcDataOnStream(
                 try testing.expectEqualStrings(expected_payload, payload);
                 return;
             },
-            .rst_stream => return error.UnexpectedReset,
+            .rst_stream => {
+                if (frame_view.header.stream_id != stream_id) continue;
+                return error.UnexpectedReset;
+            },
             else => {},
         }
     }
