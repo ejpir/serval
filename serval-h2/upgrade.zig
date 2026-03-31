@@ -131,8 +131,33 @@ pub fn buildPriorKnowledgePreambleFromUpgrade(
     settings_payload: []const u8,
     end_stream: bool,
 ) Error![]const u8 {
+    var header_block_storage: [limits.header_block_capacity_bytes]u8 = undefined;
+    return buildPriorKnowledgePreambleFromUpgradeWithHeaderStorage(
+        out,
+        request,
+        effective_path,
+        settings_payload,
+        end_stream,
+        &header_block_storage,
+    );
+}
+
+/// Builds an HTTP/2 prior-knowledge preamble from an upgrade request using caller-owned temporary
+/// header-block storage.
+/// Use this variant when the caller wants explicit ownership of the intermediate HEADERS encoding
+/// scratch buffer rather than relying on helper-local fixed storage.
+pub fn buildPriorKnowledgePreambleFromUpgradeWithHeaderStorage(
+    out: []u8,
+    request: *const Request,
+    effective_path: ?[]const u8,
+    settings_payload: []const u8,
+    end_stream: bool,
+    header_block_storage: []u8,
+) Error![]const u8 {
     assert(@intFromPtr(request) != 0);
     assert(settings_payload.len <= limits.frame_payload_capacity_bytes);
+    assert(header_block_storage.len <= limits.header_block_capacity_bytes);
+    if (header_block_storage.len < limits.header_block_capacity_bytes) return error.HeadersTooLarge;
 
     const path = effective_path orelse request.path;
     if (path.len == 0) return error.MissingPath;
@@ -140,8 +165,7 @@ pub fn buildPriorKnowledgePreambleFromUpgrade(
     const authority = request.headers.getHost() orelse return error.MissingAuthority;
     const connection = request.headers.getConnection();
 
-    var header_block_buf: [limits.header_block_capacity_bytes]u8 = undefined;
-    const header_block = try encodeHeaderBlock(&header_block_buf, request, path, authority, connection);
+    const header_block = try encodeHeaderBlock(header_block_storage, request, path, authority, connection);
 
     var cursor: usize = 0;
     cursor = try appendBytes(out, cursor, preface.client_connection_preface);

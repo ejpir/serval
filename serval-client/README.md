@@ -256,9 +256,10 @@ defer h2_pool.deinit();
 ```
 
 `H2ClientConnectionStorage` now owns both inbound receive/header scratch and
-the outbound preface, request-header-block, HEADERS, DATA, and WINDOW_UPDATE
-frame scratch used by the client H2 driver, so the connection hot path keeps
-its fixed-capacity buffers in one explicit caller-owned storage object.
+the outbound preface, SETTINGS ACK, PING ACK, request-header-block, HEADERS,
+DATA, RST_STREAM, WINDOW_UPDATE, and plain-stream writer scratch used by the
+client H2 driver, so the connection hot path keeps its fixed-capacity buffers
+in one explicit caller-owned storage object.
 
 `H2Runtime` currently provides bounded helpers for:
 - client preface + initial SETTINGS emission

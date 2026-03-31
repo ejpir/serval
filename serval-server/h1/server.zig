@@ -837,6 +837,19 @@ pub fn Server(
         const H2_ERROR_PROTOCOL: u32 = 0x1;
         const H2_ERROR_INTERNAL: u32 = 0x2;
 
+        const H2InitialSettingsStorage = struct {
+            pending_request_headers_storage: [serval_h2.header_block_capacity_bytes]u8 = undefined,
+            request_header_storage: [serval_h2.request_stable_storage_size_bytes]u8 = undefined,
+            request_fields_storage: [config.MAX_HEADERS]serval_h2.HeaderField = undefined,
+            settings_buf: [h2_runtime.initial_settings_frame_buffer_size_bytes]u8 = undefined,
+        };
+
+        const H2InitialRequestStorage = struct {
+            request_header_storage: [serval_h2.request_stable_storage_size_bytes]u8 = undefined,
+            header_block_storage: [serval_h2.header_block_capacity_bytes]u8 = undefined,
+            request_fields_storage: [config.MAX_HEADERS]serval_h2.HeaderField = undefined,
+        };
+
         fn sendH2GoAway(
             maybe_tls: ?*const TLSStream,
             io: *Io,
@@ -863,14 +876,19 @@ pub fn Server(
             runtime_cfg: config.H2Config,
             io: *Io,
             stream: Io.net.Stream,
+            storage: *H2InitialSettingsStorage,
         ) bool {
             assert(@intFromPtr(io) != 0);
+            assert(@intFromPtr(storage) != 0);
             assert(stream.socket.handle >= 0);
 
-            var pending_request_headers_storage: [serval_h2.header_block_capacity_bytes]u8 = undefined;
-            var runtime = h2_runtime.Runtime.init(runtime_cfg, &pending_request_headers_storage) catch return false;
-            var settings_buf: [h2_runtime.initial_settings_frame_buffer_size_bytes]u8 = undefined;
-            const settings_frame = runtime.writeInitialSettingsFrame(&settings_buf) catch return false;
+            var runtime = h2_runtime.Runtime.init(
+                runtime_cfg,
+                &storage.pending_request_headers_storage,
+                &storage.request_header_storage,
+                &storage.request_fields_storage,
+            ) catch return false;
+            const settings_frame = runtime.writeInitialSettingsFrame(&storage.settings_buf) catch return false;
             connectionWrite(maybe_tls, io, stream, settings_frame) catch return false;
             return true;
         }
@@ -2437,18 +2455,26 @@ pub fn Server(
             };
             defer std.heap.page_allocator.destroy(hpack_decoder);
             hpack_decoder.* = serval_h2.HpackDecoder.init();
-            const initial_request_storage_buf = std.heap.page_allocator.alloc(u8, serval_h2.request_stable_storage_size_bytes) catch {
+            const initial_request_storage = std.heap.page_allocator.create(H2InitialRequestStorage) catch {
                 log.warn("server: conn={d} h2c initial-request storage allocation failed", .{connection_id});
                 sendH2GoAway(maybe_tls, io, stream, 0, H2_ERROR_INTERNAL);
                 return true;
             };
-            defer std.heap.page_allocator.free(initial_request_storage_buf);
+            defer std.heap.page_allocator.destroy(initial_request_storage);
+            const initial_settings_storage = std.heap.page_allocator.create(H2InitialSettingsStorage) catch {
+                log.warn("server: conn={d} h2c initial-settings storage allocation failed", .{connection_id});
+                sendH2GoAway(maybe_tls, io, stream, 0, H2_ERROR_INTERNAL);
+                return true;
+            };
+            defer std.heap.page_allocator.destroy(initial_settings_storage);
             var local_settings_already_sent = false;
             while (true) {
                 serval_h2.parseInitialRequestWithDecoderInto(
                     hpack_decoder,
                     recv_buf[0..buffer_len.*],
-                    initial_request_storage_buf,
+                    &initial_request_storage.header_block_storage,
+                    &initial_request_storage.request_fields_storage,
+                    &initial_request_storage.request_header_storage,
                     parsed,
                 ) catch |err| switch (err) {
                     error.NeedMoreData => {
@@ -2456,7 +2482,7 @@ pub fn Server(
                             buffer_len.* >= serval_h2.client_connection_preface.len and
                             serval_h2.looksLikeClientConnectionPreface(recv_buf[0..buffer_len.*]))
                         {
-                            if (!sendH2InitialSettings(maybe_tls, runtime_cfg, io, stream)) {
+                            if (!sendH2InitialSettings(maybe_tls, runtime_cfg, io, stream, initial_settings_storage)) {
                                 sendH2GoAway(maybe_tls, io, stream, 0, H2_ERROR_INTERNAL);
                                 return true;
                             }

@@ -222,6 +222,9 @@ The current h2 implementation is intentionally bounded and focused:
   buffer in [forwarder.zig](/home/nick/repos/serval/serval-proxy/forwarder.zig);
   configured H2 frame sizes may be larger, but this path will emit multiple
   smaller DATA frames rather than requiring a larger local scratch buffer
+- that raw `Upgrade: h2c` path now keeps its preamble, header-block, body, and
+  frame-header scratch under one explicit forwarder-owned h2c-upgrade scratch
+  bundle instead of rebuilding separate local arrays across helper calls
 - raw gRPC h2 tunnel relay now takes deploy-time `Config.h2` runtime policy for
   idle timeout and outbound DATA frame sizing, but the proxy forwarder still
   enforces its own bounded internal frame capacity (`64 KiB`) for that raw

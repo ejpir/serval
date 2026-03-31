@@ -96,8 +96,14 @@ Current responsibilities:
 | `InitialRequestError` | Request/initial parse errors |
 | `request_stable_storage_size_bytes` | Minimum caller-provided stable storage for decoded request strings |
 | `decodeRequestHeaderBlock(header_block, stream_id, storage_out)` | Decode request header block into caller-owned stable storage |
+| `decodeRequestHeaderBlockWithFieldStorage(header_block, stream_id, fields_buf, storage_out)` | Decode request block with fresh decoder, caller-owned decoded-field scratch, and stable storage |
 | `decodeRequestHeaderBlockWithDecoder(decoder, header_block, stream_id, storage_out)` | Decode request block with caller-owned decoder and stable storage |
+| `decodeRequestHeaderBlockWithDecoderAndFieldStorage(decoder, header_block, stream_id, fields_buf, storage_out)` | Decode request block with caller-owned decoder, decoded-field scratch, and stable storage |
 | `parseInitialRequest(input, storage_out)` | Parse initial request from prior-knowledge bytes into stable storage |
+| `parseInitialRequestWithStorage(input, header_block_storage, fields_buf, storage_out)` | Parse initial request with fresh decoder plus caller-owned header-block and decoded-field scratch |
+| `parseInitialRequestWithDecoderAndHeaderStorage(decoder, input, header_block_storage, storage_out)` | Parse initial request with caller-owned decoder and temporary header-block assembly storage |
+| `parseInitialRequestWithDecoderAndStorage(decoder, input, header_block_storage, fields_buf, storage_out)` | Parse initial request with caller-owned decoder, header-block scratch, decoded-field scratch, and stable storage |
+| `buildPriorKnowledgePreambleFromUpgradeWithHeaderStorage(out, request, path, settings, end_stream, header_block_storage)` | Build upgrade preamble with caller-owned temporary header-block storage |
 | `H2cUpgradeError` | h2c upgrade validation/build errors |
 | `looksLikeUpgradeRequest(request)` | Detect HTTP/1.1 `Upgrade: h2c` |
 | `validateUpgradeRequest(request)` | Strict upgrade request validation |
@@ -153,6 +159,14 @@ layers to:
 - accept and validate `Upgrade: h2c`
 - parse prior-knowledge h2 connections
 - translate upgrade requests into upstream prior-knowledge preambles
+
+The large temporary bootstrap buffers on those paths are caller-owned now.
+`request.zig` still keeps the tiny HEADERS/CONTINUATION assembly bookkeeping
+locally, but it no longer heap-allocates that parser state around the
+caller-provided header-block storage. The explicit request-decode and
+initial-request parse paths can now also keep the bounded temporary decoded
+`HeaderField[MAX_HEADERS]` scratch under caller control rather than allocating
+it inside the helper.
 
 ### Flow control and stream state
 

@@ -98,6 +98,12 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
 
     return struct {
         const Self = @This();
+        const H2cUpgradeScratch = struct {
+            preamble_buf: [H2C_UPGRADE_PREAMBLE_BUFFER_SIZE_BYTES]u8 = undefined,
+            header_block_storage: [serval_h2.header_block_capacity_bytes]u8 = undefined,
+            body_buf: [h2_proxy_frame_capacity_usize]u8 = undefined,
+            frame_header_buf: [serval_h2.frame_header_size_bytes]u8 = undefined,
+        };
 
         pool: *Pool,
         tracer: *Tracer,
@@ -783,19 +789,21 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             const remaining_body_bytes = content_length - body_info.bytes_already_read;
             const has_request_body = content_length > 0;
 
-            var preamble_buf: [H2C_UPGRADE_PREAMBLE_BUFFER_SIZE_BYTES]u8 = undefined;
-            const preamble = serval_h2.buildPriorKnowledgePreambleFromUpgrade(
-                &preamble_buf,
+            var h2c_upgrade_scratch = H2cUpgradeScratch{};
+            const preamble = serval_h2.buildPriorKnowledgePreambleFromUpgradeWithHeaderStorage(
+                h2c_upgrade_scratch.preamble_buf[0..],
                 request,
                 effective_path,
                 decoded_settings_payload,
                 !has_request_body,
+                h2c_upgrade_scratch.header_block_storage[0..],
             ) catch return ForwardError.UnsupportedProtocol;
             upstream_socket.write_all(preamble) catch return ForwardError.SendFailed;
 
             if (body_info.initial_body.len > 0) {
                 sendH2DataFrames(
                     &upstream_socket,
+                    &h2c_upgrade_scratch.frame_header_buf,
                     body_info.initial_body,
                     remaining_body_bytes == 0,
                     self.h2_cfg.max_frame_size_bytes,
@@ -810,6 +818,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
                 io,
                 &client_socket,
                 &upstream_socket,
+                &h2c_upgrade_scratch,
                 remaining_body_bytes,
                 initial_client_bytes_after_body,
             );
@@ -844,17 +853,26 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             io: Io,
             client_socket: *Socket,
             upstream_socket: *Socket,
+            h2c_upgrade_scratch: *H2cUpgradeScratch,
             remaining_body_bytes: u64,
             initial_client_bytes_after_body: []const u8,
         ) tunnel_mod.TunnelStats {
             assert(runtime_cfg.max_frame_size_bytes >= serval_h2.settings.min_max_frame_size_bytes);
             assert(runtime_cfg.max_frame_size_bytes <= serval_h2.settings.max_max_frame_size_bytes);
             assert(runtime_cfg.tunnel_idle_timeout_ns > 0);
+            assert(@intFromPtr(h2c_upgrade_scratch) != 0);
             const start_ns = time.monotonicNanos();
             var stats = tunnel_mod.TunnelStats{};
 
             if (remaining_body_bytes > 0) {
-                if (streamGrpcH2cUpgradeBody(client_socket, upstream_socket, remaining_body_bytes, runtime_cfg.max_frame_size_bytes, &stats.client_to_upstream_bytes)) |termination| {
+                if (streamGrpcH2cUpgradeBody(
+                    client_socket,
+                    upstream_socket,
+                    h2c_upgrade_scratch,
+                    remaining_body_bytes,
+                    runtime_cfg.max_frame_size_bytes,
+                    &stats.client_to_upstream_bytes,
+                )) |termination| {
                     stats.duration_ns = @intCast(time.elapsedNanos(start_ns, time.monotonicNanos()));
                     stats.termination = termination;
                     return stats;
@@ -880,6 +898,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
         fn streamGrpcH2cUpgradeBody(
             client_socket: *Socket,
             upstream_socket: *Socket,
+            h2c_upgrade_scratch: *H2cUpgradeScratch,
             remaining_body_bytes: u64,
             max_frame_size_bytes: u32,
             counter_bytes: *u64,
@@ -887,19 +906,24 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             assert(remaining_body_bytes > 0);
             assert(max_frame_size_bytes >= serval_h2.settings.min_max_frame_size_bytes);
             assert(max_frame_size_bytes <= serval_h2.settings.max_max_frame_size_bytes);
-
-            var body_buf: [h2_proxy_frame_capacity_usize]u8 = undefined;
+            assert(@intFromPtr(h2c_upgrade_scratch) != 0);
             var remaining = remaining_body_bytes;
 
             while (remaining > 0) {
                 const to_read: usize = @intCast(@min(remaining, @as(u64, effectiveProxyH2DataChunkSizeBytes(max_frame_size_bytes))));
-                const bytes_read = client_socket.read(body_buf[0..to_read]) catch |err| {
+                const bytes_read = client_socket.read(h2c_upgrade_scratch.body_buf[0..to_read]) catch |err| {
                     return mapClientReadTermination(err);
                 };
                 if (bytes_read == 0) return .client_closed;
 
                 const end_stream = remaining == bytes_read;
-                sendH2DataFrames(upstream_socket, body_buf[0..bytes_read], end_stream, max_frame_size_bytes) catch |err| {
+                sendH2DataFrames(
+                    upstream_socket,
+                    &h2c_upgrade_scratch.frame_header_buf,
+                    h2c_upgrade_scratch.body_buf[0..bytes_read],
+                    end_stream,
+                    max_frame_size_bytes,
+                ) catch |err| {
                     return mapUpstreamWriteTermination(err);
                 };
                 counter_bytes.* += bytes_read;
@@ -911,14 +935,16 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
 
         fn sendH2DataFrames(
             upstream_socket: *Socket,
+            frame_header_buf: *[serval_h2.frame_header_size_bytes]u8,
             payload: []const u8,
             end_stream: bool,
             max_frame_size_bytes: u32,
         ) serval_socket.SocketError!void {
             assert(max_frame_size_bytes >= serval_h2.settings.min_max_frame_size_bytes);
             assert(max_frame_size_bytes <= serval_h2.settings.max_max_frame_size_bytes);
+            assert(@intFromPtr(frame_header_buf) != 0);
             if (payload.len == 0) {
-                if (end_stream) try sendH2Frame(upstream_socket, .data, serval_h2.flags_end_stream, H2C_UPGRADE_STREAM_ID, &[_]u8{});
+                if (end_stream) try sendH2Frame(upstream_socket, frame_header_buf, .data, serval_h2.flags_end_stream, H2C_UPGRADE_STREAM_ID, &[_]u8{});
                 return;
             }
 
@@ -930,7 +956,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
                 const chunk = payload[cursor .. cursor + chunk_len];
                 const is_last_chunk = cursor + chunk_len == payload.len;
                 const flags: u8 = if (end_stream and is_last_chunk) serval_h2.flags_end_stream else 0;
-                try sendH2Frame(upstream_socket, .data, flags, H2C_UPGRADE_STREAM_ID, chunk);
+                try sendH2Frame(upstream_socket, frame_header_buf, .data, flags, H2C_UPGRADE_STREAM_ID, chunk);
                 cursor += chunk_len;
             }
         }
@@ -944,13 +970,14 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
 
         fn sendH2Frame(
             upstream_socket: *Socket,
+            frame_header_buf: *[serval_h2.frame_header_size_bytes]u8,
             frame_type: serval_h2.FrameType,
             flags: u8,
             stream_id: u32,
             payload: []const u8,
         ) serval_socket.SocketError!void {
-            var header_buf: [serval_h2.frame_header_size_bytes]u8 = undefined;
-            const header = buildProxyH2FrameHeader(&header_buf, .{
+            assert(@intFromPtr(frame_header_buf) != 0);
+            const header = buildProxyH2FrameHeader(frame_header_buf, .{
                 .length = @intCast(payload.len),
                 .frame_type = frame_type,
                 .flags = flags,

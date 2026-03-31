@@ -37,9 +37,13 @@ pub const ConnectionStorage = struct {
     pending_response_headers_storage: [h2.header_block_capacity_bytes]u8 = undefined,
     request_header_block_buf: [h2.header_block_capacity_bytes]u8 = undefined,
     recv_buf: [read_buffer_size_bytes]u8 = undefined,
+    plain_write_buf: [config.STREAM_WRITE_BUFFER_SIZE_BYTES]u8 = undefined,
     preface_settings_buf: [preface_settings_buffer_size_bytes]u8 = undefined,
+    settings_ack_buf: [h2.frame_header_size_bytes]u8 = undefined,
+    ping_ack_buf: [h2.frame_header_size_bytes + h2.control.ping_payload_size_bytes]u8 = undefined,
     request_headers_frame_buf: [request_headers_frame_buffer_size_bytes]u8 = undefined,
     data_frame_buf: [data_frame_buffer_size_bytes]u8 = undefined,
+    rst_stream_buf: [h2.frame_header_size_bytes + h2.control.rst_stream_payload_size_bytes]u8 = undefined,
     conn_window_update_buf: [window_update_frame_size_bytes]u8 = undefined,
     stream_window_update_buf: [window_update_frame_size_bytes]u8 = undefined,
 };
@@ -71,9 +75,13 @@ pub const ClientConnection = struct {
     pending_response_headers_storage: []u8,
     request_header_block_buf: []u8,
     recv_buf: []u8,
+    plain_write_buf: []u8,
     preface_settings_buf: []u8,
+    settings_ack_buf: []u8,
+    ping_ack_buf: []u8,
     request_headers_frame_buf: []u8,
     data_frame_buf: []u8,
+    rst_stream_buf: []u8,
     conn_window_update_buf: []u8,
     stream_window_update_buf: []u8,
     recv_len: usize = 0,
@@ -109,9 +117,13 @@ pub const ClientConnection = struct {
         assert(storage.pending_response_headers_storage.len >= runtime_cfg.max_header_block_size_bytes);
         assert(storage.request_header_block_buf.len >= runtime_cfg.max_header_block_size_bytes);
         assert(storage.recv_buf.len == read_buffer_size_bytes);
+        assert(storage.plain_write_buf.len == config.STREAM_WRITE_BUFFER_SIZE_BYTES);
         assert(storage.preface_settings_buf.len == preface_settings_buffer_size_bytes);
+        assert(storage.settings_ack_buf.len == h2.frame_header_size_bytes);
+        assert(storage.ping_ack_buf.len == h2.frame_header_size_bytes + h2.control.ping_payload_size_bytes);
         assert(storage.request_headers_frame_buf.len == request_headers_frame_buffer_size_bytes);
         assert(storage.data_frame_buf.len == data_frame_buffer_size_bytes);
+        assert(storage.rst_stream_buf.len == h2.frame_header_size_bytes + h2.control.rst_stream_payload_size_bytes);
         assert(storage.conn_window_update_buf.len == window_update_frame_size_bytes);
         assert(storage.stream_window_update_buf.len == window_update_frame_size_bytes);
 
@@ -123,9 +135,13 @@ pub const ClientConnection = struct {
             .pending_response_headers_storage = &storage.pending_response_headers_storage,
             .request_header_block_buf = &storage.request_header_block_buf,
             .recv_buf = &storage.recv_buf,
+            .plain_write_buf = &storage.plain_write_buf,
             .preface_settings_buf = &storage.preface_settings_buf,
+            .settings_ack_buf = &storage.settings_ack_buf,
+            .ping_ack_buf = &storage.ping_ack_buf,
             .request_headers_frame_buf = &storage.request_headers_frame_buf,
             .data_frame_buf = &storage.data_frame_buf,
+            .rst_stream_buf = &storage.rst_stream_buf,
             .conn_window_update_buf = &storage.conn_window_update_buf,
             .stream_window_update_buf = &storage.stream_window_update_buf,
         };
@@ -151,8 +167,7 @@ pub const ClientConnection = struct {
         assert(@intFromPtr(self) != 0);
         assert(self.runtime.state.peer_settings_ack_pending);
 
-        var out: [h2.frame_header_size_bytes]u8 = undefined;
-        const frame = try self.runtime.writePendingSettingsAck(&out);
+        const frame = try self.runtime.writePendingSettingsAck(self.settings_ack_buf);
         try self.writeAll(frame);
     }
 
@@ -166,9 +181,8 @@ pub const ClientConnection = struct {
         assert(@intFromPtr(self) != 0);
         assert(h2.control.ping_payload_size_bytes == 8);
 
-        var out: [h2.frame_header_size_bytes + h2.control.ping_payload_size_bytes]u8 = undefined;
-        const frame = try runtime_mod.Runtime.writePingAckFrame(&out, opaque_data);
-        assert(frame.len == out.len);
+        const frame = try runtime_mod.Runtime.writePingAckFrame(self.ping_ack_buf, opaque_data);
+        assert(frame.len == self.ping_ack_buf.len);
         try self.writeAll(frame);
     }
 
@@ -382,8 +396,7 @@ pub const ClientConnection = struct {
         assert(@intFromPtr(self) != 0);
         assert(stream_id > 0);
 
-        var out: [h2.frame_header_size_bytes + h2.control.rst_stream_payload_size_bytes]u8 = undefined;
-        const frame = try self.runtime.writeRstStreamFrame(&out, .{
+        const frame = try self.runtime.writeRstStreamFrame(self.rst_stream_buf, .{
             .stream_id = stream_id,
             .error_code_raw = error_code_raw,
         });
@@ -587,8 +600,7 @@ pub const ClientConnection = struct {
         switch (self.socket.*) {
             .plain => |plain| {
                 if (self.io) |io| {
-                    var write_buf: [config.STREAM_WRITE_BUFFER_SIZE_BYTES]u8 = undefined;
-                    var writer = rawStreamForFd(plain.fd).writer(io, &write_buf);
+                    var writer = rawStreamForFd(plain.fd).writer(io, self.plain_write_buf);
                     writer.interface.writeAll(data) catch return mapIoWriteError(writer.err orelse error.WriteFailed);
                     writer.interface.flush() catch return mapIoWriteError(writer.err orelse error.WriteFailed);
                     return;

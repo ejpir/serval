@@ -280,24 +280,51 @@ pub const request_stable_storage_size_bytes = request.request_stable_storage_siz
 /// Use this when decoder state does not need to be reused across requests.
 /// The same bounds apply: `stream_id` must be non-zero, the header block must fit within the configured limit, and stable request storage must be available.
 pub const decodeRequestHeaderBlock = request.decodeRequestHeaderBlock;
+/// Convenience wrapper around `decodeRequestHeaderBlockWithDecoderAndFieldStorage` that creates a
+/// fresh HPACK decoder while still using caller-owned decoded-field scratch.
+/// Use this when decoder state does not need to persist but hidden helper-local `HeaderField`
+/// storage is still undesirable.
+pub const decodeRequestHeaderBlockWithFieldStorage = request.decodeRequestHeaderBlockWithFieldStorage;
 /// Decodes an HPACK request header block using a caller-supplied decoder instance.
 /// `decoder` must be valid, `stream_id` must be non-zero, and `header_block` must fit within the configured header-block limit.
 /// `request_storage_out` must be large enough for stable header and path storage, or the call fails with `error.StableStorageTooSmall`.
 /// Header names must already be lowercase and pseudo-headers must satisfy HTTP/2 request rules.
 /// Slices stored in the returned request reference `request_storage_out` and remain valid until that storage is overwritten or reused.
 pub const decodeRequestHeaderBlockWithDecoder = request.decodeRequestHeaderBlockWithDecoder;
+/// Decodes an HPACK request header block using caller-owned decoder state plus caller-owned
+/// temporary `HeaderField` storage.
+/// Use this variant when the caller wants the bounded decoded-field scratch under explicit owner
+/// control instead of relying on helper-local storage.
+pub const decodeRequestHeaderBlockWithDecoderAndFieldStorage = request.decodeRequestHeaderBlockWithDecoderAndFieldStorage;
 /// Parses the client connection preface and initial HTTP/2 frames for the first request.
 /// Returns an `InitialRequest` once the request header block has been fully assembled and decoded.
 /// `input` must begin with the HTTP/2 client preface prefix, and the first frame after the preface must be a SETTINGS frame.
 /// The returned request uses slices backed by `request_storage_out`; those slices remain valid only while that storage is intact.
 /// Incomplete input returns `error.NeedMoreData`, and `consumed_bytes` reports how far parsing advanced.
 pub const parseInitialRequest = request.parseInitialRequest;
+/// Parses the initial client preface and request sequence using a fresh HPACK decoder plus
+/// caller-owned header-block assembly storage and decoded-field scratch.
+/// Use this variant when the caller wants explicit control over bounded bootstrap scratch without
+/// retaining decoder state between calls.
+pub const parseInitialRequestWithStorage = request.parseInitialRequestWithStorage;
 /// Parses the client connection preface and initial HTTP/2 frames for the first request using a caller-owned HPACK decoder.
 /// Use this variant when the caller wants to keep the large decoder object off a constrained stack.
 /// The same input, storage, and lifetime rules as `parseInitialRequest` apply.
 pub const parseInitialRequestWithDecoder = request.parseInitialRequestWithDecoder;
+/// Parses the initial client preface and request using caller-owned HPACK decoder plus caller-owned
+/// HEADERS/CONTINUATION assembly scratch storage.
+/// Use this variant when both decoder state and temporary header-block assembly storage need to stay
+/// under explicit owner control.
+pub const parseInitialRequestWithDecoderAndHeaderStorage = request.parseInitialRequestWithDecoderAndHeaderStorage;
+/// Parses the initial client preface and request using caller-owned HPACK decoder, temporary
+/// header-block assembly storage, and decoded-field scratch.
+/// Use this variant when the caller wants full control over all bounded temporary storage on the
+/// bootstrap parse path rather than relying on helper-local `HeaderField[MAX_HEADERS]` storage.
+pub const parseInitialRequestWithDecoderAndStorage = request.parseInitialRequestWithDecoderAndStorage;
 /// Parses the initial client preface and request into caller-owned output storage.
 /// Use this variant on constrained stacks to avoid returning `InitialRequest` by value through nested parser frames.
+/// The caller also supplies the temporary HEADERS/CONTINUATION assembly buffer and decoded-field
+/// scratch so the bootstrap parse path does not allocate hidden helper storage.
 pub const parseInitialRequestWithDecoderInto = request.parseInitialRequestWithDecoderInto;
 
 /// Namespace for HTTP/2 upgrade helpers and the h2c request-to-preface bridge.
@@ -331,6 +358,9 @@ pub const buildUpgradeResponse = upgrade.buildUpgradeResponse;
 /// Returned slices alias `out`; the function does not allocate.
 /// Returns errors for missing request data, oversized output, or invalid frame/header construction.
 pub const buildPriorKnowledgePreambleFromUpgrade = upgrade.buildPriorKnowledgePreambleFromUpgrade;
+/// Builds an HTTP/2 prior-knowledge preamble from an upgrade request using caller-owned temporary
+/// HEADERS encoding storage.
+pub const buildPriorKnowledgePreambleFromUpgradeWithHeaderStorage = upgrade.buildPriorKnowledgePreambleFromUpgradeWithHeaderStorage;
 /// Fixed `101 Switching Protocols` response used for a successful h2c handshake.
 /// Contains `Connection: Upgrade` and `Upgrade: h2c` with the terminating CRLF sequence.
 /// This constant owns no memory and can be copied directly into an output buffer.

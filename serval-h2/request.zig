@@ -43,7 +43,7 @@ const HeaderAssembly = struct {
     stream_id: u32 = 0,
     continuation_frames: u8 = 0,
     block_len: u32 = 0,
-    block_buf: [limits.header_block_capacity_bytes]u8 = undefined,
+    block_buf: []u8 = &.{},
 };
 
 const priority_field_size_bytes: u32 = 5;
@@ -99,6 +99,26 @@ pub fn parseInitialRequest(input: []const u8, request_storage_out: []u8) Error!I
     return parseInitialRequestWithDecoder(&decoder, input, request_storage_out);
 }
 
+/// Parses the client connection preface and initial HTTP/2 frame sequence using a fresh decoder
+/// plus caller-owned header-block assembly storage and decoded-field scratch.
+/// Use this variant when the caller wants explicit ownership of all bounded temporary parse storage
+/// without retaining decoder state across calls.
+pub fn parseInitialRequestWithStorage(
+    input: []const u8,
+    header_block_storage: []u8,
+    fields_buf: []hpack.HeaderField,
+    request_storage_out: []u8,
+) Error!InitialRequest {
+    var decoder = hpack.Decoder.init();
+    return parseInitialRequestWithDecoderAndStorage(
+        &decoder,
+        input,
+        header_block_storage,
+        fields_buf,
+        request_storage_out,
+    );
+}
+
 /// Parses the client connection preface and the initial HTTP/2 frame sequence using a caller-owned HPACK decoder.
 /// Returns an `InitialRequest` once the request header block has been fully assembled and decoded.
 /// `decoder` retains dynamic-table state across calls, so callers can keep it alive when they want to avoid constructing a large decoder on a small stack.
@@ -108,14 +128,69 @@ pub fn parseInitialRequestWithDecoder(
     input: []const u8,
     request_storage_out: []u8,
 ) Error!InitialRequest {
+    var header_block_storage: [limits.header_block_capacity_bytes]u8 = undefined;
+    var fields_buf: [config.MAX_HEADERS]hpack.HeaderField = undefined;
+    return parseInitialRequestWithDecoderAndStorage(
+        decoder,
+        input,
+        &header_block_storage,
+        &fields_buf,
+        request_storage_out,
+    );
+}
+
+/// Parses the client connection preface and initial HTTP/2 frame sequence using caller-owned HPACK
+/// decoder and header-block assembly storage.
+/// This lets constrained callers keep both the large decoder and the temporary HEADERS/CONTINUATION
+/// scratch buffer out of nested parser frames.
+pub fn parseInitialRequestWithDecoderAndHeaderStorage(
+    decoder: *hpack.Decoder,
+    input: []const u8,
+    header_block_storage: []u8,
+    request_storage_out: []u8,
+) Error!InitialRequest {
+    var fields_buf: [config.MAX_HEADERS]hpack.HeaderField = undefined;
+    return parseInitialRequestWithDecoderAndStorage(
+        decoder,
+        input,
+        header_block_storage,
+        &fields_buf,
+        request_storage_out,
+    );
+}
+
+/// Parses the client connection preface and initial HTTP/2 frame sequence using caller-owned HPACK
+/// decoder, header-block assembly storage, and decoded-field scratch.
+/// Use this variant when the caller wants full control over both the temporary HEADERS/CONTINUATION
+/// assembly buffer and the bounded decoded `HeaderField[MAX_HEADERS]` scratch.
+pub fn parseInitialRequestWithDecoderAndStorage(
+    decoder: *hpack.Decoder,
+    input: []const u8,
+    header_block_storage: []u8,
+    fields_buf: []hpack.HeaderField,
+    request_storage_out: []u8,
+) Error!InitialRequest {
     var initial_request: InitialRequest = undefined;
-    try parseInitialRequestWithDecoderInto(decoder, input, request_storage_out, &initial_request);
+    try parseInitialRequestWithDecoderInto(
+        decoder,
+        input,
+        header_block_storage,
+        fields_buf,
+        request_storage_out,
+        &initial_request,
+    );
     return initial_request;
 }
 
+/// Parses the initial client preface and request sequence into caller-owned output storage.
+/// This is the most explicit bootstrap variant: the caller owns the decoder, temporary
+/// HEADERS/CONTINUATION assembly storage, temporary decoded `HeaderField[MAX_HEADERS]` scratch,
+/// and stable request storage used by the returned slices.
 pub fn parseInitialRequestWithDecoderInto(
     decoder: *hpack.Decoder,
     input: []const u8,
+    header_block_storage: []u8,
+    fields_buf: []hpack.HeaderField,
     request_storage_out: []u8,
     initial_request_out: *InitialRequest,
 ) Error!void {
@@ -123,6 +198,9 @@ pub fn parseInitialRequestWithDecoderInto(
     assert(@intFromPtr(initial_request_out) != 0);
     assert(input.len > 0);
     assert(preface.client_connection_preface.len > 0);
+    assert(header_block_storage.len <= limits.header_block_capacity_bytes);
+    assert(fields_buf.len >= config.MAX_HEADERS);
+    if (header_block_storage.len < limits.header_block_capacity_bytes) return error.HeadersTooLarge;
     if (request_storage_out.len < request_stable_storage_size_bytes) return error.StableStorageTooSmall;
 
     if (!preface.looksLikeClientConnectionPrefacePrefix(input)) return error.InvalidPreface;
@@ -132,9 +210,9 @@ pub fn parseInitialRequestWithDecoderInto(
 
     var cursor: usize = preface.client_connection_preface.len;
     var frames_seen: u32 = 0;
-    const header_assembly = std.heap.page_allocator.create(HeaderAssembly) catch return error.StableStorageTooSmall;
-    defer std.heap.page_allocator.destroy(header_assembly);
-    header_assembly.* = .{};
+    var header_assembly = HeaderAssembly{
+        .block_buf = header_block_storage,
+    };
 
     while (cursor < input.len and frames_seen < limits.max_initial_parse_frames) : (frames_seen += 1) {
         if (cursor + frame.frame_header_size_bytes > input.len) return error.NeedMoreData;
@@ -157,7 +235,8 @@ pub fn parseInitialRequestWithDecoderInto(
             payload,
             frames_seen,
             payload_end,
-            header_assembly,
+            &header_assembly,
+            fields_buf,
             request_storage_out,
             initial_request_out,
         );
@@ -180,12 +259,14 @@ fn parseInitialFrameInto(
     frames_seen: u32,
     payload_end: usize,
     header_assembly: *HeaderAssembly,
+    fields_buf: []hpack.HeaderField,
     request_storage_out: []u8,
     initial_request_out: *InitialRequest,
 ) Error!bool {
     assert(@intFromPtr(decoder) != 0);
     assert(@intFromPtr(header_assembly) != 0);
     assert(@intFromPtr(initial_request_out) != 0);
+    assert(fields_buf.len >= config.MAX_HEADERS);
     assert(payload_end >= payload.len);
 
     if (header_assembly.active and header.frame_type != .continuation) return error.InvalidFrame;
@@ -205,6 +286,7 @@ fn parseInitialFrameInto(
                 payload,
                 payload_end,
                 header_assembly,
+                fields_buf,
                 request_storage_out,
                 initial_request_out,
             );
@@ -216,6 +298,7 @@ fn parseInitialFrameInto(
                 payload,
                 payload_end,
                 header_assembly,
+                fields_buf,
                 request_storage_out,
                 initial_request_out,
             );
@@ -250,6 +333,7 @@ fn handleInitialHeadersFrameInto(
     payload: []const u8,
     payload_end: usize,
     header_assembly: *HeaderAssembly,
+    fields_buf: []hpack.HeaderField,
     request_storage_out: []u8,
     initial_request_out: *InitialRequest,
 ) Error!bool {
@@ -257,6 +341,7 @@ fn handleInitialHeadersFrameInto(
     assert(header.frame_type == .headers);
     assert(@intFromPtr(header_assembly) != 0);
     assert(@intFromPtr(initial_request_out) != 0);
+    assert(fields_buf.len >= config.MAX_HEADERS);
 
     if (header.stream_id == 0) return error.InvalidStreamId;
     if ((header.stream_id & 1) == 0) return error.InvalidStreamId;
@@ -276,6 +361,7 @@ fn handleInitialHeadersFrameInto(
             header_fragment,
             header.stream_id,
             @intCast(payload_end),
+            fields_buf,
             request_storage_out,
             initial_request_out,
         );
@@ -287,7 +373,7 @@ fn handleInitialHeadersFrameInto(
     header_assembly.stream_id = header.stream_id;
     header_assembly.continuation_frames = 0;
     header_assembly.block_len = 0;
-    try appendHeaderFragment(&header_assembly.block_buf, &header_assembly.block_len, header_fragment);
+    try appendHeaderFragment(header_assembly.block_buf, &header_assembly.block_len, header_fragment);
     return false;
 }
 
@@ -297,6 +383,7 @@ fn handleInitialContinuationFrameInto(
     payload: []const u8,
     payload_end: usize,
     header_assembly: *HeaderAssembly,
+    fields_buf: []hpack.HeaderField,
     request_storage_out: []u8,
     initial_request_out: *InitialRequest,
 ) Error!bool {
@@ -304,6 +391,7 @@ fn handleInitialContinuationFrameInto(
     assert(header.frame_type == .continuation);
     assert(@intFromPtr(header_assembly) != 0);
     assert(@intFromPtr(initial_request_out) != 0);
+    assert(fields_buf.len >= config.MAX_HEADERS);
 
     if (!header_assembly.active) return error.UnsupportedContinuation;
     if (header.stream_id != header_assembly.stream_id) return error.InvalidStreamId;
@@ -311,7 +399,7 @@ fn handleInitialContinuationFrameInto(
     if (header_assembly.continuation_frames >= limits.max_continuation_frames) return error.TooManyFrames;
 
     header_assembly.continuation_frames += 1;
-    try appendHeaderFragment(&header_assembly.block_buf, &header_assembly.block_len, payload);
+    try appendHeaderFragment(header_assembly.block_buf, &header_assembly.block_len, payload);
     if ((header.flags & frame.flags_end_headers) == 0) return false;
 
     const block_len: usize = @intCast(header_assembly.block_len);
@@ -320,6 +408,7 @@ fn handleInitialContinuationFrameInto(
         header_assembly.block_buf[0..block_len],
         header_assembly.stream_id,
         @intCast(payload_end),
+        fields_buf,
         request_storage_out,
         initial_request_out,
     );
@@ -328,15 +417,16 @@ fn handleInitialContinuationFrameInto(
 }
 
 fn appendHeaderFragment(
-    buf: *[limits.header_block_capacity_bytes]u8,
+    buf: []u8,
     len: *u32,
     fragment: []const u8,
 ) Error!void {
     assert(@intFromPtr(len) != 0);
+    assert(buf.len <= limits.header_block_capacity_bytes);
     const current_len: usize = @intCast(len.*);
-    assert(current_len <= limits.header_block_capacity_bytes);
+    assert(current_len <= buf.len);
 
-    if (fragment.len > limits.header_block_capacity_bytes - current_len) return error.HeadersTooLarge;
+    if (fragment.len > buf.len - current_len) return error.HeadersTooLarge;
     @memcpy(buf[current_len .. current_len + fragment.len], fragment);
     len.* = @intCast(current_len + fragment.len);
 }
@@ -349,11 +439,13 @@ fn buildInitialRequest(
     request_storage_out: []u8,
 ) Error!InitialRequest {
     var initial_request: InitialRequest = undefined;
+    var fields_buf: [config.MAX_HEADERS]hpack.HeaderField = undefined;
     try buildInitialRequestInto(
         decoder,
         header_block,
         stream_id,
         consumed_bytes,
+        &fields_buf,
         request_storage_out,
         &initial_request,
     );
@@ -365,6 +457,7 @@ fn buildInitialRequestInto(
     header_block: []const u8,
     stream_id: u32,
     consumed_bytes: u32,
+    fields_buf: []hpack.HeaderField,
     request_storage_out: []u8,
     initial_request_out: *InitialRequest,
 ) Error!void {
@@ -372,6 +465,7 @@ fn buildInitialRequestInto(
     assert(@intFromPtr(initial_request_out) != 0);
     assert(header_block.len <= limits.header_block_capacity_bytes);
     assert(stream_id > 0);
+    assert(fields_buf.len >= config.MAX_HEADERS);
     if (request_storage_out.len < request_stable_storage_size_bytes) return error.StableStorageTooSmall;
 
     log.debug(
@@ -384,6 +478,7 @@ fn buildInitialRequestInto(
     try decodeRequestHeaderBlockWithDecoderIntoRequest(
         decoder,
         header_block,
+        fields_buf,
         request_storage_out,
         &initial_request_out.request,
     );
@@ -406,6 +501,29 @@ pub fn decodeRequestHeaderBlock(
 
     var decoder = hpack.Decoder.init();
     return decodeRequestHeaderBlockWithDecoder(&decoder, header_block, stream_id, request_storage_out);
+}
+
+/// Decodes an HPACK request header block using a fresh decoder instance plus caller-owned
+/// temporary decoded-field storage.
+/// Use this variant when decoder state does not need to be reused but the caller still wants
+/// explicit ownership of the bounded `HeaderField[MAX_HEADERS]` scratch.
+pub fn decodeRequestHeaderBlockWithFieldStorage(
+    header_block: []const u8,
+    stream_id: u32,
+    fields_buf: []hpack.HeaderField,
+    request_storage_out: []u8,
+) Error!RequestHead {
+    assert(header_block.len <= limits.header_block_capacity_bytes);
+    assert(stream_id > 0);
+
+    var decoder = hpack.Decoder.init();
+    return decodeRequestHeaderBlockWithDecoderAndFieldStorage(
+        &decoder,
+        header_block,
+        stream_id,
+        fields_buf,
+        request_storage_out,
+    );
 }
 
 const HeaderDecodeState = struct {
@@ -434,11 +552,33 @@ pub fn decodeRequestHeaderBlockWithDecoder(
     stream_id: u32,
     request_storage_out: []u8,
 ) Error!RequestHead {
+    var fields_buf: [config.MAX_HEADERS]hpack.HeaderField = undefined;
+    return decodeRequestHeaderBlockWithDecoderAndFieldStorage(
+        decoder,
+        header_block,
+        stream_id,
+        &fields_buf,
+        request_storage_out,
+    );
+}
+
+/// Decodes an HPACK request header block into a zero-copy `RequestHead` using caller-owned
+/// temporary decoded-field storage.
+/// Use this variant when the caller wants the bounded `HeaderField[MAX_HEADERS]` scratch under
+/// explicit owner control instead of relying on helper-local storage.
+pub fn decodeRequestHeaderBlockWithDecoderAndFieldStorage(
+    decoder: *hpack.Decoder,
+    header_block: []const u8,
+    stream_id: u32,
+    fields_buf: []hpack.HeaderField,
+    request_storage_out: []u8,
+) Error!RequestHead {
     var head: RequestHead = undefined;
     try decodeRequestHeaderBlockWithDecoderInto(
         decoder,
         header_block,
         stream_id,
+        fields_buf,
         request_storage_out,
         &head,
     );
@@ -449,6 +589,7 @@ pub fn decodeRequestHeaderBlockWithDecoderInto(
     decoder: *hpack.Decoder,
     header_block: []const u8,
     stream_id: u32,
+    fields_buf: []hpack.HeaderField,
     request_storage_out: []u8,
     head_out: *RequestHead,
 ) Error!void {
@@ -456,12 +597,14 @@ pub fn decodeRequestHeaderBlockWithDecoderInto(
     assert(@intFromPtr(head_out) != 0);
     assert(header_block.len <= limits.header_block_capacity_bytes);
     assert(stream_id > 0);
+    assert(fields_buf.len >= config.MAX_HEADERS);
     if (request_storage_out.len < request_stable_storage_size_bytes) return error.StableStorageTooSmall;
 
     head_out.stream_id = stream_id;
     try decodeRequestHeaderBlockWithDecoderIntoRequest(
         decoder,
         header_block,
+        fields_buf,
         request_storage_out,
         &head_out.request,
     );
@@ -470,12 +613,14 @@ pub fn decodeRequestHeaderBlockWithDecoderInto(
 fn decodeRequestHeaderBlockWithDecoderIntoRequest(
     decoder: *hpack.Decoder,
     header_block: []const u8,
+    fields_buf: []hpack.HeaderField,
     request_storage_out: []u8,
     request_out: *Request,
 ) Error!void {
     assert(@intFromPtr(decoder) != 0);
     assert(@intFromPtr(request_out) != 0);
     assert(header_block.len <= limits.header_block_capacity_bytes);
+    assert(fields_buf.len >= config.MAX_HEADERS);
     if (request_storage_out.len < request_stable_storage_size_bytes) return error.StableStorageTooSmall;
 
     log.debug(
@@ -483,16 +628,8 @@ fn decodeRequestHeaderBlockWithDecoderIntoRequest(
         .{header_block.len},
     );
 
-    const fields_buf = std.heap.page_allocator.alloc(hpack.HeaderField, config.MAX_HEADERS) catch {
-        return error.StableStorageTooSmall;
-    };
-    defer std.heap.page_allocator.free(fields_buf);
-    const fields = try decoder.decodeHeaderBlock(header_block, fields_buf);
+    const fields = try decoder.decodeHeaderBlock(header_block, fields_buf[0..config.MAX_HEADERS]);
 
-    const state = std.heap.page_allocator.create(HeaderDecodeState) catch {
-        return error.StableStorageTooSmall;
-    };
-    defer std.heap.page_allocator.destroy(state);
     request_out.* = .{
         .method = .GET,
         .path = "",
@@ -500,7 +637,7 @@ fn decodeRequestHeaderBlockWithDecoderIntoRequest(
         .headers = HeaderMap.init(),
         .body = null,
     };
-    state.* = .{
+    var state = HeaderDecodeState{
         .request = request_out,
     };
 
@@ -512,18 +649,18 @@ fn decodeRequestHeaderBlockWithDecoderIntoRequest(
         if (!isHeaderNameLowercase(field.name)) return error.InvalidHeaderName;
 
         if (field.name.len > 0 and field.name[0] == ':') {
-            try decodePseudoHeader(state, field, request_storage_out);
+            try decodePseudoHeader(&state, field, request_storage_out);
             continue;
         }
 
-        try decodeRegularHeader(state, field, request_storage_out);
+        try decodeRegularHeader(&state, field, request_storage_out);
     }
 
     log.debug(
         "h2 request: validating request method_found={} path_found={} scheme_found={} authority_found={} protocol_found={}",
         .{ state.method_found, state.path_found, state.scheme_found, state.authority_found, state.protocol_found },
     );
-    try validateDecodedRequestState(state);
+    try validateDecodedRequestState(&state);
     log.debug("h2 request: request validation complete", .{});
 }
 
