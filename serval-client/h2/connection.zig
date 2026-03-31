@@ -35,7 +35,13 @@ const local_data_frame_payload_capacity_bytes: u32 = h2.frame_payload_capacity_b
 /// Keep this storage alive for at least as long as the associated connection.
 pub const ConnectionStorage = struct {
     pending_response_headers_storage: [h2.header_block_capacity_bytes]u8 = undefined,
+    request_header_block_buf: [h2.header_block_capacity_bytes]u8 = undefined,
     recv_buf: [read_buffer_size_bytes]u8 = undefined,
+    preface_settings_buf: [preface_settings_buffer_size_bytes]u8 = undefined,
+    request_headers_frame_buf: [request_headers_frame_buffer_size_bytes]u8 = undefined,
+    data_frame_buf: [data_frame_buffer_size_bytes]u8 = undefined,
+    conn_window_update_buf: [window_update_frame_size_bytes]u8 = undefined,
+    stream_window_update_buf: [window_update_frame_size_bytes]u8 = undefined,
 };
 
 /// Errors returned by HTTP/2 client connection setup and frame I/O.
@@ -63,7 +69,13 @@ pub const ClientConnection = struct {
     io: ?Io = null,
     runtime: runtime_mod.Runtime,
     pending_response_headers_storage: []u8,
+    request_header_block_buf: []u8,
     recv_buf: []u8,
+    preface_settings_buf: []u8,
+    request_headers_frame_buf: []u8,
+    data_frame_buf: []u8,
+    conn_window_update_buf: []u8,
+    stream_window_update_buf: []u8,
     recv_len: usize = 0,
     pending_discard_len: usize = 0,
     frame_count: u32 = 0,
@@ -95,7 +107,13 @@ pub const ClientConnection = struct {
         assert(runtime_cfg.max_frame_size_bytes <= h2.frame_payload_capacity_bytes);
         assert(runtime_cfg.max_header_block_size_bytes <= h2.header_block_capacity_bytes);
         assert(storage.pending_response_headers_storage.len >= runtime_cfg.max_header_block_size_bytes);
+        assert(storage.request_header_block_buf.len >= runtime_cfg.max_header_block_size_bytes);
         assert(storage.recv_buf.len == read_buffer_size_bytes);
+        assert(storage.preface_settings_buf.len == preface_settings_buffer_size_bytes);
+        assert(storage.request_headers_frame_buf.len == request_headers_frame_buffer_size_bytes);
+        assert(storage.data_frame_buf.len == data_frame_buffer_size_bytes);
+        assert(storage.conn_window_update_buf.len == window_update_frame_size_bytes);
+        assert(storage.stream_window_update_buf.len == window_update_frame_size_bytes);
 
         return .{
             .runtime_cfg = runtime_cfg,
@@ -103,7 +121,13 @@ pub const ClientConnection = struct {
             .io = io,
             .runtime = try runtime_mod.Runtime.init(runtime_cfg),
             .pending_response_headers_storage = &storage.pending_response_headers_storage,
+            .request_header_block_buf = &storage.request_header_block_buf,
             .recv_buf = &storage.recv_buf,
+            .preface_settings_buf = &storage.preface_settings_buf,
+            .request_headers_frame_buf = &storage.request_headers_frame_buf,
+            .data_frame_buf = &storage.data_frame_buf,
+            .conn_window_update_buf = &storage.conn_window_update_buf,
+            .stream_window_update_buf = &storage.stream_window_update_buf,
         };
     }
 
@@ -113,10 +137,10 @@ pub const ClientConnection = struct {
     pub fn sendClientPrefaceAndSettings(self: *ClientConnection) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(self.socket.get_fd() >= 0);
+        assert(self.preface_settings_buf.len == preface_settings_buffer_size_bytes);
 
-        var out: [preface_settings_buffer_size_bytes]u8 = undefined;
-        const frame = try self.runtime.writeClientPrefaceAndSettings(&out);
-        assert(frame.len <= out.len);
+        const frame = try self.runtime.writeClientPrefaceAndSettings(self.preface_settings_buf);
+        assert(frame.len <= self.preface_settings_buf.len);
         try self.writeAll(frame);
     }
 
@@ -188,9 +212,16 @@ pub const ClientConnection = struct {
     ) Error!u32 {
         assert(@intFromPtr(self) != 0);
         assert(request.path.len > 0);
+        assert(self.request_headers_frame_buf.len == request_headers_frame_buffer_size_bytes);
+        assert(self.request_header_block_buf.len >= self.runtime_cfg.max_header_block_size_bytes);
 
-        var out: [request_headers_frame_buffer_size_bytes]u8 = undefined;
-        const write = try self.runtime.writeRequestHeadersFrame(&out, request, effective_path, end_stream);
+        const write = try self.runtime.writeRequestHeadersFrame(
+            self.request_headers_frame_buf,
+            self.request_header_block_buf,
+            request,
+            effective_path,
+            end_stream,
+        );
         try self.writeAll(write.frame);
         return write.stream_id;
     }
@@ -220,9 +251,9 @@ pub const ClientConnection = struct {
     fn sendEmptyRequestDataFrame(self: *ClientConnection, stream_id: u32) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(stream_id > 0);
+        assert(self.data_frame_buf.len == data_frame_buffer_size_bytes);
 
-        var frame_out: [data_frame_buffer_size_bytes]u8 = undefined;
-        const frame = try self.runtime.writeRequestDataFrame(&frame_out, stream_id, &[_]u8{}, true);
+        const frame = try self.runtime.writeRequestDataFrame(self.data_frame_buf, stream_id, &[_]u8{}, true);
         assert(frame.len == h2.frame_header_size_bytes);
         try self.writeAll(frame);
     }
@@ -273,10 +304,10 @@ pub const ClientConnection = struct {
         const limit: usize = @intCast(sent + chunk_len);
         const chunk = payload[offset..limit];
         const is_last_chunk = sent + chunk_len == payload_len;
+        assert(self.data_frame_buf.len == data_frame_buffer_size_bytes);
 
-        var frame_out: [data_frame_buffer_size_bytes]u8 = undefined;
         const frame = try self.runtime.writeRequestDataFrame(
-            &frame_out,
+            self.data_frame_buf,
             stream_id,
             chunk,
             end_stream and is_last_chunk,
@@ -370,13 +401,13 @@ pub const ClientConnection = struct {
 
         try self.runtime.state.incrementRecvWindow(consumed_bytes);
         try self.runtime.state.incrementStreamRecvWindow(stream_id, consumed_bytes);
+        assert(self.conn_window_update_buf.len == window_update_frame_size_bytes);
+        assert(self.stream_window_update_buf.len == window_update_frame_size_bytes);
 
-        var conn_window_update_buf: [window_update_frame_size_bytes]u8 = undefined;
-        const conn_window_update = try h2.buildWindowUpdateFrame(&conn_window_update_buf, 0, consumed_bytes);
+        const conn_window_update = try h2.buildWindowUpdateFrame(self.conn_window_update_buf, 0, consumed_bytes);
         try self.writeAll(conn_window_update);
 
-        var stream_window_update_buf: [window_update_frame_size_bytes]u8 = undefined;
-        const stream_window_update = try h2.buildWindowUpdateFrame(&stream_window_update_buf, stream_id, consumed_bytes);
+        const stream_window_update = try h2.buildWindowUpdateFrame(self.stream_window_update_buf, stream_id, consumed_bytes);
         try self.writeAll(stream_window_update);
     }
 
@@ -620,7 +651,6 @@ fn readSome(socket: *Socket, maybe_io: ?Io, timeout: Io.Timeout, out: []u8) Erro
 fn waitUntilReadable(fd: i32, io: Io, timeout: Io.Timeout) Error!void {
     assert(fd >= 0);
     assert(rawStreamForFd(fd).socket.handle == fd);
-
     var messages: [1]Io.net.IncomingMessage = .{Io.net.IncomingMessage.init};
     var peek_buf: [1]u8 = undefined;
     const maybe_err, _ = rawStreamForFd(fd).socket.receiveManyTimeout(

@@ -638,10 +638,10 @@ test "StreamBridge bindingForDownstream returns stored mapping" {
     var dns_resolver: @import("serval-net").DnsResolver = undefined;
     @import("serval-net").DnsResolver.init(&dns_resolver, .{});
     var client = serval_client.Client.init(std.testing.allocator, &dns_resolver, null, false);
-    var sessions = serval_client.H2UpstreamSessionPool.init(.{});
-    defer sessions.deinit();
+    const sessions = try createTestSessionPool();
+    defer destroyTestSessionPool(sessions);
 
-    var bridge = StreamBridge.init(&client, &sessions);
+    var bridge = StreamBridge.init(&client, sessions);
     defer bridge.deinit();
 
     try bridge.binding_table.put(.{
@@ -655,14 +655,27 @@ test "StreamBridge bindingForDownstream returns stored mapping" {
     try std.testing.expectEqual(@as(u32, 7), binding.upstream_stream_id);
 }
 
+fn createTestSessionPool() !*serval_client.H2UpstreamSessionPool {
+    const sessions = try std.testing.allocator.create(serval_client.H2UpstreamSessionPool);
+    errdefer std.testing.allocator.destroy(sessions);
+    sessions.* = serval_client.H2UpstreamSessionPool.init(.{});
+    return sessions;
+}
+
+fn destroyTestSessionPool(sessions: *serval_client.H2UpstreamSessionPool) void {
+    assert(@intFromPtr(sessions) != 0);
+    sessions.deinit();
+    std.testing.allocator.destroy(sessions);
+}
+
 test "StreamBridge maps response_data and removes binding on end_stream" {
     var dns_resolver: @import("serval-net").DnsResolver = undefined;
     @import("serval-net").DnsResolver.init(&dns_resolver, .{});
     var client = serval_client.Client.init(std.testing.allocator, &dns_resolver, null, false);
-    var sessions = serval_client.H2UpstreamSessionPool.init(.{});
-    defer sessions.deinit();
+    const sessions = try createTestSessionPool();
+    defer destroyTestSessionPool(sessions);
 
-    var bridge = StreamBridge.init(&client, &sessions);
+    var bridge = StreamBridge.init(&client, sessions);
     defer bridge.deinit();
 
     const upstream_index: config.UpstreamIndex = 2;
@@ -695,10 +708,10 @@ test "StreamBridge maps stream_reset and clears binding" {
     var dns_resolver: @import("serval-net").DnsResolver = undefined;
     @import("serval-net").DnsResolver.init(&dns_resolver, .{});
     var client = serval_client.Client.init(std.testing.allocator, &dns_resolver, null, false);
-    var sessions = serval_client.H2UpstreamSessionPool.init(.{});
-    defer sessions.deinit();
+    const sessions = try createTestSessionPool();
+    defer destroyTestSessionPool(sessions);
 
-    var bridge = StreamBridge.init(&client, &sessions);
+    var bridge = StreamBridge.init(&client, sessions);
     defer bridge.deinit();
 
     const upstream_index: config.UpstreamIndex = 3;
@@ -729,10 +742,10 @@ test "StreamBridge maps by upstream index when stream ids overlap" {
     var dns_resolver: @import("serval-net").DnsResolver = undefined;
     @import("serval-net").DnsResolver.init(&dns_resolver, .{});
     var client = serval_client.Client.init(std.testing.allocator, &dns_resolver, null, false);
-    var sessions = serval_client.H2UpstreamSessionPool.init(.{});
-    defer sessions.deinit();
+    const sessions = try createTestSessionPool();
+    defer destroyTestSessionPool(sessions);
 
-    var bridge = StreamBridge.init(&client, &sessions);
+    var bridge = StreamBridge.init(&client, sessions);
     defer bridge.deinit();
 
     try bridge.binding_table.put(.{
@@ -767,10 +780,10 @@ test "StreamBridge maps by upstream session generation when ids overlap" {
     var dns_resolver: @import("serval-net").DnsResolver = undefined;
     @import("serval-net").DnsResolver.init(&dns_resolver, .{});
     var client = serval_client.Client.init(std.testing.allocator, &dns_resolver, null, false);
-    var sessions = serval_client.H2UpstreamSessionPool.init(.{});
-    defer sessions.deinit();
+    const sessions = try createTestSessionPool();
+    defer destroyTestSessionPool(sessions);
 
-    var bridge = StreamBridge.init(&client, &sessions);
+    var bridge = StreamBridge.init(&client, sessions);
     defer bridge.deinit();
 
     const upstream_index: config.UpstreamIndex = 3;
@@ -806,10 +819,10 @@ test "StreamBridge keeps bindings on no-error connection_close" {
     var dns_resolver: @import("serval-net").DnsResolver = undefined;
     @import("serval-net").DnsResolver.init(&dns_resolver, .{});
     var client = serval_client.Client.init(std.testing.allocator, &dns_resolver, null, false);
-    var sessions = serval_client.H2UpstreamSessionPool.init(.{});
-    defer sessions.deinit();
+    const sessions = try createTestSessionPool();
+    defer destroyTestSessionPool(sessions);
 
-    var bridge = StreamBridge.init(&client, &sessions);
+    var bridge = StreamBridge.init(&client, sessions);
     defer bridge.deinit();
 
     const upstream_index: config.UpstreamIndex = 7;
@@ -842,10 +855,10 @@ test "StreamBridge keeps all bindings on no-error connection_close" {
     var dns_resolver: @import("serval-net").DnsResolver = undefined;
     @import("serval-net").DnsResolver.init(&dns_resolver, .{});
     var client = serval_client.Client.init(std.testing.allocator, &dns_resolver, null, false);
-    var sessions = serval_client.H2UpstreamSessionPool.init(.{});
-    defer sessions.deinit();
+    const sessions = try createTestSessionPool();
+    defer destroyTestSessionPool(sessions);
 
-    var bridge = StreamBridge.init(&client, &sessions);
+    var bridge = StreamBridge.init(&client, sessions);
     defer bridge.deinit();
 
     const upstream_index: config.UpstreamIndex = 9;
@@ -877,10 +890,10 @@ test "StreamBridge clears only matching generation bindings on error connection_
     var dns_resolver: @import("serval-net").DnsResolver = undefined;
     @import("serval-net").DnsResolver.init(&dns_resolver, .{});
     var client = serval_client.Client.init(std.testing.allocator, &dns_resolver, null, false);
-    var sessions = serval_client.H2UpstreamSessionPool.init(.{});
-    defer sessions.deinit();
+    const sessions = try createTestSessionPool();
+    defer destroyTestSessionPool(sessions);
 
-    var bridge = StreamBridge.init(&client, &sessions);
+    var bridge = StreamBridge.init(&client, sessions);
     defer bridge.deinit();
 
     const upstream_index: config.UpstreamIndex = 8;
@@ -912,10 +925,10 @@ test "StreamBridge takeAffectedDownstreamsForConnectionClose removes only blocke
     var dns_resolver: @import("serval-net").DnsResolver = undefined;
     @import("serval-net").DnsResolver.init(&dns_resolver, .{});
     var client = serval_client.Client.init(std.testing.allocator, &dns_resolver, null, false);
-    var sessions = serval_client.H2UpstreamSessionPool.init(.{});
-    defer sessions.deinit();
+    const sessions = try createTestSessionPool();
+    defer destroyTestSessionPool(sessions);
 
-    var bridge = StreamBridge.init(&client, &sessions);
+    var bridge = StreamBridge.init(&client, sessions);
     defer bridge.deinit();
 
     const upstream_index: config.UpstreamIndex = 2;
@@ -954,10 +967,10 @@ test "StreamBridge pollNextAction returns WouldBlock when no bindings are active
     var dns_resolver: @import("serval-net").DnsResolver = undefined;
     @import("serval-net").DnsResolver.init(&dns_resolver, .{});
     var client = serval_client.Client.init(std.testing.allocator, &dns_resolver, null, false);
-    var sessions = serval_client.H2UpstreamSessionPool.init(.{});
-    defer sessions.deinit();
+    const sessions = try createTestSessionPool();
+    defer destroyTestSessionPool(sessions);
 
-    var bridge = StreamBridge.init(&client, &sessions);
+    var bridge = StreamBridge.init(&client, sessions);
     defer bridge.deinit();
 
     var evented: std.Io.Evented = undefined;

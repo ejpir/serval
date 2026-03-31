@@ -228,6 +228,7 @@ pub const Runtime = struct {
     pub fn writeRequestHeadersFrame(
         self: *Runtime,
         out: []u8,
+        header_block_storage: []u8,
         request: *const Request,
         effective_path: ?[]const u8,
         end_stream: bool,
@@ -235,13 +236,14 @@ pub const Runtime = struct {
         assert(@intFromPtr(self) != 0);
         assert(request.path.len > 0);
         assert(out.len >= h2.frame_header_size_bytes);
+        assert(self.runtime_cfg.max_header_block_size_bytes <= header_block_storage.len);
+        assert(header_block_storage.len <= h2.header_block_capacity_bytes);
 
         const path = effective_path orelse request.path;
         assert(path.len > 0);
         const authority = request.headers.getHost() orelse return error.MissingAuthority;
 
-        var header_block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
-        const header_block = try buildRequestHeaderBlock(request, path, authority, &header_block_buf);
+        const header_block = try buildRequestHeaderBlock(request, path, authority, header_block_storage);
 
         const stream = try self.state.openRequestStream(end_stream);
         const peer_max_frame_size_bytes: usize = @intCast(self.state.peer_settings.max_frame_size_bytes);
@@ -1134,8 +1136,9 @@ test "Runtime writes request HEADERS and DATA with stream lifecycle" {
     var runtime = try initRuntimeReadyForStreams();
     var request = try makeGrpcRequest("/grpc.test.Echo/Unary");
 
+    var header_block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
     var headers_buf: [h2.frame_header_size_bytes + h2.header_block_capacity_bytes]u8 = undefined;
-    const headers_write = try runtime.writeRequestHeadersFrame(&headers_buf, &request, null, false);
+    const headers_write = try runtime.writeRequestHeadersFrame(&headers_buf, &header_block_buf, &request, null, false);
     try std.testing.expectEqual(@as(u32, 1), headers_write.stream_id);
 
     const headers_header = try h2.parseFrameHeader(headers_write.frame);
@@ -1160,8 +1163,9 @@ test "Runtime fragments outbound request HEADERS with CONTINUATION when peer max
     try request.headers.put("x-long-header", "abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789");
 
     const frame_overhead_bytes: usize = h2.frame_header_size_bytes * (@as(usize, h2.max_continuation_frames) + 1);
+    var header_block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
     var headers_buf: [h2.header_block_capacity_bytes + frame_overhead_bytes]u8 = undefined;
-    const headers_write = try runtime.writeRequestHeadersFrame(&headers_buf, &request, null, true);
+    const headers_write = try runtime.writeRequestHeadersFrame(&headers_buf, &header_block_buf, &request, null, true);
 
     var cursor: usize = 0;
     var frame_count: u8 = 0;
@@ -1200,8 +1204,9 @@ test "Runtime decodes response HEADERS, DATA, and trailers" {
     var runtime = try initRuntimeReadyForStreams();
     var request = try makeGrpcRequest("/grpc.test.Echo/Unary");
 
+    var request_header_block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
     var request_frame_buf: [h2.frame_header_size_bytes + h2.header_block_capacity_bytes]u8 = undefined;
-    const request_headers = try runtime.writeRequestHeadersFrame(&request_frame_buf, &request, null, true);
+    const request_headers = try runtime.writeRequestHeadersFrame(&request_frame_buf, &request_header_block_buf, &request, null, true);
 
     var header_block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
     const response_block = try buildResponseHeaderBlock(
@@ -1281,8 +1286,9 @@ test "Runtime reassembles response HEADERS and trailers with CONTINUATION" {
     var runtime = try initRuntimeReadyForStreams();
     var request = try makeGrpcRequest("/grpc.test.Echo/Unary");
 
+    var header_block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
     var request_frame_buf: [h2.frame_header_size_bytes + h2.header_block_capacity_bytes]u8 = undefined;
-    const request_headers = try runtime.writeRequestHeadersFrame(&request_frame_buf, &request, null, true);
+    const request_headers = try runtime.writeRequestHeadersFrame(&request_frame_buf, &header_block_buf, &request, null, true);
 
     var response_block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
     const response_block = try buildResponseHeaderBlock(
@@ -1388,8 +1394,9 @@ test "Runtime rejects interleaved frame while waiting for response CONTINUATION"
     var runtime = try initRuntimeReadyForStreams();
     var request = try makeGrpcRequest("/grpc.test.Echo/Unary");
 
+    var header_block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
     var request_frame_buf: [h2.frame_header_size_bytes + h2.header_block_capacity_bytes]u8 = undefined;
-    const request_headers = try runtime.writeRequestHeadersFrame(&request_frame_buf, &request, null, true);
+    const request_headers = try runtime.writeRequestHeadersFrame(&request_frame_buf, &header_block_buf, &request, null, true);
 
     var response_block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
     const response_block = try buildResponseHeaderBlock(
@@ -1444,8 +1451,9 @@ test "Runtime rejects unexpected CONTINUATION stream" {
     var runtime = try initRuntimeReadyForStreams();
     var request = try makeGrpcRequest("/grpc.test.Echo/Unary");
 
+    var header_block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
     var request_frame_buf: [h2.frame_header_size_bytes + h2.header_block_capacity_bytes]u8 = undefined;
-    const request_headers = try runtime.writeRequestHeadersFrame(&request_frame_buf, &request, null, true);
+    const request_headers = try runtime.writeRequestHeadersFrame(&request_frame_buf, &header_block_buf, &request, null, true);
 
     var response_block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
     const response_block = try buildResponseHeaderBlock(
@@ -1494,8 +1502,9 @@ test "Runtime rejects response CONTINUATION with invalid flags" {
     var runtime = try initRuntimeReadyForStreams();
     var request = try makeGrpcRequest("/grpc.test.Echo/Unary");
 
+    var header_block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
     var request_frame_buf: [h2.frame_header_size_bytes + h2.header_block_capacity_bytes]u8 = undefined;
-    const request_headers = try runtime.writeRequestHeadersFrame(&request_frame_buf, &request, null, true);
+    const request_headers = try runtime.writeRequestHeadersFrame(&request_frame_buf, &header_block_buf, &request, null, true);
 
     var response_headers_frame_buf: [h2.frame_header_size_bytes + 1]u8 = undefined;
     const response_headers_frame = try appendFrame(
@@ -1536,8 +1545,9 @@ test "Runtime enforces response continuation frame bound" {
     var runtime = try initRuntimeReadyForStreams();
     var request = try makeGrpcRequest("/grpc.test.Echo/Unary");
 
+    var header_block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
     var request_frame_buf: [h2.frame_header_size_bytes + h2.header_block_capacity_bytes]u8 = undefined;
-    const request_headers = try runtime.writeRequestHeadersFrame(&request_frame_buf, &request, null, true);
+    const request_headers = try runtime.writeRequestHeadersFrame(&request_frame_buf, &header_block_buf, &request, null, true);
 
     var response_headers_frame_buf: [h2.frame_header_size_bytes + 1]u8 = undefined;
     const response_headers_frame = try appendFrame(
@@ -1585,8 +1595,9 @@ test "Runtime handles upstream RST_STREAM and clears stream state" {
     var runtime = try initRuntimeReadyForStreams();
     var request = try makeGrpcRequest("/grpc.test.Echo/Unary");
 
+    var header_block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
     var request_frame_buf: [h2.frame_header_size_bytes + h2.header_block_capacity_bytes]u8 = undefined;
-    const request_headers = try runtime.writeRequestHeadersFrame(&request_frame_buf, &request, null, true);
+    const request_headers = try runtime.writeRequestHeadersFrame(&request_frame_buf, &header_block_buf, &request, null, true);
 
     var rst_buf: [h2.frame_header_size_bytes + h2.control.rst_stream_payload_size_bytes]u8 = undefined;
     const rst_frame = try h2.buildRstStreamFrame(&rst_buf, request_headers.stream_id, @intFromEnum(h2.ErrorCode.cancel));
@@ -1622,8 +1633,9 @@ test "Runtime ignores duplicate upstream RST_STREAM for retired known stream" {
     const settings_action = try runtime.receiveFrame(&test_pending_response_headers_storage, settings_header, settings[h2.frame_header_size_bytes..]);
     try std.testing.expect(settings_action == .send_settings_ack);
 
-    var header_buf: [h2.header_block_capacity_bytes]u8 = undefined;
-    const request_write = try runtime.writeRequestHeadersFrame(&header_buf, &request, null, false);
+    var request_frame_buf: [h2.frame_header_size_bytes + h2.header_block_capacity_bytes]u8 = undefined;
+    var header_block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
+    const request_write = try runtime.writeRequestHeadersFrame(&request_frame_buf, &header_block_buf, &request, null, false);
     try std.testing.expectEqual(@as(u32, 1), request_write.stream_id);
 
     var rst_buf: [64]u8 = undefined;
@@ -1647,8 +1659,9 @@ test "Runtime tracks GOAWAY bound and rejects new streams above last_stream_id" 
     var runtime = try initRuntimeReadyForStreams();
     var request = try makeGrpcRequest("/grpc.test.Echo/Unary");
 
+    var header_block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
     var request_frame_buf: [h2.frame_header_size_bytes + h2.header_block_capacity_bytes]u8 = undefined;
-    _ = try runtime.writeRequestHeadersFrame(&request_frame_buf, &request, null, false);
+    _ = try runtime.writeRequestHeadersFrame(&request_frame_buf, &header_block_buf, &request, null, false);
 
     var goaway_buf: [h2.frame_header_size_bytes + h2.control.goaway_min_payload_size_bytes]u8 = undefined;
     const goaway_frame = try h2.buildGoAwayFrame(
@@ -1668,7 +1681,7 @@ test "Runtime tracks GOAWAY bound and rejects new streams above last_stream_id" 
     var second_request_frame_buf: [h2.frame_header_size_bytes + h2.header_block_capacity_bytes]u8 = undefined;
     try std.testing.expectError(
         error.ConnectionClosing,
-        runtime.writeRequestHeadersFrame(&second_request_frame_buf, &request, null, false),
+        runtime.writeRequestHeadersFrame(&second_request_frame_buf, &header_block_buf, &request, null, false),
     );
 }
 
@@ -1676,8 +1689,9 @@ test "Runtime applies WINDOW_UPDATE increments to send windows" {
     var runtime = try initRuntimeReadyForStreams();
     var request = try makeGrpcRequest("/grpc.test.Echo/Unary");
 
+    var header_block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
     var request_frame_buf: [h2.frame_header_size_bytes + h2.header_block_capacity_bytes]u8 = undefined;
-    const request_headers = try runtime.writeRequestHeadersFrame(&request_frame_buf, &request, null, false);
+    const request_headers = try runtime.writeRequestHeadersFrame(&request_frame_buf, &header_block_buf, &request, null, false);
 
     const connection_send_before = runtime.state.flow.send_window.available_bytes;
     const stream_send_before = runtime.state.getStream(request_headers.stream_id).?.send_window.available_bytes;

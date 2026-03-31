@@ -14,7 +14,9 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
-const config = @import("serval-core").config;
+const core = @import("serval-core");
+const config = core.config;
+const log = core.log.scoped(.hpack);
 const limits = @import("limits.zig");
 const huffman = @import("huffman.zig");
 
@@ -71,6 +73,7 @@ pub const Decoder = struct {
     }} ** dynamic_entry_capacity,
     dynamic_storage_len: u16 = 0,
     dynamic_storage_buf: [dynamic_storage_capacity_bytes]u8 = undefined,
+    compact_storage_buf: [dynamic_storage_capacity_bytes]u8 = undefined,
     huffman_scratch_len: u16 = 0,
     huffman_scratch_buf: [huffman_scratch_capacity_bytes]u8 = undefined,
 
@@ -109,6 +112,7 @@ pub const Decoder = struct {
         assert(out_fields.len > 0);
 
         self.huffman_scratch_len = 0;
+        log.debug("hpack: decodeHeaderBlock input_len={d} out_cap={d}", .{ input.len, out_fields.len });
 
         var cursor: usize = 0;
         var count: u32 = 0;
@@ -118,8 +122,10 @@ pub const Decoder = struct {
             if (count >= out_fields.len) return error.TooManyHeaders;
 
             const first = input[cursor];
+            log.debug("hpack: field[{d}] cursor={d} first=0x{x}", .{ count, cursor, first });
             if ((first & 0x80) != 0) {
                 const index = try decodeInteger(input, &cursor, 7);
+                log.debug("hpack: indexed field index={d}", .{index});
                 const field = try resolveIndexedHeader(self, index);
                 out_fields[count] = field;
                 count += 1;
@@ -130,6 +136,7 @@ pub const Decoder = struct {
             if ((first & 0x40) != 0) {
                 const name = try decodeHeaderName(self, input, &cursor, 6);
                 const value = try decodeString(self, input, &cursor);
+                log.debug("hpack: literal+indexing name_len={d} value_len={d}", .{ name.len, value.len });
                 out_fields[count] = .{ .name = name, .value = value };
                 count += 1;
                 saw_field = true;
@@ -146,6 +153,7 @@ pub const Decoder = struct {
 
             const name = try decodeHeaderName(self, input, &cursor, 4);
             const value = try decodeString(self, input, &cursor);
+            log.debug("hpack: literal name_len={d} value_len={d}", .{ name.len, value.len });
             out_fields[count] = .{ .name = name, .value = value };
             count += 1;
             saw_field = true;
@@ -351,7 +359,6 @@ fn compactDynamicStorage(self: *Decoder) void {
     assert(@intFromPtr(self) != 0);
     assert(self.dynamic_entry_count <= dynamic_entry_capacity);
 
-    var compacted_buf: [dynamic_storage_capacity_bytes]u8 = undefined;
     var write_offset: usize = 0;
 
     var reverse_index: usize = self.dynamic_entry_count;
@@ -364,18 +371,18 @@ fn compactDynamicStorage(self: *Decoder) void {
         const value_src_start: usize = entry.value_offset;
         const value_len: usize = entry.value_len;
 
-        @memcpy(compacted_buf[write_offset..][0..name_len], self.dynamic_storage_buf[name_src_start..][0..name_len]);
+        @memcpy(self.compact_storage_buf[write_offset..][0..name_len], self.dynamic_storage_buf[name_src_start..][0..name_len]);
         self.dynamic_entries[reverse_index].name_offset = @intCast(write_offset);
         self.dynamic_entries[reverse_index].name_len = @intCast(name_len);
         write_offset += name_len;
 
-        @memcpy(compacted_buf[write_offset..][0..value_len], self.dynamic_storage_buf[value_src_start..][0..value_len]);
+        @memcpy(self.compact_storage_buf[write_offset..][0..value_len], self.dynamic_storage_buf[value_src_start..][0..value_len]);
         self.dynamic_entries[reverse_index].value_offset = @intCast(write_offset);
         self.dynamic_entries[reverse_index].value_len = @intCast(value_len);
         write_offset += value_len;
     }
 
-    @memcpy(self.dynamic_storage_buf[0..write_offset], compacted_buf[0..write_offset]);
+    @memcpy(self.dynamic_storage_buf[0..write_offset], self.compact_storage_buf[0..write_offset]);
     self.dynamic_storage_len = @intCast(write_offset);
 }
 
@@ -465,6 +472,10 @@ fn decodeString(self: *Decoder, input: []const u8, cursor: *usize) Error![]const
     const str = input[cursor.* .. cursor.* + len];
     cursor.* += len;
 
+    log.debug(
+        "hpack: decodeString huffman={} encoded_len={d} scratch_len={d}",
+        .{ huffman_encoded, len, self.huffman_scratch_len },
+    );
     if (!huffman_encoded) return str;
 
     const scratch_start: usize = self.huffman_scratch_len;
@@ -472,6 +483,7 @@ fn decodeString(self: *Decoder, input: []const u8, cursor: *usize) Error![]const
         error.InvalidHuffman => return error.InvalidHuffman,
         error.BufferTooSmall => return error.BufferTooSmall,
     };
+    log.debug("hpack: huffman decoded_len={d}", .{decoded.len});
 
     self.huffman_scratch_len = @intCast(scratch_start + decoded.len);
     return self.huffman_scratch_buf[scratch_start .. scratch_start + decoded.len];

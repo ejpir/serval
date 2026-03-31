@@ -255,6 +255,11 @@ var h2_pool = H2UpstreamSessionPool.init();
 defer h2_pool.deinit();
 ```
 
+`H2ClientConnectionStorage` now owns both inbound receive/header scratch and
+the outbound preface, request-header-block, HEADERS, DATA, and WINDOW_UPDATE
+frame scratch used by the client H2 driver, so the connection hot path keeps
+its fixed-capacity buffers in one explicit caller-owned storage object.
+
 `H2Runtime` currently provides bounded helpers for:
 - client preface + initial SETTINGS emission
 - outbound request HEADERS/DATA frame construction on opened streams

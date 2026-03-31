@@ -292,6 +292,13 @@ pub const decodeRequestHeaderBlockWithDecoder = request.decodeRequestHeaderBlock
 /// The returned request uses slices backed by `request_storage_out`; those slices remain valid only while that storage is intact.
 /// Incomplete input returns `error.NeedMoreData`, and `consumed_bytes` reports how far parsing advanced.
 pub const parseInitialRequest = request.parseInitialRequest;
+/// Parses the client connection preface and initial HTTP/2 frames for the first request using a caller-owned HPACK decoder.
+/// Use this variant when the caller wants to keep the large decoder object off a constrained stack.
+/// The same input, storage, and lifetime rules as `parseInitialRequest` apply.
+pub const parseInitialRequestWithDecoder = request.parseInitialRequestWithDecoder;
+/// Parses the initial client preface and request into caller-owned output storage.
+/// Use this variant on constrained stacks to avoid returning `InitialRequest` by value through nested parser frames.
+pub const parseInitialRequestWithDecoderInto = request.parseInitialRequestWithDecoderInto;
 
 /// Namespace for HTTP/2 upgrade helpers and the h2c request-to-preface bridge.
 /// Re-exports validation, response-building, and prior-knowledge preamble construction helpers from `upgrade.zig`.

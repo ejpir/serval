@@ -1347,6 +1347,126 @@ pub fn build(b: *std.Build) void {
     );
     integration_test_38_step.dependOn(&run_integration_test_38.step);
 
+    const integration_test_70 = b.addTest(.{
+        .name = "integration_test_70",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: grpcurl plaintext unary interop asserts metadata and trailers against grpc h2c proxy"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_70);
+    const run_integration_test_70 = b.addRunArtifact(integration_test_70);
+
+    const integration_test_70_step = b.step(
+        "test-integration-70",
+        "Run integration test 70 (grpcurl plaintext unary interop asserts metadata and trailers against grpc h2c proxy)",
+    );
+    integration_test_70_step.dependOn(&run_integration_test_70.step);
+
+    const integration_test_92 = b.addTest(.{
+        .name = "integration_test_92",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: grpc h2c goaway last_stream_id resets higher stream and keeps lower stream"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_92);
+    const run_integration_test_92 = b.addRunArtifact(integration_test_92);
+
+    const integration_test_92_step = b.step(
+        "test-integration-92",
+        "Run integration test 92 (grpc h2c goaway last_stream_id resets higher stream and keeps lower stream)",
+    );
+    integration_test_92_step.dependOn(&run_integration_test_92.step);
+
+    const integration_test_93 = b.addTest(.{
+        .name = "integration_test_93",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: grpc h2c opens new upstream session after goaway for next stream"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_93);
+    const run_integration_test_93 = b.addRunArtifact(integration_test_93);
+
+    const integration_test_93_step = b.step(
+        "test-integration-93",
+        "Run integration test 93 (grpc h2c opens new upstream session after goaway for next stream)",
+    );
+    integration_test_93_step.dependOn(&run_integration_test_93.step);
+
+    const integration_test_99 = b.addTest(.{
+        .name = "integration_test_99",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: grpc h2c mixed goaway and non-grpc trailer reset soak loop"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_99);
+    const run_integration_test_99 = b.addRunArtifact(integration_test_99);
+
+    const integration_test_99_step = b.step(
+        "test-integration-99",
+        "Run integration test 99 (grpc h2c mixed goaway and non-grpc trailer reset soak loop)",
+    );
+    integration_test_99_step.dependOn(&run_integration_test_99.step);
+
+    const integration_test_101 = b.addTest(.{
+        .name = "integration_test_101",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: grpc h2c missing grpc-status trailer maps to downstream reset"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_101);
+    const run_integration_test_101 = b.addRunArtifact(integration_test_101);
+
+    const integration_test_101_step = b.step(
+        "test-integration-101",
+        "Run integration test 101 (grpc h2c missing grpc-status trailer maps to downstream reset)",
+    );
+    integration_test_101_step.dependOn(&run_integration_test_101.step);
+
+    const integration_test_105 = b.addTest(.{
+        .name = "integration_test_105",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: grpc h2c stream churn near concurrent-stream bound"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_105);
+    const run_integration_test_105 = b.addRunArtifact(integration_test_105);
+
+    const integration_test_105_step = b.step(
+        "test-integration-105",
+        "Run integration test 105 (grpc h2c stream churn near concurrent-stream bound)",
+    );
+    integration_test_105_step.dependOn(&run_integration_test_105.step);
+
+    const integration_test_37 = b.addTest(.{
+        .name = "integration_test_37",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: netbird reverseproxy runtime dsl enforces grpc h2c split"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_37);
+    const run_integration_test_37 = b.addRunArtifact(integration_test_37);
+
+    const integration_test_37_step = b.step(
+        "test-integration-37",
+        "Run integration test 37 (netbird reverseproxy runtime dsl enforces grpc h2c split)",
+    );
+    integration_test_37_step.dependOn(&run_integration_test_37.step);
+
+    const integration_test_42 = b.addTest(.{
+        .name = "integration_test_42",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: serval-client h2 upstream session pool reuses connected session"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_42);
+    const run_integration_test_42 = b.addRunArtifact(integration_test_42);
+
+    const integration_test_42_step = b.step(
+        "test-integration-42",
+        "Run integration test 42 (serval-client h2 upstream session pool reuses connected session)",
+    );
+    integration_test_42_step.dependOn(&run_integration_test_42.step);
+
     const integration_test_78 = b.addTest(.{
         .name = "integration_test_78",
         .root_module = integration_tests_mod,
@@ -1733,6 +1853,71 @@ pub fn build(b: *std.Build) void {
         "Run integration test 32 under sudo gdb and print a backtrace on failure",
     );
     integration_test_32_gdb_step.dependOn(&gdb_integration_test_32.step);
+
+    const gdb_integration_test_37 = b.addSystemCommand(&.{
+        "sudo",
+        "gdb",
+        "-batch",
+        "-ex",
+        "set pagination off",
+        "-ex",
+        "run",
+        "--args",
+    });
+    gdb_integration_test_37.addFileArg(integration_test_37.getEmittedBin());
+
+    const integration_test_37_gdb_step = b.step(
+        "test-integration-37-gdb",
+        "Run integration test 37 under sudo gdb and print a backtrace on failure",
+    );
+    integration_test_37_gdb_step.dependOn(&gdb_integration_test_37.step);
+
+    const gdb_integration_test_42 = b.addSystemCommand(&.{
+        "sudo",
+        "gdb",
+        "-batch",
+        "-ex",
+        "set pagination off",
+        "-ex",
+        "run",
+        "--args",
+    });
+    gdb_integration_test_42.addFileArg(integration_test_42.getEmittedBin());
+
+    const integration_test_42_gdb_step = b.step(
+        "test-integration-42-gdb",
+        "Run integration test 42 under sudo gdb and print a backtrace on failure",
+    );
+    integration_test_42_gdb_step.dependOn(&gdb_integration_test_42.step);
+
+    const gdb_integration_test_105 = b.addSystemCommand(&.{
+        "sudo",
+        "gdb",
+        "-batch",
+        "-ex",
+        "set pagination off",
+        "-ex",
+        "run",
+        "--args",
+    });
+    gdb_integration_test_105.addFileArg(integration_test_105.getEmittedBin());
+
+    const integration_test_105_gdb_step = b.step(
+        "test-integration-105-gdb",
+        "Run integration test 105 under sudo gdb and print a backtrace on failure",
+    );
+    integration_test_105_gdb_step.dependOn(&gdb_integration_test_105.step);
+
+    const integration_test_105_loop = b.addSystemCommand(&.{
+        "bash",
+        "integration/run_loop_until_failure.sh",
+        "test-integration-105",
+    });
+    const integration_test_105_loop_step = b.step(
+        "test-integration-105-loop",
+        "Run integration test 105 repeatedly until the first failure or loop limit",
+    );
+    integration_test_105_loop_step.dependOn(&integration_test_105_loop.step);
 
     // =========================================================================
     // Examples

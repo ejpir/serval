@@ -1360,6 +1360,9 @@ pub fn Server(
                         .{self.connection_ctx.connection_id},
                     );
                     self.upstream_reader_group.cancel(self.io);
+                    self.upstream_reader_group.await(self.io) catch |err| switch (err) {
+                        error.Canceled => {},
+                    };
                     self.upstream_reader_started = false;
                 }
                 self.bridge.deinit();
@@ -1407,6 +1410,9 @@ pub fn Server(
                     .{self.connection_ctx.connection_id},
                 );
                 self.upstream_reader_group.cancel(self.io);
+                self.upstream_reader_group.await(self.io) catch |err| switch (err) {
+                    error.Canceled => {},
+                };
                 self.upstream_reader_started = false;
             }
 
@@ -2015,20 +2021,32 @@ pub fn Server(
             assert(@intFromPtr(ctx) != 0);
             assert(initial_client_bytes.len > 0);
 
+            log.debug("server: conn={d} h2c bridge start initial_bytes={d} local_settings_sent={}", .{
+                connection_id,
+                initial_client_bytes.len,
+                local_settings_already_sent,
+            });
+
             var bridge_client = serval_client.Client.init(
                 std.heap.page_allocator,
                 &forwarder.dns_resolver,
                 forwarder.client_ctx,
                 forwarder.verify_upstream_tls,
             );
+            log.debug("server: conn={d} h2c bridge client initialized", .{connection_id});
             const bridge_sessions = std.heap.page_allocator.create(serval_client.H2UpstreamSessionPool) catch {
                 return forwarder_mod.ForwardError.InvalidResponse;
             };
             defer std.heap.page_allocator.destroy(bridge_sessions);
             bridge_sessions.* = serval_client.H2UpstreamSessionPool.init(runtime_cfg);
             defer bridge_sessions.deinit();
+            log.debug("server: conn={d} h2c bridge session pool initialized", .{connection_id});
 
-            var bridge_handler = H2cBridgeHandler.init(
+            const bridge_handler = std.heap.page_allocator.create(H2cBridgeHandler) catch {
+                return forwarder_mod.ForwardError.InvalidResponse;
+            };
+            defer std.heap.page_allocator.destroy(bridge_handler);
+            bridge_handler.* = H2cBridgeHandler.init(
                 handler,
                 io,
                 &bridge_client,
@@ -2036,11 +2054,13 @@ pub fn Server(
                 ctx,
             );
             defer bridge_handler.deinit();
+            log.debug("server: conn={d} h2c bridge handler initialized", .{connection_id});
 
             const start_ns = time.monotonicNanos();
+            log.debug("server: conn={d} h2c bridge entering plain connection driver", .{connection_id});
             h2_server.servePlainConnectionWithInitialBytesOptions(
                 H2cBridgeHandler,
-                &bridge_handler,
+                bridge_handler,
                 runtime_cfg,
                 @intCast(stream.socket.handle),
                 io,
@@ -2059,6 +2079,7 @@ pub fn Server(
                     else => return forwarder_mod.ForwardError.InvalidResponse,
                 }
             };
+            log.debug("server: conn={d} h2c bridge plain connection driver returned", .{connection_id});
             const end_ns = time.monotonicNanos();
 
             return .{
@@ -2378,7 +2399,7 @@ pub fn Server(
             return true;
         }
 
-        fn tryHandleH2cPriorKnowledge(
+        noinline fn tryHandleH2cPriorKnowledge(
             handler: *Handler,
             forwarder: *forwarder_mod.Forwarder(Pool, Tracer),
             metrics: *Metrics,
@@ -2403,7 +2424,19 @@ pub fn Server(
             );
 
             const parse_start_ns = realtimeNanos();
-            var parsed: serval_h2.InitialRequest = undefined;
+            const parsed = std.heap.page_allocator.create(serval_h2.InitialRequest) catch {
+                log.warn("server: conn={d} h2c initial-request state allocation failed", .{connection_id});
+                sendH2GoAway(maybe_tls, io, stream, 0, H2_ERROR_INTERNAL);
+                return true;
+            };
+            defer std.heap.page_allocator.destroy(parsed);
+            const hpack_decoder = std.heap.page_allocator.create(serval_h2.HpackDecoder) catch {
+                log.warn("server: conn={d} h2c initial-request decoder allocation failed", .{connection_id});
+                sendH2GoAway(maybe_tls, io, stream, 0, H2_ERROR_INTERNAL);
+                return true;
+            };
+            defer std.heap.page_allocator.destroy(hpack_decoder);
+            hpack_decoder.* = serval_h2.HpackDecoder.init();
             const initial_request_storage_buf = std.heap.page_allocator.alloc(u8, serval_h2.request_stable_storage_size_bytes) catch {
                 log.warn("server: conn={d} h2c initial-request storage allocation failed", .{connection_id});
                 sendH2GoAway(maybe_tls, io, stream, 0, H2_ERROR_INTERNAL);
@@ -2412,9 +2445,11 @@ pub fn Server(
             defer std.heap.page_allocator.free(initial_request_storage_buf);
             var local_settings_already_sent = false;
             while (true) {
-                parsed = serval_h2.parseInitialRequest(
+                serval_h2.parseInitialRequestWithDecoderInto(
+                    hpack_decoder,
                     recv_buf[0..buffer_len.*],
                     initial_request_storage_buf,
+                    parsed,
                 ) catch |err| switch (err) {
                     error.NeedMoreData => {
                         if (!local_settings_already_sent and
@@ -2442,11 +2477,14 @@ pub fn Server(
                         return true;
                     },
                 };
+                log.debug("server: conn={d} h2c prior-knowledge parse complete stream={d}", .{ connection_id, parsed.stream_id });
                 break;
             }
             ctx.parse_duration_ns = @intCast(@max(0, realtimeNanos() - parse_start_ns));
+            log.debug("server: conn={d} h2c parse_duration recorded", .{connection_id});
 
             const request_is_grpc = serval_grpc.classifyRequest(&parsed.request) == .grpc;
+            log.debug("server: conn={d} h2c grpc_classified={}", .{ connection_id, request_is_grpc });
             if (!request_is_grpc) {
                 log.debug(
                     "server: conn={d} prior-knowledge stream={d} classified as non-gRPC; bridge completion uses generic semantics",
@@ -2455,16 +2493,23 @@ pub fn Server(
             }
 
             metrics.requestStart();
+            log.debug("server: conn={d} h2c metrics started", .{connection_id});
             ctx.bytes_received = @intCast(buffer_len.*);
 
             var span_name_buf: [config.OTEL_MAX_NAME_LEN]u8 = std.mem.zeroes([config.OTEL_MAX_NAME_LEN]u8);
             const span_name = buildSpanName(parsed.request.method, parsed.request.path, &span_name_buf);
+            log.debug("server: conn={d} h2c span name built len={d}", .{ connection_id, span_name.len });
             const span_handle = tracer.startSpan(span_name, null);
+            log.debug("server: conn={d} h2c startSpan returned", .{connection_id});
             ctx.span_handle = span_handle;
+            log.debug("server: conn={d} h2c span_handle stored", .{connection_id});
             tracer.setStringAttribute(span_handle, "http.request.method", @tagName(parsed.request.method));
+            log.debug("server: conn={d} h2c method attribute set", .{connection_id});
             tracer.setStringAttribute(span_handle, "url.path", parsed.request.path);
+            log.debug("server: conn={d} h2c path attribute set", .{connection_id});
 
             const action_result = handler.selectUpstream(ctx, &parsed.request);
+            log.debug("server: conn={d} h2c selectUpstream returned", .{connection_id});
             const upstream: types.Upstream = blk: {
                 if (comptime hooks.hasUpstreamAction(Handler)) {
                     switch (action_result) {
@@ -2482,51 +2527,205 @@ pub fn Server(
                     break :blk action_result;
                 }
             };
+            log.debug(
+                "server: conn={d} h2c upstream selected host={s} port={d} proto={s} tls={}",
+                .{ connection_id, upstream.host, upstream.port, @tagName(upstream.http_protocol), upstream.tls },
+            );
             ctx.upstream = upstream;
-
+            log.debug("server: conn={d} h2c after upstream store", .{connection_id});
             const supports_h2c_plain = upstream.http_protocol == .h2c and !upstream.tls;
             const supports_h2_tls = upstream.http_protocol == .h2 and upstream.tls;
-
-            // Stream-aware bridge is the steady-state path for supported h2 upstreams.
-            // Keep plaintext-downstream guard: this entry point dispatches into the
-            // plain-fd h2 server driver and cannot run over frontend TLS bytes.
+            log.debug(
+                "server: conn={d} h2c upstream capabilities plain_h2c={} tls_h2={}",
+                .{ connection_id, supports_h2c_plain, supports_h2_tls },
+            );
             const use_stream_bridge = maybe_tls == null and (supports_h2c_plain or supports_h2_tls);
-
-            const forward_result = if (use_stream_bridge)
-                forwardH2cWithBridge(
+            log.debug("server: conn={d} h2c use_stream_bridge={}", .{ connection_id, use_stream_bridge });
+            if (use_stream_bridge) {
+                log.debug("server: conn={d} h2c dispatching bridge helper", .{connection_id});
+                return completeH2cPriorKnowledgeBridgeForward(
                     handler,
                     forwarder,
+                    metrics,
+                    tracer,
                     runtime_cfg,
-                    io.*,
+                    maybe_tls,
+                    io,
                     stream,
+                    plain_reader,
                     ctx,
-                    blk: {
-                        const handoff_buf = std.heap.page_allocator.alloc(u8, CONNECTION_RECV_BUFFER_SIZE_BYTES + PLAIN_STREAM_READER_BUFFER_SIZE_BYTES) catch {
-                            log.warn("server: conn={d} h2c bridge handoff buffer allocation failed", .{connection_id});
-                            sendH2GoAway(maybe_tls, io, stream, parsed.stream_id, H2_ERROR_INTERNAL);
-                            return true;
-                        };
-                        defer std.heap.page_allocator.free(handoff_buf);
-                        break :blk buildH2HandoffBytes(plain_reader, recv_buf[0..buffer_len.*], handoff_buf);
-                    },
+                    &parsed.request,
+                    parsed.stream_id,
+                    recv_buf[0..buffer_len.*],
+                    upstream,
+                    span_handle,
                     connection_id,
                     local_settings_already_sent,
-                )
-            else
-                forwarder.forwardGrpcH2c(
-                    io.*,
-                    stream,
-                    maybe_tls,
-                    &parsed.request,
-                    &upstream,
-                    recv_buf[0..buffer_len.*],
-                    span_handle,
                 );
+            }
+            log.debug("server: conn={d} h2c dispatching direct helper", .{connection_id});
+            return completeH2cPriorKnowledgeDirectForward(
+                handler,
+                forwarder,
+                metrics,
+                tracer,
+                maybe_tls,
+                io,
+                stream,
+                ctx,
+                &parsed.request,
+                parsed.stream_id,
+                recv_buf[0..buffer_len.*],
+                upstream,
+                span_handle,
+                connection_id,
+            );
+        }
+
+        noinline fn completeH2cPriorKnowledgeBridgeForward(
+            handler: *Handler,
+            forwarder: *forwarder_mod.Forwarder(Pool, Tracer),
+            metrics: *Metrics,
+            tracer: *Tracer,
+            runtime_cfg: config.H2Config,
+            maybe_tls: ?*TLSStream,
+            io: *Io,
+            stream: Io.net.Stream,
+            plain_reader: ?*Io.net.Stream.Reader,
+            ctx: *Context,
+            request: *const Request,
+            stream_id: u32,
+            visible_bytes: []const u8,
+            upstream: types.Upstream,
+            span_handle: SpanHandle,
+            connection_id: u64,
+            local_settings_already_sent: bool,
+        ) bool {
+            assert(@intFromPtr(handler) != 0);
+            assert(@intFromPtr(forwarder) != 0);
+            assert(@intFromPtr(metrics) != 0);
+            assert(@intFromPtr(tracer) != 0);
+            assert(@intFromPtr(io) != 0);
+            assert(@intFromPtr(ctx) != 0);
+            assert(@intFromPtr(request) != 0);
+            assert(stream_id > 0);
+
+            log.debug("server: conn={d} h2c bridge helper start", .{connection_id});
+            const forward_result = forwardH2cWithBridge(
+                handler,
+                forwarder,
+                runtime_cfg,
+                io.*,
+                stream,
+                ctx,
+                blk: {
+                    log.debug("server: conn={d} h2c bridge handoff buffer alloc start", .{connection_id});
+                    const handoff_buf = std.heap.page_allocator.alloc(u8, CONNECTION_RECV_BUFFER_SIZE_BYTES + PLAIN_STREAM_READER_BUFFER_SIZE_BYTES) catch {
+                        log.warn("server: conn={d} h2c bridge handoff buffer allocation failed", .{connection_id});
+                        sendH2GoAway(maybe_tls, io, stream, stream_id, H2_ERROR_INTERNAL);
+                        return true;
+                    };
+                    defer std.heap.page_allocator.free(handoff_buf);
+                    log.debug("server: conn={d} h2c bridge handoff buffer allocated len={d}", .{ connection_id, handoff_buf.len });
+                    break :blk buildH2HandoffBytes(plain_reader, visible_bytes, handoff_buf);
+                },
+                connection_id,
+                local_settings_already_sent,
+            );
+            return finishH2cPriorKnowledgeForward(
+                handler,
+                metrics,
+                tracer,
+                maybe_tls,
+                io,
+                stream,
+                ctx,
+                request,
+                stream_id,
+                upstream,
+                span_handle,
+                forward_result,
+            );
+        }
+
+        noinline fn completeH2cPriorKnowledgeDirectForward(
+            handler: *Handler,
+            forwarder: *forwarder_mod.Forwarder(Pool, Tracer),
+            metrics: *Metrics,
+            tracer: *Tracer,
+            maybe_tls: ?*TLSStream,
+            io: *Io,
+            stream: Io.net.Stream,
+            ctx: *Context,
+            request: *const Request,
+            stream_id: u32,
+            visible_bytes: []const u8,
+            upstream: types.Upstream,
+            span_handle: SpanHandle,
+            connection_id: u64,
+        ) bool {
+            assert(@intFromPtr(handler) != 0);
+            assert(@intFromPtr(forwarder) != 0);
+            assert(@intFromPtr(metrics) != 0);
+            assert(@intFromPtr(tracer) != 0);
+            assert(@intFromPtr(io) != 0);
+            assert(@intFromPtr(ctx) != 0);
+            assert(@intFromPtr(request) != 0);
+            assert(stream_id > 0);
+
+            log.debug("server: conn={d} h2c direct helper start", .{connection_id});
+            const forward_result = forwarder.forwardGrpcH2c(
+                io.*,
+                stream,
+                maybe_tls,
+                request,
+                &upstream,
+                visible_bytes,
+                span_handle,
+            );
+            return finishH2cPriorKnowledgeForward(
+                handler,
+                metrics,
+                tracer,
+                maybe_tls,
+                io,
+                stream,
+                ctx,
+                request,
+                stream_id,
+                upstream,
+                span_handle,
+                forward_result,
+            );
+        }
+
+        noinline fn finishH2cPriorKnowledgeForward(
+            handler: *Handler,
+            metrics: *Metrics,
+            tracer: *Tracer,
+            maybe_tls: ?*TLSStream,
+            io: *Io,
+            stream: Io.net.Stream,
+            ctx: *Context,
+            request: *const Request,
+            stream_id: u32,
+            upstream: types.Upstream,
+            span_handle: SpanHandle,
+            forward_result: forwarder_mod.ForwardError!forwarder_mod.ForwardResult,
+        ) bool {
+            assert(@intFromPtr(handler) != 0);
+            assert(@intFromPtr(metrics) != 0);
+            assert(@intFromPtr(tracer) != 0);
+            assert(@intFromPtr(io) != 0);
+            assert(@intFromPtr(ctx) != 0);
+            assert(@intFromPtr(request) != 0);
+            assert(stream_id > 0);
+
             const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
             ctx.duration_ns = duration_ns;
 
             if (forward_result) |result| {
-                handleForwardSuccessImpl(handler, metrics, ctx, &parsed.request, result, duration_ns, false);
+                handleForwardSuccessImpl(handler, metrics, ctx, request, result, duration_ns, false);
                 tracer.setIntAttribute(span_handle, "http.response.status_code", @intCast(result.status));
                 tracer.endSpan(span_handle, null);
             } else |err| {
@@ -2540,7 +2739,7 @@ pub fn Server(
                     _ = handler.onError(ctx, &error_ctx);
                 }
                 metrics.requestEnd(502, duration_ns);
-                sendH2GoAway(maybe_tls, io, stream, parsed.stream_id, H2_ERROR_INTERNAL);
+                sendH2GoAway(maybe_tls, io, stream, stream_id, H2_ERROR_INTERNAL);
                 tracer.setIntAttribute(span_handle, "http.response.status_code", 502);
                 tracer.endSpan(span_handle, @errorName(err));
             }
@@ -2581,7 +2780,7 @@ pub fn Server(
             // TigerStyle: Blocking handshake - std.Io handles socket-level async
             // TLS span stays open for connection lifetime - request spans are children
             var tls_span: SpanHandle = .{};
-            var maybe_tls_stream: ?TLSStream = if (tls_ctx_manager) |manager| blk: {
+            const maybe_tls_stream: ?*TLSStream = if (tls_ctx_manager) |manager| blk: {
                 const allocator = std.heap.c_allocator;
                 const tls_ctx_lease = manager.acquire() catch |err| {
                     log.err("TLS context acquire failed: {s}", .{@errorName(err)});
@@ -2593,7 +2792,7 @@ pub fn Server(
                 tls_span = tracer.startSpan("tls.handshake.server", null);
                 tracer.setIntAttribute(tls_span, "tls.ctx_generation", @intCast(tls_ctx_lease.generation));
 
-                const tls_stream = TLSStream.initServer(
+                const tls_stream_value = TLSStream.initServer(
                     tls_ctx_lease.ctx,
                     @intCast(stream.socket.handle),
                     allocator,
@@ -2604,6 +2803,14 @@ pub fn Server(
                 };
 
                 // Add handshake attributes to span
+                const tls_stream = allocator.create(TLSStream) catch {
+                    tracer.endSpan(tls_span, "OutOfMemory");
+                    log.err("TLS stream allocation failed: {s}", .{@errorName(error.OutOfMemory)});
+                    return;
+                };
+                errdefer allocator.destroy(tls_stream);
+                tls_stream.* = tls_stream_value;
+
                 const info = &tls_stream.info;
                 tracer.setStringAttribute(tls_span, "tls.version", info.version());
                 tracer.setStringAttribute(tls_span, "tls.cipher", info.cipher());
@@ -2623,16 +2830,24 @@ pub fn Server(
 
                 break :blk tls_stream;
             } else null;
-            defer if (maybe_tls_stream) |*tls_stream| tls_stream.close();
+            defer if (maybe_tls_stream) |tls_stream| {
+                tls_stream.close();
+                std.heap.c_allocator.destroy(tls_stream);
+            };
             // End TLS span when connection closes
             defer if (tls_span.isValid()) tracer.endSpan(tls_span, null);
 
             // Initialize context with connection-scoped fields
-            var ctx = Context.init();
+            const ctx = std.heap.page_allocator.create(Context) catch {
+                log.err("server: conn={d} failed to allocate context", .{connection_id});
+                return;
+            };
+            defer std.heap.page_allocator.destroy(ctx);
+            ctx.* = Context.init();
             ctx.connection_id = connection_id;
             ctx.connection_start_ns = connection_start_ns;
             ctx.request_number = 0;
-            set_client_endpoint_from_socket(&ctx, stream.socket.handle) catch |err| {
+            set_client_endpoint_from_socket(ctx, stream.socket.handle) catch |err| {
                 const unknown_addr: []const u8 = "unknown";
                 @memset(&ctx.client_addr, 0);
                 @memcpy(ctx.client_addr[0..unknown_addr.len], unknown_addr);
@@ -2670,7 +2885,7 @@ pub fn Server(
 
             // Get mutable pointer to TLS stream for I/O operations (if TLS is active)
             // TigerStyle: Mutable pointer needed for forwarder to write TLS responses.
-            const maybe_tls_ptr: ?*TLSStream = if (maybe_tls_stream) |*tls| tls else null;
+            const maybe_tls_ptr: ?*TLSStream = maybe_tls_stream;
             var plain_reader_buf: [PLAIN_STREAM_READER_BUFFER_SIZE_BYTES]u8 = undefined;
             var plain_stream_reader = stream.reader(io_mut, &plain_reader_buf);
             const maybe_plain_reader: ?*Io.net.Stream.Reader = if (maybe_tls_ptr == null) &plain_stream_reader else null;
@@ -2696,7 +2911,7 @@ pub fn Server(
                         H2cBridgeHandler,
                         handler,
                         forwarder,
-                        &ctx,
+                        ctx,
                         cfg.h2,
                         maybe_tls_ptr,
                         io,
@@ -2709,7 +2924,7 @@ pub fn Server(
                         handler,
                         metrics,
                         tracer,
-                        &ctx,
+                        ctx,
                         cfg.h2,
                         maybe_tls_ptr,
                         io_mut,
@@ -2721,8 +2936,18 @@ pub fn Server(
             }
 
             // Request processing state
-            var parser = Parser.init();
-            var recv_buf: [CONNECTION_RECV_BUFFER_SIZE_BYTES]u8 = std.mem.zeroes([CONNECTION_RECV_BUFFER_SIZE_BYTES]u8);
+            const parser = std.heap.page_allocator.create(Parser) catch {
+                log.err("server: conn={d} failed to allocate parser", .{connection_id});
+                return;
+            };
+            defer std.heap.page_allocator.destroy(parser);
+            parser.* = Parser.init();
+            const recv_buf = std.heap.page_allocator.alloc(u8, CONNECTION_RECV_BUFFER_SIZE_BYTES) catch {
+                log.err("server: conn={d} failed to allocate receive buffer", .{connection_id});
+                return;
+            };
+            defer std.heap.page_allocator.free(recv_buf);
+            @memset(recv_buf, 0);
             var request_count: u32 = 0;
             var buffer_offset: usize = 0;
             var buffer_len: usize = 0;
@@ -2755,7 +2980,7 @@ pub fn Server(
                 log.debug("server: conn={d} waiting for request handler_start={d}", .{ connection_id, @as(u64, @intCast(handler_start_ns)) });
                 const read_start_ns = realtimeNanos();
                 if (buffer_offset >= buffer_len) {
-                    const n = connectionRead(maybe_tls_ptr, &io_mut, stream, maybe_plain_reader, &recv_buf, connection_id) orelse return;
+                    const n = connectionRead(maybe_tls_ptr, &io_mut, stream, maybe_plain_reader, recv_buf, connection_id) orelse return;
                     buffer_len = n;
                     buffer_offset = 0;
                 }
@@ -2764,13 +2989,13 @@ pub fn Server(
                     handler,
                     metrics,
                     tracer,
-                    &ctx,
+                    ctx,
                     cfg.h2,
                     maybe_tls_ptr,
                     io_mut,
                     stream,
                     maybe_plain_reader,
-                    recv_buf[0..],
+                    recv_buf,
                     &buffer_len,
                     connection_id,
                 )) return;
@@ -2785,8 +3010,8 @@ pub fn Server(
                     &io_mut,
                     stream,
                     maybe_plain_reader,
-                    &ctx,
-                    recv_buf[0..],
+                    ctx,
+                    recv_buf,
                     &buffer_len,
                     connection_id,
                 )) return;
@@ -2797,7 +3022,7 @@ pub fn Server(
                 }
 
                 // Accumulate reads until complete headers received
-                if (!accumulateHeaders(maybe_tls_ptr, &io_mut, stream, recv_buf[0..], buffer_offset, &buffer_len, connection_id)) return;
+                if (!accumulateHeaders(maybe_tls_ptr, &io_mut, stream, recv_buf, buffer_offset, &buffer_len, connection_id)) return;
                 const read_elapsed_ns = realtimeNanos() - read_start_ns;
                 const read_duration_us: u64 = if (read_elapsed_ns >= 0) @intCast(@divFloor(read_elapsed_ns, 1000)) else 0;
                 log.debug("server: conn={d} received bytes={d} read_us={d}", .{ connection_id, buffer_len - buffer_offset, read_duration_us });
@@ -2887,7 +3112,7 @@ pub fn Server(
                     ctx._body_reader = &body_reader;
 
                     var on_request_control_flow: OnRequestControlFlow = .fall_through;
-                    switch (handler.onRequest(&ctx, &parser.request, response_buf)) {
+                    switch (handler.onRequest(ctx, &parser.request, response_buf)) {
                         .continue_request => {
                             on_request_control_flow = .fall_through;
                         }, // Fall through to selectUpstream
@@ -2900,7 +3125,7 @@ pub fn Server(
                             tracer.endSpan(span_handle, null);
                             buffer_offset += parser.headers_end + body_length_for_offset;
                             on_request_control_flow = shortCircuitControlFlow(
-                                &parser,
+                                parser,
                                 &parser.request,
                                 &body_reader,
                                 initial_body_bytes,
@@ -2917,7 +3142,7 @@ pub fn Server(
                             tracer.endSpan(span_handle, reject.reason);
                             buffer_offset += parser.headers_end + body_length_for_offset;
                             on_request_control_flow = shortCircuitControlFlow(
-                                &parser,
+                                parser,
                                 &parser.request,
                                 &body_reader,
                                 initial_body_bytes,
@@ -2963,7 +3188,7 @@ pub fn Server(
                                 var stream_error: bool = false;
 
                                 while (chunk_count < max_chunk_count) : (chunk_count += 1) {
-                                    const maybe_len = handler.nextChunk(&ctx, response_buf) catch |err| {
+                                    const maybe_len = handler.nextChunk(ctx, response_buf) catch |err| {
                                         // S6: Log error before terminating stream
                                         log.err("streaming response failed at chunk {d}: {s}", .{ chunk_count, @errorName(err) });
                                         sendFinalChunk(&tls_writer) catch |final_err| {
@@ -3012,7 +3237,7 @@ pub fn Server(
                                 }
                                 buffer_offset += parser.headers_end + body_length_for_offset;
                                 on_request_control_flow = shortCircuitControlFlow(
-                                    &parser,
+                                    parser,
                                     &parser.request,
                                     &body_reader,
                                     initial_body_bytes,
@@ -3030,7 +3255,9 @@ pub fn Server(
                     }
                 }
 
-                var h2c_upgrade_settings_buf: [serval_h2.frame_payload_capacity_bytes]u8 = undefined;
+                var h2c_upgrade_settings_storage: ?[]u8 = null;
+                defer if (h2c_upgrade_settings_storage) |buf| std.heap.page_allocator.free(buf);
+
                 const h2c_upgrade_settings: ?[]const u8 = if (h2c_upgrade_candidate) blk: {
                     if (maybe_tls_ptr != null) {
                         sendErrorResponseTls(maybe_tls_ptr, &io_mut, stream, 400, "Bad h2c Upgrade Request");
@@ -3041,10 +3268,20 @@ pub fn Server(
                         return;
                     }
 
+                    const h2c_upgrade_settings_buf = std.heap.page_allocator.alloc(u8, serval_h2.frame_payload_capacity_bytes) catch {
+                        sendErrorResponseTls(maybe_tls_ptr, &io_mut, stream, 500, "Internal Server Error");
+                        const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
+                        metrics.requestEnd(500, duration_ns);
+                        tracer.setIntAttribute(span_handle, "http.response.status_code", 500);
+                        tracer.endSpan(span_handle, "OutOfMemory");
+                        return;
+                    };
+                    h2c_upgrade_settings_storage = h2c_upgrade_settings_buf;
+
                     const settings_payload = serval_h2.validateUpgradeRequest(
                         &parser.request,
                         parser.body_framing,
-                        &h2c_upgrade_settings_buf,
+                        h2c_upgrade_settings_buf,
                     ) catch |err| {
                         sendErrorResponseTls(maybe_tls_ptr, &io_mut, stream, 400, "Bad h2c Upgrade Request");
                         const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
@@ -3073,8 +3310,8 @@ pub fn Server(
                         maybe_tls_ptr,
                         &io_mut,
                         stream,
-                        &ctx,
-                        &parser,
+                        ctx,
+                        parser,
                         recv_buf[0..],
                         buffer_offset,
                         buffer_len,
@@ -3095,7 +3332,7 @@ pub fn Server(
                     };
 
                     if (comptime has_select_websocket) {
-                        switch (handler.selectWebSocket(&ctx, &parser.request)) {
+                        switch (handler.selectWebSocket(ctx, &parser.request)) {
                             .decline => {},
                             .reject => |reject| {
                                 sendErrorResponseTls(maybe_tls_ptr, &io_mut, stream, reject.status, reject.reason);
@@ -3124,7 +3361,7 @@ pub fn Server(
                                         .request_number = ctx.request_number,
                                         .client_addr = ctx.client_addr,
                                     };
-                                    handler.onLog(&ctx, log_entry);
+                                    handler.onLog(ctx, log_entry);
                                 }
                                 tracer.setIntAttribute(span_handle, "http.response.status_code", @intCast(reject.status));
                                 tracer.endSpan(span_handle, reject.reason);
@@ -3172,7 +3409,7 @@ pub fn Server(
                                             .request_number = ctx.request_number,
                                             .client_addr = ctx.client_addr,
                                         };
-                                        handler.onLog(&ctx, log_entry);
+                                        handler.onLog(ctx, log_entry);
                                     }
                                     tracer.setIntAttribute(span_handle, "http.response.status_code", 500);
                                     tracer.endSpan(span_handle, @errorName(err));
@@ -3192,7 +3429,7 @@ pub fn Server(
                                 );
                                 var websocket_error_name: ?[]const u8 = null;
 
-                                handler.handleWebSocket(&ctx, &parser.request, &ws_session) catch |err| {
+                                handler.handleWebSocket(ctx, &parser.request, &ws_session) catch |err| {
                                     websocket_error_name = @errorName(err);
                                     if (ws_session.state() == .open) {
                                         ws_session.close(serval_websocket.close.internal_error, "") catch |close_err| {
@@ -3222,7 +3459,7 @@ pub fn Server(
                                 handleNativeWebSocketCompleteImpl(
                                     handler,
                                     metrics,
-                                    &ctx,
+                                    ctx,
                                     &parser.request,
                                     ctx.bytes_sent,
                                     websocket_duration_ns,
@@ -3237,7 +3474,7 @@ pub fn Server(
                 }
 
                 // Select upstream and forward (or reject if handler returns action)
-                const action_result = handler.selectUpstream(&ctx, &parser.request);
+                const action_result = handler.selectUpstream(ctx, &parser.request);
 
                 // Handle action-style return (Router.Action) vs plain Upstream
                 const upstream: types.Upstream = blk: {
@@ -3285,7 +3522,7 @@ pub fn Server(
                                         .request_number = ctx.request_number,
                                         .client_addr = ctx.client_addr,
                                     };
-                                    handler.onLog(&ctx, log_entry);
+                                    handler.onLog(ctx, log_entry);
                                 }
                                 tracer.setIntAttribute(span_handle, "http.response.status_code", @intCast(rej.status));
                                 tracer.endSpan(span_handle, null);
@@ -3299,7 +3536,7 @@ pub fn Server(
                                 const body_length = getBodyLength(&parser.request);
                                 buffer_offset += parser.headers_end + body_length;
                                 switch (shortCircuitControlFlow(
-                                    &parser,
+                                    parser,
                                     &parser.request,
                                     null,
                                     available_body_bytes,
@@ -3320,7 +3557,7 @@ pub fn Server(
                 ctx.upstream = upstream;
 
                 if (h2c_upgrade_settings) |settings_payload| {
-                    const body_info = buildBodyInfo(&parser, &recv_buf, buffer_offset, buffer_len);
+                    const body_info = buildBodyInfo(parser, recv_buf, buffer_offset, buffer_len);
                     const initial_h2_offset = buffer_offset + parser.headers_end + @as(usize, @intCast(body_info.bytes_already_read));
                     assert(initial_h2_offset <= buffer_len);
                     const initial_client_bytes_after_body = recv_buf[initial_h2_offset..buffer_len];
@@ -3334,12 +3571,12 @@ pub fn Server(
                             io,
                             maybe_tls_ptr,
                             stream,
-                            &parser,
+                            parser,
                             recv_buf[0..],
                             buffer_offset,
                             buffer_len,
                             settings_payload,
-                            &ctx,
+                            ctx,
                             connection_id,
                         )
                     else
@@ -3360,11 +3597,11 @@ pub fn Server(
                     ctx.duration_ns = h2c_upgrade_duration_ns;
 
                     if (h2c_upgrade_result) |fwd_result| {
-                        handleForwardSuccessImpl(handler, metrics, &ctx, &parser.request, fwd_result, h2c_upgrade_duration_ns, false);
+                        handleForwardSuccessImpl(handler, metrics, ctx, &parser.request, fwd_result, h2c_upgrade_duration_ns, false);
                         tracer.setIntAttribute(span_handle, "http.response.status_code", @intCast(fwd_result.status));
                         tracer.endSpan(span_handle, null);
                     } else |err| {
-                        handleForwardErrorImpl(handler, metrics, maybe_tls_ptr, &io_mut, stream, &ctx, &parser.request, upstream, err, h2c_upgrade_duration_ns);
+                        handleForwardErrorImpl(handler, metrics, maybe_tls_ptr, &io_mut, stream, ctx, &parser.request, upstream, err, h2c_upgrade_duration_ns);
                         tracer.setIntAttribute(span_handle, "http.response.status_code", 502);
                         tracer.endSpan(span_handle, @errorName(err));
                     }
@@ -3392,11 +3629,11 @@ pub fn Server(
                     ctx.duration_ns = websocket_duration_ns;
 
                     if (websocket_result) |fwd_result| {
-                        handleForwardSuccessImpl(handler, metrics, &ctx, &parser.request, fwd_result, websocket_duration_ns, false);
+                        handleForwardSuccessImpl(handler, metrics, ctx, &parser.request, fwd_result, websocket_duration_ns, false);
                         tracer.setIntAttribute(span_handle, "http.response.status_code", @intCast(fwd_result.status));
                         tracer.endSpan(span_handle, null);
                     } else |err| {
-                        handleForwardErrorImpl(handler, metrics, maybe_tls_ptr, &io_mut, stream, &ctx, &parser.request, upstream, err, websocket_duration_ns);
+                        handleForwardErrorImpl(handler, metrics, maybe_tls_ptr, &io_mut, stream, ctx, &parser.request, upstream, err, websocket_duration_ns);
                         tracer.setIntAttribute(span_handle, "http.response.status_code", 502);
                         tracer.endSpan(span_handle, @errorName(err));
                     }
@@ -3405,7 +3642,7 @@ pub fn Server(
 
                 // Extract body info and forward
                 // Pass ctx.rewritten_path for path rewriting support (e.g., strip_prefix in router)
-                const body_info = buildBodyInfo(&parser, &recv_buf, buffer_offset, buffer_len);
+                const body_info = buildBodyInfo(parser, recv_buf, buffer_offset, buffer_len);
                 const forward_result = forwarder.forward(io, stream, maybe_tls_ptr, &parser.request, &upstream, body_info, span_handle, ctx.rewritten_path);
 
                 const duration_ns: u64 = @intCast(realtimeNanos() - ctx.start_time_ns);
@@ -3417,7 +3654,7 @@ pub fn Server(
 
                 // Process result and determine connection state
                 const result: ProcessResult = if (forward_result) |fwd_result| blk: {
-                    handleForwardSuccessImpl(handler, metrics, &ctx, &parser.request, fwd_result, duration_ns, true);
+                    handleForwardSuccessImpl(handler, metrics, ctx, &parser.request, fwd_result, duration_ns, true);
                     tracer.setIntAttribute(span_handle, "http.response.status_code", @intCast(fwd_result.status));
                     tracer.endSpan(span_handle, null);
 
@@ -3426,7 +3663,7 @@ pub fn Server(
 
                     break :blk if (should_close) .close_connection else .keep_alive;
                 } else |err| blk: {
-                    handleForwardErrorImpl(handler, metrics, maybe_tls_ptr, &io_mut, stream, &ctx, &parser.request, upstream, err, duration_ns);
+                    handleForwardErrorImpl(handler, metrics, maybe_tls_ptr, &io_mut, stream, ctx, &parser.request, upstream, err, duration_ns);
                     tracer.setIntAttribute(span_handle, "http.response.status_code", 502);
                     tracer.endSpan(span_handle, @errorName(err));
                     break :blk .fatal_error;

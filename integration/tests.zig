@@ -7023,7 +7023,9 @@ test "integration: serval-client h2 upstream session pool reuses connected sessi
     serval_net.DnsResolver.init(&dns_resolver, .{});
     var http_client = serval_client.Client.init(testing.allocator, &dns_resolver, null, false);
 
-    var session_pool = serval_client.H2UpstreamSessionPool.init(.{});
+    const session_pool = try testing.allocator.create(serval_client.H2UpstreamSessionPool);
+    defer testing.allocator.destroy(session_pool);
+    session_pool.* = serval_client.H2UpstreamSessionPool.init(.{});
     defer session_pool.deinit();
 
     var evented: std.Io.Evented = undefined;
@@ -7084,10 +7086,12 @@ test "integration: serval-proxy h2 stream bridge binds downstream to upstream st
     serval_net.DnsResolver.init(&dns_resolver, .{});
     var http_client = serval_client.Client.init(testing.allocator, &dns_resolver, null, false);
 
-    var session_pool = serval_client.H2UpstreamSessionPool.init(.{});
+    const session_pool = try testing.allocator.create(serval_client.H2UpstreamSessionPool);
+    defer testing.allocator.destroy(session_pool);
+    session_pool.* = serval_client.H2UpstreamSessionPool.init(.{});
     defer session_pool.deinit();
 
-    var bridge = serval.proxy.H2StreamBridge.init(&http_client, &session_pool);
+    var bridge = serval.proxy.H2StreamBridge.init(&http_client, session_pool);
     defer bridge.deinit();
 
     var evented: std.Io.Evented = undefined;

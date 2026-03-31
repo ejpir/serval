@@ -391,6 +391,9 @@ pub const ResponseWriter = struct {
     runtime: *runtime_mod.Runtime,
     states: *ResponseStateTable,
     stream_trackers: *StreamTrackerTable,
+    header_block_buf: [h2.header_block_capacity_bytes]u8 = undefined,
+    header_block_frame_buf: [header_block_frame_buffer_size_bytes]u8 = undefined,
+    data_frame_buf: [frame_buffer_size_bytes]u8 = undefined,
 
     /// Send the response HEADERS for an open stream.
     /// Requires `status >= 100` and fails if headers were already sent or the stream is closed.
@@ -400,19 +403,19 @@ pub const ResponseWriter = struct {
         assert(@intFromPtr(self) != 0);
         assert(status >= 100);
         assert(self.stream_id > 0);
+        assert(self.header_block_buf.len == h2.header_block_capacity_bytes);
+        assert(self.header_block_frame_buf.len == header_block_frame_buffer_size_bytes);
 
         var state = try self.states.getOrInsert(self.stream_id);
         if (state.headers_sent) return error.HeadersAlreadySent;
         if (state.closed) return error.ResponseClosed;
 
-        var block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
-        const block = try buildResponseHeaderBlock(status, headers, &block_buf);
+        const block = try buildResponseHeaderBlock(status, headers, &self.header_block_buf);
         const peer_max_frame_size_bytes = responsePeerMaxFrameSizeBytes(self.runtime);
         const max_payload_size_bytes: usize = @min(@as(usize, h2.frame_payload_capacity_bytes), peer_max_frame_size_bytes);
 
-        var frame_buf: [header_block_frame_buffer_size_bytes]u8 = undefined;
         const frame = try appendHeaderBlockFrames(
-            &frame_buf,
+            &self.header_block_frame_buf,
             self.stream_id,
             block,
             end_stream,
@@ -432,6 +435,7 @@ pub const ResponseWriter = struct {
     pub fn sendData(self: *ResponseWriter, payload: []const u8, end_stream: bool) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(self.stream_id > 0);
+        assert(self.data_frame_buf.len == frame_buffer_size_bytes);
 
         var state = self.states.get(self.stream_id) orelse return error.ResponseStateNotFound;
         if (!state.headers_sent) return error.HeadersNotSent;
@@ -441,8 +445,7 @@ pub const ResponseWriter = struct {
 
         if (payload.len == 0) {
             if (end_stream) {
-                var empty_frame_buf: [frame_buffer_size_bytes]u8 = undefined;
-                const empty_frame = try appendFrame(&empty_frame_buf, .data, h2.flags_end_stream, self.stream_id, &[_]u8{});
+                const empty_frame = try appendFrame(&self.data_frame_buf, .data, h2.flags_end_stream, self.stream_id, &[_]u8{});
                 try writeAll(self.io_conn, self.io, empty_frame);
                 try self.stream_trackers.markResponseData(self.stream_id, 0, true);
                 try self.finishStream(state);
@@ -469,19 +472,19 @@ pub const ResponseWriter = struct {
     pub fn sendTrailers(self: *ResponseWriter, trailers: []const Header) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(self.stream_id > 0);
+        assert(self.header_block_buf.len == h2.header_block_capacity_bytes);
+        assert(self.header_block_frame_buf.len == header_block_frame_buffer_size_bytes);
 
         const state = self.states.get(self.stream_id) orelse return error.ResponseStateNotFound;
         if (!state.headers_sent) return error.HeadersNotSent;
         if (state.closed) return error.ResponseClosed;
 
-        var block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
-        const block = try buildHeaderBlock(trailers, false, 0, &block_buf);
+        const block = try buildHeaderBlock(trailers, false, 0, &self.header_block_buf);
         const peer_max_frame_size_bytes = responsePeerMaxFrameSizeBytes(self.runtime);
         const max_payload_size_bytes: usize = @min(@as(usize, h2.frame_payload_capacity_bytes), peer_max_frame_size_bytes);
 
-        var frame_buf: [header_block_frame_buffer_size_bytes]u8 = undefined;
         const frame = try appendHeaderBlockFrames(
-            &frame_buf,
+            &self.header_block_frame_buf,
             self.stream_id,
             block,
             true,
@@ -2536,7 +2539,6 @@ fn timeoutForNanoseconds(timeout_ns: u64) Io.Timeout {
 fn waitUntilReadable(fd: i32, io: Io, timeout: Io.Timeout) Error!void {
     assert(fd >= 0);
     assert(tls_read_readiness_timeout_ns > 0);
-
     var messages: [1]Io.net.IncomingMessage = .{Io.net.IncomingMessage.init};
     var peek_buf: [1]u8 = undefined;
     const maybe_err, _ = rawStreamForFd(fd).socket.receiveManyTimeout(

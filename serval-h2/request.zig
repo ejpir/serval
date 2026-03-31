@@ -8,6 +8,7 @@ const assert = std.debug.assert;
 
 const core = @import("serval-core");
 const config = core.config;
+const log = core.log.scoped(.h2_request);
 const types = core.types;
 const limits = @import("limits.zig");
 const HeaderMap = types.HeaderMap;
@@ -94,6 +95,32 @@ pub const Error = error{
 /// while that storage remains intact. `consumed_bytes` reports how many input bytes were consumed
 /// through the end of the request header block.
 pub fn parseInitialRequest(input: []const u8, request_storage_out: []u8) Error!InitialRequest {
+    var decoder = hpack.Decoder.init();
+    return parseInitialRequestWithDecoder(&decoder, input, request_storage_out);
+}
+
+/// Parses the client connection preface and the initial HTTP/2 frame sequence using a caller-owned HPACK decoder.
+/// Returns an `InitialRequest` once the request header block has been fully assembled and decoded.
+/// `decoder` retains dynamic-table state across calls, so callers can keep it alive when they want to avoid constructing a large decoder on a small stack.
+/// The returned request uses slices backed by `request_storage_out`; those slices are valid only while that storage remains intact.
+pub fn parseInitialRequestWithDecoder(
+    decoder: *hpack.Decoder,
+    input: []const u8,
+    request_storage_out: []u8,
+) Error!InitialRequest {
+    var initial_request: InitialRequest = undefined;
+    try parseInitialRequestWithDecoderInto(decoder, input, request_storage_out, &initial_request);
+    return initial_request;
+}
+
+pub fn parseInitialRequestWithDecoderInto(
+    decoder: *hpack.Decoder,
+    input: []const u8,
+    request_storage_out: []u8,
+    initial_request_out: *InitialRequest,
+) Error!void {
+    assert(@intFromPtr(decoder) != 0);
+    assert(@intFromPtr(initial_request_out) != 0);
     assert(input.len > 0);
     assert(preface.client_connection_preface.len > 0);
     if (request_storage_out.len < request_stable_storage_size_bytes) return error.StableStorageTooSmall;
@@ -101,9 +128,13 @@ pub fn parseInitialRequest(input: []const u8, request_storage_out: []u8) Error!I
     if (!preface.looksLikeClientConnectionPrefacePrefix(input)) return error.InvalidPreface;
     if (input.len < preface.client_connection_preface.len) return error.NeedMoreData;
 
+    log.debug("h2 request: parseInitialRequestWithDecoder input_len={d}", .{input.len});
+
     var cursor: usize = preface.client_connection_preface.len;
     var frames_seen: u32 = 0;
-    var header_assembly = HeaderAssembly{};
+    const header_assembly = std.heap.page_allocator.create(HeaderAssembly) catch return error.StableStorageTooSmall;
+    defer std.heap.page_allocator.destroy(header_assembly);
+    header_assembly.* = .{};
 
     while (cursor < input.len and frames_seen < limits.max_initial_parse_frames) : (frames_seen += 1) {
         if (cursor + frame.frame_header_size_bytes > input.len) return error.NeedMoreData;
@@ -115,15 +146,25 @@ pub fn parseInitialRequest(input: []const u8, request_storage_out: []u8) Error!I
         if (payload_end > input.len) return error.NeedMoreData;
         const payload = input[payload_start..payload_end];
 
-        const maybe_request = try parseInitialFrame(
+        log.debug(
+            "h2 request: frame[{d}] type={s} stream={d} len={d}",
+            .{ frames_seen, @tagName(header.frame_type), header.stream_id, header.length },
+        );
+
+        const found_request = try parseInitialFrameInto(
+            decoder,
             header,
             payload,
             frames_seen,
             payload_end,
-            &header_assembly,
+            header_assembly,
             request_storage_out,
+            initial_request_out,
         );
-        if (maybe_request) |initial_request| return initial_request;
+        if (found_request) {
+            log.debug("h2 request: parseInitialRequestWithDecoder completed request", .{});
+            return;
+        }
 
         cursor = payload_end;
     }
@@ -132,15 +173,19 @@ pub fn parseInitialRequest(input: []const u8, request_storage_out: []u8) Error!I
     return error.NeedMoreData;
 }
 
-fn parseInitialFrame(
+fn parseInitialFrameInto(
+    decoder: *hpack.Decoder,
     header: frame.FrameHeader,
     payload: []const u8,
     frames_seen: u32,
     payload_end: usize,
     header_assembly: *HeaderAssembly,
     request_storage_out: []u8,
-) Error!?InitialRequest {
+    initial_request_out: *InitialRequest,
+) Error!bool {
+    assert(@intFromPtr(decoder) != 0);
     assert(@intFromPtr(header_assembly) != 0);
+    assert(@intFromPtr(initial_request_out) != 0);
     assert(payload_end >= payload.len);
 
     if (header_assembly.active and header.frame_type != .continuation) return error.InvalidFrame;
@@ -154,27 +199,31 @@ fn parseInitialFrame(
             if (header.length != priority_field_size_bytes) return error.InvalidFrame;
         },
         .headers => {
-            return handleInitialHeadersFrame(
+            return handleInitialHeadersFrameInto(
+                decoder,
                 header,
                 payload,
                 payload_end,
                 header_assembly,
                 request_storage_out,
+                initial_request_out,
             );
         },
         .continuation => {
-            return handleInitialContinuationFrame(
+            return handleInitialContinuationFrameInto(
+                decoder,
                 header,
                 payload,
                 payload_end,
                 header_assembly,
                 request_storage_out,
+                initial_request_out,
             );
         },
         else => {},
     }
 
-    return null;
+    return false;
 }
 
 fn validateInitialSettingsFrame(header: frame.FrameHeader, payload: []const u8, frames_seen: u32) Error!void {
@@ -195,15 +244,19 @@ fn validateInitialSettingsFrame(header: frame.FrameHeader, payload: []const u8, 
     };
 }
 
-fn handleInitialHeadersFrame(
+fn handleInitialHeadersFrameInto(
+    decoder: *hpack.Decoder,
     header: frame.FrameHeader,
     payload: []const u8,
     payload_end: usize,
     header_assembly: *HeaderAssembly,
     request_storage_out: []u8,
-) Error!?InitialRequest {
+    initial_request_out: *InitialRequest,
+) Error!bool {
+    assert(@intFromPtr(decoder) != 0);
     assert(header.frame_type == .headers);
     assert(@intFromPtr(header_assembly) != 0);
+    assert(@intFromPtr(initial_request_out) != 0);
 
     if (header.stream_id == 0) return error.InvalidStreamId;
     if ((header.stream_id & 1) == 0) return error.InvalidStreamId;
@@ -218,7 +271,16 @@ fn handleInitialHeadersFrame(
 
     if ((header.flags & frame.flags_end_headers) != 0) {
         if (header_fragment.len > limits.header_block_capacity_bytes) return error.HeadersTooLarge;
-        return try buildInitialRequest(header_fragment, header.stream_id, @intCast(payload_end), request_storage_out);
+        try buildInitialRequestInto(
+            decoder,
+            header_fragment,
+            header.stream_id,
+            @intCast(payload_end),
+            request_storage_out,
+            initial_request_out,
+        );
+        log.debug("h2 request: initial HEADERS request built", .{});
+        return true;
     }
 
     header_assembly.active = true;
@@ -226,18 +288,22 @@ fn handleInitialHeadersFrame(
     header_assembly.continuation_frames = 0;
     header_assembly.block_len = 0;
     try appendHeaderFragment(&header_assembly.block_buf, &header_assembly.block_len, header_fragment);
-    return null;
+    return false;
 }
 
-fn handleInitialContinuationFrame(
+fn handleInitialContinuationFrameInto(
+    decoder: *hpack.Decoder,
     header: frame.FrameHeader,
     payload: []const u8,
     payload_end: usize,
     header_assembly: *HeaderAssembly,
     request_storage_out: []u8,
-) Error!?InitialRequest {
+    initial_request_out: *InitialRequest,
+) Error!bool {
+    assert(@intFromPtr(decoder) != 0);
     assert(header.frame_type == .continuation);
     assert(@intFromPtr(header_assembly) != 0);
+    assert(@intFromPtr(initial_request_out) != 0);
 
     if (!header_assembly.active) return error.UnsupportedContinuation;
     if (header.stream_id != header_assembly.stream_id) return error.InvalidStreamId;
@@ -246,15 +312,19 @@ fn handleInitialContinuationFrame(
 
     header_assembly.continuation_frames += 1;
     try appendHeaderFragment(&header_assembly.block_buf, &header_assembly.block_len, payload);
-    if ((header.flags & frame.flags_end_headers) == 0) return null;
+    if ((header.flags & frame.flags_end_headers) == 0) return false;
 
     const block_len: usize = @intCast(header_assembly.block_len);
-    return try buildInitialRequest(
+    try buildInitialRequestInto(
+        decoder,
         header_assembly.block_buf[0..block_len],
         header_assembly.stream_id,
         @intCast(payload_end),
         request_storage_out,
+        initial_request_out,
     );
+    log.debug("h2 request: continuation request built", .{});
+    return true;
 }
 
 fn appendHeaderFragment(
@@ -272,21 +342,52 @@ fn appendHeaderFragment(
 }
 
 fn buildInitialRequest(
+    decoder: *hpack.Decoder,
     header_block: []const u8,
     stream_id: u32,
     consumed_bytes: u32,
     request_storage_out: []u8,
 ) Error!InitialRequest {
+    var initial_request: InitialRequest = undefined;
+    try buildInitialRequestInto(
+        decoder,
+        header_block,
+        stream_id,
+        consumed_bytes,
+        request_storage_out,
+        &initial_request,
+    );
+    return initial_request;
+}
+
+fn buildInitialRequestInto(
+    decoder: *hpack.Decoder,
+    header_block: []const u8,
+    stream_id: u32,
+    consumed_bytes: u32,
+    request_storage_out: []u8,
+    initial_request_out: *InitialRequest,
+) Error!void {
+    assert(@intFromPtr(decoder) != 0);
+    assert(@intFromPtr(initial_request_out) != 0);
     assert(header_block.len <= limits.header_block_capacity_bytes);
     assert(stream_id > 0);
     if (request_storage_out.len < request_stable_storage_size_bytes) return error.StableStorageTooSmall;
 
-    const head = try decodeRequestHeaderBlock(header_block, stream_id, request_storage_out);
-    return .{
-        .request = head.request,
-        .stream_id = head.stream_id,
-        .consumed_bytes = consumed_bytes,
-    };
+    log.debug(
+        "h2 request: buildInitialRequest stream={d} header_block_len={d}",
+        .{ stream_id, header_block.len },
+    );
+
+    initial_request_out.stream_id = stream_id;
+    initial_request_out.consumed_bytes = consumed_bytes;
+    try decodeRequestHeaderBlockWithDecoderIntoRequest(
+        decoder,
+        header_block,
+        request_storage_out,
+        &initial_request_out.request,
+    );
+    log.debug("h2 request: buildInitialRequestInto decode complete", .{});
 }
 
 /// Decodes an HPACK request header block using a fresh decoder instance.
@@ -308,13 +409,7 @@ pub fn decodeRequestHeaderBlock(
 }
 
 const HeaderDecodeState = struct {
-    request: Request = .{
-        .method = .GET,
-        .path = "",
-        .version = .@"HTTP/1.1",
-        .headers = HeaderMap.init(),
-        .body = null,
-    },
+    request: *Request,
     method_found: bool = false,
     path_found: bool = false,
     scheme_found: bool = false,
@@ -339,28 +434,97 @@ pub fn decodeRequestHeaderBlockWithDecoder(
     stream_id: u32,
     request_storage_out: []u8,
 ) Error!RequestHead {
+    var head: RequestHead = undefined;
+    try decodeRequestHeaderBlockWithDecoderInto(
+        decoder,
+        header_block,
+        stream_id,
+        request_storage_out,
+        &head,
+    );
+    return head;
+}
+
+pub fn decodeRequestHeaderBlockWithDecoderInto(
+    decoder: *hpack.Decoder,
+    header_block: []const u8,
+    stream_id: u32,
+    request_storage_out: []u8,
+    head_out: *RequestHead,
+) Error!void {
     assert(@intFromPtr(decoder) != 0);
+    assert(@intFromPtr(head_out) != 0);
     assert(header_block.len <= limits.header_block_capacity_bytes);
     assert(stream_id > 0);
     if (request_storage_out.len < request_stable_storage_size_bytes) return error.StableStorageTooSmall;
 
-    var fields_buf: [config.MAX_HEADERS]hpack.HeaderField = undefined;
-    const fields = try decoder.decodeHeaderBlock(header_block, &fields_buf);
-    var state = HeaderDecodeState{};
+    head_out.stream_id = stream_id;
+    try decodeRequestHeaderBlockWithDecoderIntoRequest(
+        decoder,
+        header_block,
+        request_storage_out,
+        &head_out.request,
+    );
+}
 
-    for (fields) |field| {
+fn decodeRequestHeaderBlockWithDecoderIntoRequest(
+    decoder: *hpack.Decoder,
+    header_block: []const u8,
+    request_storage_out: []u8,
+    request_out: *Request,
+) Error!void {
+    assert(@intFromPtr(decoder) != 0);
+    assert(@intFromPtr(request_out) != 0);
+    assert(header_block.len <= limits.header_block_capacity_bytes);
+    if (request_storage_out.len < request_stable_storage_size_bytes) return error.StableStorageTooSmall;
+
+    log.debug(
+        "h2 request: decodeRequestHeaderBlockWithDecoder header_block_len={d}",
+        .{header_block.len},
+    );
+
+    const fields_buf = std.heap.page_allocator.alloc(hpack.HeaderField, config.MAX_HEADERS) catch {
+        return error.StableStorageTooSmall;
+    };
+    defer std.heap.page_allocator.free(fields_buf);
+    const fields = try decoder.decodeHeaderBlock(header_block, fields_buf);
+
+    const state = std.heap.page_allocator.create(HeaderDecodeState) catch {
+        return error.StableStorageTooSmall;
+    };
+    defer std.heap.page_allocator.destroy(state);
+    request_out.* = .{
+        .method = .GET,
+        .path = "",
+        .version = .@"HTTP/1.1",
+        .headers = HeaderMap.init(),
+        .body = null,
+    };
+    state.* = .{
+        .request = request_out,
+    };
+
+    for (fields, 0..) |field, index| {
+        log.debug(
+            "h2 request: materialize field[{d}] name={s} value_len={d}",
+            .{ index, field.name, field.value.len },
+        );
         if (!isHeaderNameLowercase(field.name)) return error.InvalidHeaderName;
 
         if (field.name.len > 0 and field.name[0] == ':') {
-            try decodePseudoHeader(&state, field, request_storage_out);
+            try decodePseudoHeader(state, field, request_storage_out);
             continue;
         }
 
-        try decodeRegularHeader(&state, field, request_storage_out);
+        try decodeRegularHeader(state, field, request_storage_out);
     }
 
-    try validateDecodedRequestState(&state);
-    return .{ .request = state.request, .stream_id = stream_id };
+    log.debug(
+        "h2 request: validating request method_found={} path_found={} scheme_found={} authority_found={} protocol_found={}",
+        .{ state.method_found, state.path_found, state.scheme_found, state.authority_found, state.protocol_found },
+    );
+    try validateDecodedRequestState(state);
+    log.debug("h2 request: request validation complete", .{});
 }
 
 fn decodePseudoHeader(
@@ -401,7 +565,7 @@ fn decodePseudoHeader(
             &state.storage_cursor,
             field.value,
         );
-        try putRequestHeader(&state.request, "x-forwarded-proto", proto_value);
+        try putRequestHeader(state.request, "x-forwarded-proto", proto_value);
         state.scheme_found = true;
         return;
     }
@@ -413,7 +577,7 @@ fn decodePseudoHeader(
             &state.storage_cursor,
             field.value,
         );
-        try putRequestHeader(&state.request, "host", authority);
+        try putRequestHeader(state.request, "host", authority);
         state.authority_found = true;
         state.authority_value = authority;
         return;
@@ -441,7 +605,7 @@ fn decodeProtocolPseudoHeader(
         &state.storage_cursor,
         field.value,
     );
-    try putRequestHeader(&state.request, "x-http2-protocol", protocol_value);
+    try putRequestHeader(state.request, "x-http2-protocol", protocol_value);
     state.protocol_found = true;
 }
 
@@ -473,7 +637,7 @@ fn decodeRegularHeader(
         &state.storage_cursor,
         field.value,
     );
-    try putRequestHeader(&state.request, stable_name, stable_value);
+    try putRequestHeader(state.request, stable_name, stable_value);
 }
 
 fn putRequestHeader(request: *Request, name: []const u8, value: []const u8) Error!void {
