@@ -17,11 +17,11 @@ pub const HealthState = health_state.HealthState;
 /// Re-export of `serval-core.config.UpstreamIndex` for indexing health-tracked backends.
 /// Use this type for backend slots within the configured upstream bound.
 /// This is a type alias only; it does not allocate, own, or validate values on its own.
-pub const UpstreamIndex = health_state.UpstreamIndex;
+pub const UpstreamIndex = @import("serval-core").config.UpstreamIndex;
 /// Re-export of `serval-core.config.MAX_UPSTREAMS` for health state sizing.
 /// This is the fixed upper bound for tracked upstream backends and the bitmap width used by this module.
 /// No runtime behavior or ownership is associated with this alias.
-pub const MAX_UPSTREAMS = health_state.MAX_UPSTREAMS;
+pub const MAX_UPSTREAMS = @import("serval-core").config.MAX_UPSTREAMS;
 
 test {
     _ = health_state;

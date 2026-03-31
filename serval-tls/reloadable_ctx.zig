@@ -7,9 +7,8 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const ssl = @import("ssl.zig");
-const config = @import("serval-core").config;
 
-const slot_capacity: usize = config.TLS_RELOADABLE_CTX_SLOT_COUNT;
+const slot_capacity: usize = 5;
 const mutex_lock_max_attempts: u32 = 1_000_000;
 
 /// Errors returned by `ReloadableServerCtx` lease/reload operations.

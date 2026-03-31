@@ -160,18 +160,6 @@ comptime {
 // Forwarding / Retry Limits
 // =============================================================================
 
-/// Maximum stale connection retries before creating fresh connection.
-/// When a pooled connection is detected as stale (closed by backend),
-/// the forwarder retries up to this many times before giving up and
-/// creating a fresh TCP connection.
-/// TigerStyle: Bounded retry prevents pool exhaustion spiral.
-pub const MAX_STALE_RETRIES: u8 = 2;
-
-/// Default upstream connection timeout in nanoseconds.
-/// Used when creating TCP connections to backend servers.
-/// TigerStyle: u64 nanoseconds, 30 seconds default (typical for load balancers).
-pub const CONNECT_TIMEOUT_NS: u64 = 30 * 1000 * 1000 * 1000;
-
 /// Initial read buffer size for h2c prior-knowledge request parsing.
 /// Must fit client preface + SETTINGS + first HEADERS block in common cases.
 pub const H2C_INITIAL_READ_BUFFER_SIZE_BYTES: u32 = 16 * 1024;
@@ -234,18 +222,6 @@ pub const H2_SERVER_IDLE_TIMEOUT_NS: u64 = time.secondsToNanos(3600);
 /// poll(2) timeout for h2c/gRPC tunnel relay.
 /// TigerStyle: Fixed interval keeps timeout checks responsive without busy-looping.
 pub const H2C_TUNNEL_POLL_TIMEOUT_MS: i32 = 1000;
-
-/// Maximum uncompressed gRPC message size supported by helper utilities.
-/// TigerStyle: Explicit bound prevents unbounded envelope parsing.
-pub const GRPC_MAX_MESSAGE_SIZE_BYTES: u32 = 4 * 1024 * 1024;
-
-/// Maximum idle time for an upgraded WebSocket tunnel.
-/// TigerStyle: Explicit timeout bounds long-lived relay loops.
-pub const WEBSOCKET_TUNNEL_IDLE_TIMEOUT_NS: u64 = time.secondsToNanos(3600);
-
-/// poll(2) timeout for WebSocket tunnel relay.
-/// TigerStyle: Small fixed interval keeps timeout checks responsive without busy-looping.
-pub const WEBSOCKET_TUNNEL_POLL_TIMEOUT_MS: i32 = 1000;
 
 /// Maximum application message size for native WebSocket endpoints.
 /// TigerStyle: Explicit bound prevents unbounded buffering during fragmentation reassembly.
@@ -385,76 +361,8 @@ pub const DNS_MAX_ADDRESSES: u8 = 16;
 // Admin API Configuration (for reconfigurable data planes)
 // =============================================================================
 
-/// Default admin API port for data plane management.
-pub const DEFAULT_ADMIN_PORT: u16 = 9901;
-
 /// Maximum request body size for admin API endpoints (1MB).
 pub const MAX_ADMIN_REQUEST_BYTES: u32 = 1024 * 1024;
-
-/// Maximum response body size for admin API endpoints (1MB).
-pub const MAX_ADMIN_RESPONSE_BYTES: u32 = 1024 * 1024;
-
-/// Admin request read timeout in nanoseconds (5 seconds).
-pub const ADMIN_READ_TIMEOUT_NS: u64 = time.secondsToNanos(5);
-
-/// Admin response write timeout in nanoseconds (5 seconds).
-pub const ADMIN_WRITE_TIMEOUT_NS: u64 = time.secondsToNanos(5);
-
-/// Maximum accept iterations per cycle for admin server.
-pub const MAX_ADMIN_ACCEPT_ITERATIONS: u32 = 100;
-
-// =============================================================================
-// Dynamic Configuration Updates
-// =============================================================================
-
-/// Grace period after config swap before old config cleanup (milliseconds).
-/// Allows in-flight requests using old config to complete.
-pub const CONFIG_SWAP_GRACE_MS: u64 = 1000;
-
-/// Number of router slots for atomic double-buffering.
-pub const MAX_ROUTER_SLOTS: u8 = 2;
-
-/// Maximum retries for pushing config to data plane.
-pub const MAX_CONFIG_PUSH_RETRIES: u8 = 3;
-
-/// Timeout for config push to data plane in nanoseconds (5 seconds).
-pub const CONFIG_PUSH_TIMEOUT_NS: u64 = time.secondsToNanos(5);
-
-/// Base delay for exponential backoff on config push retry (milliseconds).
-pub const CONFIG_PUSH_BACKOFF_BASE_MS: u64 = 100;
-
-/// Maximum backoff delay for config push retry (milliseconds).
-pub const MAX_CONFIG_PUSH_BACKOFF_MS: u64 = 5000;
-
-// =============================================================================
-// TLS Reloadable Context
-// =============================================================================
-
-/// Number of server TLS context slots for hot-reload generations.
-/// One active slot + bounded retired generations awaiting in-flight release.
-pub const TLS_RELOADABLE_CTX_SLOT_COUNT: u8 = 5;
-
-comptime {
-    if (TLS_RELOADABLE_CTX_SLOT_COUNT < 2) {
-        @compileError("TLS_RELOADABLE_CTX_SLOT_COUNT must be >= 2");
-    }
-}
-
-// =============================================================================
-// HTTP Client
-// =============================================================================
-
-/// Client connection timeout in nanoseconds.
-/// TigerStyle: u64 nanoseconds, 5 seconds default.
-pub const CLIENT_CONNECT_TIMEOUT_NS: u64 = time.secondsToNanos(5);
-
-/// Client read timeout in nanoseconds.
-/// TigerStyle: u64 nanoseconds, 30 seconds default.
-pub const CLIENT_READ_TIMEOUT_NS: u64 = time.secondsToNanos(30);
-
-/// Client write timeout in nanoseconds.
-/// TigerStyle: u64 nanoseconds, 30 seconds default.
-pub const CLIENT_WRITE_TIMEOUT_NS: u64 = time.secondsToNanos(30);
 
 // =============================================================================
 // ACME / Let's Encrypt

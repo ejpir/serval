@@ -45,11 +45,17 @@ const HeaderAssembly = struct {
 };
 
 const priority_field_size_bytes: u32 = 5;
+const header_block_storage_budget_bytes: u32 = 8 * 1024;
+
+comptime {
+    assert(header_block_storage_budget_bytes == config.H2_MAX_HEADER_BLOCK_SIZE_BYTES);
+}
+
 // Reserve one header-block budget for copied names and one for copied values.
 /// Minimum caller-provided stable storage, in bytes, required to decode one request.
 /// This is currently sized as two full header-block budgets: one for copied header names and one
 /// for copied header values.
-pub const request_stable_storage_size_bytes: u32 = config.H2_MAX_HEADER_BLOCK_SIZE_BYTES * 2;
+pub const request_stable_storage_size_bytes: u32 = header_block_storage_budget_bytes * 2;
 
 /// Error set returned by HTTP/2 request parsing and header decoding.
 /// It covers preface, frame, HPACK, header-validation, and storage-capacity failures, including

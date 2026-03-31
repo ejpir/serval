@@ -47,3 +47,20 @@ Follow TigerStyle bias toward concreteness:
 - Parser helper → `serval-http/parser.zig` (or split file if parser gets too large)
 - Weighted round-robin → `serval-lb`
 - New forwarding mechanism → `serval-proxy`
+
+## Public Const Ownership Audit
+
+- Single-owner values should usually be private `const` in the owning file, not `pub const` in `serval-core`.
+- Top-level non-core `pub const` aliases that resolve back into `serval-core` are ownership-drift candidates.
+- Exact semantic duplicates across non-core top-level `pub const` declarations are duplication candidates even when names differ.
+- Use `zig build audit-pub-consts-report` to inspect current findings.
+- Use `zig build audit-pub-consts` to fail the build on those findings.
+
+To enforce this locally before each commit:
+
+```bash
+git config core.hooksPath .githooks
+chmod +x .githooks/pre-commit
+```
+
+The repo-managed pre-commit hook runs `zig build audit-pub-consts`.

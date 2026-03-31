@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
-const config = @import("serval-core").config;
+const max_message_size_bytes: u32 = 4 * 1024 * 1024;
 
 /// The fixed size, in bytes, of a gRPC wire prefix.
 /// This includes the 1-byte compression flag and 4-byte big-endian length field.
@@ -55,8 +55,8 @@ pub fn parsePrefix(raw: []const u8) Error!MessagePrefix {
     if (compression_flag != 0 and compression_flag != 1) return error.InvalidCompressionFlag;
 
     const length_bytes = std.mem.readInt(u32, raw[1..5], .big);
-    if (length_bytes > config.GRPC_MAX_MESSAGE_SIZE_BYTES) return error.MessageTooLarge;
-    assert(length_bytes <= config.GRPC_MAX_MESSAGE_SIZE_BYTES);
+    if (length_bytes > max_message_size_bytes) return error.MessageTooLarge;
+    assert(length_bytes <= max_message_size_bytes);
 
     return .{
         .compressed = compression_flag == 1,
@@ -102,7 +102,7 @@ pub fn parseFrame(raw: []const u8) Error!FrameView {
 /// Returns `error.BufferTooSmall` if `out` cannot hold the 5-byte prefix plus payload.
 pub fn buildMessage(out: []u8, compressed: bool, payload: []const u8) Error![]const u8 {
     assert(prefix_size_bytes == 5);
-    if (payload.len > config.GRPC_MAX_MESSAGE_SIZE_BYTES) return error.MessageTooLarge;
+    if (payload.len > max_message_size_bytes) return error.MessageTooLarge;
 
     const total_len: usize = prefix_size_bytes + payload.len;
     if (out.len < total_len) return error.BufferTooSmall;
@@ -144,7 +144,7 @@ pub fn nextFrame(raw: []const u8, cursor_bytes: *u32) Error!?FrameView {
 }
 
 fn totalFrameSizeBytes(length_bytes: u32) u32 {
-    assert(length_bytes <= config.GRPC_MAX_MESSAGE_SIZE_BYTES);
+    assert(length_bytes <= max_message_size_bytes);
     const total = prefix_size_bytes + length_bytes;
     assert(total >= prefix_size_bytes);
     return total;
@@ -170,7 +170,7 @@ test "parsePrefix rejects invalid compression flag" {
 
 test "parsePrefix rejects oversized message length" {
     var raw: [5]u8 = .{ 0, 0, 0, 0, 0 };
-    std.mem.writeInt(u32, raw[1..5], config.GRPC_MAX_MESSAGE_SIZE_BYTES + 1, .big);
+    std.mem.writeInt(u32, raw[1..5], max_message_size_bytes + 1, .big);
     try std.testing.expectError(error.MessageTooLarge, parsePrefix(&raw));
 }
 
@@ -196,7 +196,7 @@ test "buildMessage rejects small output buffer" {
 }
 
 test "buildMessage rejects oversized payload" {
-    const oversize_len: usize = @as(usize, config.GRPC_MAX_MESSAGE_SIZE_BYTES) + 1;
+    const oversize_len: usize = @as(usize, max_message_size_bytes) + 1;
     const payload = try std.testing.allocator.alloc(u8, oversize_len);
     defer std.testing.allocator.free(payload);
 
@@ -215,7 +215,7 @@ test "boundary zero-length payload builds and parses" {
 }
 
 test "boundary max payload builds and parses" {
-    const payload_len: usize = config.GRPC_MAX_MESSAGE_SIZE_BYTES;
+    const payload_len: usize = max_message_size_bytes;
     const payload = try std.testing.allocator.alloc(u8, payload_len);
     defer std.testing.allocator.free(payload);
 
@@ -229,7 +229,7 @@ test "boundary max payload builds and parses" {
     const built = try buildMessage(out, true, payload);
     const frame = try parseFrame(built);
     try std.testing.expect(frame.prefix.compressed);
-    try std.testing.expectEqual(@as(u32, config.GRPC_MAX_MESSAGE_SIZE_BYTES), frame.prefix.length_bytes);
+    try std.testing.expectEqual(@as(u32, max_message_size_bytes), frame.prefix.length_bytes);
     try std.testing.expect(std.mem.eql(u8, payload, frame.payload));
 }
 

@@ -7,6 +7,7 @@
 const core = @import("serval-core");
 const BodyFraming = core.BodyFraming;
 const HttpProtocol = core.HttpProtocol;
+const Protocol = HttpProtocol;
 
 // =============================================================================
 // Forward Errors
@@ -109,11 +110,6 @@ pub const BodyInfo = struct {
 // =============================================================================
 // Protocol
 // =============================================================================
-
-/// Wire protocol for upstream connection.
-/// Determined by ALPN (TLS) or preface detection (cleartext).
-/// TigerStyle: Explicit enum, not bool, for future protocol additions.
-pub const Protocol = HttpProtocol;
 
 // =============================================================================
 // Tests

@@ -184,16 +184,29 @@ zig build test-tls              # Run serval-tls tests
 zig build test-h2               # Run serval-h2 tests
 zig build test-grpc             # Run serval-grpc tests
 zig build test-acme             # Run serval-acme tests
+zig build audit-pub-consts      # Fail on non-core core-alias drift / exact semantic duplicates
+zig build audit-pub-consts-report # Report pub const ownership findings without failing
 zig build test-integration      # Run end-to-end integration tests
 zig build test-integration-h2c-grpc-completion-fast  # Focused gRPC h2c completion checks
 zig build test-integration-h2-generic-completeness-fast # Focused non-gRPC h2 parity checks
 zig build test-integration-h2-mixed-hardening-fast      # Focused mixed GOAWAY/reset/cancel hardening checks
 zig build test-integration-h2-mixed-hardening-soak      # Extended mixed-workload h2 soak set
 zig build test-integration-h2c-upgrade-tls-upstream   # Focused h2c upgrade -> TLS h2 upstream check
+
+Ownership rule: shared cross-module config stays in `serval-core`; single-owner tunables should stay private in the owning file or module.
 zig build test-h2-conformance-ci                       # h2spec sweep (plain + TLS conformance server)
 zig build test-integration-perf-throughput-h2         # Optional h2 throughput check (h2load, opt-in)
 zig build test-integration-perf-throughput-h2-max     # Optional high-throughput h2 profile (h2load, opt-in)
 ```
+
+To enable the repo-managed pre-commit hook:
+
+```bash
+git config core.hooksPath .githooks
+chmod +x .githooks/pre-commit
+```
+
+That hook runs `zig build audit-pub-consts` before each commit.
 
 ## Examples
 

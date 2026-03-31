@@ -347,6 +347,59 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Build-time pub const ownership audit tool.
+    const pub_const_audit_options = b.addOptions();
+    pub_const_audit_options.addOption([]const u8, "repo_root", b.pathFromRoot("."));
+
+    const pub_const_audit_mod = b.createModule(.{
+        .root_source_file = b.path("tools/pub_const_audit.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pub_const_audit_mod.addOptions("pub_const_audit_options", pub_const_audit_options);
+
+    const pub_const_audit = b.addExecutable(.{
+        .name = "pub-const-audit",
+        .root_module = pub_const_audit_mod,
+    });
+    force_llvm_lld(pub_const_audit);
+
+    const run_pub_const_audit = b.addRunArtifact(pub_const_audit);
+    run_pub_const_audit.addArgs(&.{
+        "--repo-root",
+        b.pathFromRoot("."),
+    });
+    const audit_pub_consts_step = b.step(
+        "audit-pub-consts",
+        "Audit top-level non-core pub const ownership and semantic duplicates",
+    );
+    audit_pub_consts_step.dependOn(&run_pub_const_audit.step);
+
+    const run_pub_const_audit_report = b.addRunArtifact(pub_const_audit);
+    run_pub_const_audit_report.addArgs(&.{
+        "--repo-root",
+        b.pathFromRoot("."),
+        "--report-only",
+    });
+    const audit_pub_consts_report_step = b.step(
+        "audit-pub-consts-report",
+        "Report top-level non-core pub const ownership and semantic duplicates without failing",
+    );
+    audit_pub_consts_report_step.dependOn(&run_pub_const_audit_report.step);
+
+    const pub_const_audit_tests_mod = b.createModule(.{
+        .root_source_file = b.path("tools/pub_const_audit.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pub_const_audit_tests_mod.addOptions("pub_const_audit_options", pub_const_audit_options);
+    const pub_const_audit_tests = b.addTest(.{
+        .name = "pub_const_audit_tests",
+        .root_module = pub_const_audit_tests_mod,
+    });
+    force_llvm_lld(pub_const_audit_tests);
+    const run_pub_const_audit_tests = b.addRunArtifact(pub_const_audit_tests);
+
     // =========================================================================
     // Tests
     // =========================================================================
@@ -388,6 +441,13 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run all serval library tests");
     test_step.dependOn(&run_serval_tests.step);
+    test_step.dependOn(&run_pub_const_audit_tests.step);
+
+    const test_pub_const_audit_step = b.step(
+        "test-pub-const-audit",
+        "Run unit tests for the pub const ownership audit tool",
+    );
+    test_pub_const_audit_step.dependOn(&run_pub_const_audit_tests.step);
 
     // Load balancer handler tests
     // Note: Links SSL libraries since serval-prober and serval-lb now depend on serval-tls

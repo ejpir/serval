@@ -40,6 +40,7 @@ For performance-sensitive code:
 
 - TigerStyle constraints re-checked
 - Architecture/layer constraints preserved
+- Public `pub const` ownership drift checked when shared aliases/constants were touched
 - Module README updated if behavior changed
 - `serval/ARCHITECTURE.md` still accurate
 - Command results captured with exit codes
@@ -49,4 +50,5 @@ For performance-sensitive code:
 ```bash
 zig build
 zig build test
+zig build audit-pub-consts-report
 ```

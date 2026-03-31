@@ -17,12 +17,9 @@ pub const setting_size_bytes: u32 = 6;
 /// Default HPACK header table size in bytes used for new connection state.
 /// This value matches the HTTP/2 default dynamic table size.
 pub const default_header_table_size_bytes: u32 = 4096;
-/// Sentinel meaning the peer did not advertise a concurrent-stream limit.
-/// This uses the maximum `u32` value to represent an effectively unbounded limit.
-pub const max_concurrent_streams_unbounded: u32 = std.math.maxInt(u32);
-/// Sentinel meaning the peer did not advertise a header list size limit.
-/// This uses the maximum `u32` value to represent an effectively unbounded limit.
-pub const max_header_list_size_unbounded: u32 = std.math.maxInt(u32);
+/// Sentinel meaning the peer did not advertise a `u32`-bounded limit.
+/// This uses the maximum `u32` value to represent an effectively unbounded setting.
+const unbounded_limit_u32: u32 = std.math.maxInt(u32);
 /// Minimum legal HTTP/2 `MAX_FRAME_SIZE` value in bytes.
 /// This is the protocol lower bound for the `max_frame_size_bytes` setting.
 pub const min_max_frame_size_bytes: u32 = 16_384;
@@ -65,10 +62,10 @@ pub const Setting = struct {
 pub const Settings = struct {
     header_table_size_bytes: u32 = default_header_table_size_bytes,
     enable_push: bool = true,
-    max_concurrent_streams: u32 = max_concurrent_streams_unbounded,
+    max_concurrent_streams: u32 = unbounded_limit_u32,
     initial_window_size_bytes: u32 = config.H2_INITIAL_WINDOW_SIZE_BYTES,
     max_frame_size_bytes: u32 = config.H2_MAX_FRAME_SIZE_BYTES,
-    max_header_list_size_bytes: u32 = max_header_list_size_unbounded,
+    max_header_list_size_bytes: u32 = unbounded_limit_u32,
     enable_connect_protocol: bool = true,
 };
 

@@ -55,8 +55,8 @@ pub fn verifyTracer(comptime T: type) void {
 
 /// Lightweight reference to a span.
 /// Defined in serval-core for use by Context.
-/// Re-exported here for convenience.
-pub const SpanHandle = core.SpanHandle;
+/// Kept private here; the public alias lives at the module root.
+const SpanHandle = core.SpanHandle;
 
 // =============================================================================
 // NoopTracer (zero overhead)

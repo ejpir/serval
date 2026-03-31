@@ -10,10 +10,10 @@
 pub const tracing = @import("tracing.zig");
 /// Alias of [`tracing.SpanHandle`] re-exported by `serval-tracing`.
 /// This introduces no new behavior; semantics, ownership/lifetime rules,
-/// and any validity requirements are exactly those of `tracing.SpanHandle`.
+/// and any validity requirements are exactly those of `serval-core.SpanHandle`.
 /// Constructing/using values follows the underlying type's API; this alias
 /// itself performs no allocation and cannot fail.
-pub const SpanHandle = tracing.SpanHandle;
+pub const SpanHandle = @import("serval-core").SpanHandle;
 /// Alias to `tracing.NoopTracer`, the no-op tracer implementation used by Serval.
 /// Use this when an API requires a tracer but tracing should be effectively disabled.
 /// Semantics, ownership/lifetime expectations, and error behavior are exactly those of `tracing.NoopTracer`.

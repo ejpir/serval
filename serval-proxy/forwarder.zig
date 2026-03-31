@@ -73,6 +73,8 @@ const Request = types.Request;
 const Upstream = types.Upstream;
 const Method = types.Method;
 const Connection = pool_mod.Connection;
+const max_stale_retries: u8 = 2;
+const connect_timeout_ns: u64 = 30 * 1000 * 1000 * 1000;
 
 // =============================================================================
 // Forwarder
@@ -129,12 +131,8 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             };
         }
 
-        /// Maximum stale connection retries - imported from config.
-        /// TigerStyle: Single source of truth for tunables.
-        const MAX_STALE_RETRIES = config.MAX_STALE_RETRIES;
-
         /// Forward request to upstream, returning response metadata.
-        /// Auto-retries up to MAX_STALE_RETRIES on stale pooled connections.
+        /// Auto-retries up to `max_stale_retries` on stale pooled connections.
         /// body_info contains metadata for streaming request body from client.
         /// parent_span is the root request span for creating child trace spans.
         /// client_tls is the TLS stream for client connection (for encrypted responses).
@@ -175,7 +173,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             var stale_retries: u8 = 0;
 
             // Try pooled connections with bounded retry on stale
-            while (stale_retries < MAX_STALE_RETRIES) : (stale_retries += 1) {
+            while (stale_retries < max_stale_retries) : (stale_retries += 1) {
                 if (self.pool.acquire(upstream.idx)) |pooled_conn| {
                     const pool_end_ns = time.monotonicNanos();
                     const pool_wait_ns = time.elapsedNanos(pool_start_ns, pool_end_ns);
@@ -183,7 +181,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
                     // Check for unusable connection before using pooled connection
                     // TigerStyle: Detect stale data, closed by peer, socket errors.
                     if (pooled_conn.isUnusable()) {
-                        debugLog("forward: pool hit but STALE (retry {d}/{d}), closing", .{ stale_retries + 1, MAX_STALE_RETRIES });
+                        debugLog("forward: pool hit but STALE (retry {d}/{d}), closing", .{ stale_retries + 1, max_stale_retries });
                         var stale_conn = pooled_conn;
                         stale_conn.close();
                         continue; // Try next pooled connection
@@ -211,8 +209,8 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
                         forward_span,
                         effective_path,
                     ) catch |err| {
-                        if (err == ForwardError.StaleConnection and stale_retries + 1 < MAX_STALE_RETRIES) {
-                            debugLog("forward: StaleConnection during send (retry {d}/{d})", .{ stale_retries + 1, MAX_STALE_RETRIES });
+                        if (err == ForwardError.StaleConnection and stale_retries + 1 < max_stale_retries) {
+                            debugLog("forward: StaleConnection during send (retry {d}/{d})", .{ stale_retries + 1, max_stale_retries });
                             // Note: connection is closed by errdefer in forwardWithConnection
                             continue; // Try next pooled connection
                         }
@@ -293,7 +291,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             const pool_start_ns = time.monotonicNanos();
             var stale_retries: u8 = 0;
 
-            while (stale_retries < MAX_STALE_RETRIES) : (stale_retries += 1) {
+            while (stale_retries < max_stale_retries) : (stale_retries += 1) {
                 if (self.pool.acquire(upstream.idx)) |pooled_conn| {
                     const pool_wait_ns = time.elapsedNanos(pool_start_ns, time.monotonicNanos());
                     if (pooled_conn.isUnusable()) {
@@ -320,7 +318,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
                         effective_path,
                         forwarded,
                     ) catch |err| {
-                        if (err == ForwardError.StaleConnection and stale_retries + 1 < MAX_STALE_RETRIES) {
+                        if (err == ForwardError.StaleConnection and stale_retries + 1 < max_stale_retries) {
                             continue;
                         }
                         self.tracer.setIntAttribute(pool_span, "wait_ns", @intCast(pool_wait_ns));
@@ -380,7 +378,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             // TCP connect phase with span
             const connect_span = self.tracer.startSpan("tcp_connect", forward_span);
             const connect_config = ConnectConfig{
-                .timeout_ns = config.CONNECT_TIMEOUT_NS,
+                .timeout_ns = connect_timeout_ns,
                 .verify_upstream_tls = self.verify_upstream_tls,
                 .client_ctx = self.client_ctx,
             };
@@ -459,7 +457,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
 
             const connect_span = self.tracer.startSpan("tcp_connect", forward_span);
             const connect_config = ConnectConfig{
-                .timeout_ns = config.CONNECT_TIMEOUT_NS,
+                .timeout_ns = connect_timeout_ns,
                 .verify_upstream_tls = self.verify_upstream_tls,
                 .client_ctx = self.client_ctx,
             };
@@ -646,7 +644,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
 
             const connect_span = self.tracer.startSpan("connect_upstream", forward_span);
             const connect_cfg = ConnectConfig{
-                .timeout_ns = config.CONNECT_TIMEOUT_NS,
+                .timeout_ns = connect_timeout_ns,
                 .verify_upstream_tls = self.verify_upstream_tls,
                 .client_ctx = self.client_ctx,
             };
@@ -746,7 +744,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
 
             const connect_span = self.tracer.startSpan("connect_upstream", forward_span);
             const connect_cfg = ConnectConfig{
-                .timeout_ns = config.CONNECT_TIMEOUT_NS,
+                .timeout_ns = connect_timeout_ns,
                 .verify_upstream_tls = self.verify_upstream_tls,
                 .client_ctx = self.client_ctx,
             };
@@ -1150,7 +1148,7 @@ test "Forwarder init with SimplePool" {
 
 test "CRITICAL: MAX_STALE_RETRIES is bounded (no infinite retry)" {
     // TigerStyle: All loops must be bounded
-    const MAX = config.MAX_STALE_RETRIES;
+    const MAX = max_stale_retries;
 
     // Document current value
     try std.testing.expectEqual(@as(u8, 2), MAX);

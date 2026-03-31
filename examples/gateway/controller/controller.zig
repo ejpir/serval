@@ -4,7 +4,7 @@
 //! Coordinates between K8s watcher and data plane.
 //!
 //! Uses serval-server.MinimalServer for admin API instead of raw sockets.
-//! Uses serval-core.config for all constants (no local definitions).
+//! Uses explicit module-owned constants for controller-side defaults.
 //!
 //! TigerStyle: Thread-safe state, uses serval components, explicit errors.
 
@@ -17,8 +17,6 @@ const log = serval_core.log.scoped(.gateway_controller);
 const gateway = @import("serval-k8s-gateway");
 const GatewayConfig = gateway.GatewayConfig;
 const Gateway = gateway.Gateway;
-
-const core_config = serval_core.config;
 
 const routerclient = @import("routerclient/mod.zig");
 const RouterClient = routerclient.RouterClient;
@@ -670,9 +668,8 @@ test "Controller getConfig returns null initially" {
     try std.testing.expect(ctrl.getConfig() == null);
 }
 
-test "Controller uses default admin port from config" {
-    // Verify we can use serval-core.config constants
-    const default_port = core_config.DEFAULT_ADMIN_PORT;
+test "Controller uses router client default admin port" {
+    const default_port = routerclient.DEFAULT_ADMIN_PORT;
     try std.testing.expectEqual(@as(u16, 9901), default_port);
 
     const k8s_client = try createTestK8sClient(std.testing.allocator);

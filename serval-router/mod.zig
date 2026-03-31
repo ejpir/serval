@@ -19,6 +19,12 @@ pub const Router = router.Router;
 /// This re-exports `router.MAX_POOLS` so callers can use a stable module-level constant.
 /// Exceeding this limit in pool-related configuration is invalid and should be rejected by validation paths.
 pub const MAX_POOLS = router.MAX_POOLS;
+/// Upper bound on the number of routes supported by this module.
+pub const MAX_ROUTES = router.MAX_ROUTES;
+/// Upper bound on the number of allowed-host filters supported by this module.
+pub const MAX_ALLOWED_HOSTS = router.MAX_ALLOWED_HOSTS;
+/// Upper bound on one hostname value accepted by router APIs.
+pub const MAX_HOSTNAME_LEN = router.MAX_HOSTNAME_LEN;
 
 // Types
 /// Public re-export of `types.Route`, the route-table entry consumed by `Router`.
@@ -54,8 +60,8 @@ pub const LbHandler = types.LbHandler;
 pub const LbConfig = types.LbConfig;
 /// Re-export of [`types.Upstream`] for router-facing APIs.
 /// Use this alias when referring to upstream endpoint configuration through `serval-router`.
-/// Behavior, fields, validation, and lifetime semantics are defined by `types.Upstream`.
-pub const Upstream = types.Upstream;
+/// Behavior, fields, validation, and lifetime semantics are defined by `serval-core.Upstream`.
+pub const Upstream = @import("serval-core").Upstream;
 
 test {
     // Run tests from all submodules

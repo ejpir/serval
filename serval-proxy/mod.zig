@@ -26,9 +26,9 @@ pub const ForwardResult = types.ForwardResult;
 pub const BodyInfo = types.BodyInfo;
 /// Public re-export of the proxy upstream wire protocol enum.
 /// Use this for selected/negotiated HTTP protocol values (`.h1`, `.h2c`, `.h2`).
-/// Semantics are identical to `types.Protocol`; this is a type alias, not a wrapper.
+/// Semantics are identical to `serval-core.HttpProtocol`; this is a type alias, not a wrapper.
 /// Value type only: no allocation, ownership transfer, or error behavior.
-pub const Protocol = types.Protocol;
+pub const Protocol = @import("serval-core").HttpProtocol;
 
 /// Re-exports the proxy tunneling module from `tunnel.zig`.
 /// Use this namespace to access tunnel-related types and functions via `proxy.tunnel`.

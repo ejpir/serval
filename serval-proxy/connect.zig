@@ -24,10 +24,11 @@ const Socket = serval_socket.Socket;
 const serval_client = @import("serval-client");
 const Client = serval_client.Client;
 const ClientError = serval_client.ClientError;
+const HttpProtocol = serval_core.HttpProtocol;
 
 const types = @import("types.zig");
 const ForwardError = types.ForwardError;
-const Protocol = types.Protocol;
+const Protocol = HttpProtocol;
 
 const Upstream = serval_core.types.Upstream;
 

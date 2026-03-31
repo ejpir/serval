@@ -9,10 +9,11 @@ const std = @import("std");
 const testing = std.testing;
 const Thread = std.Thread;
 
+const config = @import("serval-core").config;
 const health_state = @import("health_state.zig");
 const HealthState = health_state.HealthState;
-const UpstreamIndex = health_state.UpstreamIndex;
-const MAX_UPSTREAMS = health_state.MAX_UPSTREAMS;
+const UpstreamIndex = config.UpstreamIndex;
+const MAX_UPSTREAMS = config.MAX_UPSTREAMS;
 
 // =============================================================================
 // Constants

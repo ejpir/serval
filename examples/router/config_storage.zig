@@ -27,6 +27,8 @@ const Route = serval_router.Route;
 const PoolConfig = serval_router.PoolConfig;
 const Upstream = serval_router.Upstream;
 const DnsResolver = serval_net.DnsResolver;
+const max_router_slots: usize = 2;
+const config_swap_grace_ms: u64 = 1000;
 
 // =============================================================================
 // Config Storage (per-slot)
@@ -169,11 +171,11 @@ pub const ConfigStorage = struct {
 
 /// Double-buffered config storage (one per router slot).
 /// TigerStyle: Config data lives here, outlives JSON parsing.
-var storage: [config.MAX_ROUTER_SLOTS]ConfigStorage = .{ .{}, .{} };
+var storage: [max_router_slots]ConfigStorage = .{ .{}, .{} };
 
 /// Double-buffered Router storage for atomic swap.
 /// TigerStyle: Fixed-size array, no runtime allocation after init.
-var router_storage: [config.MAX_ROUTER_SLOTS]Router = undefined;
+var router_storage: [max_router_slots]Router = undefined;
 
 /// Atomic pointer to currently active router.
 /// TigerStyle: Acquire/release ordering ensures visibility of initialized router.
@@ -189,7 +191,7 @@ var router_generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 
 /// Track which slots have been initialized (for cleanup).
 /// TigerStyle: Explicit initialization state per slot.
-var slot_initialized: [config.MAX_ROUTER_SLOTS]bool = .{ false, false };
+var slot_initialized: [max_router_slots]bool = .{ false, false };
 
 /// Mutex to serialize config swaps.
 /// TigerStyle: Prevents concurrent swap race conditions during grace period.
@@ -238,7 +240,7 @@ pub fn swapRouter(
     const inactive_slot: u8 = 1 - current_slot;
 
     // S1: Slot index must be valid (0 or 1)
-    assert(inactive_slot < config.MAX_ROUTER_SLOTS);
+    assert(inactive_slot < max_router_slots);
 
     // Deinit old router in inactive slot if it was previously initialized.
     // This is safe because no requests should be using the inactive slot.
@@ -281,7 +283,7 @@ pub fn swapRouter(
     // Grace period: allow in-flight requests using old config to complete.
     // TigerStyle: Bounded wait with explicit timeout from config.
     // TigerStyle: Grace period in milliseconds converted to seconds + nanoseconds
-    const grace_ns: u64 = config.CONFIG_SWAP_GRACE_MS * time.ns_per_ms;
+    const grace_ns: u64 = config_swap_grace_ms * time.ns_per_ms;
     std.Io.sleep(std.Options.debug_io, .fromNanoseconds(@intCast(grace_ns)), .awake) catch |err| {
         std.log.warn("router config grace sleep failed: {s}", .{@errorName(err)});
     };

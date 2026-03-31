@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "${repo_root}"
+
+zig_bin="/usr/local/zig-x86_64-linux-0.16.0-dev.3039+b490412cd/zig"
+if [[ ! -x "${zig_bin}" ]]; then
+    zig_bin="zig"
+fi
+
+echo "pre-commit: running pub const ownership audit"
+"${zig_bin}" build audit-pub-consts

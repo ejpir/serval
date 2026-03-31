@@ -11,6 +11,10 @@ const std = @import("std");
 const serval_core = @import("serval-core");
 const gateway = @import("serval-k8s-gateway");
 const core_config = serval_core.config;
+const default_admin_port: u16 = 9901;
+const max_retries: u8 = 3;
+const backoff_base_ms: u64 = 100;
+const max_backoff_ms: u64 = 5000;
 
 // ============================================================================
 // Re-exports
@@ -30,7 +34,7 @@ pub const PushResult = @import("types.zig").PushResult;
 // ============================================================================
 
 /// Default admin port for router.
-pub const DEFAULT_ADMIN_PORT: u16 = core_config.DEFAULT_ADMIN_PORT;
+pub const DEFAULT_ADMIN_PORT: u16 = default_admin_port;
 
 /// Maximum JSON payload size in bytes.
 pub const MAX_JSON_SIZE_BYTES: u32 = gateway.translator.MAX_JSON_SIZE_BYTES;
@@ -39,13 +43,13 @@ pub const MAX_JSON_SIZE_BYTES: u32 = gateway.translator.MAX_JSON_SIZE_BYTES;
 pub const MAX_RESPONSE_HEADER_SIZE_BYTES: u32 = core_config.MAX_HEADER_SIZE_BYTES;
 
 /// Maximum retries for config push (TigerStyle S4: bounded).
-pub const MAX_RETRIES: u8 = core_config.MAX_CONFIG_PUSH_RETRIES;
+pub const MAX_RETRIES: u8 = max_retries;
 
 /// Base backoff delay in milliseconds.
-pub const BACKOFF_BASE_MS: u64 = core_config.CONFIG_PUSH_BACKOFF_BASE_MS;
+pub const BACKOFF_BASE_MS: u64 = backoff_base_ms;
 
 /// Maximum backoff delay in milliseconds.
-pub const MAX_BACKOFF_MS: u64 = core_config.MAX_CONFIG_PUSH_BACKOFF_MS;
+pub const MAX_BACKOFF_MS: u64 = max_backoff_ms;
 
 /// Admin endpoint path for route updates.
 pub const ADMIN_ROUTES_PATH: []const u8 = "/routes/update";
@@ -90,11 +94,11 @@ pub const RouterClientError = error{
 // Tests
 // ============================================================================
 
-test "Constants match serval-core config" {
-    try std.testing.expectEqual(core_config.DEFAULT_ADMIN_PORT, DEFAULT_ADMIN_PORT);
-    try std.testing.expectEqual(core_config.MAX_CONFIG_PUSH_RETRIES, MAX_RETRIES);
-    try std.testing.expectEqual(core_config.CONFIG_PUSH_BACKOFF_BASE_MS, BACKOFF_BASE_MS);
-    try std.testing.expectEqual(core_config.MAX_CONFIG_PUSH_BACKOFF_MS, MAX_BACKOFF_MS);
+test "router client defaults remain bounded and explicit" {
+    try std.testing.expectEqual(@as(u16, 9901), DEFAULT_ADMIN_PORT);
+    try std.testing.expectEqual(@as(u8, 3), MAX_RETRIES);
+    try std.testing.expectEqual(@as(u64, 100), BACKOFF_BASE_MS);
+    try std.testing.expectEqual(@as(u64, 5000), MAX_BACKOFF_MS);
 }
 
 test "RouterClientError has all expected variants" {

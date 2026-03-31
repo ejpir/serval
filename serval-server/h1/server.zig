@@ -22,7 +22,7 @@ const DnsConfig = serval_net.DnsConfig;
 
 const pool_mod = @import("serval-pool").pool;
 const metrics_mod = @import("serval-metrics").metrics;
-const tracing_mod = @import("serval-tracing").tracing;
+const tracing_mod = @import("serval-tracing");
 const SpanHandle = tracing_mod.SpanHandle;
 const serval_http = @import("serval-http");
 const parser_mod = serval_http.parser;

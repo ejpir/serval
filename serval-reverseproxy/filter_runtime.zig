@@ -8,9 +8,13 @@ const ir = @import("ir.zig");
 const request_stream = @import("stream_request.zig");
 
 /// Maximum number of loaded filters the registry can store.
-/// This is tied to `config.MAX_ROUTES` so the filter registry capacity tracks the configured route limit.
+/// This owner-public bound stays aligned with the shared route budget.
 /// Use this constant when sizing registry-backed storage or validating plugin registration limits.
-pub const MAX_LOADED_FILTERS: usize = config.MAX_ROUTES;
+pub const MAX_LOADED_FILTERS: usize = 128;
+
+comptime {
+    assert(MAX_LOADED_FILTERS == config.MAX_ROUTES);
+}
 
 /// Errors returned by filter registry setup and route hook execution.
 /// `TooManyLoadedFilters` and `DuplicatePluginBinding` report registry binding failures.

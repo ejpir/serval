@@ -9,28 +9,28 @@ const std = @import("std");
 const assert = std.debug.assert;
 const core = @import("serval-core");
 const log = core.log.scoped(.otel);
-const config = core.config;
 const time = core.time;
+const limits = @import("limits.zig");
 const span_mod = @import("span.zig");
 const tracer_mod = @import("tracer.zig");
 
 const Span = span_mod.Span;
 const SpanProcessor = tracer_mod.SpanProcessor;
 
-// Constants from serval-core/config.zig (single source of truth)
+// Module-owned limits
 /// Maximum queue capacity used by the OTEL processor.
-/// This constant aliases `config.OTEL_MAX_QUEUE_SIZE`, so its value is defined centrally in `serval-core` config.
+/// This constant aliases `limits.MAX_QUEUE_SIZE`, the compile-time queue bound owned by `serval-otel`.
 /// It is a compile-time constant and does not allocate, own resources, or return errors.
-pub const MAX_QUEUE_SIZE = config.OTEL_MAX_QUEUE_SIZE;
+pub const MAX_QUEUE_SIZE = limits.MAX_QUEUE_SIZE;
 /// Maximum number of spans a `BatchingProcessor` export operation may include.
-/// Mirrors `serval-core.config.OTEL_MAX_EXPORT_BATCH_SIZE` as this module's public limit.
+/// Mirrors `limits.MAX_EXPORT_BATCH_SIZE` as this module's public limit.
 /// Used as a fixed compile-time array bound (`export_buffer`) and as the upper bound for `Config.max_export_batch_size`.
 /// This declaration has no runtime behavior or errors; enforcement occurs in `BatchingProcessor.init` assertions.
-pub const MAX_EXPORT_BATCH_SIZE = config.OTEL_MAX_EXPORT_BATCH_SIZE;
+pub const MAX_EXPORT_BATCH_SIZE = limits.MAX_EXPORT_BATCH_SIZE;
 /// Default OpenTelemetry batch delay, in milliseconds, used by the processor.
-/// This constant is an alias of `config.OTEL_BATCH_DELAY_MS`, so its value is defined centrally in config.
+/// This constant is an alias of `limits.DEFAULT_BATCH_DELAY_MS`, so its value is defined in `serval-otel`.
 /// Affects timing defaults only; reading this constant has no ownership, lifetime, or error behavior.
-pub const DEFAULT_BATCH_DELAY_MS = config.OTEL_BATCH_DELAY_MS;
+pub const DEFAULT_BATCH_DELAY_MS = limits.DEFAULT_BATCH_DELAY_MS;
 
 // =============================================================================
 // Exporter Interface
@@ -129,7 +129,7 @@ pub const SimpleProcessor = struct {
 /// TigerStyle: mutex released during export to avoid blocking producers.
 pub const BatchingProcessor = struct {
     // Configuration (TigerStyle: explicit u32, _ms suffix)
-    // Uses module-level constants from config.zig as defaults
+    // Uses module-owned limits as defaults
     /// Runtime configuration for the batch processor.
     /// `scheduled_delay_ms` controls the export wake-up delay in milliseconds, and `max_export_batch_size` limits the number of spans per batch.
     /// `init` validates both fields before use; the defaults are chosen from the module's batch timing and size constants.
@@ -143,7 +143,7 @@ pub const BatchingProcessor = struct {
     config: Config,
 
     // Fixed-size queue (TigerStyle: no dynamic allocation after init)
-    // Uses MAX_QUEUE_SIZE from config.zig
+    // Uses MAX_QUEUE_SIZE from module limits
     queue: [MAX_QUEUE_SIZE]Span,
     queue_len: u32,
 

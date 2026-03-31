@@ -26,13 +26,12 @@ const Socket = serval_socket.Socket;
 const core = @import("serval-core");
 const config = core.config;
 
-// Re-export from config for backward compatibility.
 /// Maximum number of chunk-processing iterations allowed while forwarding a chunked body.
-/// This is an alias of `config.MAX_CHUNK_ITERATIONS` and is used to keep the forwarding loop bounded.
-pub const MAX_CHUNK_ITERATIONS = config.MAX_CHUNK_ITERATIONS;
+/// This private alias of `config.MAX_CHUNK_ITERATIONS` keeps the forwarding loop bounded.
+const MAX_CHUNK_ITERATIONS = config.MAX_CHUNK_ITERATIONS;
 /// Buffer size, in bytes, used while forwarding chunked bodies.
-/// This is an alias of `config.CHUNK_BUFFER_SIZE_BYTES` so the proxy layer follows the shared configuration value.
-pub const CHUNK_BUFFER_SIZE_BYTES = config.CHUNK_BUFFER_SIZE_BYTES;
+/// This private alias of `config.CHUNK_BUFFER_SIZE_BYTES` keeps chunk forwarding aligned with shared buffer sizing.
+const CHUNK_BUFFER_SIZE_BYTES = config.CHUNK_BUFFER_SIZE_BYTES;
 
 // =============================================================================
 // Public API

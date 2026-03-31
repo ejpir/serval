@@ -37,6 +37,10 @@ const std = @import("std");
 // Public Exports
 // =============================================================================
 
+/// Public import of the module-owned OpenTelemetry limits.
+/// Use this namespace for explicit compile-time bounds defined by `serval-otel`.
+pub const limits = @import("limits.zig");
+
 // Core types
 /// Public import of `types.zig`.
 /// Use this namespace for trace identifiers, flags, state, and context types.
@@ -156,7 +160,7 @@ pub const exporter = @import("exporter.zig");
 pub const OTLPExporter = exporter.OTLPExporter;
 /// Alias for `exporter.Config`.
 /// Configures the OTLP HTTP/JSON exporter, including endpoint, service metadata, and timeout.
-/// Field defaults come from `serval-core.config`; the type itself owns no resources.
+/// Field defaults come from `serval-otel` module limits; the type itself owns no resources.
 pub const OTLPConfig = exporter.Config;
 
 // ID Generator
@@ -385,6 +389,7 @@ test "global API without init returns disabled spans" {
 
 // Run all submodule tests
 test {
+    _ = @import("limits.zig");
     _ = @import("types.zig");
     _ = @import("span.zig");
     _ = @import("id_generator.zig");

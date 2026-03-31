@@ -23,7 +23,7 @@ pub const LbConfig = lb.LbConfig;
 /// Includes backend address/config fields: `host`, `port`, connection-pool `idx`, `tls`, and `http_protocol`.
 /// `host` is a borrowed `[]const u8`; ownership stays with the caller, and backing memory must outlive use.
 /// This alias adds no behavior or error paths; initialization and validation semantics come from `core.Upstream`.
-pub const Upstream = core.Upstream;
+const Upstream = core.Upstream;
 
 /// Strip port from hostname, handling IPv6 bracket notation.
 ///

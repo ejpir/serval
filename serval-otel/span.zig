@@ -7,7 +7,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const core = @import("serval-core");
 const log = core.log.scoped(.otel);
-const config = core.config;
+const limits = @import("limits.zig");
 const types = @import("types.zig");
 
 // Re-export types for convenience
@@ -41,29 +41,29 @@ pub const TraceFlags = types.TraceFlags;
 pub const InstrumentationScope = types.InstrumentationScope;
 
 // =============================================================================
-// Constants (from serval-core/config.zig)
+// Module-owned limits
 // =============================================================================
 
 /// Maximum number of attributes a span can store.
-/// This value is sourced from `config.OTEL_MAX_ATTRIBUTES` and is a fixed compile-time limit.
+/// This value is sourced from `limits.MAX_ATTRIBUTES` and is a fixed compile-time limit.
 /// Use it when sizing or validating span attribute storage.
-pub const MAX_ATTRIBUTES = config.OTEL_MAX_ATTRIBUTES;
+pub const MAX_ATTRIBUTES = limits.MAX_ATTRIBUTES;
 /// Maximum number of events a span can store.
-/// This value is sourced from `config.OTEL_MAX_EVENTS` and is a fixed compile-time limit.
+/// This value is sourced from `limits.MAX_EVENTS` and is a fixed compile-time limit.
 /// Use it when sizing or validating span event storage.
-pub const MAX_EVENTS = config.OTEL_MAX_EVENTS;
+pub const MAX_EVENTS = limits.MAX_EVENTS;
 /// Maximum number of span links stored inline on a span.
 /// The span's fixed-size link buffer is sized to this limit.
-pub const MAX_LINKS = config.OTEL_MAX_LINKS;
+pub const MAX_LINKS = limits.MAX_LINKS;
 /// Maximum number of bytes stored inline for attribute and event keys.
 /// Callers should keep keys within this bound before copying them in.
-pub const MAX_KEY_LEN = config.OTEL_MAX_KEY_LEN;
+pub const MAX_KEY_LEN = limits.MAX_KEY_LEN;
 /// Maximum number of bytes stored inline for span names.
 /// `Span.init` asserts that the provided name does not exceed this limit.
-pub const MAX_NAME_LEN = config.OTEL_MAX_NAME_LEN;
+pub const MAX_NAME_LEN = limits.MAX_NAME_LEN;
 /// Maximum number of bytes stored inline for attribute string values.
 /// Longer inputs passed to `fromString` are truncated to this size.
-pub const MAX_STRING_VALUE_LEN = config.OTEL_MAX_STRING_VALUE_LEN;
+pub const MAX_STRING_VALUE_LEN = limits.MAX_STRING_VALUE_LEN;
 
 // =============================================================================
 // Attribute Value - discriminated union for attribute types
@@ -85,29 +85,29 @@ pub const AttributeValue = union(enum) {
     const Self = @This();
 
     /// Constructs an `AttributeValue` containing a boolean value.
-/// The value is stored directly in the union.
-/// No allocation or validation is performed.
+    /// The value is stored directly in the union.
+    /// No allocation or validation is performed.
     pub fn fromBool(val: bool) Self {
         return .{ .bool_val = val };
     }
 
     /// Constructs an `AttributeValue` containing an integer value.
-/// The value is stored directly in the union.
-/// No allocation or validation is performed.
+    /// The value is stored directly in the union.
+    /// No allocation or validation is performed.
     pub fn fromInt(val: i64) Self {
         return .{ .int_val = val };
     }
 
     /// Constructs an `AttributeValue` containing a floating-point value.
-/// The value is stored directly in the union.
-/// No allocation or validation is performed.
+    /// The value is stored directly in the union.
+    /// No allocation or validation is performed.
     pub fn fromDouble(val: f64) Self {
         return .{ .double_val = val };
     }
 
     /// Copies `val` into the inline string buffer and returns a string variant.
-/// Inputs longer than `MAX_STRING_VALUE_LEN` bytes are truncated.
-/// No allocation or error is performed.
+    /// Inputs longer than `MAX_STRING_VALUE_LEN` bytes are truncated.
+    /// No allocation or error is performed.
     pub fn fromString(val: []const u8) Self {
         var result = Self{ .string_val = .{ .data = undefined, .len = 0 } };
         const copy_len = @min(val.len, MAX_STRING_VALUE_LEN);
@@ -117,9 +117,9 @@ pub const AttributeValue = union(enum) {
     }
 
     /// Returns the stored string value when this union holds `.string_val`.
-/// Non-string variants return `null`.
-/// The returned slice aliases the union's inline string buffer, so the union
-/// value must stay alive for as long as the slice is used.
+    /// Non-string variants return `null`.
+    /// The returned slice aliases the union's inline string buffer, so the union
+    /// value must stay alive for as long as the slice is used.
     pub fn getString(self: Self) ?[]const u8 {
         return switch (self) {
             .string_val => |s| s.data[0..s.len],
@@ -144,9 +144,9 @@ pub const Attribute = struct {
 
     // TigerStyle: use pointer to avoid copying and dangling slice
     /// Returns the stored key as a slice of the inline buffer.
-/// The returned slice aliases storage owned by `self` and remains valid while
-/// that object is alive and the key length is unchanged.
-/// No allocation or copying is performed.
+    /// The returned slice aliases storage owned by `self` and remains valid while
+    /// that object is alive and the key length is unchanged.
+    /// No allocation or copying is performed.
     pub fn getKey(self: *const Self) []const u8 {
         return self.key[0..self.key_len];
     }
@@ -168,9 +168,9 @@ pub const Event = struct {
 
     // TigerStyle: use pointer to avoid copying and dangling slice
     /// Returns the stored name as a slice of the inline buffer.
-/// The returned slice aliases storage owned by `self` and remains valid while
-/// that object is alive and the name length is unchanged.
-/// No allocation or copying is performed.
+    /// The returned slice aliases storage owned by `self` and remains valid while
+    /// that object is alive and the name length is unchanged.
+    /// No allocation or copying is performed.
     pub fn getName(self: *const Self) []const u8 {
         return self.name[0..self.name_len];
     }

@@ -481,8 +481,8 @@ const alpn_protocol_acme_tls_1: []const u8 = "acme-tls/1";
 /// Public re-export of `serval-core.config.AlpnMixedOfferPolicy` for TLS-facing APIs in this module.
 /// Governs ALPN behavior for mixed `h2`/`http/1.1` client offers, including strict `http11_only` deployments.
 /// Variant semantics are defined by the source enum (`prefer_http11`, `prefer_h2`, `http11_only`); this alias does not modify them.
-/// This is a type alias only: no allocation, ownership/lifetime effects, or error behavior.
-pub const AlpnMixedOfferPolicy = config.AlpnMixedOfferPolicy;
+/// This is a private type alias only: no allocation, ownership/lifetime effects, or error behavior.
+const AlpnMixedOfferPolicy = config.AlpnMixedOfferPolicy;
 
 /// Decision for server-side ALPN hook handling during TLS negotiation.
 /// `default_policy` applies the normal ALPN selection policy.

@@ -9,13 +9,13 @@ const assert = std.debug.assert;
 const config = @import("serval-core").config;
 
 /// Maximum number of upstream backends supported by this module.
-/// This value is re-exported from `serval-core.config.MAX_UPSTREAMS`
-/// and is used to size fixed-capacity health counters and bitmaps.
-pub const MAX_UPSTREAMS: u8 = config.MAX_UPSTREAMS;
+/// This is a private alias of `serval-core.config.MAX_UPSTREAMS`
+/// used to size fixed-capacity health counters and bitmaps.
+const MAX_UPSTREAMS: u8 = config.MAX_UPSTREAMS;
 /// Type used to index backends tracked by this health state.
-/// It is an alias of `serval-core.config.UpstreamIndex`, so it stays
+/// It aliases `serval-core.config.UpstreamIndex` so it stays
 /// consistent with the shared upstream bound used across the codebase.
-pub const UpstreamIndex = config.UpstreamIndex;
+const UpstreamIndex = config.UpstreamIndex;
 
 /// Cache line size for alignment to prevent false sharing.
 const CACHE_LINE_BYTES: usize = 64;

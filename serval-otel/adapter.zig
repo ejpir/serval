@@ -9,9 +9,9 @@ const std = @import("std");
 const assert = std.debug.assert;
 const core = @import("serval-core");
 const log = core.log.scoped(.otel);
-const config = core.config;
 const tracing = @import("serval-tracing");
 const SpanHandle = tracing.SpanHandle;
+const limits = @import("limits.zig");
 
 const span_mod = @import("span.zig");
 const types = @import("types.zig");
@@ -30,12 +30,12 @@ const SpanProcessor = tracer_mod.SpanProcessor;
 const RandomIDGenerator = id_gen_mod.RandomIDGenerator;
 
 // =============================================================================
-// Constants (from serval-core/config.zig - single source of truth)
+// Module-owned limits
 // =============================================================================
 
 /// Maximum number of concurrent active spans.
 /// TigerStyle: fixed at compile time, no runtime allocation.
-pub const MAX_ACTIVE_SPANS = config.OTEL_MAX_ACTIVE_SPANS;
+pub const MAX_ACTIVE_SPANS = limits.MAX_ACTIVE_SPANS;
 
 // =============================================================================
 // OtelTracer

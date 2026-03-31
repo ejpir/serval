@@ -30,6 +30,10 @@ pub const ServerAlpnHookInput = ssl.ServerAlpnHookInput;
 /// This is a type alias only; variant meanings, preconditions, and error-handling
 /// implications are defined by `ssl.ServerAlpnHookDecision`.
 pub const ServerAlpnHookDecision = ssl.ServerAlpnHookDecision;
+/// Public re-export of `serval-core.config.AlpnMixedOfferPolicy` for TLS callers.
+/// Use this enum to configure mixed `h2` and `http/1.1` ALPN selection policy.
+/// Variant semantics are defined by `serval-core.config.AlpnMixedOfferPolicy`.
+pub const AlpnMixedOfferPolicy = @import("serval-core").config.AlpnMixedOfferPolicy;
 /// Alias for [`ssl.ServerCertHook`] exposed by `serval-tls`.
 /// Use this type when wiring server-certificate hook callbacks in this module.
 /// Behavior, callback contract, ownership/lifetime requirements, and any error

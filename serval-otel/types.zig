@@ -4,25 +4,24 @@
 //! explicit sizes (u8, u16, u32, u64 - not usize except for slice indexing).
 
 const std = @import("std");
-const core = @import("serval-core");
-const config = core.config;
+const limits = @import("limits.zig");
 
 // =============================================================================
-// Constants (from serval-core/config.zig - single source of truth)
+// Module-owned limits
 // =============================================================================
 
 /// Maximum number of trace state entries permitted.
 /// This is a direct alias of the configured OpenTelemetry limit.
-/// Keep validation in sync with `config.OTEL_MAX_TRACE_STATE_ENTRIES`.
-pub const MAX_TRACE_STATE_ENTRIES = config.OTEL_MAX_TRACE_STATE_ENTRIES;
+/// Keep validation in sync with `limits.MAX_TRACE_STATE_ENTRIES`.
+pub const MAX_TRACE_STATE_ENTRIES = limits.MAX_TRACE_STATE_ENTRIES;
 /// Maximum allowed length of a trace state key.
 /// This is a direct alias of the configured OpenTelemetry limit.
-/// Keep validation in sync with `config.OTEL_MAX_TRACE_STATE_KEY_LEN`.
-pub const MAX_TRACE_STATE_KEY_LEN = config.OTEL_MAX_TRACE_STATE_KEY_LEN;
+/// Keep validation in sync with `limits.MAX_TRACE_STATE_KEY_LEN`.
+pub const MAX_TRACE_STATE_KEY_LEN = limits.MAX_TRACE_STATE_KEY_LEN;
 /// Maximum allowed length of a trace state value.
 /// This is a direct alias of the configured OpenTelemetry limit.
-/// Keep validation in sync with `config.OTEL_MAX_TRACE_STATE_VALUE_LEN`.
-pub const MAX_TRACE_STATE_VALUE_LEN = config.OTEL_MAX_TRACE_STATE_VALUE_LEN;
+/// Keep validation in sync with `limits.MAX_TRACE_STATE_VALUE_LEN`.
+pub const MAX_TRACE_STATE_VALUE_LEN = limits.MAX_TRACE_STATE_VALUE_LEN;
 
 // =============================================================================
 // TraceID - 128-bit trace identifier

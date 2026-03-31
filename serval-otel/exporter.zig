@@ -13,6 +13,7 @@ const log = core.log.scoped(.otel);
 const core_config = core.config;
 const core_types = core.types;
 const debugLog = core.debugLog;
+const limits = @import("limits.zig");
 
 const net = @import("serval-net");
 const DnsResolver = net.DnsResolver;
@@ -35,18 +36,18 @@ const Span = span_mod.Span;
 const SpanExporter = processor.SpanExporter;
 
 // =============================================================================
-// Constants (from serval-core/config.zig - single source of truth)
+// Module-owned limits
 // =============================================================================
 
 /// Default OTLP collector endpoint used when no endpoint is provided in configuration.
-/// This is an alias of the shared Serval core OTEL default endpoint value.
-pub const DEFAULT_ENDPOINT = core_config.OTEL_DEFAULT_ENDPOINT;
+/// This is an alias of `limits.DEFAULT_ENDPOINT`.
+pub const DEFAULT_ENDPOINT = limits.DEFAULT_ENDPOINT;
 /// Maximum number of bytes reserved for OTLP export payload assembly.
-/// This is an alias of the shared Serval core OTEL export buffer size configuration value.
-pub const MAX_EXPORT_BUFFER_SIZE = core_config.OTEL_MAX_EXPORT_BUFFER_SIZE_BYTES;
+/// This is an alias of `limits.MAX_EXPORT_BUFFER_SIZE`.
+pub const MAX_EXPORT_BUFFER_SIZE = limits.MAX_EXPORT_BUFFER_SIZE;
 /// HTTP timeout in milliseconds used by the OTLP exporter.
-/// This is an alias of the shared Serval core OTEL timeout configuration value.
-pub const HTTP_TIMEOUT_MS = core_config.OTEL_HTTP_TIMEOUT_MS;
+/// This is an alias of `limits.HTTP_TIMEOUT_MS`.
+pub const HTTP_TIMEOUT_MS = limits.HTTP_TIMEOUT_MS;
 
 /// Maximum hostname length for parsed endpoints.
 const MAX_HOST_LEN: usize = core_config.DNS_MAX_HOSTNAME_LEN;

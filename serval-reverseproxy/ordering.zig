@@ -6,8 +6,12 @@ const config = @import("serval-core").config;
 
 /// Maximum number of plugins that can participate in one resolved chain.
 /// This is the fixed capacity used by `resolve()` and `OrderedChain`.
-/// The value is sourced from `config.MAX_ROUTES`.
-pub const MAX_CHAIN_PLUGINS: usize = config.MAX_ROUTES;
+/// The owner-public bound stays aligned with the shared route budget.
+pub const MAX_CHAIN_PLUGINS: usize = 128;
+
+comptime {
+    assert(MAX_CHAIN_PLUGINS == config.MAX_ROUTES);
+}
 
 /// Describes one plugin and its relative ordering constraints.
 /// `plugin_id` names the plugin being placed; `before` and `after` list peer plugin IDs that must come later or earlier.

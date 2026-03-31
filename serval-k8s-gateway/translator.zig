@@ -22,6 +22,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const core = @import("serval-core");
 const core_config = core.config;
+const serval_router = @import("serval-router");
 const gw_config = @import("config.zig");
 
 // ============================================================================
@@ -29,22 +30,27 @@ const gw_config = @import("config.zig");
 // ============================================================================
 
 /// Maximum JSON output size in bytes (1MB).
-/// Matches MAX_ADMIN_REQUEST_BYTES from serval-core/config.zig.
+/// Matches the router admin payload bound used by current examples.
 /// TigerStyle Y3: Units in name.
-pub const MAX_JSON_SIZE_BYTES: u32 = core_config.MAX_ADMIN_REQUEST_BYTES;
+pub const MAX_JSON_SIZE_BYTES: u32 = 1024 * 1024;
 
 /// Maximum routes to include in JSON output.
-pub const MAX_ROUTES: u8 = core_config.MAX_ROUTES;
+pub const MAX_ROUTES: u8 = serval_router.MAX_ROUTES;
 
 /// Maximum pools to include in JSON output.
-pub const MAX_POOLS: u8 = core_config.MAX_POOLS;
+pub const MAX_POOLS: u8 = serval_router.MAX_POOLS;
 
 /// Maximum upstreams per pool in JSON output.
-pub const MAX_UPSTREAMS_PER_POOL: u8 = core_config.MAX_UPSTREAMS_PER_POOL;
+pub const MAX_UPSTREAMS_PER_POOL: u8 = 64;
 
 /// Maximum allowed hosts to include in JSON output.
-/// TigerStyle S7: Bounded by MAX_ALLOWED_HOSTS from serval-core.
-pub const MAX_ALLOWED_HOSTS: u8 = core_config.MAX_ALLOWED_HOSTS;
+/// TigerStyle S7: Bounded by router-owned MAX_ALLOWED_HOSTS.
+pub const MAX_ALLOWED_HOSTS: u8 = serval_router.MAX_ALLOWED_HOSTS;
+
+comptime {
+    if (MAX_JSON_SIZE_BYTES != core_config.MAX_ADMIN_REQUEST_BYTES) @compileError("translator MAX_JSON_SIZE_BYTES must stay in sync with router admin payload limit");
+    if (MAX_UPSTREAMS_PER_POOL != core_config.MAX_UPSTREAMS_PER_POOL) @compileError("translator MAX_UPSTREAMS_PER_POOL must stay in sync with router pool bound");
+}
 
 /// Maximum iterations for route generation loop.
 /// Accounts for: routes * rules * matches * hostnames (or 1 if no hostnames).

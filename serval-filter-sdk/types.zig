@@ -13,10 +13,10 @@ pub const MAX_TAG_KEY_BYTES: u32 = 64;
 /// Values longer than this limit are rejected by assertions in the public API.
 pub const MAX_TAG_VALUE_BYTES: u32 = 256;
 
-/// Re-export of `core.RejectResponse` for filter SDK consumers.
-/// Use this alias when constructing a `Decision.reject` response.
+/// Private alias of `core.RejectResponse` for filter SDK consumers.
+/// Use this when constructing a `Decision.reject` response inside this module.
 /// Ownership and semantics are defined by `serval-core`.
-pub const RejectResponse = core.RejectResponse;
+const RejectResponse = core.RejectResponse;
 
 /// Borrowed header fields exposed through the SDK read and write views.
 /// Both `name` and `value` reference existing storage and are not owned by this type.

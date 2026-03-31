@@ -48,7 +48,7 @@ pub const Decision = types.Decision;
 /// Re-exports `core.RejectResponse` for filter rejection responses.
 /// Use this type when returning `.reject` from `Decision`.
 /// Refer to `serval-core` for the exact fields and lifetime rules.
-pub const RejectResponse = types.RejectResponse;
+pub const RejectResponse = @import("serval-core").RejectResponse;
 
 /// Re-exports the compile-time filter contract verifier from `verify.zig`.
 /// Use it to validate that a filter type exposes supported hook signatures.

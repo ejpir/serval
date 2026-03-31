@@ -6,9 +6,13 @@ const config = @import("serval-core").config;
 const ir = @import("ir.zig");
 
 /// Maximum number of plugin IDs that can appear in an `EffectiveChain`.
-/// This is tied to `config.MAX_ROUTES`, so the chain capacity follows the router configuration.
+/// This owner-public bound stays aligned with the shared route budget.
 /// Composition fails with `CompositionError.TooManyEffectivePlugins` if the effective set would exceed this limit.
-pub const MAX_EFFECTIVE_PLUGINS: usize = config.MAX_ROUTES;
+pub const MAX_EFFECTIVE_PLUGINS: usize = 128;
+
+comptime {
+    assert(MAX_EFFECTIVE_PLUGINS == config.MAX_ROUTES);
+}
 
 /// Errors returned while composing an effective plugin chain.
 /// `TooManyEffectivePlugins` is reported when appending would exceed `MAX_EFFECTIVE_PLUGINS`.
