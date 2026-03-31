@@ -75,6 +75,7 @@ const Method = types.Method;
 const Connection = pool_mod.Connection;
 const max_stale_retries: u8 = 2;
 const connect_timeout_ns: u64 = 30 * 1000 * 1000 * 1000;
+const h2c_tunnel_poll_timeout_ms: i32 = 1000;
 const h2_proxy_frame_capacity_bytes: u32 = 64 * 1024;
 const h2_proxy_frame_capacity_usize: usize = h2_proxy_frame_capacity_bytes;
 
@@ -684,7 +685,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
                 initial_client_bytes,
                 &[_]u8{},
                 self.h2_cfg.tunnel_idle_timeout_ns,
-                config.H2C_TUNNEL_POLL_TIMEOUT_MS,
+                h2c_tunnel_poll_timeout_ms,
             );
             self.tracer.setIntAttribute(tunnel_span, "duration_ns", @intCast(tunnel_stats.duration_ns));
             self.tracer.setIntAttribute(tunnel_span, "client_to_upstream_bytes", @intCast(tunnel_stats.client_to_upstream_bytes));
@@ -863,7 +864,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
                 initial_client_bytes_after_body,
                 &[_]u8{},
                 runtime_cfg.tunnel_idle_timeout_ns,
-                config.H2C_TUNNEL_POLL_TIMEOUT_MS,
+                h2c_tunnel_poll_timeout_ms,
             );
             stats.client_to_upstream_bytes += tunnel_stats.client_to_upstream_bytes;
             stats.upstream_to_client_bytes += tunnel_stats.upstream_to_client_bytes;

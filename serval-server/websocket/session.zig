@@ -15,6 +15,7 @@ const serval_websocket = @import("serval-websocket");
 const frame = serval_websocket.frame;
 const close_mod = serval_websocket.close;
 const default_websocket_cfg = config.WebSocketConfig{};
+const websocket_session_poll_timeout_ms: i32 = 1000;
 
 /// High-level classification of a WebSocket message payload.
 /// `text` messages are expected to contain valid UTF-8, while `binary` messages carry opaque bytes.
@@ -221,7 +222,7 @@ pub const WebSocketSession = struct {
 
         while (fragments < self.accept.max_fragments_per_message) {
             const header = try self.readFrameHeader(self.accept.idle_timeout_ns);
-            var control_buf: [config.WEBSOCKET_MAX_CONTROL_PAYLOAD_SIZE_BYTES]u8 = undefined;
+            var control_buf: [serval_websocket.max_control_payload_size_bytes]u8 = undefined;
 
             switch (header.opcode) {
                 .ping => {
@@ -310,11 +311,11 @@ pub const WebSocketSession = struct {
     }
 
     /// Sends a websocket ping control frame with the given payload.
-    /// The payload length must not exceed `config.WEBSOCKET_MAX_CONTROL_PAYLOAD_SIZE_BYTES`.
+    /// The payload length must not exceed `serval_websocket.max_control_payload_size_bytes`.
     /// The session must be in a writable state; otherwise `ensureWritableState` returns an error.
     /// The payload slice is borrowed for the duration of the call and is not retained.
     pub fn sendPing(self: *WebSocketSession, payload: []const u8) SessionError!void {
-        assert(payload.len <= config.WEBSOCKET_MAX_CONTROL_PAYLOAD_SIZE_BYTES);
+        assert(payload.len <= serval_websocket.max_control_payload_size_bytes);
 
         try self.ensureWritableState();
         try self.sendControlFrame(.ping, payload);
@@ -328,7 +329,7 @@ pub const WebSocketSession = struct {
         if (self.state_value == .closed) return error.SessionClosed;
         if (self.state_value == .close_sent) return;
 
-        var payload_buf: [config.WEBSOCKET_MAX_CONTROL_PAYLOAD_SIZE_BYTES]u8 = undefined;
+        var payload_buf: [serval_websocket.max_control_payload_size_bytes]u8 = undefined;
         const payload = close_mod.buildClosePayload(&payload_buf, code, reason) catch |err| {
             return mapCloseBuildError(err);
         };
@@ -347,7 +348,7 @@ pub const WebSocketSession = struct {
 
         const start_ns = time.monotonicNanos();
         const deadline_ns = start_ns + self.accept.close_timeout_ns;
-        var control_buf: [config.WEBSOCKET_MAX_CONTROL_PAYLOAD_SIZE_BYTES]u8 = undefined;
+        var control_buf: [serval_websocket.max_control_payload_size_bytes]u8 = undefined;
 
         while (time.elapsedNanos(start_ns, time.monotonicNanos()) <= self.accept.close_timeout_ns) {
             const header = self.readFrameHeaderUntil(deadline_ns) catch |err| {
@@ -486,7 +487,7 @@ pub const WebSocketSession = struct {
     }
 
     fn readControlPayload(self: *WebSocketSession, header: frame.Header, timeout_ns: u64) SessionError![]const u8 {
-        var control_buf: [config.WEBSOCKET_MAX_CONTROL_PAYLOAD_SIZE_BYTES]u8 = undefined;
+        var control_buf: [serval_websocket.max_control_payload_size_bytes]u8 = undefined;
         return self.readControlPayloadInto(header, timeout_ns, &control_buf);
     }
 
@@ -494,9 +495,9 @@ pub const WebSocketSession = struct {
         self: *WebSocketSession,
         header: frame.Header,
         timeout_ns: u64,
-        control_buf: *[config.WEBSOCKET_MAX_CONTROL_PAYLOAD_SIZE_BYTES]u8,
+        control_buf: *[serval_websocket.max_control_payload_size_bytes]u8,
     ) SessionError![]const u8 {
-        assert(header.payload_len <= config.WEBSOCKET_MAX_CONTROL_PAYLOAD_SIZE_BYTES);
+        assert(header.payload_len <= serval_websocket.max_control_payload_size_bytes);
 
         const payload_len_u32: u32 = @intCast(header.payload_len);
         if (payload_len_u32 == 0) return control_buf[0..0];
@@ -513,9 +514,9 @@ pub const WebSocketSession = struct {
         self: *WebSocketSession,
         header: frame.Header,
         deadline_ns: u64,
-        control_buf: *[config.WEBSOCKET_MAX_CONTROL_PAYLOAD_SIZE_BYTES]u8,
+        control_buf: *[serval_websocket.max_control_payload_size_bytes]u8,
     ) SessionError![]const u8 {
-        assert(header.payload_len <= config.WEBSOCKET_MAX_CONTROL_PAYLOAD_SIZE_BYTES);
+        assert(header.payload_len <= serval_websocket.max_control_payload_size_bytes);
 
         const payload_len_u32: u32 = @intCast(header.payload_len);
         if (payload_len_u32 == 0) return control_buf[0..0];
@@ -667,7 +668,7 @@ pub const WebSocketSession = struct {
         const fd = self.transport.getFd();
         if (fd < 0) return error.ReadFailed;
 
-        const poll_interval_ms_u64: u64 = @intCast(config.WEBSOCKET_SESSION_POLL_TIMEOUT_MS);
+        const poll_interval_ms_u64: u64 = @intCast(websocket_session_poll_timeout_ms);
         const poll_interval_ns: u64 = time.millisToNanos(poll_interval_ms_u64);
         const max_iterations_u64 = @max(@as(u64, 1), (timeout_ns / poll_interval_ns) + 2);
         const max_iterations: u32 = if (max_iterations_u64 > std.math.maxInt(u32))
@@ -702,7 +703,7 @@ pub const WebSocketSession = struct {
 
     fn sendControlFrame(self: *WebSocketSession, opcode: frame.Opcode, payload: []const u8) SessionError!void {
         assert(frame.isControlOpcode(opcode));
-        if (payload.len > config.WEBSOCKET_MAX_CONTROL_PAYLOAD_SIZE_BYTES) {
+        if (payload.len > serval_websocket.max_control_payload_size_bytes) {
             return error.MessageTooLarge;
         }
         try self.sendFrameRaw(opcode, payload);
@@ -736,7 +737,7 @@ pub const WebSocketSession = struct {
     fn abortWithClose(self: *WebSocketSession, close_code: u16) void {
         if (self.state_value == .closed) return;
 
-        var payload_buf: [config.WEBSOCKET_MAX_CONTROL_PAYLOAD_SIZE_BYTES]u8 = undefined;
+        var payload_buf: [serval_websocket.max_control_payload_size_bytes]u8 = undefined;
         const payload = close_mod.buildClosePayload(&payload_buf, close_code, "") catch |err| switch (err) {
             error.InvalidCloseCode,
             error.InvalidCloseReason,
@@ -805,7 +806,7 @@ fn mapWriteTransportError(err: TransportError) SessionError {
 
 fn computePollTimeoutMs(remaining_ns: u64) i32 {
     const remaining_ms_u64 = time.nanosToMillis(remaining_ns);
-    const clamped_ms_u64 = @min(@as(u64, @intCast(config.WEBSOCKET_SESSION_POLL_TIMEOUT_MS)), remaining_ms_u64);
+    const clamped_ms_u64 = @min(@as(u64, @intCast(websocket_session_poll_timeout_ms)), remaining_ms_u64);
     if (clamped_ms_u64 == 0) return 1;
     return @intCast(@min(clamped_ms_u64, @as(u64, std.math.maxInt(i32))));
 }
@@ -953,7 +954,7 @@ test "WebSocketSession sendText writes unmasked server frame" {
 }
 
 test "WebSocketSession peer close returns null and sends mirrored close" {
-    var payload_buf: [config.WEBSOCKET_MAX_CONTROL_PAYLOAD_SIZE_BYTES]u8 = undefined;
+    var payload_buf: [serval_websocket.max_control_payload_size_bytes]u8 = undefined;
     const close_payload = try close_mod.buildClosePayload(&payload_buf, close_mod.normal_closure, "bye");
 
     var input: [128]u8 = undefined;

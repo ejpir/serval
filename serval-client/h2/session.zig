@@ -78,7 +78,7 @@ pub const SessionState = struct {
         assert(@intFromPtr(self) != 0);
         assert(header.frame_type == .settings);
 
-        var parsed_buf: [config.H2_MAX_SETTINGS_PER_FRAME]h2.Setting = undefined;
+        var parsed_buf: [h2.max_settings_per_frame]h2.Setting = undefined;
         const parsed = try h2.parseSettingsFrame(header, payload, &parsed_buf);
 
         if ((header.flags & h2.flags_ack) != 0) {

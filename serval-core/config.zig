@@ -160,10 +160,6 @@ comptime {
 // Forwarding / Retry Limits
 // =============================================================================
 
-/// Initial read buffer size for h2c prior-knowledge request parsing.
-/// Must fit client preface + SETTINGS + first HEADERS block in common cases.
-pub const H2C_INITIAL_READ_BUFFER_SIZE_BYTES: u32 = 16 * 1024;
-
 /// Default HTTP/2 frame size per RFC 9113.
 pub const H2_MAX_FRAME_SIZE_BYTES: u32 = 16_384;
 
@@ -171,25 +167,9 @@ pub const H2_MAX_FRAME_SIZE_BYTES: u32 = 16_384;
 /// TigerStyle: Explicit bound prevents unbounded HPACK parsing on new connections.
 pub const H2_MAX_HEADER_BLOCK_SIZE_BYTES: u32 = 8 * 1024;
 
-/// Maximum frames inspected before selecting an upstream for h2c tunneling.
-/// TigerStyle: Bounded loop for connection preface parsing.
-pub const H2_MAX_INITIAL_PARSE_FRAMES: u32 = 16;
-
-/// Maximum CONTINUATION frames accepted while assembling one header block.
-/// TigerStyle: Explicit bound prevents unbounded header-fragment loops.
-pub const H2_MAX_CONTINUATION_FRAMES: u8 = 16;
-
-/// Maximum SETTINGS entries accepted in a single SETTINGS payload.
-/// TigerStyle: Fixed-capacity parser output for bounded connection setup.
-pub const H2_MAX_SETTINGS_PER_FRAME: u8 = 32;
-
 /// Maximum concurrent active streams tracked per HTTP/2 connection.
 /// TigerStyle: Fixed-capacity stream table prevents unbounded fan-out.
 pub const H2_MAX_CONCURRENT_STREAMS: u16 = 128;
-
-/// Maximum live upstream HTTP/2 sessions per upstream index in rollover mode.
-/// One active session for new streams plus one draining GOAWAY session.
-pub const H2_MAX_SESSIONS_PER_UPSTREAM: u8 = 2;
 
 /// Default per-stream HTTP/2 flow-control window.
 /// TigerStyle: Explicit RFC default in bytes.
@@ -219,10 +199,6 @@ pub const H2C_TUNNEL_IDLE_TIMEOUT_NS: u64 = time.secondsToNanos(3600);
 /// TigerStyle: Downstream h2/gRPC clients can legitimately stay quiet between RPCs.
 pub const H2_SERVER_IDLE_TIMEOUT_NS: u64 = time.secondsToNanos(3600);
 
-/// poll(2) timeout for h2c/gRPC tunnel relay.
-/// TigerStyle: Fixed interval keeps timeout checks responsive without busy-looping.
-pub const H2C_TUNNEL_POLL_TIMEOUT_MS: i32 = 1000;
-
 /// Maximum application message size for native WebSocket endpoints.
 /// TigerStyle: Explicit bound prevents unbounded buffering during fragmentation reassembly.
 pub const WEBSOCKET_MAX_MESSAGE_SIZE_BYTES: u32 = 1024 * 1024;
@@ -238,13 +214,6 @@ pub const WEBSOCKET_SESSION_IDLE_TIMEOUT_NS: u64 = time.secondsToNanos(60);
 /// Maximum time to wait for peer close after sending a WebSocket close frame.
 /// TigerStyle: Close handshake loops must be explicitly bounded.
 pub const WEBSOCKET_CLOSE_TIMEOUT_NS: u64 = time.secondsToNanos(5);
-
-/// poll(2) timeout for native WebSocket session reads.
-/// TigerStyle: Fixed interval keeps timeout checks responsive without busy-waiting.
-pub const WEBSOCKET_SESSION_POLL_TIMEOUT_MS: i32 = 1000;
-
-/// Maximum allowed control-frame payload size per RFC 6455 Section 5.5.
-pub const WEBSOCKET_MAX_CONTROL_PAYLOAD_SIZE_BYTES: u32 = 125;
 
 // =============================================================================
 // Health Check Limits

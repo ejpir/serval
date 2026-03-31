@@ -11,6 +11,7 @@ Current code also includes an `h2/` subdirectory with bounded outbound HTTP/2 pr
 - `H2Runtime` for frame-level actions (client preface+SETTINGS emission, request HEADERS/DATA frame building with bounded outbound HEADERS+CONTINUATION fragmentation honoring peer max-frame limits, response HEADERS/DATA/trailer parsing with bounded HEADERS+CONTINUATION reassembly and bounded HPACK dynamic-table/Huffman decode, and GOAWAY/RST/WINDOW_UPDATE handling)
 - `H2ClientConnection` as a fixed-buffer socket driver over `H2Runtime` for prior-knowledge h2c sessions
 - `H2UpstreamSessionPool` as a fixed-capacity per-upstream cache that owns connected `H2ClientConnection` sessions, supports GOAWAY rollover (active + draining session), and reuses sessions until stale/invalid state
+- `h2_max_sessions_per_upstream` as the owner-local rollover bound for active + draining upstream h2 sessions
 
 The h2 transport adapter now translates TLS `WantRead` / `WantWrite` signals
 from `serval-tls` back into the client session's existing bounded retry model,

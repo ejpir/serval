@@ -4,6 +4,11 @@
 //! and subprotocol negotiation helpers.
 //! TigerStyle: Protocol-only module, no socket ownership.
 
+/// Re-exports owner-local protocol limits from `limits.zig`.
+pub const limits = @import("limits.zig");
+/// Maximum allowed control-frame payload size per RFC 6455 Section 5.5.
+pub const max_control_payload_size_bytes = limits.max_control_payload_size_bytes;
+
 /// Re-exports the `serval-websocket/handshake.zig` namespace.
 /// Use this module for WebSocket handshake validation, accept-key computation, and related constants.
 /// The helpers operate on caller-owned request and header data without taking ownership.
@@ -168,6 +173,7 @@ pub const validateSubprotocolSelection = subprotocol.validateSelection;
 pub const isSubprotocolToken = subprotocol.isToken;
 
 test {
+    _ = @import("limits.zig");
     _ = @import("handshake.zig");
     _ = @import("frame.zig");
     _ = @import("close.zig");

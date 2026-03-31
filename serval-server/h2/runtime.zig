@@ -406,7 +406,7 @@ fn handleContinuation(self: *Runtime, header: h2.FrameHeader, payload: []const u
     if (header.stream_id != self.pending_request_headers.stream_id) return error.InvalidStreamId;
     if ((header.flags & ~(h2.flags_end_headers)) != 0) return error.InvalidFrame;
 
-    if (self.pending_request_headers.continuation_frames >= config.H2_MAX_CONTINUATION_FRAMES) {
+    if (self.pending_request_headers.continuation_frames >= h2.max_continuation_frames) {
         return error.TooManyFrames;
     }
     self.pending_request_headers.continuation_frames += 1;
@@ -1171,7 +1171,7 @@ test "Runtime enforces continuation frame bound" {
 
     var continuation_frame_buf: [h2.frame_header_size_bytes + 1]u8 = undefined;
     var count: u8 = 0;
-    while (count < config.H2_MAX_CONTINUATION_FRAMES + 1) : (count += 1) {
+    while (count < h2.max_continuation_frames + 1) : (count += 1) {
         const continuation = try appendFrame(&continuation_frame_buf, .continuation, 0, 1, "x");
         const continuation_header = try h2.parseFrameHeader(continuation);
         const result = runtime.receiveFrame(
@@ -1179,7 +1179,7 @@ test "Runtime enforces continuation frame bound" {
             continuation[h2.frame_header_size_bytes .. h2.frame_header_size_bytes + continuation_header.length],
         );
 
-        if (count == config.H2_MAX_CONTINUATION_FRAMES) {
+        if (count == h2.max_continuation_frames) {
             try std.testing.expectError(error.TooManyFrames, result);
             return;
         }

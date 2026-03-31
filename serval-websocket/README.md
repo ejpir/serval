@@ -32,6 +32,7 @@ Current users:
 | Symbol | Description |
 |--------|-------------|
 | `HandshakeError` | Client/server handshake validation errors |
+| `max_control_payload_size_bytes` | RFC 6455 control-frame payload limit |
 | `websocket_accept_guid` | RFC 6455 GUID constant |
 | `websocket_client_nonce_size_bytes` | Client nonce size |
 | `websocket_accept_key_size_bytes` | Base64 accept-key size |
@@ -67,6 +68,7 @@ Current users:
 | File | Purpose |
 |------|---------|
 | `mod.zig` | Public API re-exports |
+| `limits.zig` | Owner-local protocol payload limits |
 | `handshake.zig` | Upgrade request/response validation helpers |
 | `frame.zig` | Frame header parse/encode + masking helpers |
 | `close.zig` | Close-code and close-payload validation |

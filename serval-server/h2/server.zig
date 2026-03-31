@@ -31,7 +31,7 @@ const Request = types.Request;
 
 const read_buffer_size_bytes: usize = h2.client_connection_preface.len + h2.frame_header_size_bytes + config.H2_MAX_FRAME_SIZE_BYTES;
 const frame_buffer_size_bytes: usize = h2.frame_header_size_bytes + config.H2_MAX_FRAME_SIZE_BYTES;
-const header_block_frame_overhead_bytes: usize = h2.frame_header_size_bytes * (@as(usize, config.H2_MAX_CONTINUATION_FRAMES) + 1);
+const header_block_frame_overhead_bytes: usize = h2.frame_header_size_bytes * (@as(usize, h2.max_continuation_frames) + 1);
 const header_block_frame_buffer_size_bytes: usize = config.H2_MAX_HEADER_BLOCK_SIZE_BYTES + header_block_frame_overhead_bytes;
 const response_table_capacity: usize = config.H2_MAX_CONCURRENT_STREAMS;
 const upgrade_preamble_size_bytes: usize =
@@ -2720,7 +2720,7 @@ fn appendHeaderBlockFrames(
 
     var continuation_frames: u8 = 0;
     while (block_cursor < header_block.len) {
-        if (continuation_frames >= config.H2_MAX_CONTINUATION_FRAMES) return error.FrameLimitExceeded;
+        if (continuation_frames >= h2.max_continuation_frames) return error.FrameLimitExceeded;
 
         const chunk_len: usize = @min(header_block.len - block_cursor, max_payload_size_bytes);
         const is_last_chunk = block_cursor + chunk_len == header_block.len;
@@ -2786,7 +2786,7 @@ test "appendHeaderBlockFrames emits HEADERS plus CONTINUATION fragments" {
     var saw_continuation = false;
     var last_flags: u8 = 0;
     while (cursor < frames.len) {
-        try std.testing.expect(frame_count < config.H2_MAX_CONTINUATION_FRAMES + 1);
+        try std.testing.expect(frame_count < h2.max_continuation_frames + 1);
         const header = try h2.parseFrameHeader(frames[cursor .. cursor + h2.frame_header_size_bytes]);
         const frame_len: usize = h2.frame_header_size_bytes + header.length;
         try std.testing.expect(cursor + frame_len <= frames.len);

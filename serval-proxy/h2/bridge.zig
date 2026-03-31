@@ -159,7 +159,7 @@ pub const StreamBridge = struct {
 
     /// Opens or reuses an upstream HTTP/2 session, sends request headers, and records the downstream-to-upstream binding.
     /// Duplicate downstream stream ids fail with `error.DuplicateDownstreamStream`.
-    /// The bridge retries across at most `config.H2_MAX_SESSIONS_PER_UPSTREAM` attempts and closes generations that become `ConnectionClosing`.
+    /// The bridge retries across at most `serval_client.h2_max_sessions_per_upstream` attempts and closes generations that become `ConnectionClosing`.
     pub fn openDownstreamStream(
         self: *StreamBridge,
         io: Io,
@@ -178,7 +178,7 @@ pub const StreamBridge = struct {
             return error.DuplicateDownstreamStream;
         }
 
-        const max_open_attempts: u8 = config.H2_MAX_SESSIONS_PER_UPSTREAM;
+        const max_open_attempts: u8 = serval_client.h2_max_sessions_per_upstream;
         var attempts: u8 = 0;
 
         while (attempts < max_open_attempts) : (attempts += 1) {

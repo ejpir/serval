@@ -25,7 +25,7 @@ const preface_settings_buffer_size_bytes: usize =
     h2.client_connection_preface.len +
     h2.frame_header_size_bytes +
     (4 * h2.setting_size_bytes);
-const request_headers_frame_overhead_bytes: usize = h2.frame_header_size_bytes * (@as(usize, config.H2_MAX_CONTINUATION_FRAMES) + 1);
+const request_headers_frame_overhead_bytes: usize = h2.frame_header_size_bytes * (@as(usize, h2.max_continuation_frames) + 1);
 const request_headers_frame_buffer_size_bytes: usize = config.H2_MAX_HEADER_BLOCK_SIZE_BYTES + request_headers_frame_overhead_bytes;
 const data_frame_buffer_size_bytes: usize = h2.frame_header_size_bytes + config.H2_MAX_FRAME_SIZE_BYTES;
 const window_update_frame_size_bytes: usize = h2.frame_header_size_bytes + h2.control.window_update_payload_size_bytes;
@@ -131,16 +131,16 @@ pub const ClientConnection = struct {
     }
 
     /// Complete the HTTP/2 client handshake by sending the preface and waiting for the peer's settings state.
-    /// Loops until peer settings are received and acknowledged, or until `config.H2_MAX_INITIAL_PARSE_FRAMES` frames have been parsed.
+    /// Loops until peer settings are received and acknowledged, or until `h2.max_initial_parse_frames` frames have been parsed.
     /// Returns `error.ConnectionClosing`, `error.UnexpectedHandshakeFrame`, `error.MissingInitialSettings`, or `error.WriteFailed` for the corresponding handshake failure.
     pub fn completeHandshake(self: *ClientConnection) Error!void {
         assert(@intFromPtr(self) != 0);
-        assert(config.H2_MAX_INITIAL_PARSE_FRAMES > 0);
+        assert(h2.max_initial_parse_frames > 0);
 
         try self.sendClientPrefaceAndSettings();
 
         var frames: u32 = 0;
-        while (frames < config.H2_MAX_INITIAL_PARSE_FRAMES) : (frames += 1) {
+        while (frames < h2.max_initial_parse_frames) : (frames += 1) {
             if (self.runtime.state.peer_settings_received and !self.runtime.state.peer_settings_ack_pending) {
                 return;
             }

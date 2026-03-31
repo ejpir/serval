@@ -9,6 +9,7 @@ const assert = std.debug.assert;
 const core = @import("serval-core");
 const config = core.config;
 const types = core.types;
+const limits = @import("limits.zig");
 const HeaderMap = types.HeaderMap;
 const Method = types.Method;
 const Request = types.Request;
@@ -108,7 +109,7 @@ pub fn parseInitialRequest(input: []const u8, request_storage_out: []u8) Error!I
     var frames_seen: u32 = 0;
     var header_assembly = HeaderAssembly{};
 
-    while (cursor < input.len and frames_seen < config.H2_MAX_INITIAL_PARSE_FRAMES) : (frames_seen += 1) {
+    while (cursor < input.len and frames_seen < limits.max_initial_parse_frames) : (frames_seen += 1) {
         if (cursor + frame.frame_header_size_bytes > input.len) return error.NeedMoreData;
 
         const header = try frame.parseFrameHeader(input[cursor..]);
@@ -131,7 +132,7 @@ pub fn parseInitialRequest(input: []const u8, request_storage_out: []u8) Error!I
         cursor = payload_end;
     }
 
-    if (frames_seen >= config.H2_MAX_INITIAL_PARSE_FRAMES) return error.TooManyFrames;
+    if (frames_seen >= limits.max_initial_parse_frames) return error.TooManyFrames;
     return error.NeedMoreData;
 }
 
@@ -245,7 +246,7 @@ fn handleInitialContinuationFrame(
     if (!header_assembly.active) return error.UnsupportedContinuation;
     if (header.stream_id != header_assembly.stream_id) return error.InvalidStreamId;
     if ((header.flags & ~frame.flags_end_headers) != 0) return error.InvalidFrame;
-    if (header_assembly.continuation_frames >= config.H2_MAX_CONTINUATION_FRAMES) return error.TooManyFrames;
+    if (header_assembly.continuation_frames >= limits.max_continuation_frames) return error.TooManyFrames;
 
     header_assembly.continuation_frames += 1;
     try appendHeaderFragment(&header_assembly.block_buf, &header_assembly.block_len, payload);
@@ -1132,7 +1133,7 @@ test "parseInitialRequest enforces continuation frame bound" {
     pos += 1;
 
     var count: u8 = 0;
-    while (count < config.H2_MAX_CONTINUATION_FRAMES + 1) : (count += 1) {
+    while (count < limits.max_continuation_frames + 1) : (count += 1) {
         const continuation_header = try frame.buildFrameHeader(input_buf[pos..][0..frame.frame_header_size_bytes], .{
             .length = 1,
             .frame_type = .continuation,

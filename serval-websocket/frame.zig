@@ -6,8 +6,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
-const serval_core = @import("serval-core");
-const config = serval_core.config;
+const limits = @import("limits.zig");
 
 /// Maximum number of bytes needed to represent any header handled by this module.
 /// This covers the base header, extended payload length, and optional 4-byte mask key.
@@ -115,7 +114,7 @@ pub fn parseHeader(input: []const u8, role: PeerRole) FrameError!Header {
 
     if (header.isControl()) {
         if (!header.fin) return error.InvalidControlFrame;
-        if (header.payload_len > config.WEBSOCKET_MAX_CONTROL_PAYLOAD_SIZE_BYTES) {
+        if (header.payload_len > limits.max_control_payload_size_bytes) {
             return error.InvalidControlFrame;
         }
     }

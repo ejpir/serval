@@ -8,6 +8,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 const config = @import("serval-core").config;
+const limits = @import("limits.zig");
 const frame = @import("frame.zig");
 
 /// Size in bytes of one HTTP/2 SETTINGS entry on the wire.
@@ -86,7 +87,7 @@ pub const Error = error{
 
 /// Validates HTTP/2 SETTINGS frame invariants for `header` and `payload`.
 /// The frame must use stream 0, and ACK frames must have an empty payload.
-/// Non-ACK payloads must have a valid SETTINGS length and stay within `config.H2_MAX_SETTINGS_PER_FRAME`.
+/// Non-ACK payloads must have a valid SETTINGS length and stay within `limits.max_settings_per_frame`.
 /// Returns the relevant `Error` when a frame-level constraint is violated.
 pub fn validateFrame(header: frame.FrameHeader, payload: []const u8) Error!void {
     assert(header.length == payload.len);
@@ -99,7 +100,7 @@ pub fn validateFrame(header: frame.FrameHeader, payload: []const u8) Error!void 
     }
 
     if (!isPayloadLengthValid(payload.len)) return error.InvalidPayloadLength;
-    if (payload.len / setting_size_bytes > config.H2_MAX_SETTINGS_PER_FRAME) {
+    if (payload.len / setting_size_bytes > limits.max_settings_per_frame) {
         return error.TooManySettings;
     }
 }
@@ -126,13 +127,13 @@ pub fn parseFrame(
 /// Each decoded setting is validated before being stored; invalid entries return the corresponding `Error`.
 /// On success, returns the initialized prefix of `out_settings` containing the decoded settings.
 pub fn parsePayload(payload: []const u8, out_settings: []Setting) Error![]const Setting {
-    assert(out_settings.len >= config.H2_MAX_SETTINGS_PER_FRAME or out_settings.len > 0);
+    assert(out_settings.len >= limits.max_settings_per_frame or out_settings.len > 0);
     assert(payload.len <= config.H2_MAX_FRAME_SIZE_BYTES);
 
     if (!isPayloadLengthValid(payload.len)) return error.InvalidPayloadLength;
 
     const count: usize = payload.len / setting_size_bytes;
-    if (count > config.H2_MAX_SETTINGS_PER_FRAME) return error.TooManySettings;
+    if (count > limits.max_settings_per_frame) return error.TooManySettings;
     if (count > out_settings.len) return error.TooManySettings;
 
     var cursor: usize = 0;
@@ -150,11 +151,11 @@ pub fn parsePayload(payload: []const u8, out_settings: []Setting) Error![]const 
 }
 
 /// Encodes `settings` into HTTP/2 SETTINGS payload bytes in network byte order.
-/// `out` must be large enough for `settings.len * 6` bytes, and `settings.len` must not exceed `config.H2_MAX_SETTINGS_PER_FRAME`.
+/// `out` must be large enough for `settings.len * 6` bytes, and `settings.len` must not exceed `limits.max_settings_per_frame`.
 /// Each setting is validated before it is written; invalid settings return the corresponding `Error`.
 /// On success, returns the initialized prefix of `out` containing the encoded payload.
 pub fn buildPayload(out: []u8, settings: []const Setting) Error![]const u8 {
-    assert(settings.len <= config.H2_MAX_SETTINGS_PER_FRAME);
+    assert(settings.len <= limits.max_settings_per_frame);
     assert(setting_size_bytes == 6);
 
     const needed = settings.len * setting_size_bytes;
@@ -172,11 +173,11 @@ pub fn buildPayload(out: []u8, settings: []const Setting) Error![]const u8 {
 }
 
 /// Applies each SETTINGS entry in `settings` to `target` in order.
-/// `target` must be a valid pointer, and `settings.len` must not exceed `config.H2_MAX_SETTINGS_PER_FRAME`.
+/// `target` must be a valid pointer, and `settings.len` must not exceed `limits.max_settings_per_frame`.
 /// Returns the first validation or application error raised by `applySetting`.
 pub fn applySettings(target: *Settings, settings: []const Setting) Error!void {
     assert(@intFromPtr(target) != 0);
-    assert(settings.len <= config.H2_MAX_SETTINGS_PER_FRAME);
+    assert(settings.len <= limits.max_settings_per_frame);
 
     for (settings) |setting| {
         try applySetting(target, setting);
@@ -249,7 +250,7 @@ test "parsePayload parses canonical settings payload" {
         0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x03, 0x00, 0x00, 0x00, 0x64,
     };
-    var out: [config.H2_MAX_SETTINGS_PER_FRAME]Setting = undefined;
+    var out: [limits.max_settings_per_frame]Setting = undefined;
 
     const parsed = try parsePayload(&payload, &out);
     try std.testing.expectEqual(@as(usize, 2), parsed.len);
@@ -266,7 +267,7 @@ test "buildPayload round-trips settings" {
         .{ .id = 0x8, .value = 1 },
     };
     var payload: [settings.len * setting_size_bytes]u8 = undefined;
-    var out: [config.H2_MAX_SETTINGS_PER_FRAME]Setting = undefined;
+    var out: [limits.max_settings_per_frame]Setting = undefined;
 
     const encoded = try buildPayload(&payload, &settings);
     const parsed = try parsePayload(encoded, &out);
@@ -291,14 +292,14 @@ test "validateFrame rejects ack payload" {
 
 test "parsePayload rejects invalid enable_push" {
     const payload = [_]u8{ 0x00, 0x02, 0x00, 0x00, 0x00, 0x02 };
-    var out: [config.H2_MAX_SETTINGS_PER_FRAME]Setting = undefined;
+    var out: [limits.max_settings_per_frame]Setting = undefined;
 
     try std.testing.expectError(error.InvalidEnablePush, parsePayload(&payload, &out));
 }
 
 test "parsePayload rejects invalid max_frame_size" {
     const payload = [_]u8{ 0x00, 0x05, 0x00, 0x00, 0x10, 0x00 };
-    var out: [config.H2_MAX_SETTINGS_PER_FRAME]Setting = undefined;
+    var out: [limits.max_settings_per_frame]Setting = undefined;
 
     try std.testing.expectError(error.InvalidMaxFrameSize, parsePayload(&payload, &out));
 }
@@ -324,9 +325,9 @@ test "settings payload roundtrip property over deterministic corpus" {
     var prng = std.Random.DefaultPrng.init(0x51e7_5100);
     const random = prng.random();
 
-    var settings_in: [config.H2_MAX_SETTINGS_PER_FRAME]Setting = undefined;
-    var settings_out: [config.H2_MAX_SETTINGS_PER_FRAME]Setting = undefined;
-    var payload_buf: [config.H2_MAX_SETTINGS_PER_FRAME * setting_size_bytes]u8 = undefined;
+    var settings_in: [limits.max_settings_per_frame]Setting = undefined;
+    var settings_out: [limits.max_settings_per_frame]Setting = undefined;
+    var payload_buf: [limits.max_settings_per_frame * setting_size_bytes]u8 = undefined;
 
     const valid_ids = [_]u16{ 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x8 };
 
@@ -363,7 +364,7 @@ test "settings parsePayload fuzz corpus maintains validation boundaries" {
     const random = prng.random();
 
     var payload: [96]u8 = undefined;
-    var out: [config.H2_MAX_SETTINGS_PER_FRAME]Setting = undefined;
+    var out: [limits.max_settings_per_frame]Setting = undefined;
 
     var iteration: u32 = 0;
     while (iteration < 512) : (iteration += 1) {
@@ -380,6 +381,6 @@ test "settings parsePayload fuzz corpus maintains validation boundaries" {
             else => return err,
         };
 
-        try std.testing.expect(parsed.len <= config.H2_MAX_SETTINGS_PER_FRAME);
+        try std.testing.expect(parsed.len <= limits.max_settings_per_frame);
     }
 }

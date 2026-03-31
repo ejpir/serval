@@ -814,7 +814,7 @@ fn readServerFrameSocket(socket: *serval.Socket, initial: []const u8, out: []u8)
 }
 
 fn sendClientCloseSocket(socket: *serval.Socket) !void {
-    var payload_buf: [serval.config.WEBSOCKET_MAX_CONTROL_PAYLOAD_SIZE_BYTES]u8 = undefined;
+    var payload_buf: [serval.websocket.max_control_payload_size_bytes]u8 = undefined;
     const payload = try serval.buildWebSocketClosePayload(
         &payload_buf,
         serval.websocket.close_normal_closure,
@@ -1210,7 +1210,7 @@ fn readServerFrame(sock: posix.socket_t, initial: []const u8, out: []u8) !Server
 }
 
 fn sendClientClose(sock: posix.socket_t) !void {
-    var payload_buf: [serval.config.WEBSOCKET_MAX_CONTROL_PAYLOAD_SIZE_BYTES]u8 = undefined;
+    var payload_buf: [serval.websocket.max_control_payload_size_bytes]u8 = undefined;
     const payload = try serval.buildWebSocketClosePayload(
         &payload_buf,
         serval.websocket.close_normal_closure,

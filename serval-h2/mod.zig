@@ -3,6 +3,15 @@
 //! Layer 1 (Protocol).
 //! TigerStyle: Bounded parsing, explicit errors, no socket ownership.
 
+/// Re-exports owner-local protocol limits from `limits.zig`.
+pub const limits = @import("limits.zig");
+/// Maximum frames inspected while parsing the initial prior-knowledge request.
+pub const max_initial_parse_frames = limits.max_initial_parse_frames;
+/// Maximum CONTINUATION frames accepted while assembling a single header block.
+pub const max_continuation_frames = limits.max_continuation_frames;
+/// Maximum SETTINGS entries accepted in a single SETTINGS payload.
+pub const max_settings_per_frame = limits.max_settings_per_frame;
+
 /// Namespace for HTTP/2 frame header helpers and related constants.
 /// Re-exports the frame types, error set, flags, and encode/parse functions used by the h2 layer.
 /// This module contains no socket or connection ownership.
@@ -315,6 +324,7 @@ pub const buildPriorKnowledgePreambleFromUpgrade = upgrade.buildPriorKnowledgePr
 pub const h2c_upgrade_response = upgrade.upgrade_response;
 
 test {
+    _ = @import("limits.zig");
     _ = @import("frame.zig");
     _ = @import("preface.zig");
     _ = @import("hpack.zig");

@@ -492,7 +492,7 @@ fn handleContinuation(self: *Runtime, header: h2.FrameHeader, payload: []const u
     if (header.stream_id != self.pending_response_headers.stream_id) return error.ContinuationStreamMismatch;
     if ((header.flags & ~(h2.flags_end_headers)) != 0) return error.UnsupportedContinuation;
 
-    if (self.pending_response_headers.continuation_frames >= config.H2_MAX_CONTINUATION_FRAMES) {
+    if (self.pending_response_headers.continuation_frames >= h2.max_continuation_frames) {
         return error.TooManyContinuationFrames;
     }
     self.pending_response_headers.continuation_frames += 1;
@@ -917,7 +917,7 @@ fn appendHeaderBlockFrames(
 
     var continuation_frames: u8 = 0;
     while (block_cursor < header_block.len) {
-        if (continuation_frames >= config.H2_MAX_CONTINUATION_FRAMES) return error.HeaderBlockTooLarge;
+        if (continuation_frames >= h2.max_continuation_frames) return error.HeaderBlockTooLarge;
 
         const chunk_len: usize = @min(header_block.len - block_cursor, max_payload_size_bytes);
         const is_last_chunk = block_cursor + chunk_len == header_block.len;
@@ -1003,7 +1003,7 @@ fn makeGrpcRequest(path: []const u8) !Request {
 }
 
 fn initRuntimeReadyForStreams() !Runtime {
-    assert(config.H2_MAX_SETTINGS_PER_FRAME > 0);
+    assert(h2.max_settings_per_frame > 0);
     assert(h2.client_connection_preface.len > 0);
 
     var runtime = try Runtime.init(.{});
@@ -1128,7 +1128,7 @@ test "Runtime fragments outbound request HEADERS with CONTINUATION when peer max
     var request = try makeGrpcRequest("/grpc.test.Echo/Unary");
     try request.headers.put("x-long-header", "abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789");
 
-    const frame_overhead_bytes: usize = h2.frame_header_size_bytes * (@as(usize, config.H2_MAX_CONTINUATION_FRAMES) + 1);
+    const frame_overhead_bytes: usize = h2.frame_header_size_bytes * (@as(usize, h2.max_continuation_frames) + 1);
     var headers_buf: [config.H2_MAX_HEADER_BLOCK_SIZE_BYTES + frame_overhead_bytes]u8 = undefined;
     const headers_write = try runtime.writeRequestHeadersFrame(&headers_buf, &request, null, true);
 
@@ -1138,7 +1138,7 @@ test "Runtime fragments outbound request HEADERS with CONTINUATION when peer max
     var last_flags: u8 = 0;
 
     while (cursor < headers_write.frame.len) {
-        try std.testing.expect(frame_count < config.H2_MAX_CONTINUATION_FRAMES + 1);
+        try std.testing.expect(frame_count < h2.max_continuation_frames + 1);
 
         const header = try h2.parseFrameHeader(headers_write.frame[cursor .. cursor + h2.frame_header_size_bytes]);
         const frame_len: usize = h2.frame_header_size_bytes + header.length;
@@ -1512,7 +1512,7 @@ test "Runtime enforces response continuation frame bound" {
 
     var continuation_frame_buf: [h2.frame_header_size_bytes + 1]u8 = undefined;
     var count: u8 = 0;
-    while (count < config.H2_MAX_CONTINUATION_FRAMES + 1) : (count += 1) {
+    while (count < h2.max_continuation_frames + 1) : (count += 1) {
         const continuation_frame = try appendFrame(
             &continuation_frame_buf,
             .continuation,
@@ -1526,7 +1526,7 @@ test "Runtime enforces response continuation frame bound" {
             continuation_frame[h2.frame_header_size_bytes .. h2.frame_header_size_bytes + continuation_header.length],
         );
 
-        if (count == config.H2_MAX_CONTINUATION_FRAMES) {
+        if (count == h2.max_continuation_frames) {
             try std.testing.expectError(error.TooManyContinuationFrames, result);
             return;
         }

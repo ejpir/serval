@@ -17,6 +17,7 @@ const Request = types.Request;
 const Version = types.Version;
 
 const frame = @import("frame.zig");
+const limits = @import("limits.zig");
 const settings = @import("settings.zig");
 const hpack = @import("hpack.zig");
 const preface = @import("preface.zig");
@@ -101,7 +102,7 @@ pub fn validateUpgradeRequest(
     const settings_value = try findUniqueHeaderValue(&request.headers, "HTTP2-Settings");
     const decoded = try decodeSettingsValue(settings_value, decoded_settings_out);
 
-    var parsed_settings: [config.H2_MAX_SETTINGS_PER_FRAME]settings.Setting = undefined;
+    var parsed_settings: [limits.max_settings_per_frame]settings.Setting = undefined;
     _ = try settings.parsePayload(decoded, &parsed_settings);
     return decoded;
 }

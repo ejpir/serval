@@ -96,6 +96,8 @@ pub const H2UpstreamSession = h2_upstream_pool.UpstreamSession;
 /// Those pointers become invalid when their slot is closed/replaced or when the pool is deinitialized.
 /// This alias itself has no error behavior; fallible operations on the type return `H2UpstreamSessionError`.
 pub const H2UpstreamSessionPool = h2_upstream_pool.UpstreamSessionPool;
+/// Maximum live upstream HTTP/2 sessions retained per upstream slot during rollover.
+pub const h2_max_sessions_per_upstream = h2_upstream_pool.max_sessions_per_upstream;
 /// Error set for HTTP/2 upstream session-pool operations.
 /// This is a direct alias of `h2_upstream_pool.Error`; it adds no behavior or extra variants.
 /// Includes pool-level failures such as `UnsupportedProtocol` and `UpstreamSessionPoolExhausted`,

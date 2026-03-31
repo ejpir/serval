@@ -20,6 +20,7 @@ This module is the shared protocol toolbox for:
 
 Current responsibilities:
 
+- owner-local bounded protocol limits (`limits.zig`)
 - frame header parsing/encoding
 - client connection preface detection
 - SETTINGS parsing/encoding/validation/application
@@ -41,6 +42,7 @@ Current responsibilities:
 | `FrameType` | HTTP/2 frame type enum |
 | `FrameHeader` | Parsed/encoded frame header |
 | `FrameError` | Frame-parse errors |
+| `max_initial_parse_frames`, `max_continuation_frames`, `max_settings_per_frame` | Owner-local bounded protocol limits |
 | `parseFrameHeader(raw)` | Parse frame header |
 | `buildFrameHeader(out, header)` | Encode frame header |
 | `frame_header_size_bytes` | Header size constant |
@@ -107,6 +109,7 @@ Current responsibilities:
 | File | Purpose |
 |------|---------|
 | `mod.zig` | Public API re-exports |
+| `limits.zig` | Owner-local bounded parser/settings limits |
 | `frame.zig` | Frame header parsing/encoding |
 | `preface.zig` | Client preface detection |
 | `settings.zig` | SETTINGS helpers |

@@ -6,8 +6,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
-const serval_core = @import("serval-core");
-const config = serval_core.config;
+const limits = @import("limits.zig");
 
 /// WebSocket close code `1000`, indicating a normal, graceful shutdown.
 /// Use this when the connection is ending without error and no further frames are expected.
@@ -102,7 +101,7 @@ pub fn parseClosePayload(payload: []const u8) CloseError!CloseInfo {
         return .{ .code = null, .reason = "" };
     }
     if (payload.len == 1) return error.InvalidClosePayload;
-    if (payload.len > config.WEBSOCKET_MAX_CONTROL_PAYLOAD_SIZE_BYTES) {
+    if (payload.len > limits.max_control_payload_size_bytes) {
         return error.PayloadTooLarge;
     }
 
@@ -132,7 +131,7 @@ pub fn buildClosePayload(out: []u8, code: u16, reason: []const u8) CloseError![]
 
     const reason_len_bytes: u32 = @intCast(reason.len);
     const total_len_bytes: u32 = 2 + reason_len_bytes;
-    if (total_len_bytes > config.WEBSOCKET_MAX_CONTROL_PAYLOAD_SIZE_BYTES) {
+    if (total_len_bytes > limits.max_control_payload_size_bytes) {
         return error.PayloadTooLarge;
     }
     if (out.len < @as(usize, @intCast(total_len_bytes))) return error.BufferTooSmall;
@@ -202,7 +201,7 @@ test "parseClosePayload rejects invalid UTF-8 reason" {
 }
 
 test "parseClosePayload rejects payload larger than control frame maximum" {
-    var payload: [config.WEBSOCKET_MAX_CONTROL_PAYLOAD_SIZE_BYTES + 1]u8 = undefined;
+    var payload: [limits.max_control_payload_size_bytes + 1]u8 = undefined;
     payload[0] = 0x03;
     payload[1] = 0xE8;
     @memset(payload[2..], 'a');
@@ -211,7 +210,7 @@ test "parseClosePayload rejects payload larger than control frame maximum" {
 }
 
 test "buildClosePayload encodes code and reason" {
-    var out: [config.WEBSOCKET_MAX_CONTROL_PAYLOAD_SIZE_BYTES]u8 = undefined;
+    var out: [limits.max_control_payload_size_bytes]u8 = undefined;
     const encoded = try buildClosePayload(&out, normal_closure, "bye");
 
     try std.testing.expectEqual(@as(usize, 5), encoded.len);
@@ -229,7 +228,7 @@ test "buildClosePayload rejects too-small output buffer" {
 }
 
 test "buildClosePayload rejects payload larger than control frame maximum" {
-    var out: [config.WEBSOCKET_MAX_CONTROL_PAYLOAD_SIZE_BYTES]u8 = undefined;
+    var out: [limits.max_control_payload_size_bytes]u8 = undefined;
     var reason: [124]u8 = undefined;
     @memset(&reason, 'a');
 
