@@ -127,22 +127,30 @@ const ResponseState = struct {
     pending_payload_len: u32 = 0,
     pending_payload_sent: u32 = 0,
     pending_end_stream: bool = false,
-    pending_payload_buf: [h2.frame_payload_capacity_bytes]u8 = undefined,
 };
 
 const ResponseStateTable = struct {
     slots: [response_table_capacity]ResponseState = [_]ResponseState{.{}} ** response_table_capacity,
+    pending_payload_storage: [response_table_capacity][h2.frame_payload_capacity_bytes]u8 = undefined,
     count: u16 = 0,
+
+    fn findIndex(self: *ResponseStateTable, stream_id: u32) ?usize {
+        assert(@intFromPtr(self) != 0);
+        assert(stream_id > 0);
+
+        for (self.slots[0..], 0..) |*slot, index| {
+            if (!slot.used) continue;
+            if (slot.stream_id == stream_id) return index;
+        }
+        return null;
+    }
 
     fn get(self: *ResponseStateTable, stream_id: u32) ?*ResponseState {
         assert(@intFromPtr(self) != 0);
         assert(stream_id > 0);
 
-        for (self.slots[0..]) |*slot| {
-            if (!slot.used) continue;
-            if (slot.stream_id == stream_id) return slot;
-        }
-        return null;
+        const index = self.findIndex(stream_id) orelse return null;
+        return &self.slots[index];
     }
 
     fn getOrInsert(self: *ResponseStateTable, stream_id: u32) Error!*ResponseState {
@@ -162,19 +170,28 @@ const ResponseStateTable = struct {
         return error.ResponseTableFull;
     }
 
+    fn pendingPayloadBuf(self: *ResponseStateTable, stream_id: u32) Error![]u8 {
+        assert(@intFromPtr(self) != 0);
+        assert(stream_id > 0);
+
+        const index = self.findIndex(stream_id) orelse return error.ResponseStateNotFound;
+        return self.pending_payload_storage[index][0..];
+    }
+
     fn remove(self: *ResponseStateTable, stream_id: u32) void {
         assert(@intFromPtr(self) != 0);
         assert(stream_id > 0);
 
-        for (self.slots[0..]) |*slot| {
-            if (!slot.used) continue;
-            if (slot.stream_id != stream_id) continue;
-            slot.* = .{};
-            assert(self.count > 0);
-            self.count -= 1;
-            return;
-        }
+        const index = self.findIndex(stream_id) orelse return;
+        self.slots[index] = .{};
+        assert(self.count > 0);
+        self.count -= 1;
     }
+};
+
+const ConnectionStorage = struct {
+    pending_request_headers_storage: [h2.header_block_capacity_bytes]u8 = undefined,
+    recv_buf: [read_buffer_size_bytes]u8 = undefined,
 };
 
 const StreamTracker = struct {
@@ -434,12 +451,13 @@ pub const ResponseWriter = struct {
 
         if (payload.len > h2.frame_payload_capacity_bytes) return error.ResponsePayloadTooLarge;
 
-        @memcpy(state.pending_payload_buf[0..payload.len], payload);
+        const pending_payload_buf = try self.states.pendingPayloadBuf(self.stream_id);
+        @memcpy(pending_payload_buf[0..payload.len], payload);
         state.pending_payload_len = @intCast(payload.len);
         state.pending_payload_sent = 0;
         state.pending_end_stream = end_stream;
 
-        const ended_stream = try flushResponseStatePendingData(self.io_conn, self.io, self.runtime, state, self.stream_trackers);
+        const ended_stream = try flushResponseStatePendingData(self.io_conn, self.io, self.runtime, self.states, state, self.stream_trackers);
         if (ended_stream) try self.finishStream(state);
     }
 
@@ -502,11 +520,13 @@ fn flushResponseStatePendingData(
     io_conn: *ConnectionIo,
     io: Io,
     runtime: *runtime_mod.Runtime,
+    response_states: *ResponseStateTable,
     state: *ResponseState,
     stream_trackers: *StreamTrackerTable,
 ) Error!bool {
     assert(@intFromPtr(io_conn) != 0);
     assert(@intFromPtr(runtime) != 0);
+    assert(@intFromPtr(response_states) != 0);
     assert(@intFromPtr(state) != 0);
     assert(@intFromPtr(stream_trackers) != 0);
 
@@ -537,6 +557,7 @@ fn flushResponseStatePendingData(
     const end = start + chunk_len;
     const finished_payload = end == state.pending_payload_len;
     const send_end_stream = finished_payload and state.pending_end_stream;
+    const pending_payload_buf = try response_states.pendingPayloadBuf(state.stream_id);
 
     var frame_buf: [frame_buffer_size_bytes]u8 = undefined;
     const frame = try appendFrame(
@@ -544,7 +565,7 @@ fn flushResponseStatePendingData(
         .data,
         if (send_end_stream) h2.flags_end_stream else 0,
         state.stream_id,
-        state.pending_payload_buf[start..end],
+        pending_payload_buf[start..end],
     );
     try writeAll(io_conn, io, frame);
 
@@ -899,6 +920,23 @@ fn initReceiveBuffer(recv_buf: *[read_buffer_size_bytes]u8, buffer_len: *usize, 
     if (initial_bytes.len == 0) return;
     @memcpy(recv_buf[0..initial_bytes.len], initial_bytes);
     buffer_len.* = initial_bytes.len;
+}
+
+fn initConnectionStorage(
+    runtime_cfg: config.H2Config,
+    storage: *ConnectionStorage,
+    buffer_len: *usize,
+    initial_bytes: []const u8,
+) void {
+    assert(@intFromPtr(storage) != 0);
+    assert(@intFromPtr(buffer_len) != 0);
+    assert(initial_bytes.len <= storage.recv_buf.len);
+    assert(runtime_cfg.max_header_block_size_bytes <= storage.pending_request_headers_storage.len);
+
+    initReceiveBuffer(&storage.recv_buf, buffer_len, initial_bytes);
+
+    assert(buffer_len.* == initial_bytes.len);
+    assert(buffer_len.* <= storage.recv_buf.len);
 }
 
 fn startBackgroundTasksIfPresent(
@@ -1312,8 +1350,8 @@ fn serveConnectionWithInitialBytesOptions(
     assert(@intFromPtr(io_conn) != 0);
     assert(initial_bytes.len <= read_buffer_size_bytes);
 
-    var pending_request_headers_storage: [h2.header_block_capacity_bytes]u8 = undefined;
-    var runtime = try runtime_mod.Runtime.init(runtime_cfg, &pending_request_headers_storage);
+    var connection_storage = ConnectionStorage{};
+    var runtime = try runtime_mod.Runtime.init(runtime_cfg, &connection_storage.pending_request_headers_storage);
     var response_states = ResponseStateTable{};
     var stream_trackers = StreamTrackerTable{};
     var connection_mutex: Io.Mutex = .init;
@@ -1328,15 +1366,14 @@ fn serveConnectionWithInitialBytesOptions(
     });
     try sendInitialServerSettings(io_conn, io, connection_id, &runtime, options.local_settings_already_sent);
 
-    var recv_buf: [read_buffer_size_bytes]u8 = undefined;
     var buffer_len: usize = undefined;
-    initReceiveBuffer(&recv_buf, &buffer_len, initial_bytes);
+    initConnectionStorage(runtime_cfg, &connection_storage, &buffer_len, initial_bytes);
     try consumeClientPrefaceFromBuffer(
         io_conn,
         maybe_plain_reader,
         io,
         &runtime,
-        &recv_buf,
+        &connection_storage.recv_buf,
         &buffer_len,
         connection_id,
     );
@@ -1364,7 +1401,7 @@ fn serveConnectionWithInitialBytesOptions(
         &response_states,
         &stream_trackers,
         &connection_mutex,
-        &recv_buf,
+        &connection_storage.recv_buf,
         &buffer_len,
     );
 }
@@ -1477,8 +1514,8 @@ pub fn serveUpgradedConnection(
     var plain_read_buf: [config.STREAM_READ_BUFFER_SIZE_BYTES]u8 = undefined;
     var plain_reader = rawStreamForFd(fd).reader(io, &plain_read_buf);
 
-    var pending_request_headers_storage: [h2.header_block_capacity_bytes]u8 = undefined;
-    var runtime = try runtime_mod.Runtime.init(.{}, &pending_request_headers_storage);
+    var connection_storage = ConnectionStorage{};
+    var runtime = try runtime_mod.Runtime.init(.{}, &connection_storage.pending_request_headers_storage);
     var response_states = ResponseStateTable{};
     var stream_trackers = StreamTrackerTable{};
     var connection_mutex: Io.Mutex = .init;
@@ -1512,6 +1549,8 @@ pub fn serveUpgradedConnection(
         remaining_body_bytes,
         &connection_mutex,
         initial_client_h2_bytes,
+        .{},
+        &connection_storage,
     );
 }
 
@@ -1531,9 +1570,12 @@ fn runUpgradedBodyAndFrameLoop(
     remaining_body_bytes: u64,
     connection_mutex: *Io.Mutex,
     initial_client_h2_bytes: []const u8,
+    runtime_cfg: config.H2Config,
+    connection_storage: *ConnectionStorage,
 ) Error!void {
     assert(@intFromPtr(handler) != 0);
     assert(@intFromPtr(request) != 0);
+    assert(@intFromPtr(connection_storage) != 0);
     assert(initial_client_h2_bytes.len <= read_buffer_size_bytes);
 
     processUpgradeSyntheticRequestAndBody(
@@ -1555,10 +1597,9 @@ fn runUpgradedBodyAndFrameLoop(
         return err;
     };
 
-    var recv_buf: [read_buffer_size_bytes]u8 = undefined;
     var buffer_len: usize = undefined;
-    initReceiveBuffer(&recv_buf, &buffer_len, initial_client_h2_bytes);
-    consumeOptionalUpgradeClientPreface(io_conn, plain_reader, io, &recv_buf, &buffer_len) catch |err| {
+    initConnectionStorage(runtime_cfg, connection_storage, &buffer_len, initial_client_h2_bytes);
+    consumeOptionalUpgradeClientPreface(io_conn, plain_reader, io, &connection_storage.recv_buf, &buffer_len) catch |err| {
         try sendRuntimeErrorGoAway(runtime, io_conn, io, 0, err);
         closeTrackedStreamsForFatalError(Handler, handler, connection_id, stream_trackers, err);
         return err;
@@ -1574,7 +1615,7 @@ fn runUpgradedBodyAndFrameLoop(
         response_states,
         stream_trackers,
         connection_mutex,
-        &recv_buf,
+        &connection_storage.recv_buf,
         &buffer_len,
     );
 }
@@ -1866,7 +1907,7 @@ fn flushPendingResponseData(
         if (!state.used) continue;
         if (state.closed) continue;
 
-        const ended_stream = try flushResponseStatePendingData(io_conn, io, runtime, state, stream_trackers);
+        const ended_stream = try flushResponseStatePendingData(io_conn, io, runtime, response_states, state, stream_trackers);
         if (!ended_stream) continue;
 
         const stream_id = state.stream_id;

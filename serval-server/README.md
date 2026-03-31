@@ -12,6 +12,7 @@ Runtime protocol policy now comes from nested server config sections rather than
 - `Config.websocket` controls native WebSocket session limits such as message size, fragment count, and close/idle timeouts.
 - Fixed compile-time capacities still stay in owner modules or shared core invariants; runtime settings are validated against those bounds.
 - The terminated server-side h2 runtime now takes caller-owned HEADERS/CONTINUATION scratch storage for pending request-header assembly, so that scratch-buffer ownership stays with the connection driver instead of being embedded in the protocol runtime state.
+- The terminated server-side h2 driver now groups its per-connection receive buffer and request-header scratch in explicit connection-owned storage, so hot-path buffer ownership is no longer split across unrelated local arrays.
 
 ## Module Structure
 
