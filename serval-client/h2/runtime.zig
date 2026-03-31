@@ -115,7 +115,7 @@ const PendingResponseHeaders = struct {
     is_trailers: bool = false,
     continuation_frames: u8 = 0,
     block_len: u32 = 0,
-    block_buf: [config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined,
+    block_buf: [h2.header_block_capacity_bytes]u8 = undefined,
 };
 
 /// Public HTTP/2 client runtime state for prior-knowledge upstream sessions.
@@ -135,6 +135,8 @@ pub const Runtime = struct {
     pub fn init(runtime_cfg: config.H2Config) Error!Runtime {
         assert(runtime_cfg.connection_window_size_bytes > 0);
         assert(runtime_cfg.max_header_block_size_bytes > 0);
+        assert(runtime_cfg.max_frame_size_bytes <= h2.frame_payload_capacity_bytes);
+        assert(runtime_cfg.max_header_block_size_bytes <= h2.header_block_capacity_bytes);
         return .{
             .runtime_cfg = runtime_cfg,
             .state = try session.SessionState.init(runtime_cfg),
@@ -239,7 +241,7 @@ pub const Runtime = struct {
         assert(path.len > 0);
         const authority = request.headers.getHost() orelse return error.MissingAuthority;
 
-        var header_block_buf: [config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+        var header_block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
         const header_block = try buildRequestHeaderBlock(request, path, authority, &header_block_buf);
 
         const stream = try self.state.openRequestStream(end_stream);
@@ -528,7 +530,7 @@ fn appendPendingResponseHeaderFragment(self: *Runtime, payload: []const u8) Erro
     assert(self.pending_response_headers.active);
 
     const current_len: usize = @intCast(self.pending_response_headers.block_len);
-    if (current_len + payload.len > config.H2_MAX_HEADER_BLOCK_SIZE_BYTES) return error.HeaderBlockTooLarge;
+    if (current_len + payload.len > h2.header_block_capacity_bytes) return error.HeaderBlockTooLarge;
 
     @memcpy(
         self.pending_response_headers.block_buf[current_len .. current_len + payload.len],
@@ -578,7 +580,7 @@ fn finishPendingResponseHeaders(self: *Runtime) Error!ReceiveAction {
 
 fn resetPendingResponseHeaders(self: *Runtime) void {
     assert(@intFromPtr(self) != 0);
-    assert(self.pending_response_headers.block_len <= config.H2_MAX_HEADER_BLOCK_SIZE_BYTES);
+    assert(self.pending_response_headers.block_len <= h2.header_block_capacity_bytes);
 
     self.pending_response_headers.active = false;
     self.pending_response_headers.stream_id = 0;
@@ -720,7 +722,7 @@ fn handleGoAway(self: *Runtime, header: h2.FrameHeader, payload: []const u8) Err
 
 fn buildLocalSettingsPayload(local_settings: h2.Settings, out: []u8) Error![]const u8 {
     assert(local_settings.max_frame_size_bytes >= h2.settings.min_max_frame_size_bytes);
-    assert(local_settings.max_frame_size_bytes <= config.H2_MAX_FRAME_SIZE_BYTES);
+    assert(local_settings.max_frame_size_bytes <= h2.frame_payload_capacity_bytes);
 
     const settings = [_]h2.Setting{
         .{ .id = @intFromEnum(h2.SettingId.enable_push), .value = if (local_settings.enable_push) 1 else 0 },
@@ -752,7 +754,7 @@ fn buildRequestHeaderBlock(
         const encoded = try h2.encodeLiteralHeaderWithoutIndexing(out[cursor..], header.name, header.value);
         cursor += encoded.len;
 
-        if (cursor > config.H2_MAX_HEADER_BLOCK_SIZE_BYTES) return error.HeaderBlockTooLarge;
+        if (cursor > h2.header_block_capacity_bytes) return error.HeaderBlockTooLarge;
     }
 
     return out[0..cursor];
@@ -814,7 +816,7 @@ fn methodToken(method: Method) []const u8 {
 
 fn decodeResponseHeaderBlock(decoder: *h2.HpackDecoder, header_block: []const u8) Error!Response {
     assert(@intFromPtr(decoder) != 0);
-    assert(header_block.len <= config.H2_MAX_HEADER_BLOCK_SIZE_BYTES);
+    assert(header_block.len <= h2.header_block_capacity_bytes);
 
     var fields_buf: [config.MAX_HEADERS]h2.HeaderField = undefined;
     const fields = try h2.decodeHeaderBlockWithDecoder(decoder, header_block, &fields_buf);
@@ -854,7 +856,7 @@ fn decodeResponseHeaderBlock(decoder: *h2.HpackDecoder, header_block: []const u8
 
 fn decodeTrailerHeaderBlock(decoder: *h2.HpackDecoder, header_block: []const u8) Error!HeaderMap {
     assert(@intFromPtr(decoder) != 0);
-    assert(header_block.len <= config.H2_MAX_HEADER_BLOCK_SIZE_BYTES);
+    assert(header_block.len <= h2.header_block_capacity_bytes);
 
     var fields_buf: [config.MAX_HEADERS]h2.HeaderField = undefined;
     const fields = try h2.decodeHeaderBlockWithDecoder(decoder, header_block, &fields_buf);
@@ -1103,7 +1105,7 @@ test "Runtime writes request HEADERS and DATA with stream lifecycle" {
     var runtime = try initRuntimeReadyForStreams();
     var request = try makeGrpcRequest("/grpc.test.Echo/Unary");
 
-    var headers_buf: [h2.frame_header_size_bytes + config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+    var headers_buf: [h2.frame_header_size_bytes + h2.header_block_capacity_bytes]u8 = undefined;
     const headers_write = try runtime.writeRequestHeadersFrame(&headers_buf, &request, null, false);
     try std.testing.expectEqual(@as(u32, 1), headers_write.stream_id);
 
@@ -1129,7 +1131,7 @@ test "Runtime fragments outbound request HEADERS with CONTINUATION when peer max
     try request.headers.put("x-long-header", "abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789");
 
     const frame_overhead_bytes: usize = h2.frame_header_size_bytes * (@as(usize, h2.max_continuation_frames) + 1);
-    var headers_buf: [config.H2_MAX_HEADER_BLOCK_SIZE_BYTES + frame_overhead_bytes]u8 = undefined;
+    var headers_buf: [h2.header_block_capacity_bytes + frame_overhead_bytes]u8 = undefined;
     const headers_write = try runtime.writeRequestHeadersFrame(&headers_buf, &request, null, true);
 
     var cursor: usize = 0;
@@ -1169,17 +1171,17 @@ test "Runtime decodes response HEADERS, DATA, and trailers" {
     var runtime = try initRuntimeReadyForStreams();
     var request = try makeGrpcRequest("/grpc.test.Echo/Unary");
 
-    var request_frame_buf: [h2.frame_header_size_bytes + config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+    var request_frame_buf: [h2.frame_header_size_bytes + h2.header_block_capacity_bytes]u8 = undefined;
     const request_headers = try runtime.writeRequestHeadersFrame(&request_frame_buf, &request, null, true);
 
-    var header_block_buf: [config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+    var header_block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
     const response_block = try buildResponseHeaderBlock(
         200,
         &.{.{ .name = "content-type", .value = "application/grpc" }},
         &header_block_buf,
     );
 
-    var response_headers_frame_buf: [h2.frame_header_size_bytes + config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+    var response_headers_frame_buf: [h2.frame_header_size_bytes + h2.header_block_capacity_bytes]u8 = undefined;
     const response_headers_frame = try appendFrame(
         &response_headers_frame_buf,
         .headers,
@@ -1217,10 +1219,10 @@ test "Runtime decodes response HEADERS, DATA, and trailers" {
         else => return error.UnexpectedAction,
     }
 
-    var trailer_block_buf: [config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+    var trailer_block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
     const trailer_block = try buildHeaderBlock(&.{.{ .name = "grpc-status", .value = "0" }}, &trailer_block_buf);
 
-    var trailer_frame_buf: [h2.frame_header_size_bytes + config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+    var trailer_frame_buf: [h2.frame_header_size_bytes + h2.header_block_capacity_bytes]u8 = undefined;
     const trailer_frame = try appendFrame(
         &trailer_frame_buf,
         .headers,
@@ -1248,10 +1250,10 @@ test "Runtime reassembles response HEADERS and trailers with CONTINUATION" {
     var runtime = try initRuntimeReadyForStreams();
     var request = try makeGrpcRequest("/grpc.test.Echo/Unary");
 
-    var request_frame_buf: [h2.frame_header_size_bytes + config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+    var request_frame_buf: [h2.frame_header_size_bytes + h2.header_block_capacity_bytes]u8 = undefined;
     const request_headers = try runtime.writeRequestHeadersFrame(&request_frame_buf, &request, null, true);
 
-    var response_block_buf: [config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+    var response_block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
     const response_block = try buildResponseHeaderBlock(
         200,
         &.{.{ .name = "content-type", .value = "application/grpc" }},
@@ -1261,7 +1263,7 @@ test "Runtime reassembles response HEADERS and trailers with CONTINUATION" {
     try std.testing.expect(response_split > 0);
     try std.testing.expect(response_split < response_block.len);
 
-    var response_headers_frame_buf: [h2.frame_header_size_bytes + config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+    var response_headers_frame_buf: [h2.frame_header_size_bytes + h2.header_block_capacity_bytes]u8 = undefined;
     const response_headers_frame = try appendFrame(
         &response_headers_frame_buf,
         .headers,
@@ -1277,7 +1279,7 @@ test "Runtime reassembles response HEADERS and trailers with CONTINUATION" {
     try std.testing.expect(first_headers_action == .none);
     try std.testing.expect(runtime.pending_response_headers.active);
 
-    var response_cont_frame_buf: [h2.frame_header_size_bytes + config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+    var response_cont_frame_buf: [h2.frame_header_size_bytes + h2.header_block_capacity_bytes]u8 = undefined;
     const response_continuation = try appendFrame(
         &response_cont_frame_buf,
         .continuation,
@@ -1301,13 +1303,13 @@ test "Runtime reassembles response HEADERS and trailers with CONTINUATION" {
     }
     try std.testing.expect(!runtime.pending_response_headers.active);
 
-    var trailer_block_buf: [config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+    var trailer_block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
     const trailer_block = try buildHeaderBlock(&.{.{ .name = "grpc-status", .value = "0" }}, &trailer_block_buf);
     const trailer_split: usize = trailer_block.len / 2;
     try std.testing.expect(trailer_split > 0);
     try std.testing.expect(trailer_split < trailer_block.len);
 
-    var trailer_frame_buf: [h2.frame_header_size_bytes + config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+    var trailer_frame_buf: [h2.frame_header_size_bytes + h2.header_block_capacity_bytes]u8 = undefined;
     const trailer_frame = try appendFrame(
         &trailer_frame_buf,
         .headers,
@@ -1323,7 +1325,7 @@ test "Runtime reassembles response HEADERS and trailers with CONTINUATION" {
     try std.testing.expect(first_trailer_action == .none);
     try std.testing.expect(runtime.pending_response_headers.active);
 
-    var trailer_cont_frame_buf: [h2.frame_header_size_bytes + config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+    var trailer_cont_frame_buf: [h2.frame_header_size_bytes + h2.header_block_capacity_bytes]u8 = undefined;
     const trailer_continuation = try appendFrame(
         &trailer_cont_frame_buf,
         .continuation,
@@ -1351,17 +1353,17 @@ test "Runtime rejects interleaved frame while waiting for response CONTINUATION"
     var runtime = try initRuntimeReadyForStreams();
     var request = try makeGrpcRequest("/grpc.test.Echo/Unary");
 
-    var request_frame_buf: [h2.frame_header_size_bytes + config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+    var request_frame_buf: [h2.frame_header_size_bytes + h2.header_block_capacity_bytes]u8 = undefined;
     const request_headers = try runtime.writeRequestHeadersFrame(&request_frame_buf, &request, null, true);
 
-    var response_block_buf: [config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+    var response_block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
     const response_block = try buildResponseHeaderBlock(
         200,
         &.{.{ .name = "content-type", .value = "application/grpc" }},
         &response_block_buf,
     );
 
-    var response_headers_frame_buf: [h2.frame_header_size_bytes + config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+    var response_headers_frame_buf: [h2.frame_header_size_bytes + h2.header_block_capacity_bytes]u8 = undefined;
     const response_headers_frame = try appendFrame(
         &response_headers_frame_buf,
         .headers,
@@ -1405,10 +1407,10 @@ test "Runtime rejects unexpected CONTINUATION stream" {
     var runtime = try initRuntimeReadyForStreams();
     var request = try makeGrpcRequest("/grpc.test.Echo/Unary");
 
-    var request_frame_buf: [h2.frame_header_size_bytes + config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+    var request_frame_buf: [h2.frame_header_size_bytes + h2.header_block_capacity_bytes]u8 = undefined;
     const request_headers = try runtime.writeRequestHeadersFrame(&request_frame_buf, &request, null, true);
 
-    var response_block_buf: [config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+    var response_block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
     const response_block = try buildResponseHeaderBlock(
         200,
         &.{.{ .name = "content-type", .value = "application/grpc" }},
@@ -1416,7 +1418,7 @@ test "Runtime rejects unexpected CONTINUATION stream" {
     );
     const split: usize = response_block.len / 2;
 
-    var response_headers_frame_buf: [h2.frame_header_size_bytes + config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+    var response_headers_frame_buf: [h2.frame_header_size_bytes + h2.header_block_capacity_bytes]u8 = undefined;
     const response_headers_frame = try appendFrame(
         &response_headers_frame_buf,
         .headers,
@@ -1430,7 +1432,7 @@ test "Runtime rejects unexpected CONTINUATION stream" {
         response_headers_frame[h2.frame_header_size_bytes .. h2.frame_header_size_bytes + response_headers_header.length],
     );
 
-    var continuation_frame_buf: [h2.frame_header_size_bytes + config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+    var continuation_frame_buf: [h2.frame_header_size_bytes + h2.header_block_capacity_bytes]u8 = undefined;
     const continuation_frame = try appendFrame(
         &continuation_frame_buf,
         .continuation,
@@ -1453,7 +1455,7 @@ test "Runtime rejects response CONTINUATION with invalid flags" {
     var runtime = try initRuntimeReadyForStreams();
     var request = try makeGrpcRequest("/grpc.test.Echo/Unary");
 
-    var request_frame_buf: [h2.frame_header_size_bytes + config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+    var request_frame_buf: [h2.frame_header_size_bytes + h2.header_block_capacity_bytes]u8 = undefined;
     const request_headers = try runtime.writeRequestHeadersFrame(&request_frame_buf, &request, null, true);
 
     var response_headers_frame_buf: [h2.frame_header_size_bytes + 1]u8 = undefined;
@@ -1493,7 +1495,7 @@ test "Runtime enforces response continuation frame bound" {
     var runtime = try initRuntimeReadyForStreams();
     var request = try makeGrpcRequest("/grpc.test.Echo/Unary");
 
-    var request_frame_buf: [h2.frame_header_size_bytes + config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+    var request_frame_buf: [h2.frame_header_size_bytes + h2.header_block_capacity_bytes]u8 = undefined;
     const request_headers = try runtime.writeRequestHeadersFrame(&request_frame_buf, &request, null, true);
 
     var response_headers_frame_buf: [h2.frame_header_size_bytes + 1]u8 = undefined;
@@ -1540,7 +1542,7 @@ test "Runtime handles upstream RST_STREAM and clears stream state" {
     var runtime = try initRuntimeReadyForStreams();
     var request = try makeGrpcRequest("/grpc.test.Echo/Unary");
 
-    var request_frame_buf: [h2.frame_header_size_bytes + config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+    var request_frame_buf: [h2.frame_header_size_bytes + h2.header_block_capacity_bytes]u8 = undefined;
     const request_headers = try runtime.writeRequestHeadersFrame(&request_frame_buf, &request, null, true);
 
     var rst_buf: [h2.frame_header_size_bytes + h2.control.rst_stream_payload_size_bytes]u8 = undefined;
@@ -1577,7 +1579,7 @@ test "Runtime ignores duplicate upstream RST_STREAM for retired known stream" {
     const settings_action = try runtime.receiveFrame(settings_header, settings[h2.frame_header_size_bytes..]);
     try std.testing.expect(settings_action == .send_settings_ack);
 
-    var header_buf: [config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+    var header_buf: [h2.header_block_capacity_bytes]u8 = undefined;
     const request_write = try runtime.writeRequestHeadersFrame(&header_buf, &request, null, false);
     try std.testing.expectEqual(@as(u32, 1), request_write.stream_id);
 
@@ -1602,7 +1604,7 @@ test "Runtime tracks GOAWAY bound and rejects new streams above last_stream_id" 
     var runtime = try initRuntimeReadyForStreams();
     var request = try makeGrpcRequest("/grpc.test.Echo/Unary");
 
-    var request_frame_buf: [h2.frame_header_size_bytes + config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+    var request_frame_buf: [h2.frame_header_size_bytes + h2.header_block_capacity_bytes]u8 = undefined;
     _ = try runtime.writeRequestHeadersFrame(&request_frame_buf, &request, null, false);
 
     var goaway_buf: [h2.frame_header_size_bytes + h2.control.goaway_min_payload_size_bytes]u8 = undefined;
@@ -1620,7 +1622,7 @@ test "Runtime tracks GOAWAY bound and rejects new streams above last_stream_id" 
         else => return error.UnexpectedAction,
     }
 
-    var second_request_frame_buf: [h2.frame_header_size_bytes + config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+    var second_request_frame_buf: [h2.frame_header_size_bytes + h2.header_block_capacity_bytes]u8 = undefined;
     try std.testing.expectError(
         error.ConnectionClosing,
         runtime.writeRequestHeadersFrame(&second_request_frame_buf, &request, null, false),
@@ -1631,7 +1633,7 @@ test "Runtime applies WINDOW_UPDATE increments to send windows" {
     var runtime = try initRuntimeReadyForStreams();
     var request = try makeGrpcRequest("/grpc.test.Echo/Unary");
 
-    var request_frame_buf: [h2.frame_header_size_bytes + config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+    var request_frame_buf: [h2.frame_header_size_bytes + h2.header_block_capacity_bytes]u8 = undefined;
     const request_headers = try runtime.writeRequestHeadersFrame(&request_frame_buf, &request, null, false);
 
     const connection_send_before = runtime.state.flow.send_window.available_bytes;

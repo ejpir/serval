@@ -18,6 +18,7 @@ const serval_client = @import("serval-client");
 const client_request = serval_client.request;
 const Connection = serval_client.Connection;
 const serval_grpc = @import("serval-grpc");
+const serval_h2 = @import("serval-h2");
 const serval_http = @import("serval-http");
 const parseContentLengthValue = serval_http.parseContentLengthValue;
 const serval_proxy = @import("serval-proxy");
@@ -469,7 +470,7 @@ pub fn GenericTlsH2FrontendHandler(
                     try writer.sendHeaders(response_headers.status, h2_headers, false);
                     if (pre_read.len > 0) try writer.sendData(pre_read, remaining == 0);
 
-                    var response_buf: [config.H2_MAX_FRAME_SIZE_BYTES]u8 = undefined;
+                    var response_buf: [serval_h2.frame_payload_capacity_bytes]u8 = undefined;
                     var frame_count: u32 = 0;
                     while (remaining > 0 and frame_count < config.H2_SERVER_MAX_FRAME_COUNT) : (frame_count += 1) {
                         const to_read: usize = @intCast(@min(@as(u64, response_buf.len), remaining));
@@ -486,7 +487,7 @@ pub fn GenericTlsH2FrontendHandler(
                     try writer.sendHeaders(response_headers.status, h2_headers, false);
                     var body_reader = serval_client.BodyReader.init(&conn.socket, response_headers.body_framing);
                     body_reader.preloadChunkedBytes(pre_read) catch return error.UpstreamResponseBodyReadFailed;
-                    var response_buf: [config.H2_MAX_FRAME_SIZE_BYTES]u8 = undefined;
+                    var response_buf: [serval_h2.frame_payload_capacity_bytes]u8 = undefined;
 
                     var frame_count: u32 = 0;
                     while (frame_count < config.H2_SERVER_MAX_FRAME_COUNT) : (frame_count += 1) {
@@ -748,7 +749,7 @@ pub fn GenericTlsH2FrontendHandler(
             assert(@intFromPtr(self) != 0);
             assert(stream_id > 0);
 
-            var read_buf: [config.H2_MAX_FRAME_SIZE_BYTES]u8 = undefined;
+            var read_buf: [serval_h2.frame_payload_capacity_bytes]u8 = undefined;
             const timeout = timeoutForMilliseconds(websocket_read_timeout_ms);
 
             while (true) {
@@ -902,7 +903,7 @@ pub fn GenericTlsH2FrontendHandler(
 
         fn sendSimpleTextResponse(writer: *h2_server.ResponseWriter, status: u16, message: []const u8) h2_server.Error!void {
             assert(@intFromPtr(writer) != 0);
-            assert(message.len <= config.H2_MAX_FRAME_SIZE_BYTES);
+            assert(message.len <= serval_h2.frame_payload_capacity_bytes);
             try writer.sendHeaders(status, &.{.{ .name = "content-type", .value = "text/plain" }}, false);
             try writer.sendData(message, true);
         }

@@ -341,18 +341,6 @@ pub const MAX_ADMIN_REQUEST_BYTES: u32 = 1024 * 1024;
 /// TigerStyle: Fixed-capacity SAN list bound.
 pub const ACME_MAX_DOMAINS_PER_CERT: u8 = 16;
 
-/// Maximum active HTTP-01 challenges tracked concurrently.
-/// TigerStyle: Bounded challenge table for deterministic memory usage.
-pub const ACME_MAX_ACTIVE_CHALLENGES: u8 = 64;
-
-/// Maximum ACME poll attempts for challenge/order status transitions.
-/// TigerStyle: Bounded polling loop.
-pub const ACME_MAX_POLL_ATTEMPTS: u16 = 120;
-
-/// Maximum state transitions executed in one manager tick.
-/// TigerStyle: Bounded work per scheduler cycle.
-pub const ACME_MAX_TRANSITIONS_PER_TICK: u8 = 32;
-
 /// Maximum ACME directory URL length in bytes.
 pub const ACME_MAX_DIRECTORY_URL_BYTES: u16 = 1024;
 
@@ -365,39 +353,6 @@ pub const ACME_MAX_STATE_DIR_PATH_BYTES: u16 = 512;
 /// Maximum hostname/domain length in bytes (RFC 1035: 253 octets).
 pub const ACME_MAX_DOMAIN_NAME_LEN: u16 = 253;
 
-/// Maximum HTTP-01 token length in bytes.
-pub const ACME_MAX_HTTP01_TOKEN_BYTES: u16 = 128;
-
-/// Maximum HTTP-01 key-authorization length in bytes.
-pub const ACME_MAX_HTTP01_KEY_AUTHORIZATION_BYTES: u16 = 512;
-
-/// Maximum Replay-Nonce header value length in bytes.
-pub const ACME_MAX_NONCE_BYTES: u16 = 512;
-
-/// Maximum ACME directory response payload in bytes.
-/// TigerStyle: Explicit cap for JSON parsing input.
-pub const ACME_MAX_DIRECTORY_RESPONSE_BYTES: u32 = 64 * 1024;
-
-/// Maximum ACME account response payload in bytes.
-/// TigerStyle: Explicit cap for JSON parsing input.
-pub const ACME_MAX_ACCOUNT_RESPONSE_BYTES: u32 = 64 * 1024;
-
-/// Maximum ACME order response payload in bytes.
-/// TigerStyle: Explicit cap for JSON parsing input.
-pub const ACME_MAX_ORDER_RESPONSE_BYTES: u32 = 128 * 1024;
-
-/// Maximum JSON body bytes emitted in ACME JWS payload encoding.
-/// TigerStyle: Bounded serializer output.
-pub const ACME_MAX_JWS_BODY_BYTES: u32 = 64 * 1024;
-
-/// Maximum detached JWS signature bytes accepted by serializers.
-/// ES256 signatures are 64 bytes; bound leaves room for future algorithms.
-pub const ACME_MAX_JWS_SIGNATURE_BYTES: u16 = 512;
-
-/// Maximum authorization URLs tracked from one order response.
-/// In HTTP-01 flow this should match domain count upper bound.
-pub const ACME_MAX_AUTHORIZATION_URLS_PER_ORDER: u8 = ACME_MAX_DOMAINS_PER_CERT;
-
 /// Minimum renew-before window in nanoseconds (1 day).
 pub const ACME_MIN_RENEW_BEFORE_NS: u64 = time.secondsToNanos(24 * 60 * 60);
 
@@ -406,9 +361,6 @@ pub const ACME_MAX_RENEW_BEFORE_NS: u64 = time.secondsToNanos(365 * 24 * 60 * 60
 
 /// Default renew-before window in nanoseconds (30 days).
 pub const ACME_DEFAULT_RENEW_BEFORE_NS: u64 = time.secondsToNanos(30 * 24 * 60 * 60);
-
-/// Default HTTP-01 listener port.
-pub const ACME_DEFAULT_HTTP01_PORT: u16 = 80;
 
 /// Default ACME poll interval in milliseconds.
 pub const ACME_DEFAULT_POLL_INTERVAL_MS: u32 = 2000;
@@ -422,27 +374,6 @@ pub const ACME_DEFAULT_FAIL_BACKOFF_MAX_MS: u32 = 3_600_000;
 comptime {
     if (ACME_MAX_DOMAINS_PER_CERT == 0) {
         @compileError("ACME_MAX_DOMAINS_PER_CERT must be > 0");
-    }
-    if (ACME_MAX_ACTIVE_CHALLENGES == 0) {
-        @compileError("ACME_MAX_ACTIVE_CHALLENGES must be > 0");
-    }
-    if (ACME_MAX_POLL_ATTEMPTS == 0) {
-        @compileError("ACME_MAX_POLL_ATTEMPTS must be > 0");
-    }
-    if (ACME_MAX_NONCE_BYTES == 0) {
-        @compileError("ACME_MAX_NONCE_BYTES must be > 0");
-    }
-    if (ACME_MAX_DIRECTORY_RESPONSE_BYTES == 0) {
-        @compileError("ACME_MAX_DIRECTORY_RESPONSE_BYTES must be > 0");
-    }
-    if (ACME_MAX_ORDER_RESPONSE_BYTES == 0) {
-        @compileError("ACME_MAX_ORDER_RESPONSE_BYTES must be > 0");
-    }
-    if (ACME_MAX_JWS_BODY_BYTES == 0) {
-        @compileError("ACME_MAX_JWS_BODY_BYTES must be > 0");
-    }
-    if (ACME_MAX_JWS_SIGNATURE_BYTES == 0) {
-        @compileError("ACME_MAX_JWS_SIGNATURE_BYTES must be > 0");
     }
 }
 

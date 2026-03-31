@@ -19,6 +19,7 @@ const transport = @import("transport.zig");
 const signer_mod = @import("signer.zig");
 const runtime = @import("runtime.zig");
 const storage = @import("storage.zig");
+const limits = @import("limits.zig");
 
 const serval_client = @import("serval-client");
 const Client = serval_client.Client;
@@ -56,7 +57,7 @@ pub const SignedBodies = struct {
     /// `self` must remain valid while the returned slice is in use; the slice aliases storage owned by `self`.
     pub fn bodyForOperation(self: *const SignedBodies, operation: orchestration.Operation) Error![]const u8 {
         assert(@intFromPtr(self) != 0);
-        assert(self.new_account_body.len <= config.ACME_MAX_JWS_BODY_BYTES);
+        assert(self.new_account_body.len <= limits.max_jws_body_bytes);
 
         return switch (operation) {
             .fetch_nonce => &.{},
@@ -69,8 +70,8 @@ pub const SignedBodies = struct {
     }
 
     fn requireSignedBody(value: []const u8) Error![]const u8 {
-        assert(config.ACME_MAX_JWS_BODY_BYTES > 0);
-        assert(value.len <= config.ACME_MAX_JWS_BODY_BYTES);
+        assert(limits.max_jws_body_bytes > 0);
+        assert(value.len <= limits.max_jws_body_bytes);
         if (value.len == 0) return error.MissingSignedBody;
         return value;
     }
@@ -177,7 +178,7 @@ const ExecutionDisposition = enum(u8) {
 pub const Manager = struct {
     state: acme_types.CertState = .idle,
     flow_ctx: orchestration.FlowContext,
-    max_transitions_per_tick: u8 = config.ACME_MAX_TRANSITIONS_PER_TICK,
+    max_transitions_per_tick: u8 = limits.max_transitions_per_tick,
     upstream_idx: config.UpstreamIndex = 0,
     retry_backoff: backoff.BoundedBackoff,
     backoff_wait_until_ns: u64 = 0,
@@ -501,7 +502,7 @@ pub const Manager = struct {
 
 fn nextStateFromOrder(order: *const client.OrderResponse) acme_types.CertState {
     assert(@intFromPtr(order) != 0);
-    assert(order.authorization_count <= config.ACME_MAX_AUTHORIZATION_URLS_PER_ORDER);
+    assert(order.authorization_count <= limits.max_authorization_urls_per_order);
 
     return switch (order.status) {
         .ready => .finalize_order,

@@ -29,22 +29,22 @@ const ssl = serval_tls.ssl;
 
 const Request = types.Request;
 
-const read_buffer_size_bytes: usize = h2.client_connection_preface.len + h2.frame_header_size_bytes + config.H2_MAX_FRAME_SIZE_BYTES;
-const frame_buffer_size_bytes: usize = h2.frame_header_size_bytes + config.H2_MAX_FRAME_SIZE_BYTES;
+const read_buffer_size_bytes: usize = h2.client_connection_preface.len + h2.frame_header_size_bytes + h2.frame_payload_capacity_bytes;
+const frame_buffer_size_bytes: usize = h2.frame_header_size_bytes + h2.frame_payload_capacity_bytes;
 const header_block_frame_overhead_bytes: usize = h2.frame_header_size_bytes * (@as(usize, h2.max_continuation_frames) + 1);
-const header_block_frame_buffer_size_bytes: usize = config.H2_MAX_HEADER_BLOCK_SIZE_BYTES + header_block_frame_overhead_bytes;
+const header_block_frame_buffer_size_bytes: usize = h2.header_block_capacity_bytes + header_block_frame_overhead_bytes;
 const response_table_capacity: usize = config.H2_MAX_CONCURRENT_STREAMS;
 const upgrade_preamble_size_bytes: usize =
     h2.client_connection_preface.len +
     (2 * h2.frame_header_size_bytes) +
-    config.H2_MAX_FRAME_SIZE_BYTES +
-    config.H2_MAX_HEADER_BLOCK_SIZE_BYTES;
+    h2.frame_payload_capacity_bytes +
+    h2.header_block_capacity_bytes;
 const read_max_retry_count: u32 = 30_000;
 const tls_read_readiness_timeout_ns: u64 = config.H2_SERVER_IDLE_TIMEOUT_NS;
 const write_retry_sleep_ns: u64 = time.ns_per_ms;
 const write_stall_timeout_ns: u64 = 30 * time.ns_per_s;
 const write_max_retry_count: u32 = 30_000;
-const response_send_chunk_size_bytes: usize = config.H2_MAX_FRAME_SIZE_BYTES;
+const response_send_chunk_size_bytes: usize = h2.frame_payload_capacity_bytes;
 
 const ConnectionIo = union(enum) {
     plain_fd: i32,
@@ -127,7 +127,7 @@ const ResponseState = struct {
     pending_payload_len: u32 = 0,
     pending_payload_sent: u32 = 0,
     pending_end_stream: bool = false,
-    pending_payload_buf: [config.H2_MAX_FRAME_SIZE_BYTES]u8 = undefined,
+    pending_payload_buf: [h2.frame_payload_capacity_bytes]u8 = undefined,
 };
 
 const ResponseStateTable = struct {
@@ -387,10 +387,10 @@ pub const ResponseWriter = struct {
         if (state.headers_sent) return error.HeadersAlreadySent;
         if (state.closed) return error.ResponseClosed;
 
-        var block_buf: [config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+        var block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
         const block = try buildResponseHeaderBlock(status, headers, &block_buf);
         const peer_max_frame_size_bytes = responsePeerMaxFrameSizeBytes(self.runtime);
-        const max_payload_size_bytes: usize = @min(@as(usize, config.H2_MAX_FRAME_SIZE_BYTES), peer_max_frame_size_bytes);
+        const max_payload_size_bytes: usize = @min(@as(usize, h2.frame_payload_capacity_bytes), peer_max_frame_size_bytes);
 
         var frame_buf: [header_block_frame_buffer_size_bytes]u8 = undefined;
         const frame = try appendHeaderBlockFrames(
@@ -432,7 +432,7 @@ pub const ResponseWriter = struct {
             return;
         }
 
-        if (payload.len > config.H2_MAX_FRAME_SIZE_BYTES) return error.ResponsePayloadTooLarge;
+        if (payload.len > h2.frame_payload_capacity_bytes) return error.ResponsePayloadTooLarge;
 
         @memcpy(state.pending_payload_buf[0..payload.len], payload);
         state.pending_payload_len = @intCast(payload.len);
@@ -455,10 +455,10 @@ pub const ResponseWriter = struct {
         if (!state.headers_sent) return error.HeadersNotSent;
         if (state.closed) return error.ResponseClosed;
 
-        var block_buf: [config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+        var block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
         const block = try buildHeaderBlock(trailers, false, 0, &block_buf);
         const peer_max_frame_size_bytes = responsePeerMaxFrameSizeBytes(self.runtime);
-        const max_payload_size_bytes: usize = @min(@as(usize, config.H2_MAX_FRAME_SIZE_BYTES), peer_max_frame_size_bytes);
+        const max_payload_size_bytes: usize = @min(@as(usize, h2.frame_payload_capacity_bytes), peer_max_frame_size_bytes);
 
         var frame_buf: [header_block_frame_buffer_size_bytes]u8 = undefined;
         const frame = try appendHeaderBlockFrames(
@@ -925,7 +925,7 @@ fn bootstrapUpgradedConnection(
     settings_payload: []const u8,
 ) Error!void {
     assert(@intFromPtr(handler) != 0);
-    assert(settings_payload.len <= config.H2_MAX_FRAME_SIZE_BYTES);
+    assert(settings_payload.len <= h2.frame_payload_capacity_bytes);
 
     var settings_buf: [runtime_mod.initial_settings_frame_buffer_size_bytes]u8 = undefined;
     const initial_settings = try runtime.writeInitialSettingsFrame(&settings_buf);
@@ -1368,7 +1368,7 @@ fn applyUpgradePeerSettings(
     settings_payload: []const u8,
 ) Error!void {
     assert(@intFromPtr(handler) != 0);
-    assert(settings_payload.len <= config.H2_MAX_FRAME_SIZE_BYTES);
+    assert(settings_payload.len <= h2.frame_payload_capacity_bytes);
 
     const peer_settings_header = h2.FrameHeader{
         .length = @intCast(settings_payload.len),
@@ -1457,7 +1457,7 @@ pub fn serveUpgradedConnection(
     assert(@intFromPtr(handler) != 0);
     assert(fd >= 0);
     assert(@intFromPtr(request) != 0);
-    assert(settings_payload.len <= config.H2_MAX_FRAME_SIZE_BYTES);
+    assert(settings_payload.len <= h2.frame_payload_capacity_bytes);
     assert(initial_client_h2_bytes.len <= read_buffer_size_bytes);
 
     var io_conn = ConnectionIo.initPlain(fd);
@@ -2040,7 +2040,7 @@ fn processUpgradeBody(
     var remaining: u64 = remaining_body_bytes;
 
     while (initial_cursor < initial_body.len) {
-        const chunk_len = @min(initial_body.len - initial_cursor, config.H2_MAX_FRAME_SIZE_BYTES);
+        const chunk_len = @min(initial_body.len - initial_cursor, h2.frame_payload_capacity_bytes);
         const is_last_chunk = (initial_cursor + chunk_len == initial_body.len) and (remaining == 0);
 
         try processUpgradeBodyChunk(
@@ -2060,9 +2060,9 @@ fn processUpgradeBody(
 
     if (remaining == 0) return;
 
-    var body_buf: [config.H2_MAX_FRAME_SIZE_BYTES]u8 = undefined;
+    var body_buf: [h2.frame_payload_capacity_bytes]u8 = undefined;
     while (remaining > 0) {
-        const max_read: usize = @intCast(@min(remaining, config.H2_MAX_FRAME_SIZE_BYTES));
+        const max_read: usize = @intCast(@min(remaining, h2.frame_payload_capacity_bytes));
         const n = try readSome(io_conn, plain_reader, io, body_buf[0..max_read]);
         if (n == 0) return error.ConnectionClosed;
 
@@ -2098,7 +2098,7 @@ fn processUpgradeBodyChunk(
     end_stream: bool,
 ) Error!void {
     assert(payload.len > 0);
-    assert(payload.len <= config.H2_MAX_FRAME_SIZE_BYTES);
+    assert(payload.len <= h2.frame_payload_capacity_bytes);
 
     const data_header = h2.FrameHeader{
         .length = @intCast(payload.len),
@@ -2154,7 +2154,7 @@ fn replenishReceiveWindows(io_conn: *ConnectionIo, io: Io, runtime: *runtime_mod
     assert(@intFromPtr(io_conn) != 0);
     assert(@intFromPtr(runtime) != 0);
     assert(stream_id > 0);
-    assert(consumed_bytes <= config.H2_MAX_FRAME_SIZE_BYTES);
+    assert(consumed_bytes <= h2.frame_payload_capacity_bytes);
 
     if (consumed_bytes == 0) return;
 
@@ -2263,7 +2263,7 @@ fn sendRuntimeErrorGoAway(runtime: *runtime_mod.Runtime, io_conn: *ConnectionIo,
 
 fn logRuntimeFrameError(connection_id: u64, header: h2.FrameHeader, err: anyerror) void {
     assert(header.stream_id <= 0x7fff_ffff);
-    assert(header.length <= config.H2_MAX_FRAME_SIZE_BYTES);
+    assert(header.length <= h2.frame_payload_capacity_bytes);
 
     log.warn(
         "h2: conn={d} frame_err frame_type={s} stream_id={d} flags=0x{x} length={d} err={s} goaway={s}",
@@ -2681,7 +2681,7 @@ fn buildHeaderBlock(headers: []const Header, include_status: bool, status: u16, 
     for (headers) |header| {
         const encoded = try h2.encodeLiteralHeaderWithoutIndexing(out[cursor..], header.name, header.value);
         cursor += encoded.len;
-        if (cursor > config.H2_MAX_HEADER_BLOCK_SIZE_BYTES) return error.HeaderBlockTooLarge;
+        if (cursor > h2.header_block_capacity_bytes) return error.HeaderBlockTooLarge;
     }
 
     return out[0..cursor];
@@ -2745,7 +2745,7 @@ fn appendHeaderBlockFrames(
 
 fn appendFrame(out: []u8, frame_type: h2.FrameType, flags: u8, stream_id: u32, payload: []const u8) Error![]const u8 {
     assert(out.len >= h2.frame_header_size_bytes);
-    assert(payload.len <= config.H2_MAX_FRAME_SIZE_BYTES);
+    assert(payload.len <= h2.frame_payload_capacity_bytes);
 
     const header = try h2.buildFrameHeader(out[0..h2.frame_header_size_bytes], .{
         .length = @intCast(payload.len),
@@ -2758,7 +2758,7 @@ fn appendFrame(out: []u8, frame_type: h2.FrameType, flags: u8, stream_id: u32, p
 }
 
 test "buildResponseHeaderBlock encodes :status and application headers" {
-    var out: [config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+    var out: [h2.header_block_capacity_bytes]u8 = undefined;
     const block = try buildResponseHeaderBlock(200, &.{.{ .name = "content-type", .value = "application/grpc" }}, &out);
 
     var fields_buf: [config.MAX_HEADERS]h2.HeaderField = undefined;

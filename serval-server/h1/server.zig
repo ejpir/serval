@@ -2092,7 +2092,7 @@ pub fn Server(
             assert(@intFromPtr(parser) != 0);
             assert(@intFromPtr(ctx) != 0);
             assert(buffer_offset <= buffer_len);
-            assert(settings_payload.len <= config.H2_MAX_FRAME_SIZE_BYTES);
+            assert(settings_payload.len <= serval_h2.frame_payload_capacity_bytes);
 
             if (maybe_tls != null) return forwarder_mod.ForwardError.UnsupportedProtocol;
 
@@ -2297,7 +2297,7 @@ pub fn Server(
             assert(@intFromPtr(ctx) != 0);
             assert(@intFromPtr(parser) != 0);
             assert(buffer_offset <= buffer_len);
-            assert(settings_payload.len <= config.H2_MAX_FRAME_SIZE_BYTES);
+            assert(settings_payload.len <= serval_h2.frame_payload_capacity_bytes);
 
             if (maybe_tls != null) return false;
             if (comptime !@hasDecl(Handler, "handleH2Headers")) return false;
@@ -3029,7 +3029,7 @@ pub fn Server(
                     }
                 }
 
-                var h2c_upgrade_settings_buf: [config.H2_MAX_FRAME_SIZE_BYTES]u8 = undefined;
+                var h2c_upgrade_settings_buf: [serval_h2.frame_payload_capacity_bytes]u8 = undefined;
                 const h2c_upgrade_settings: ?[]const u8 = if (h2c_upgrade_candidate) blk: {
                     if (maybe_tls_ptr != null) {
                         sendErrorResponseTls(maybe_tls_ptr, &io_mut, stream, 400, "Bad h2c Upgrade Request");

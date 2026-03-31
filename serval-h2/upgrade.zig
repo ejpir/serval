@@ -82,7 +82,7 @@ pub fn validateUpgradeRequest(
     decoded_settings_out: []u8,
 ) Error![]const u8 {
     assert(@intFromPtr(request) != 0);
-    assert(decoded_settings_out.len >= config.H2_MAX_FRAME_SIZE_BYTES);
+    assert(decoded_settings_out.len >= limits.frame_payload_capacity_bytes);
 
     if (request.version != .@"HTTP/1.1") return error.InvalidVersion;
     if (body_framing == .chunked) return error.UnsupportedBodyFraming;
@@ -123,7 +123,7 @@ pub fn buildUpgradeResponse(out: []u8) Error![]const u8 {
 /// Builds an HTTP/2 prior-knowledge preface from an upgrade request.
 /// Writes the client connection preface, a SETTINGS frame, and a HEADERS frame into `out` and returns the written slice.
 /// `request` must point to a valid request with a non-empty path and `Host` header; `effective_path` overrides `request.path` when present.
-/// `settings_payload` must already be a valid SETTINGS payload and fit within `config.H2_MAX_FRAME_SIZE_BYTES`; returns `error.MissingPath` or `error.MissingAuthority` when required request data is absent.
+/// `settings_payload` must already be a valid SETTINGS payload and fit within `limits.frame_payload_capacity_bytes`; returns `error.MissingPath` or `error.MissingAuthority` when required request data is absent.
 pub fn buildPriorKnowledgePreambleFromUpgrade(
     out: []u8,
     request: *const Request,
@@ -132,7 +132,7 @@ pub fn buildPriorKnowledgePreambleFromUpgrade(
     end_stream: bool,
 ) Error![]const u8 {
     assert(@intFromPtr(request) != 0);
-    assert(settings_payload.len <= config.H2_MAX_FRAME_SIZE_BYTES);
+    assert(settings_payload.len <= limits.frame_payload_capacity_bytes);
 
     const path = effective_path orelse request.path;
     if (path.len == 0) return error.MissingPath;
@@ -140,7 +140,7 @@ pub fn buildPriorKnowledgePreambleFromUpgrade(
     const authority = request.headers.getHost() orelse return error.MissingAuthority;
     const connection = request.headers.getConnection();
 
-    var header_block_buf: [config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+    var header_block_buf: [limits.header_block_capacity_bytes]u8 = undefined;
     const header_block = try encodeHeaderBlock(&header_block_buf, request, path, authority, connection);
 
     var cursor: usize = 0;
@@ -170,13 +170,13 @@ fn findUniqueHeaderValue(headers: *const types.HeaderMap, name: []const u8) Erro
 }
 
 fn decodeSettingsValue(value: []const u8, out: []u8) Error![]const u8 {
-    assert(out.len >= config.H2_MAX_FRAME_SIZE_BYTES);
+    assert(out.len >= limits.frame_payload_capacity_bytes);
     assert(settings.setting_size_bytes == 6);
 
     const decoded_len = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(value) catch {
         return error.InvalidHttp2Settings;
     };
-    if (decoded_len > config.H2_MAX_FRAME_SIZE_BYTES) return error.InvalidHttp2Settings;
+    if (decoded_len > limits.frame_payload_capacity_bytes) return error.InvalidHttp2Settings;
     if (decoded_len % 6 != 0) return error.InvalidSettingsPayload;
 
     std.base64.url_safe_no_pad.Decoder.decode(out[0..decoded_len], value) catch {
@@ -215,7 +215,7 @@ fn encodeHeaderBlock(
 
 fn shouldForwardHeader(name: []const u8, connection: ?[]const u8) bool {
     assert(name.len > 0);
-    assert(name.len <= config.H2_MAX_HEADER_BLOCK_SIZE_BYTES);
+    assert(name.len <= limits.header_block_capacity_bytes);
 
     if (eqlIgnoreCase(name, "connection")) return false;
     if (eqlIgnoreCase(name, "upgrade")) return false;
@@ -233,7 +233,7 @@ fn shouldForwardHeader(name: []const u8, connection: ?[]const u8) bool {
 
 fn appendHeaderLowercaseName(out: []u8, cursor: usize, name: []const u8, value: []const u8) Error!usize {
     assert(cursor <= out.len);
-    assert(name.len <= config.H2_MAX_HEADER_BLOCK_SIZE_BYTES);
+    assert(name.len <= limits.header_block_capacity_bytes);
 
     var lower_name_buf: [256]u8 = undefined;
     if (name.len > lower_name_buf.len) return error.HeadersTooLarge;
@@ -259,7 +259,7 @@ fn appendHeader(out: []u8, cursor: usize, name: []const u8, value: []const u8) E
 
 fn appendBytes(out: []u8, cursor: usize, data: []const u8) Error!usize {
     assert(cursor <= out.len);
-    assert(data.len <= config.H2_MAX_FRAME_SIZE_BYTES or data.len == preface.client_connection_preface.len);
+    assert(data.len <= limits.frame_payload_capacity_bytes or data.len == preface.client_connection_preface.len);
 
     if (cursor > out.len) return error.BufferTooSmall;
     if (out.len - cursor < data.len) return error.BufferTooSmall;
@@ -276,7 +276,7 @@ fn appendFrame(
     payload: []const u8,
 ) Error!usize {
     assert(stream_id <= 0x7fff_ffff);
-    assert(payload.len <= config.H2_MAX_FRAME_SIZE_BYTES);
+    assert(payload.len <= limits.frame_payload_capacity_bytes);
 
     if (cursor > out.len) return error.BufferTooSmall;
 
@@ -308,7 +308,7 @@ fn methodToBytes(method: Method) []const u8 {
 
 fn headerHasToken(value: []const u8, token: []const u8) bool {
     assert(token.len > 0);
-    assert(token.len <= config.H2_MAX_HEADER_BLOCK_SIZE_BYTES);
+    assert(token.len <= limits.header_block_capacity_bytes);
 
     var parts = std.mem.splitScalar(u8, value, ',');
     var count: u32 = 0;
@@ -353,7 +353,7 @@ test "validateUpgradeRequest decodes HTTP2-Settings" {
     try request.headers.put("content-type", "application/grpc");
     try request.headers.put("te", "trailers");
 
-    var decoded_buf: [config.H2_MAX_FRAME_SIZE_BYTES]u8 = undefined;
+    var decoded_buf: [limits.frame_payload_capacity_bytes]u8 = undefined;
     const decoded = try validateUpgradeRequest(&request, .{ .content_length = 5 }, &decoded_buf);
     try std.testing.expectEqualSlices(u8, &settings_raw, decoded);
 }
@@ -369,7 +369,7 @@ test "validateUpgradeRequest rejects chunked request body" {
     try request.headers.put("Upgrade", "h2c");
     try request.headers.put("HTTP2-Settings", "");
 
-    var decoded_buf: [config.H2_MAX_FRAME_SIZE_BYTES]u8 = undefined;
+    var decoded_buf: [limits.frame_payload_capacity_bytes]u8 = undefined;
     try std.testing.expectError(error.UnsupportedBodyFraming, validateUpgradeRequest(&request, .chunked, &decoded_buf));
 }
 
@@ -388,7 +388,7 @@ test "buildPriorKnowledgePreambleFromUpgrade translates request into h2 preamble
     try request.headers.put("te", "trailers");
     try request.headers.put("content-length", "5");
 
-    var out: [preface.client_connection_preface.len + 2 * frame.frame_header_size_bytes + config.H2_MAX_HEADER_BLOCK_SIZE_BYTES + config.H2_MAX_FRAME_SIZE_BYTES]u8 = undefined;
+    var out: [preface.client_connection_preface.len + 2 * frame.frame_header_size_bytes + limits.header_block_capacity_bytes + limits.frame_payload_capacity_bytes]u8 = undefined;
     const preamble = try buildPriorKnowledgePreambleFromUpgrade(&out, &request, "/rewritten", &settings_raw, false);
     var request_storage_buf: [@import("request.zig").request_stable_storage_size_bytes]u8 = undefined;
     const parsed = try @import("request.zig").parseInitialRequest(preamble, &request_storage_buf);

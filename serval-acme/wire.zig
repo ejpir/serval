@@ -12,10 +12,11 @@ const HeaderMap = core.HeaderMap;
 const Method = types.Method;
 const client = @import("client.zig");
 const jws = @import("jws.zig");
+const limits = @import("limits.zig");
 
 const max_host_bytes = config.ACME_MAX_DOMAIN_NAME_LEN;
 const max_path_bytes = config.ACME_MAX_DIRECTORY_URL_BYTES;
-const max_body_bytes = config.ACME_MAX_JWS_BODY_BYTES;
+const max_body_bytes = limits.max_jws_body_bytes;
 
 /// Errors raised while parsing or validating wire-format URL and ACME response data.
 /// This set includes invalid URL parts, oversize host or path data, invalid ports, oversized bodies, and missing ACME headers.

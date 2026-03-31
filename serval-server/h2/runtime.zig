@@ -88,7 +88,7 @@ const PendingRequestHeaders = struct {
     end_stream: bool = false,
     continuation_frames: u8 = 0,
     block_len: u32 = 0,
-    block_buf: [config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined,
+    block_buf: [h2.header_block_capacity_bytes]u8 = undefined,
 };
 
 const request_body_tracker_capacity: usize = config.H2_MAX_CONCURRENT_STREAMS;
@@ -120,6 +120,8 @@ pub const Runtime = struct {
     pub fn init(runtime_cfg: config.H2Config) Error!Runtime {
         assert(request_body_tracker_capacity > 0);
         assert(h2.request_stable_storage_size_bytes > 0);
+        assert(runtime_cfg.max_frame_size_bytes <= h2.frame_payload_capacity_bytes);
+        assert(runtime_cfg.max_header_block_size_bytes <= h2.header_block_capacity_bytes);
         return .{
             .runtime_cfg = runtime_cfg,
             .state = try connection.ConnectionState.init(runtime_cfg),
@@ -323,7 +325,7 @@ fn decodeRequestHeadForStream(
 ) Error!h2.RequestHead {
     assert(@intFromPtr(self) != 0);
     assert(stream_id > 0);
-    assert(header_block.len <= config.H2_MAX_HEADER_BLOCK_SIZE_BYTES);
+    assert(header_block.len <= h2.header_block_capacity_bytes);
 
     return h2.decodeRequestHeaderBlockWithDecoder(
         &self.header_decoder,
@@ -440,7 +442,7 @@ fn appendPendingHeaderFragment(self: *Runtime, payload: []const u8) Error!void {
     assert(self.pending_request_headers.active);
 
     const current_len: usize = @intCast(self.pending_request_headers.block_len);
-    if (current_len + payload.len > config.H2_MAX_HEADER_BLOCK_SIZE_BYTES) {
+    if (current_len + payload.len > h2.header_block_capacity_bytes) {
         return error.HeadersTooLarge;
     }
 
@@ -481,7 +483,7 @@ fn finishPendingRequestHeaders(self: *Runtime) Error!ReceiveAction {
 
 fn resetPendingRequestHeaders(self: *Runtime) void {
     assert(@intFromPtr(self) != 0);
-    assert(self.pending_request_headers.block_len <= config.H2_MAX_HEADER_BLOCK_SIZE_BYTES);
+    assert(self.pending_request_headers.block_len <= h2.header_block_capacity_bytes);
 
     self.pending_request_headers.active = false;
     self.pending_request_headers.stream_id = 0;
@@ -491,8 +493,8 @@ fn resetPendingRequestHeaders(self: *Runtime) void {
 }
 
 fn trimPaddedPayload(payload: []const u8) Error![]const u8 {
-    assert(payload.len <= config.H2_MAX_FRAME_SIZE_BYTES);
-    assert(config.H2_MAX_FRAME_SIZE_BYTES > 0);
+    assert(payload.len <= h2.frame_payload_capacity_bytes);
+    assert(h2.frame_payload_capacity_bytes > 0);
     if (payload.len == 0) return error.InvalidFrame;
 
     const pad_len: usize = payload[0];
@@ -713,7 +715,7 @@ fn handleGoAway(self: *Runtime, header: h2.FrameHeader, payload: []const u8) Err
 
 fn buildLocalSettingsPayload(local_settings: h2.Settings, out: []u8) Error![]const u8 {
     assert(local_settings.max_frame_size_bytes >= h2.settings.min_max_frame_size_bytes);
-    assert(local_settings.max_frame_size_bytes <= config.H2_MAX_FRAME_SIZE_BYTES);
+    assert(local_settings.max_frame_size_bytes <= h2.frame_payload_capacity_bytes);
     const settings = [_]h2.Setting{
         .{ .id = @intFromEnum(h2.SettingId.enable_push), .value = if (local_settings.enable_push) 1 else 0 },
         .{ .id = @intFromEnum(h2.SettingId.max_concurrent_streams), .value = local_settings.max_concurrent_streams },

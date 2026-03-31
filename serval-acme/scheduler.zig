@@ -12,6 +12,7 @@ const core = @import("serval-core");
 const config = core.config;
 const time = core.time;
 const backoff_mod = @import("backoff.zig");
+const limits = @import("limits.zig");
 
 /// Errors returned by scheduler configuration and execution.
 /// `InvalidCheckInterval` is raised when the polling interval is zero, `FatalFailure` signals an unrecoverable callback result, and `MaxIterationsExceeded` caps the run loop.
@@ -60,7 +61,7 @@ pub const Config = struct {
     /// `check_interval_ms` must be non-zero or `error.InvalidCheckInterval` is returned.
     /// The function leaves all other policy fields at their default values.
     pub fn init(check_interval_ms: u32) Error!Config {
-        assert(config.ACME_MAX_POLL_ATTEMPTS > 0);
+        assert(limits.max_poll_attempts > 0);
         assert(check_interval_ms <= std.math.maxInt(u32));
         if (check_interval_ms == 0) return error.InvalidCheckInterval;
         return .{ .check_interval_ms = check_interval_ms };

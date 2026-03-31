@@ -6,11 +6,11 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
-const config = @import("serval-core").config;
 const client = @import("client.zig");
+const limits = @import("limits.zig");
 
-const max_jws_body_bytes = config.ACME_MAX_JWS_BODY_BYTES;
-const max_signature_bytes = config.ACME_MAX_JWS_SIGNATURE_BYTES;
+const max_jws_body_bytes = limits.max_jws_body_bytes;
+const max_signature_bytes = limits.max_jws_signature_bytes;
 const max_jwk_coordinate_b64_bytes = 96;
 const JwsLen = u16;
 
@@ -230,7 +230,7 @@ pub fn serializeSigningInput(
     var cursor: JwsLen = 0;
     const protected_end = std.math.add(JwsLen, cursor, protected_b64_len) catch return error.OutputTooSmall;
     _ = std.base64.url_safe_no_pad.Encoder.encode(
-        out[@intCast(cursor) .. @intCast(protected_end)],
+        out[@intCast(cursor)..@intCast(protected_end)],
         protected_header_json,
     );
     cursor = protected_end;
@@ -240,7 +240,7 @@ pub fn serializeSigningInput(
 
     const payload_end = std.math.add(JwsLen, cursor, payload_b64_len) catch return error.OutputTooSmall;
     _ = std.base64.url_safe_no_pad.Encoder.encode(
-        out[@intCast(cursor) .. @intCast(payload_end)],
+        out[@intCast(cursor)..@intCast(payload_end)],
         payload_json,
     );
     cursor = payload_end;
@@ -285,7 +285,7 @@ pub fn serializeFlattenedJws(out: []u8, params: FlattenedJwsParams) Error![]cons
 
     const protected_end = std.math.add(JwsLen, cursor, protected_b64_len) catch return error.OutputTooSmall;
     _ = std.base64.url_safe_no_pad.Encoder.encode(
-        out[@intCast(cursor) .. @intCast(protected_end)],
+        out[@intCast(cursor)..@intCast(protected_end)],
         params.protected_header_json,
     );
     cursor = protected_end;
@@ -294,7 +294,7 @@ pub fn serializeFlattenedJws(out: []u8, params: FlattenedJwsParams) Error![]cons
 
     const payload_end = std.math.add(JwsLen, cursor, payload_b64_len) catch return error.OutputTooSmall;
     _ = std.base64.url_safe_no_pad.Encoder.encode(
-        out[@intCast(cursor) .. @intCast(payload_end)],
+        out[@intCast(cursor)..@intCast(payload_end)],
         params.payload_json,
     );
     cursor = payload_end;
@@ -303,7 +303,7 @@ pub fn serializeFlattenedJws(out: []u8, params: FlattenedJwsParams) Error![]cons
 
     const signature_end = std.math.add(JwsLen, cursor, signature_b64_len) catch return error.OutputTooSmall;
     _ = std.base64.url_safe_no_pad.Encoder.encode(
-        out[@intCast(cursor) .. @intCast(signature_end)],
+        out[@intCast(cursor)..@intCast(signature_end)],
         params.signature,
     );
     cursor = signature_end;

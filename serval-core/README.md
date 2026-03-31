@@ -84,13 +84,6 @@ const custom = headers.get("X-Custom");    // ?[]const u8
 - `WEBSOCKET_CLOSE_TIMEOUT_NS` - 5s close-handshake timeout
 - `TLS_RELOADABLE_CTX_SLOT_COUNT` - 5 bounded SSL_CTX generation slots for hot reload
 - `ACME_MAX_DOMAINS_PER_CERT` - 16 SANs maximum per managed certificate
-- `ACME_MAX_ACTIVE_CHALLENGES` - 64 active HTTP-01 tokens in fixed store
-- `ACME_MAX_NONCE_BYTES` - 512-byte replay-nonce bound
-- `ACME_MAX_DIRECTORY_RESPONSE_BYTES` - 64KiB directory JSON parse bound
-- `ACME_MAX_ACCOUNT_RESPONSE_BYTES` - 64KiB account JSON parse bound
-- `ACME_MAX_ORDER_RESPONSE_BYTES` - 128KiB order JSON parse bound
-- `ACME_MAX_JWS_BODY_BYTES` - 64KiB ACME payload serializer bound
-- `ACME_MAX_JWS_SIGNATURE_BYTES` - 512-byte JWS signature input bound
 - `ACME_DEFAULT_RENEW_BEFORE_NS` - 30-day renewal lead time
 
 ### Logging

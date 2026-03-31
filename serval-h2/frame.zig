@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
-const config = @import("serval-core").config;
+const limits = @import("limits.zig");
 
 /// Size of an HTTP/2 frame header in bytes.
 /// Frame headers are fixed at 9 bytes on the wire.
@@ -75,7 +75,7 @@ pub const Error = error{
 };
 
 /// Parses a 9-byte HTTP/2 frame header from `raw` and returns its decoded fields.
-/// Returns `error.NeedMoreData` if `raw` is shorter than the fixed header size, or `error.FrameTooLarge` if the encoded length exceeds `config.H2_MAX_FRAME_SIZE_BYTES`.
+/// Returns `error.NeedMoreData` if `raw` is shorter than the fixed header size, or `error.FrameTooLarge` if the encoded length exceeds `limits.frame_payload_capacity_bytes`.
 /// Unknown frame-type codes are mapped to `.extension` rather than failing the parse.
 /// The reserved bit in the stream identifier is masked off in the returned `FrameHeader`.
 pub fn parseFrameHeader(raw: []const u8) Error!FrameHeader {
@@ -87,7 +87,7 @@ pub fn parseFrameHeader(raw: []const u8) Error!FrameHeader {
     const length = (@as(u32, raw[0]) << 16) |
         (@as(u32, raw[1]) << 8) |
         @as(u32, raw[2]);
-    if (length > config.H2_MAX_FRAME_SIZE_BYTES) return error.FrameTooLarge;
+    if (length > limits.frame_payload_capacity_bytes) return error.FrameTooLarge;
 
     const frame_type: FrameType = switch (raw[3]) {
         0...9 => @enumFromInt(raw[3]),
@@ -107,14 +107,14 @@ pub fn parseFrameHeader(raw: []const u8) Error!FrameHeader {
 
 /// Serializes `header` into the HTTP/2 wire-format frame header in `out`.
 /// Returns a slice backed by `out` containing exactly 9 bytes when successful.
-/// Fails with `error.BufferTooSmall` if `out` cannot hold the fixed-size header, or `error.FrameTooLarge` if `header.length` exceeds `config.H2_MAX_FRAME_SIZE_BYTES`.
+/// Fails with `error.BufferTooSmall` if `out` cannot hold the fixed-size header, or `error.FrameTooLarge` if `header.length` exceeds `limits.frame_payload_capacity_bytes`.
 /// The caller must ensure `header.stream_id` fits in 31 bits; the reserved bit is not written.
 pub fn buildFrameHeader(out: []u8, header: FrameHeader) Error![]const u8 {
     assert(out.len > 0);
     assert(header.stream_id <= 0x7fff_ffff);
 
     if (out.len < frame_header_size_bytes) return error.BufferTooSmall;
-    if (header.length > config.H2_MAX_FRAME_SIZE_BYTES) return error.FrameTooLarge;
+    if (header.length > limits.frame_payload_capacity_bytes) return error.FrameTooLarge;
 
     out[0] = @intCast((header.length >> 16) & 0xff);
     out[1] = @intCast((header.length >> 8) & 0xff);
@@ -181,7 +181,7 @@ test "frame header roundtrip property over deterministic corpus" {
             .extension;
 
         const header = FrameHeader{
-            .length = random.intRangeAtMost(u32, 0, config.H2_MAX_FRAME_SIZE_BYTES),
+            .length = random.intRangeAtMost(u32, 0, limits.frame_payload_capacity_bytes),
             .frame_type = frame_type,
             .flags = random.int(u8),
             .stream_id = random.intRangeAtMost(u32, 0, 0x7fff_ffff),

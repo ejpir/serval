@@ -20,6 +20,11 @@ pub const RuntimeConfig = types.RuntimeConfig;
 /// Treat each case as a hard validation failure when building runtime ACME state.
 pub const TypesError = types.Error;
 
+/// Re-export of ACME owner-internal capacity limits.
+/// These bounds size parser buffers, serializer outputs, and retry loops inside
+/// `serval-acme`; deploy-time schema knobs remain in `serval-core.config`.
+pub const limits = @import("limits.zig");
+
 /// Re-export of the ACME backoff utilities module.
 /// This namespace contains the bounded retry scheduler and its associated error set.
 /// Use it when you need the module-level backoff helpers rather than the type aliases in `mod.zig`.

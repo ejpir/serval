@@ -23,7 +23,7 @@ pub const default_header_table_size_bytes: u32 = 4096;
 const unbounded_limit_u32: u32 = std.math.maxInt(u32);
 /// Minimum legal HTTP/2 `MAX_FRAME_SIZE` value in bytes.
 /// This is the protocol lower bound for the `max_frame_size_bytes` setting.
-pub const min_max_frame_size_bytes: u32 = 16_384;
+pub const min_max_frame_size_bytes: u32 = limits.frame_payload_capacity_bytes;
 /// Maximum legal HTTP/2 `MAX_FRAME_SIZE` value in bytes.
 /// This is the protocol upper bound for the `max_frame_size_bytes` setting.
 pub const max_max_frame_size_bytes: u32 = 16_777_215;
@@ -65,7 +65,7 @@ pub const Settings = struct {
     enable_push: bool = true,
     max_concurrent_streams: u32 = unbounded_limit_u32,
     initial_window_size_bytes: u32 = config.H2_INITIAL_WINDOW_SIZE_BYTES,
-    max_frame_size_bytes: u32 = config.H2_MAX_FRAME_SIZE_BYTES,
+    max_frame_size_bytes: u32 = limits.frame_payload_capacity_bytes,
     max_header_list_size_bytes: u32 = unbounded_limit_u32,
     enable_connect_protocol: bool = true,
 };
@@ -128,7 +128,7 @@ pub fn parseFrame(
 /// On success, returns the initialized prefix of `out_settings` containing the decoded settings.
 pub fn parsePayload(payload: []const u8, out_settings: []Setting) Error![]const Setting {
     assert(out_settings.len >= limits.max_settings_per_frame or out_settings.len > 0);
-    assert(payload.len <= config.H2_MAX_FRAME_SIZE_BYTES);
+    assert(payload.len <= limits.frame_payload_capacity_bytes);
 
     if (!isPayloadLengthValid(payload.len)) return error.InvalidPayloadLength;
 
@@ -240,7 +240,7 @@ fn decodeSettingId(raw_id: u16) ?SettingId {
 }
 
 fn isPayloadLengthValid(payload_len: usize) bool {
-    assert(payload_len <= config.H2_MAX_FRAME_SIZE_BYTES);
+    assert(payload_len <= limits.frame_payload_capacity_bytes);
     assert(setting_size_bytes == 6);
     return payload_len % setting_size_bytes == 0;
 }

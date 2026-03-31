@@ -299,6 +299,7 @@ pub const ConnectionState = struct {
 fn defaultLocalSettings(runtime_cfg: config.H2Config) h2.Settings {
     assert(runtime_cfg.max_concurrent_streams > 0);
     assert(runtime_cfg.initial_window_size_bytes <= config.H2_MAX_WINDOW_SIZE_BYTES);
+    assert(runtime_cfg.max_frame_size_bytes <= h2.frame_payload_capacity_bytes);
 
     const defaults: h2.Settings = .{
         .enable_push = false,

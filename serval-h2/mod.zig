@@ -11,6 +11,10 @@ pub const max_initial_parse_frames = limits.max_initial_parse_frames;
 pub const max_continuation_frames = limits.max_continuation_frames;
 /// Maximum SETTINGS entries accepted in a single SETTINGS payload.
 pub const max_settings_per_frame = limits.max_settings_per_frame;
+/// Fixed compile-time frame payload capacity used by current h2 helpers.
+pub const frame_payload_capacity_bytes = limits.frame_payload_capacity_bytes;
+/// Fixed compile-time header-block storage capacity used by current h2 helpers.
+pub const header_block_capacity_bytes = limits.header_block_capacity_bytes;
 
 /// Namespace for HTTP/2 frame header helpers and related constants.
 /// Re-exports the frame types, error set, flags, and encode/parse functions used by the h2 layer.

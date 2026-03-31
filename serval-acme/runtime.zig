@@ -22,6 +22,7 @@ const csr_mod = @import("csr.zig");
 const storage = @import("storage.zig");
 const tls_alpn_hook_mod = @import("tls_alpn_hook.zig");
 const tls_alpn_cert_mod = @import("tls_alpn_cert.zig");
+const limits = @import("limits.zig");
 
 const serval_client = @import("serval-client");
 const Client = serval_client.Client;
@@ -407,7 +408,7 @@ fn authorizeTlsAlpn01(
 ) Error!void {
     assert(@intFromPtr(flow_ctx) != 0);
     assert(@intFromPtr(challenge) != 0);
-    var key_auth_buf: [config.ACME_MAX_HTTP01_KEY_AUTHORIZATION_BYTES]u8 = undefined;
+    var key_auth_buf: [limits.max_http01_key_authorization_bytes]u8 = undefined;
     const key_auth = try signer.computeKeyAuthorization(challenge.token(), &key_auth_buf);
 
     var cert_pem_buf: [8192]u8 = undefined;
@@ -495,7 +496,7 @@ fn pollAuthorizationValid(
     assert(@intFromPtr(flow_ctx) != 0);
     assert(@intFromPtr(auth_url) != 0);
     var attempt: u16 = 0;
-    while (attempt < config.ACME_MAX_POLL_ATTEMPTS) : (attempt += 1) {
+    while (attempt < limits.max_poll_attempts) : (attempt += 1) {
         const polled = try fetchAuthorization(flow_ctx, acme_client, signer, io, work, auth_url);
         switch (polled.status) {
             .valid => return,
@@ -549,7 +550,7 @@ fn pollOrderValid(
     assert(@intFromPtr(flow_ctx) != 0);
     assert(@intFromPtr(acme_client) != 0);
     var attempt: u16 = 0;
-    while (attempt < config.ACME_MAX_POLL_ATTEMPTS) : (attempt += 1) {
+    while (attempt < limits.max_poll_attempts) : (attempt += 1) {
         const fetch_order_body = try signer.signWithKid(
             work.jws_buf,
             &flow_ctx.nonce,

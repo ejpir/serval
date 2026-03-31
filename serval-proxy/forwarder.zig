@@ -123,7 +123,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             // S1: preconditions - pointers must be valid
             assert(@intFromPtr(p) != 0);
             assert(@intFromPtr(t) != 0);
-            assert(h2_cfg.max_frame_size_bytes >= config.H2_MAX_FRAME_SIZE_BYTES);
+            assert(h2_cfg.max_frame_size_bytes >= serval_h2.settings.min_max_frame_size_bytes);
             assert(h2_cfg.max_frame_size_bytes <= h2_proxy_frame_capacity_bytes);
             assert(h2_cfg.tunnel_idle_timeout_ns > 0);
 
@@ -718,7 +718,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             serval_h2.client_connection_preface.len +
             (2 * serval_h2.frame_header_size_bytes) +
             h2_proxy_frame_capacity_usize +
-            config.H2_MAX_HEADER_BLOCK_SIZE_BYTES;
+            serval_h2.header_block_capacity_bytes;
 
         /// Forward an HTTP/1.1 `Upgrade: h2c` gRPC request by translating the
         /// upgrade exchange into an upstream prior-knowledge h2c session.
@@ -843,7 +843,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             remaining_body_bytes: u64,
             initial_client_bytes_after_body: []const u8,
         ) tunnel_mod.TunnelStats {
-            assert(runtime_cfg.max_frame_size_bytes >= config.H2_MAX_FRAME_SIZE_BYTES);
+            assert(runtime_cfg.max_frame_size_bytes >= serval_h2.settings.min_max_frame_size_bytes);
             assert(runtime_cfg.max_frame_size_bytes <= h2_proxy_frame_capacity_bytes);
             assert(runtime_cfg.tunnel_idle_timeout_ns > 0);
             const start_ns = time.monotonicNanos();
@@ -881,7 +881,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             counter_bytes: *u64,
         ) ?tunnel_mod.Termination {
             assert(remaining_body_bytes > 0);
-            assert(max_frame_size_bytes >= config.H2_MAX_FRAME_SIZE_BYTES);
+            assert(max_frame_size_bytes >= serval_h2.settings.min_max_frame_size_bytes);
             assert(max_frame_size_bytes <= h2_proxy_frame_capacity_bytes);
 
             var body_buf: [h2_proxy_frame_capacity_usize]u8 = undefined;
@@ -911,7 +911,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             end_stream: bool,
             max_frame_size_bytes: u32,
         ) serval_socket.SocketError!void {
-            assert(max_frame_size_bytes >= config.H2_MAX_FRAME_SIZE_BYTES);
+            assert(max_frame_size_bytes >= serval_h2.settings.min_max_frame_size_bytes);
             assert(max_frame_size_bytes <= h2_proxy_frame_capacity_bytes);
             if (payload.len == 0) {
                 if (end_stream) try sendH2Frame(upstream_socket, .data, serval_h2.flags_end_stream, H2C_UPGRADE_STREAM_ID, &[_]u8{});

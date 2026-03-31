@@ -10,6 +10,7 @@ Layer 2 (Infrastructure).
 
 - Explicit ACME certificate lifecycle state enum (`CertState`)
 - Runtime-validated fixed-capacity ACME config copy (`RuntimeConfig`)
+- Owner-internal ACME runtime/parser limits (`limits.zig`)
 - Bounded exponential backoff helper (`backoff.zig`):
   - fixed min/max range validation
   - deterministic capped jitter

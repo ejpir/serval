@@ -17,6 +17,7 @@ const runtime = @import("runtime.zig");
 const scheduler_mod = @import("scheduler.zig");
 const backoff_mod = @import("backoff.zig");
 const hook_mod = @import("tls_alpn_hook.zig");
+const limits = @import("limits.zig");
 
 const serval_client = @import("serval-client");
 const Client = serval_client.Client;
@@ -240,9 +241,9 @@ pub const ManagedRenewer = struct {
     cert_current_path_bytes: [cert_path_buf_size_bytes]u8,
 
     header_buf: [config.MAX_HEADER_SIZE_BYTES]u8,
-    body_buf: [config.ACME_MAX_ORDER_RESPONSE_BYTES]u8,
-    jws_buf: [config.ACME_MAX_JWS_BODY_BYTES]u8,
-    payload_buf: [config.ACME_MAX_JWS_BODY_BYTES]u8,
+    body_buf: [limits.max_order_response_bytes]u8,
+    jws_buf: [limits.max_jws_body_bytes]u8,
+    payload_buf: [limits.max_jws_body_bytes]u8,
     csr_der_buf: [csr_buf_size_bytes]u8,
     key_pem_buf: [key_pem_buf_size_bytes]u8,
     cert_path_buf: [cert_path_buf_size_bytes]u8,

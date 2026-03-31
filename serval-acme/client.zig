@@ -7,18 +7,19 @@ const std = @import("std");
 const assert = std.debug.assert;
 const config = @import("serval-core").config;
 const acme_types = @import("types.zig");
+const limits = @import("limits.zig");
 
 const max_url_bytes = config.ACME_MAX_DIRECTORY_URL_BYTES;
-const max_nonce_bytes = config.ACME_MAX_NONCE_BYTES;
+const max_nonce_bytes = limits.max_nonce_bytes;
 const max_contact_email_bytes = config.ACME_MAX_CONTACT_EMAIL_BYTES;
 const max_identifiers_per_order = config.ACME_MAX_DOMAINS_PER_CERT;
-const max_authorization_urls_per_order = config.ACME_MAX_AUTHORIZATION_URLS_PER_ORDER;
-const max_directory_response_bytes = config.ACME_MAX_DIRECTORY_RESPONSE_BYTES;
-const max_account_response_bytes = config.ACME_MAX_ACCOUNT_RESPONSE_BYTES;
-const max_order_response_bytes = config.ACME_MAX_ORDER_RESPONSE_BYTES;
-const max_jws_body_bytes = config.ACME_MAX_JWS_BODY_BYTES;
+const max_authorization_urls_per_order = limits.max_authorization_urls_per_order;
+const max_directory_response_bytes = limits.max_directory_response_bytes;
+const max_account_response_bytes = limits.max_account_response_bytes;
+const max_order_response_bytes = limits.max_order_response_bytes;
+const max_jws_body_bytes = limits.max_jws_body_bytes;
 const max_challenges_per_authorization = 16;
-const max_challenge_token_bytes = config.ACME_MAX_HTTP01_TOKEN_BYTES;
+const max_challenge_token_bytes = limits.max_http01_token_bytes;
 const output_cursor_max: u32 = max_jws_body_bytes;
 
 const json_parse_scratch_size_bytes = 8192;

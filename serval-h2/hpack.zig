@@ -15,6 +15,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const config = @import("serval-core").config;
+const limits = @import("limits.zig");
 const huffman = @import("huffman.zig");
 
 /// A decoded HTTP header field.
@@ -41,9 +42,9 @@ pub const Error = error{
 
 const default_dynamic_table_size_bytes: u32 = 4096;
 const dynamic_entry_overhead_size_bytes: u32 = 32;
-const dynamic_storage_capacity_bytes: usize = config.H2_MAX_HEADER_BLOCK_SIZE_BYTES;
+const dynamic_storage_capacity_bytes: usize = limits.header_block_capacity_bytes;
 const dynamic_entry_capacity: usize = 256;
-const huffman_scratch_capacity_bytes: usize = config.H2_MAX_HEADER_BLOCK_SIZE_BYTES * 2;
+const huffman_scratch_capacity_bytes: usize = limits.header_block_capacity_bytes * 2;
 
 const DynamicEntry = struct {
     name_offset: u16,

@@ -11,10 +11,11 @@ const config = core.config;
 const HeaderMap = core.HeaderMap;
 const Method = core.types.Method;
 const client = @import("client.zig");
+const limits = @import("limits.zig");
 const wire = @import("wire.zig");
 
 const max_problem_document_bytes: u32 = @intCast(
-    @max(config.ACME_MAX_ACCOUNT_RESPONSE_BYTES, config.ACME_MAX_ORDER_RESPONSE_BYTES),
+    @max(limits.max_account_response_bytes, limits.max_order_response_bytes),
 );
 const problem_parse_scratch_size_bytes = 2048;
 

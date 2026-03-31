@@ -5,13 +5,13 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
-const config = @import("serval-core").config;
 const client = @import("client.zig");
 const jws = @import("jws.zig");
+const limits = @import("limits.zig");
 
 const Scheme = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 
-const max_body_bytes = config.ACME_MAX_JWS_BODY_BYTES;
+const max_body_bytes = limits.max_jws_body_bytes;
 const max_sig_bytes = Scheme.Signature.encoded_length;
 
 /// Errors returned by ACME account signing and key-authorization helpers.

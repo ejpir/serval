@@ -4,6 +4,7 @@ const core = @import("serval-core");
 const config = core.config;
 
 const acme = @import("serval-acme");
+const acme_limits = acme.limits;
 const net = @import("serval-net");
 const client_mod = @import("serval-client");
 const tls = @import("serval-tls");
@@ -49,9 +50,9 @@ pub fn main() !void {
     const signer = acme.AcmeAccountSigner.generate(io);
 
     var header_buf: [config.MAX_HEADER_SIZE_BYTES]u8 = undefined;
-    var body_buf: [config.ACME_MAX_ORDER_RESPONSE_BYTES]u8 = undefined;
-    var jws_buf: [config.ACME_MAX_JWS_BODY_BYTES]u8 = undefined;
-    var payload_buf: [config.ACME_MAX_JWS_BODY_BYTES]u8 = undefined;
+    var body_buf: [acme_limits.max_order_response_bytes]u8 = undefined;
+    var jws_buf: [acme_limits.max_jws_body_bytes]u8 = undefined;
+    var payload_buf: [acme_limits.max_jws_body_bytes]u8 = undefined;
     var csr_der_buf: [32 * 1024]u8 = undefined;
     var key_pem_buf: [32 * 1024]u8 = undefined;
     var cert_path_buf: [1024]u8 = undefined;

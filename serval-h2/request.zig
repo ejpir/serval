@@ -42,15 +42,11 @@ const HeaderAssembly = struct {
     stream_id: u32 = 0,
     continuation_frames: u8 = 0,
     block_len: u32 = 0,
-    block_buf: [config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined,
+    block_buf: [limits.header_block_capacity_bytes]u8 = undefined,
 };
 
 const priority_field_size_bytes: u32 = 5;
-const header_block_storage_budget_bytes: u32 = 8 * 1024;
-
-comptime {
-    assert(header_block_storage_budget_bytes == config.H2_MAX_HEADER_BLOCK_SIZE_BYTES);
-}
+const header_block_storage_budget_bytes: u32 = limits.header_block_capacity_bytes;
 
 // Reserve one header-block budget for copied names and one for copied values.
 /// Minimum caller-provided stable storage, in bytes, required to decode one request.
@@ -221,7 +217,7 @@ fn handleInitialHeadersFrame(
     }
 
     if ((header.flags & frame.flags_end_headers) != 0) {
-        if (header_fragment.len > config.H2_MAX_HEADER_BLOCK_SIZE_BYTES) return error.HeadersTooLarge;
+        if (header_fragment.len > limits.header_block_capacity_bytes) return error.HeadersTooLarge;
         return try buildInitialRequest(header_fragment, header.stream_id, @intCast(payload_end), request_storage_out);
     }
 
@@ -262,15 +258,15 @@ fn handleInitialContinuationFrame(
 }
 
 fn appendHeaderFragment(
-    buf: *[config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8,
+    buf: *[limits.header_block_capacity_bytes]u8,
     len: *u32,
     fragment: []const u8,
 ) Error!void {
     assert(@intFromPtr(len) != 0);
     const current_len: usize = @intCast(len.*);
-    assert(current_len <= config.H2_MAX_HEADER_BLOCK_SIZE_BYTES);
+    assert(current_len <= limits.header_block_capacity_bytes);
 
-    if (fragment.len > config.H2_MAX_HEADER_BLOCK_SIZE_BYTES - current_len) return error.HeadersTooLarge;
+    if (fragment.len > limits.header_block_capacity_bytes - current_len) return error.HeadersTooLarge;
     @memcpy(buf[current_len .. current_len + fragment.len], fragment);
     len.* = @intCast(current_len + fragment.len);
 }
@@ -281,7 +277,7 @@ fn buildInitialRequest(
     consumed_bytes: u32,
     request_storage_out: []u8,
 ) Error!InitialRequest {
-    assert(header_block.len <= config.H2_MAX_HEADER_BLOCK_SIZE_BYTES);
+    assert(header_block.len <= limits.header_block_capacity_bytes);
     assert(stream_id > 0);
     if (request_storage_out.len < request_stable_storage_size_bytes) return error.StableStorageTooSmall;
 
@@ -297,14 +293,14 @@ fn buildInitialRequest(
 /// This is a convenience wrapper around `decodeRequestHeaderBlockWithDecoder` for callers that do
 /// not need to reuse HPACK decoder state across requests.
 /// The same bounds and storage requirements apply: `stream_id` must be non-zero, the header block
-/// must fit within `config.H2_MAX_HEADER_BLOCK_SIZE_BYTES`, and `request_storage_out` must be
+/// must fit within `limits.header_block_capacity_bytes`, and `request_storage_out` must be
 /// large enough for stable request storage.
 pub fn decodeRequestHeaderBlock(
     header_block: []const u8,
     stream_id: u32,
     request_storage_out: []u8,
 ) Error!RequestHead {
-    assert(header_block.len <= config.H2_MAX_HEADER_BLOCK_SIZE_BYTES);
+    assert(header_block.len <= limits.header_block_capacity_bytes);
     assert(stream_id > 0);
 
     var decoder = hpack.Decoder.init();
@@ -332,7 +328,7 @@ const HeaderDecodeState = struct {
 
 /// Decodes an HPACK request header block into a zero-copy `RequestHead`.
 /// The decoder must be valid, `stream_id` must be non-zero, and `header_block` must not exceed
-/// `config.H2_MAX_HEADER_BLOCK_SIZE_BYTES`. `request_storage_out` must be large enough for stable
+/// `limits.header_block_capacity_bytes`. `request_storage_out` must be large enough for stable
 /// header and path storage, or the call fails with `error.StableStorageTooSmall`.
 /// Header names must already be lowercase and pseudo headers must satisfy HTTP/2 request rules.
 /// Slices stored in the returned request reference `request_storage_out` and remain valid until that
@@ -344,7 +340,7 @@ pub fn decodeRequestHeaderBlockWithDecoder(
     request_storage_out: []u8,
 ) Error!RequestHead {
     assert(@intFromPtr(decoder) != 0);
-    assert(header_block.len <= config.H2_MAX_HEADER_BLOCK_SIZE_BYTES);
+    assert(header_block.len <= limits.header_block_capacity_bytes);
     assert(stream_id > 0);
     if (request_storage_out.len < request_stable_storage_size_bytes) return error.StableStorageTooSmall;
 
@@ -531,8 +527,8 @@ fn copyIntoStableStorage(storage: []u8, cursor: *u32, data: []const u8) Error![]
 }
 
 fn parseMethod(token: []const u8) ?Method {
-    assert(token.len <= config.H2_MAX_HEADER_BLOCK_SIZE_BYTES);
-    assert(config.H2_MAX_HEADER_BLOCK_SIZE_BYTES > 0);
+    assert(token.len <= limits.header_block_capacity_bytes);
+    assert(limits.header_block_capacity_bytes > 0);
 
     const map = std.StaticStringMap(Method).initComptime(.{
         .{ "GET", .GET },
@@ -549,7 +545,7 @@ fn parseMethod(token: []const u8) ?Method {
 }
 
 fn isHeaderNameLowercase(name: []const u8) bool {
-    assert(name.len <= config.H2_MAX_HEADER_BLOCK_SIZE_BYTES);
+    assert(name.len <= limits.header_block_capacity_bytes);
 
     if (name.len == 0) return false;
 
@@ -563,8 +559,8 @@ fn isHeaderNameLowercase(name: []const u8) bool {
 }
 
 fn isConnectionSpecificHeader(name: []const u8) bool {
-    assert(name.len <= config.H2_MAX_HEADER_BLOCK_SIZE_BYTES);
-    assert(config.H2_MAX_HEADER_BLOCK_SIZE_BYTES > 0);
+    assert(name.len <= limits.header_block_capacity_bytes);
+    assert(limits.header_block_capacity_bytes > 0);
 
     if (std.mem.eql(u8, name, "connection")) return true;
     if (std.mem.eql(u8, name, "proxy-connection")) return true;
@@ -575,8 +571,8 @@ fn isConnectionSpecificHeader(name: []const u8) bool {
 }
 
 fn isTeTrailersOnly(value: []const u8) bool {
-    assert(value.len <= config.H2_MAX_HEADER_BLOCK_SIZE_BYTES);
-    assert(config.H2_MAX_HEADER_BLOCK_SIZE_BYTES > 0);
+    assert(value.len <= limits.header_block_capacity_bytes);
+    assert(limits.header_block_capacity_bytes > 0);
 
     const trimmed = std.mem.trim(u8, value, " \t");
     if (trimmed.len == 0) return false;

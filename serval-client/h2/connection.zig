@@ -20,14 +20,14 @@ const Request = types.Request;
 const Socket = serval_socket.Socket;
 const SocketError = serval_socket.SocketError;
 
-const read_buffer_size_bytes: usize = h2.frame_header_size_bytes + config.H2_MAX_FRAME_SIZE_BYTES;
+const read_buffer_size_bytes: usize = h2.frame_header_size_bytes + h2.frame_payload_capacity_bytes;
 const preface_settings_buffer_size_bytes: usize =
     h2.client_connection_preface.len +
     h2.frame_header_size_bytes +
     (4 * h2.setting_size_bytes);
 const request_headers_frame_overhead_bytes: usize = h2.frame_header_size_bytes * (@as(usize, h2.max_continuation_frames) + 1);
-const request_headers_frame_buffer_size_bytes: usize = config.H2_MAX_HEADER_BLOCK_SIZE_BYTES + request_headers_frame_overhead_bytes;
-const data_frame_buffer_size_bytes: usize = h2.frame_header_size_bytes + config.H2_MAX_FRAME_SIZE_BYTES;
+const request_headers_frame_buffer_size_bytes: usize = h2.header_block_capacity_bytes + request_headers_frame_overhead_bytes;
+const data_frame_buffer_size_bytes: usize = h2.frame_header_size_bytes + h2.frame_payload_capacity_bytes;
 const window_update_frame_size_bytes: usize = h2.frame_header_size_bytes + h2.control.window_update_payload_size_bytes;
 
 /// Errors returned by HTTP/2 client connection setup and frame I/O.
@@ -80,6 +80,8 @@ pub const ClientConnection = struct {
     fn initMaybeIo(socket: *Socket, io: ?Io, runtime_cfg: config.H2Config) Error!ClientConnection {
         assert(@intFromPtr(socket) != 0);
         assert(socket.get_fd() >= 0);
+        assert(runtime_cfg.max_frame_size_bytes <= h2.frame_payload_capacity_bytes);
+        assert(runtime_cfg.max_header_block_size_bytes <= h2.header_block_capacity_bytes);
 
         return .{
             .runtime_cfg = runtime_cfg,
@@ -899,7 +901,7 @@ test "ClientConnection replenishes receive windows for active stream" {
     const request_headers_header = try h2.parseFrameHeader(&request_headers_wire_header);
     try std.testing.expectEqual(h2.FrameType.headers, request_headers_header.frame_type);
 
-    var request_header_block_buf: [config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+    var request_header_block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
     const request_header_block_len: usize = @intCast(request_headers_header.length);
     try readExact(fds[1], request_header_block_buf[0..request_header_block_len]);
 
@@ -958,7 +960,7 @@ test "ClientConnection request send and response receive round-trip" {
     try std.testing.expectEqual(h2.FrameType.headers, request_headers_header.frame_type);
     try std.testing.expectEqual(stream_id, request_headers_header.stream_id);
 
-    var request_header_block_buf: [config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+    var request_header_block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
     const request_header_block_len: usize = @intCast(request_headers_header.length);
     try readExact(fds[1], request_header_block_buf[0..request_header_block_len]);
 
@@ -978,14 +980,14 @@ test "ClientConnection request send and response receive round-trip" {
     try readExact(fds[1], request_data_payload_buf[0..request_data_len]);
     try std.testing.expectEqualStrings("ping", request_data_payload_buf[0..request_data_len]);
 
-    var response_header_block_buf: [config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+    var response_header_block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
     const response_header_block = try buildResponseHeaderBlock(
         200,
         &.{.{ .name = "content-type", .value = "application/grpc" }},
         &response_header_block_buf,
     );
 
-    var response_headers_frame_buf: [h2.frame_header_size_bytes + config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+    var response_headers_frame_buf: [h2.frame_header_size_bytes + h2.header_block_capacity_bytes]u8 = undefined;
     const response_headers_frame = try appendFrame(
         &response_headers_frame_buf,
         .headers,
@@ -1002,10 +1004,10 @@ test "ClientConnection request send and response receive round-trip" {
     try std.testing.expectEqualStrings("pong", response_data_frame[h2.frame_header_size_bytes .. h2.frame_header_size_bytes + 4]);
     try writeAllFd(fds[1], response_data_frame);
 
-    var trailer_block_buf: [config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+    var trailer_block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
     const trailer_block = try buildHeaderBlock(&.{.{ .name = "grpc-status", .value = "0" }}, &trailer_block_buf);
 
-    var trailers_frame_buf: [h2.frame_header_size_bytes + config.H2_MAX_HEADER_BLOCK_SIZE_BYTES]u8 = undefined;
+    var trailers_frame_buf: [h2.frame_header_size_bytes + h2.header_block_capacity_bytes]u8 = undefined;
     const trailers_frame = try appendFrame(
         &trailers_frame_buf,
         .headers,

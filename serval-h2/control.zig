@@ -9,6 +9,7 @@ const assert = std.debug.assert;
 
 const config = @import("serval-core").config;
 const frame = @import("frame.zig");
+const limits = @import("limits.zig");
 
 /// Size, in bytes, of an HTTP/2 PING payload.
 /// HTTP/2 requires PING frames to carry exactly 8 octets of opaque data.
@@ -59,10 +60,10 @@ pub const GoAway = struct {
 
     /// Map a GOAWAY error code to the corresponding `ErrorCode` value.
     /// Returns `null` when `error_code_raw` is not one of the known enum tags.
-    /// The method asserts that `last_stream_id` is 31-bit clean and that `debug_data` is within the configured frame-size bound.
+    /// The method asserts that `last_stream_id` is 31-bit clean and that `debug_data` is within the owner-local frame-size bound.
     pub fn errorCode(self: GoAway) ?ErrorCode {
         assert(self.last_stream_id <= 0x7fff_ffff);
-        assert(self.debug_data.len <= config.H2_MAX_FRAME_SIZE_BYTES);
+        assert(self.debug_data.len <= limits.frame_payload_capacity_bytes);
         return std.meta.intToEnum(ErrorCode, self.error_code_raw) catch null;
     }
 };
