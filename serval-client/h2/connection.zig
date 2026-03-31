@@ -29,6 +29,14 @@ const request_headers_frame_overhead_bytes: usize = h2.frame_header_size_bytes *
 const request_headers_frame_buffer_size_bytes: usize = h2.header_block_capacity_bytes + request_headers_frame_overhead_bytes;
 const data_frame_buffer_size_bytes: usize = h2.frame_header_size_bytes + h2.frame_payload_capacity_bytes;
 const window_update_frame_size_bytes: usize = h2.frame_header_size_bytes + h2.control.window_update_payload_size_bytes;
+const local_data_frame_payload_capacity_bytes: u32 = h2.frame_payload_capacity_bytes;
+
+/// Caller-owned fixed storage for a `ClientConnection`.
+/// Keep this storage alive for at least as long as the associated connection.
+pub const ConnectionStorage = struct {
+    pending_response_headers_storage: [h2.header_block_capacity_bytes]u8 = undefined,
+    recv_buf: [read_buffer_size_bytes]u8 = undefined,
+};
 
 /// Errors returned by HTTP/2 client connection setup and frame I/O.
 /// `ReadFailed` and `WriteFailed` report socket-level I/O failures.
@@ -54,7 +62,8 @@ pub const ClientConnection = struct {
     socket: *Socket,
     io: ?Io = null,
     runtime: runtime_mod.Runtime,
-    recv_buf: [read_buffer_size_bytes]u8 = undefined,
+    pending_response_headers_storage: []u8,
+    recv_buf: []u8,
     recv_len: usize = 0,
     pending_discard_len: usize = 0,
     frame_count: u32 = 0,
@@ -62,32 +71,39 @@ pub const ClientConnection = struct {
     /// Initialize a client connection that uses the socket's default I/O path.
     /// Requires a non-null socket pointer with an open file descriptor; the socket remains owned by the caller.
     /// Propagates any error returned by shared connection initialization.
-    pub fn init(socket: *Socket, runtime_cfg: config.H2Config) Error!ClientConnection {
+    pub fn init(socket: *Socket, runtime_cfg: config.H2Config, storage: *ConnectionStorage) Error!ClientConnection {
         assert(@intFromPtr(socket) != 0);
         assert(socket.get_fd() >= 0);
-        return initMaybeIo(socket, null, runtime_cfg);
+        assert(@intFromPtr(storage) != 0);
+        return initMaybeIo(socket, null, runtime_cfg, storage);
     }
 
     /// Initialize a client connection that uses the provided I/O object for network operations.
     /// Requires a non-null socket pointer with an open file descriptor; the socket remains owned by the caller.
     /// Propagates any error returned by shared connection initialization.
-    pub fn initWithIo(socket: *Socket, io: Io, runtime_cfg: config.H2Config) Error!ClientConnection {
+    pub fn initWithIo(socket: *Socket, io: Io, runtime_cfg: config.H2Config, storage: *ConnectionStorage) Error!ClientConnection {
         assert(@intFromPtr(socket) != 0);
         assert(socket.get_fd() >= 0);
-        return initMaybeIo(socket, io, runtime_cfg);
+        assert(@intFromPtr(storage) != 0);
+        return initMaybeIo(socket, io, runtime_cfg, storage);
     }
 
-    fn initMaybeIo(socket: *Socket, io: ?Io, runtime_cfg: config.H2Config) Error!ClientConnection {
+    fn initMaybeIo(socket: *Socket, io: ?Io, runtime_cfg: config.H2Config, storage: *ConnectionStorage) Error!ClientConnection {
         assert(@intFromPtr(socket) != 0);
         assert(socket.get_fd() >= 0);
+        assert(@intFromPtr(storage) != 0);
         assert(runtime_cfg.max_frame_size_bytes <= h2.frame_payload_capacity_bytes);
         assert(runtime_cfg.max_header_block_size_bytes <= h2.header_block_capacity_bytes);
+        assert(storage.pending_response_headers_storage.len >= runtime_cfg.max_header_block_size_bytes);
+        assert(storage.recv_buf.len == read_buffer_size_bytes);
 
         return .{
             .runtime_cfg = runtime_cfg,
             .socket = socket,
             .io = io,
             .runtime = try runtime_mod.Runtime.init(runtime_cfg),
+            .pending_response_headers_storage = &storage.pending_response_headers_storage,
+            .recv_buf = &storage.recv_buf,
         };
     }
 
@@ -283,10 +299,22 @@ pub const ClientConnection = struct {
         const stream_window = stream.send_window.available_bytes;
         const window_budget = @min(connection_window, stream_window);
         const remaining = payload_len - sent;
-        const max_frame = self.runtime.state.peer_settings.max_frame_size_bytes;
-        const chunk_len = @min(remaining, @min(window_budget, max_frame));
+        const peer_max_frame = self.runtime.state.peer_settings.max_frame_size_bytes;
+        const effective_max_frame = effectiveLocalDataFramePayloadSizeBytes(peer_max_frame);
+        const chunk_len = @min(remaining, @min(window_budget, effective_max_frame));
         assert(chunk_len <= remaining);
         return chunk_len;
+    }
+
+    fn effectiveLocalDataFramePayloadSizeBytes(peer_max_frame_size_bytes: u32) u32 {
+        assert(peer_max_frame_size_bytes >= h2.settings.min_max_frame_size_bytes);
+        assert(peer_max_frame_size_bytes <= h2.settings.max_max_frame_size_bytes);
+        assert(local_data_frame_payload_capacity_bytes > 0);
+
+        const effective = @min(peer_max_frame_size_bytes, local_data_frame_payload_capacity_bytes);
+        assert(effective > 0);
+        assert(effective <= local_data_frame_payload_capacity_bytes);
+        return effective;
     }
 
     fn logAndReturnMissingStream(
@@ -385,7 +413,11 @@ pub const ClientConnection = struct {
         const frame_len: usize = @as(usize, h2.frame_header_size_bytes) + @as(usize, header.length);
         const payload_start: usize = h2.frame_header_size_bytes;
         const payload_end: usize = frame_len;
-        const action = try self.runtime.receiveFrame(header, self.recv_buf[payload_start..payload_end]);
+        const action = try self.runtime.receiveFrame(
+            self.pending_response_headers_storage,
+            header,
+            self.recv_buf[payload_start..payload_end],
+        );
 
         self.pending_discard_len = frame_len;
         self.frame_count += 1;
@@ -715,6 +747,7 @@ fn appendFrame(
 ) ![]const u8 {
     assert(out.len >= h2.frame_header_size_bytes);
     assert(payload.len <= std.math.maxInt(u24));
+    assert(out.len >= h2.frame_header_size_bytes + payload.len);
 
     const header = try h2.buildFrameHeader(out[0..h2.frame_header_size_bytes], .{
         .length = @intCast(payload.len),
@@ -832,7 +865,8 @@ test "ClientConnection sends client preface and initial settings" {
     defer _ = std.c.close(fds[1]);
 
     var socket = Socket.Plain.init_client(fds[0]);
-    var conn = try ClientConnection.init(&socket, .{});
+    var storage = ConnectionStorage{};
+    var conn = try ClientConnection.init(&socket, .{}, &storage);
     try conn.sendClientPrefaceAndSettings();
 
     var expected_runtime = try runtime_mod.Runtime.init(.{});
@@ -854,7 +888,8 @@ test "ClientConnection completeHandshake sends settings ACK" {
     try writeAllFd(fds[1], peer_settings);
 
     var socket = Socket.Plain.init_client(fds[0]);
-    var conn = try ClientConnection.init(&socket, .{});
+    var storage = ConnectionStorage{};
+    var conn = try ClientConnection.init(&socket, .{}, &storage);
     try conn.completeHandshake();
 
     var expected_runtime = try runtime_mod.Runtime.init(.{});
@@ -883,7 +918,8 @@ test "ClientConnection replenishes receive windows for active stream" {
     try writeAllFd(fds[1], peer_settings);
 
     var socket = Socket.Plain.init_client(fds[0]);
-    var conn = try ClientConnection.init(&socket, .{});
+    var storage = ConnectionStorage{};
+    var conn = try ClientConnection.init(&socket, .{}, &storage);
     try conn.completeHandshake();
 
     var expected_runtime = try runtime_mod.Runtime.init(.{});
@@ -940,7 +976,8 @@ test "ClientConnection request send and response receive round-trip" {
     try writeAllFd(fds[1], peer_settings);
 
     var socket = Socket.Plain.init_client(fds[0]);
-    var conn = try ClientConnection.init(&socket, .{});
+    var storage = ConnectionStorage{};
+    var conn = try ClientConnection.init(&socket, .{}, &storage);
     try conn.completeHandshake();
 
     var expected_runtime = try runtime_mod.Runtime.init(.{});
@@ -1047,4 +1084,15 @@ test "ClientConnection request send and response receive round-trip" {
     }
 
     try std.testing.expect(conn.runtime.state.getStream(stream_id) == null);
+}
+
+test "effectiveLocalDataFramePayloadSizeBytes clamps peer max to local capacity" {
+    try std.testing.expectEqual(
+        local_data_frame_payload_capacity_bytes,
+        ClientConnection.effectiveLocalDataFramePayloadSizeBytes(h2.settings.max_max_frame_size_bytes),
+    );
+    try std.testing.expectEqual(
+        h2.settings.min_max_frame_size_bytes,
+        ClientConnection.effectiveLocalDataFramePayloadSizeBytes(h2.settings.min_max_frame_size_bytes),
+    );
 }

@@ -42,7 +42,8 @@ Current responsibilities:
 | `FrameType` | HTTP/2 frame type enum |
 | `FrameHeader` | Parsed/encoded frame header |
 | `FrameError` | Frame-parse errors |
-| `max_initial_parse_frames`, `max_continuation_frames`, `max_settings_per_frame`, `frame_payload_capacity_bytes`, `header_block_capacity_bytes` | Owner-local bounded protocol limits |
+| `max_initial_parse_frames`, `max_continuation_frames`, `max_settings_per_frame`, `frame_payload_capacity_bytes`, `header_block_capacity_bytes` | Owner-local bounded protocol/helper capacities |
+| `max_frame_payload_size_bytes` | RFC wire-format 24-bit frame payload ceiling |
 | `parseFrameHeader(raw)` | Parse frame header |
 | `buildFrameHeader(out, header)` | Encode frame header |
 | `frame_header_size_bytes` | Header size constant |

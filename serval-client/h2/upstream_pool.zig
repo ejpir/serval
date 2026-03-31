@@ -75,6 +75,7 @@ pub const UpstreamSession = struct {
     upstream_idx: config.UpstreamIndex,
     generation: u32,
     connection: Connection,
+    h2_storage: connection_mod.ConnectionStorage,
     h2: connection_mod.ClientConnection,
     last_used_ns: u64,
 
@@ -277,6 +278,7 @@ pub const UpstreamSessionPool = struct {
             .upstream_idx = upstream.idx,
             .generation = generation,
             .connection = connected.conn,
+            .h2_storage = .{},
             .h2 = undefined,
             .last_used_ns = time.monotonicNanos(),
         };
@@ -287,7 +289,7 @@ pub const UpstreamSessionPool = struct {
             slot.active_session = null;
         }
 
-        session.h2 = try connection_mod.ClientConnection.initWithIo(&session.connection.socket, io, self.h2_cfg);
+        session.h2 = try connection_mod.ClientConnection.initWithIo(&session.connection.socket, io, self.h2_cfg, &session.h2_storage);
         try session.h2.sendClientPrefaceAndSettings();
         session.last_used_ns = time.monotonicNanos();
 
@@ -658,7 +660,8 @@ test "UpstreamSessionPool reuses healthy cached session" {
         .last_used_ns = time.monotonicNanos(),
     };
 
-    var h2_conn = try connection_mod.ClientConnection.init(&conn.socket, .{});
+    var h2_storage = connection_mod.ConnectionStorage{};
+    var h2_conn = try connection_mod.ClientConnection.init(&conn.socket, .{}, &h2_storage);
     h2_conn.runtime.state.preface_sent = true;
     h2_conn.runtime.state.peer_settings_received = true;
     h2_conn.runtime.state.local_settings_ack_pending = false;
@@ -717,7 +720,8 @@ test "sessionNeedsReconnect defers goaway reconnect while active streams remain"
         .last_used_ns = time.monotonicNanos(),
     };
 
-    var h2_conn = try connection_mod.ClientConnection.init(&conn.socket, .{});
+    var h2_storage = connection_mod.ConnectionStorage{};
+    var h2_conn = try connection_mod.ClientConnection.init(&conn.socket, .{}, &h2_storage);
     h2_conn.runtime.state.preface_sent = true;
     h2_conn.runtime.state.peer_settings_received = true;
     h2_conn.runtime.state.local_settings_ack_pending = false;
@@ -730,6 +734,7 @@ test "sessionNeedsReconnect defers goaway reconnect while active streams remain"
         .upstream_idx = 0,
         .generation = 1,
         .connection = conn,
+        .h2_storage = h2_storage,
         .h2 = h2_conn,
         .last_used_ns = time.monotonicNanos(),
     };
@@ -748,7 +753,8 @@ test "sessionNeedsReconnect reconnects goaway session after active streams drain
         .last_used_ns = time.monotonicNanos(),
     };
 
-    var h2_conn = try connection_mod.ClientConnection.init(&conn.socket, .{});
+    var h2_storage = connection_mod.ConnectionStorage{};
+    var h2_conn = try connection_mod.ClientConnection.init(&conn.socket, .{}, &h2_storage);
     h2_conn.runtime.state.preface_sent = true;
     h2_conn.runtime.state.peer_settings_received = true;
     h2_conn.runtime.state.local_settings_ack_pending = false;
@@ -762,6 +768,7 @@ test "sessionNeedsReconnect reconnects goaway session after active streams drain
         .upstream_idx = 0,
         .generation = 1,
         .connection = conn,
+        .h2_storage = h2_storage,
         .h2 = h2_conn,
         .last_used_ns = time.monotonicNanos(),
     };
@@ -780,7 +787,8 @@ test "rotateActiveSessionForRollover keeps draining session for in-flight stream
         .last_used_ns = time.monotonicNanos(),
     };
 
-    var h2_conn = try connection_mod.ClientConnection.init(&conn.socket, .{});
+    var h2_storage = connection_mod.ConnectionStorage{};
+    var h2_conn = try connection_mod.ClientConnection.init(&conn.socket, .{}, &h2_storage);
     h2_conn.runtime.state.preface_sent = true;
     h2_conn.runtime.state.peer_settings_received = true;
     h2_conn.runtime.state.local_settings_ack_pending = false;
@@ -798,6 +806,7 @@ test "rotateActiveSessionForRollover keeps draining session for in-flight stream
             .upstream_idx = 0,
             .generation = 1,
             .connection = conn,
+            .h2_storage = h2_storage,
             .h2 = h2_conn,
             .last_used_ns = time.monotonicNanos(),
         },
@@ -827,11 +836,13 @@ test "UpstreamSessionPool getByGeneration resolves active and draining sessions"
         .last_used_ns = time.monotonicNanos(),
     };
 
-    var active_h2 = try connection_mod.ClientConnection.init(&active_conn.socket, .{});
+    var active_h2_storage = connection_mod.ConnectionStorage{};
+    var active_h2 = try connection_mod.ClientConnection.init(&active_conn.socket, .{}, &active_h2_storage);
     active_h2.runtime.state.preface_sent = true;
     active_h2.runtime.state.peer_settings_received = true;
 
-    var draining_h2 = try connection_mod.ClientConnection.init(&draining_conn.socket, .{});
+    var draining_h2_storage = connection_mod.ConnectionStorage{};
+    var draining_h2 = try connection_mod.ClientConnection.init(&draining_conn.socket, .{}, &draining_h2_storage);
     draining_h2.runtime.state.preface_sent = true;
     draining_h2.runtime.state.peer_settings_received = true;
 
@@ -850,6 +861,7 @@ test "UpstreamSessionPool getByGeneration resolves active and draining sessions"
             .upstream_idx = upstream_idx,
             .generation = 2,
             .connection = active_conn,
+            .h2_storage = active_h2_storage,
             .h2 = active_h2,
             .last_used_ns = time.monotonicNanos(),
         },
@@ -857,6 +869,7 @@ test "UpstreamSessionPool getByGeneration resolves active and draining sessions"
             .upstream_idx = upstream_idx,
             .generation = 1,
             .connection = draining_conn,
+            .h2_storage = draining_h2_storage,
             .h2 = draining_h2,
             .last_used_ns = time.monotonicNanos(),
         },
@@ -876,7 +889,8 @@ test "UpstreamSessionPool closeAll clears all slots" {
         .created_ns = time.monotonicNanos(),
         .last_used_ns = time.monotonicNanos(),
     };
-    const h2_conn = try connection_mod.ClientConnection.init(&conn.socket, .{});
+    var h2_storage = connection_mod.ConnectionStorage{};
+    const h2_conn = try connection_mod.ClientConnection.init(&conn.socket, .{}, &h2_storage);
 
     var pool = UpstreamSessionPool.init(.{});
     const upstream_idx: config.UpstreamIndex = 2;
@@ -891,6 +905,7 @@ test "UpstreamSessionPool closeAll clears all slots" {
             .upstream_idx = upstream_idx,
             .generation = 1,
             .connection = conn,
+            .h2_storage = h2_storage,
             .h2 = h2_conn,
             .last_used_ns = time.monotonicNanos(),
         },

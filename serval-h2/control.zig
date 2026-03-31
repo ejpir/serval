@@ -60,10 +60,10 @@ pub const GoAway = struct {
 
     /// Map a GOAWAY error code to the corresponding `ErrorCode` value.
     /// Returns `null` when `error_code_raw` is not one of the known enum tags.
-    /// The method asserts that `last_stream_id` is 31-bit clean and that `debug_data` is within the owner-local frame-size bound.
+    /// The method asserts that `last_stream_id` is 31-bit clean and that `debug_data` fits in the HTTP/2 wire-format frame-length field.
     pub fn errorCode(self: GoAway) ?ErrorCode {
         assert(self.last_stream_id <= 0x7fff_ffff);
-        assert(self.debug_data.len <= limits.frame_payload_capacity_bytes);
+        assert(self.debug_data.len <= frame.max_frame_payload_size_bytes);
         return std.meta.intToEnum(ErrorCode, self.error_code_raw) catch null;
     }
 };

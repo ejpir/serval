@@ -75,6 +75,10 @@ pub const H2RequestHeadersWrite = h2.RequestHeadersWrite;
 /// Ownership and lifetime rules are the same as the underlying `h2` connection APIs.
 /// Any error behavior is defined by the specific `h2.ClientConnection` operations you call.
 pub const H2ClientConnection = h2.ClientConnection;
+/// Re-export of `h2.ConnectionStorage`, the caller-owned fixed storage required by `H2ClientConnection`.
+/// Keep this storage alive for at least as long as the associated HTTP/2 client connection.
+/// This alias itself has no error behavior; any failures arise from `H2ClientConnection` APIs that borrow it.
+pub const H2ClientConnectionStorage = h2.ConnectionStorage;
 /// Public re-export of `h2.ConnectionError`, used by `H2ClientConnection` send/receive and handshake operations.
 /// Covers transport/driver failures (`ReadFailed`, `WriteFailed`, `ConnectionClosed`, `WouldBlock`) and
 /// connection-state limits (`FrameLimitExceeded`, `SendWindowExhausted`, `UnexpectedHandshakeFrame`, `ConnectionClosing`).

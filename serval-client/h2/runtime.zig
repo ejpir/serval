@@ -115,7 +115,6 @@ const PendingResponseHeaders = struct {
     is_trailers: bool = false,
     continuation_frames: u8 = 0,
     block_len: u32 = 0,
-    block_buf: [h2.header_block_capacity_bytes]u8 = undefined,
 };
 
 /// Public HTTP/2 client runtime state for prior-knowledge upstream sessions.
@@ -309,12 +308,22 @@ pub const Runtime = struct {
     }
 
     /// Processes one received HTTP/2 frame and updates runtime state.
+    /// `pending_response_headers_storage` is caller-owned scratch space used to
+    /// assemble HEADERS/CONTINUATION fragments for a single in-flight response
+    /// header block.
     /// `payload.len` must match `header.length`, and the connection must already have
     /// sent the client preface; non-SETTINGS frames before peer settings raise `error.MissingInitialSettings`.
     /// Returns a `ReceiveAction` for peer events that require an outbound response, or an error for unsupported or invalid frame sequencing.
-    pub fn receiveFrame(self: *Runtime, header: h2.FrameHeader, payload: []const u8) Error!ReceiveAction {
+    pub fn receiveFrame(
+        self: *Runtime,
+        pending_response_headers_storage: []u8,
+        header: h2.FrameHeader,
+        payload: []const u8,
+    ) Error!ReceiveAction {
         assert(@intFromPtr(self) != 0);
         assert(header.length == payload.len);
+        assert(self.runtime_cfg.max_header_block_size_bytes <= pending_response_headers_storage.len);
+        assert(pending_response_headers_storage.len <= h2.header_block_capacity_bytes);
 
         try ensureConnectionReady(self, header.frame_type);
 
@@ -324,13 +333,13 @@ pub const Runtime = struct {
 
         return switch (header.frame_type) {
             .settings => try handleSettings(self, header, payload),
-            .headers => try handleHeaders(self, header, payload),
+            .headers => try handleHeaders(self, pending_response_headers_storage, header, payload),
             .data => try handleData(self, header, payload),
             .ping => try handlePing(header, payload),
             .window_update => try handleWindowUpdate(self, header, payload),
             .rst_stream => try handleRstStream(self, header, payload),
             .goaway => try handleGoAway(self, header, payload),
-            .continuation => try handleContinuation(self, header, payload),
+            .continuation => try handleContinuation(self, pending_response_headers_storage, header, payload),
             .priority => error.UnsupportedPriority,
             .push_promise => error.UnsupportedPushPromise,
             .extension => .none,
@@ -425,7 +434,12 @@ fn handleSettings(self: *Runtime, header: h2.FrameHeader, payload: []const u8) E
     return .send_settings_ack;
 }
 
-fn handleHeaders(self: *Runtime, header: h2.FrameHeader, payload: []const u8) Error!ReceiveAction {
+fn handleHeaders(
+    self: *Runtime,
+    pending_response_headers_storage: []u8,
+    header: h2.FrameHeader,
+    payload: []const u8,
+) Error!ReceiveAction {
     assert(@intFromPtr(self) != 0);
     assert(header.frame_type == .headers);
 
@@ -453,7 +467,7 @@ fn handleHeaders(self: *Runtime, header: h2.FrameHeader, payload: []const u8) Er
 
     if (!state_entry.headers_received) {
         if ((header.flags & h2.flags_end_headers) == 0) {
-            try startResponseHeaderContinuation(self, header.stream_id, end_stream, false, payload);
+            try startResponseHeaderContinuation(self, pending_response_headers_storage, header.stream_id, end_stream, false, payload);
             return .none;
         }
 
@@ -475,7 +489,7 @@ fn handleHeaders(self: *Runtime, header: h2.FrameHeader, payload: []const u8) Er
     if (!end_stream) return error.TrailersMustEndStream;
 
     if ((header.flags & h2.flags_end_headers) == 0) {
-        try startResponseHeaderContinuation(self, header.stream_id, true, true, payload);
+        try startResponseHeaderContinuation(self, pending_response_headers_storage, header.stream_id, true, true, payload);
         return .none;
     }
 
@@ -485,7 +499,12 @@ fn handleHeaders(self: *Runtime, header: h2.FrameHeader, payload: []const u8) Er
     return .{ .response_trailers = .{ .stream_id = header.stream_id, .trailers = trailers } };
 }
 
-fn handleContinuation(self: *Runtime, header: h2.FrameHeader, payload: []const u8) Error!ReceiveAction {
+fn handleContinuation(
+    self: *Runtime,
+    pending_response_headers_storage: []u8,
+    header: h2.FrameHeader,
+    payload: []const u8,
+) Error!ReceiveAction {
     assert(@intFromPtr(self) != 0);
     assert(header.frame_type == .continuation);
     assert(header.length == payload.len);
@@ -499,14 +518,15 @@ fn handleContinuation(self: *Runtime, header: h2.FrameHeader, payload: []const u
     }
     self.pending_response_headers.continuation_frames += 1;
 
-    try appendPendingResponseHeaderFragment(self, payload);
+    try appendPendingResponseHeaderFragment(self, pending_response_headers_storage, payload);
 
     if ((header.flags & h2.flags_end_headers) == 0) return .none;
-    return try finishPendingResponseHeaders(self);
+    return try finishPendingResponseHeaders(self, pending_response_headers_storage);
 }
 
 fn startResponseHeaderContinuation(
     self: *Runtime,
+    pending_response_headers_storage: []u8,
     stream_id: u32,
     end_stream: bool,
     is_trailers: bool,
@@ -522,24 +542,31 @@ fn startResponseHeaderContinuation(
     self.pending_response_headers.continuation_frames = 0;
     self.pending_response_headers.block_len = 0;
 
-    try appendPendingResponseHeaderFragment(self, payload);
+    try appendPendingResponseHeaderFragment(self, pending_response_headers_storage, payload);
 }
 
-fn appendPendingResponseHeaderFragment(self: *Runtime, payload: []const u8) Error!void {
+fn appendPendingResponseHeaderFragment(
+    self: *Runtime,
+    pending_response_headers_storage: []u8,
+    payload: []const u8,
+) Error!void {
     assert(@intFromPtr(self) != 0);
     assert(self.pending_response_headers.active);
 
     const current_len: usize = @intCast(self.pending_response_headers.block_len);
-    if (current_len + payload.len > h2.header_block_capacity_bytes) return error.HeaderBlockTooLarge;
+    if (current_len + payload.len > pending_response_headers_storage.len) return error.HeaderBlockTooLarge;
 
     @memcpy(
-        self.pending_response_headers.block_buf[current_len .. current_len + payload.len],
+        pending_response_headers_storage[current_len .. current_len + payload.len],
         payload,
     );
     self.pending_response_headers.block_len = @intCast(current_len + payload.len);
 }
 
-fn finishPendingResponseHeaders(self: *Runtime) Error!ReceiveAction {
+fn finishPendingResponseHeaders(
+    self: *Runtime,
+    pending_response_headers_storage: []const u8,
+) Error!ReceiveAction {
     assert(@intFromPtr(self) != 0);
     assert(self.pending_response_headers.active);
 
@@ -549,7 +576,7 @@ fn finishPendingResponseHeaders(self: *Runtime) Error!ReceiveAction {
     const block_len: usize = @intCast(self.pending_response_headers.block_len);
     errdefer resetPendingResponseHeaders(self);
 
-    const block = self.pending_response_headers.block_buf[0..block_len];
+    const block = pending_response_headers_storage[0..block_len];
     if (is_trailers) {
         const trailers = try decodeTrailerHeaderBlock(&self.header_decoder, block);
         try self.state.endRemoteStream(stream_id);
@@ -1004,6 +1031,8 @@ fn makeGrpcRequest(path: []const u8) !Request {
     return request;
 }
 
+var test_pending_response_headers_storage: [h2.header_block_capacity_bytes]u8 = undefined;
+
 fn initRuntimeReadyForStreams() !Runtime {
     assert(h2.max_settings_per_frame > 0);
     assert(h2.client_connection_preface.len > 0);
@@ -1019,7 +1048,7 @@ fn initRuntimeReadyForStreams() !Runtime {
         .flags = 0,
         .stream_id = 0,
     };
-    const action = try runtime.receiveFrame(peer_settings, &[_]u8{});
+    const action = try runtime.receiveFrame(&test_pending_response_headers_storage, peer_settings, &[_]u8{});
     switch (action) {
         .send_settings_ack => {},
         else => return error.UnexpectedAction,
@@ -1059,7 +1088,7 @@ test "Runtime requires peer settings before non-settings frames" {
 
     try std.testing.expectError(
         error.MissingInitialSettings,
-        runtime.receiveFrame(ping_header, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 }),
+        runtime.receiveFrame(&test_pending_response_headers_storage, ping_header, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 }),
     );
 }
 
@@ -1075,7 +1104,7 @@ test "Runtime receives peer settings, sends ACK, and accepts SETTINGS ACK" {
         .flags = 0,
         .stream_id = 0,
     };
-    const action = try runtime.receiveFrame(peer_settings, &[_]u8{});
+    const action = try runtime.receiveFrame(&test_pending_response_headers_storage, peer_settings, &[_]u8{});
     switch (action) {
         .send_settings_ack => {},
         else => return error.UnexpectedAction,
@@ -1096,7 +1125,7 @@ test "Runtime receives peer settings, sends ACK, and accepts SETTINGS ACK" {
         .flags = h2.flags_ack,
         .stream_id = 0,
     };
-    const ack_action = try runtime.receiveFrame(settings_ack, &[_]u8{});
+    const ack_action = try runtime.receiveFrame(&test_pending_response_headers_storage, settings_ack, &[_]u8{});
     try std.testing.expect(ack_action == .none);
     try std.testing.expect(!runtime.state.local_settings_ack_pending);
 }
@@ -1191,6 +1220,7 @@ test "Runtime decodes response HEADERS, DATA, and trailers" {
     );
     const response_headers_header = try h2.parseFrameHeader(response_headers_frame);
     const headers_action = try runtime.receiveFrame(
+        &test_pending_response_headers_storage,
         response_headers_header,
         response_headers_frame[h2.frame_header_size_bytes .. h2.frame_header_size_bytes + response_headers_header.length],
     );
@@ -1210,7 +1240,7 @@ test "Runtime decodes response HEADERS, DATA, and trailers" {
         .flags = 0,
         .stream_id = request_headers.stream_id,
     };
-    const data_action = try runtime.receiveFrame(data_header, "pong");
+    const data_action = try runtime.receiveFrame(&test_pending_response_headers_storage, data_header, "pong");
     switch (data_action) {
         .response_data => |resp_data| {
             try std.testing.expectEqualStrings("pong", resp_data.payload);
@@ -1232,6 +1262,7 @@ test "Runtime decodes response HEADERS, DATA, and trailers" {
     );
     const trailer_header = try h2.parseFrameHeader(trailer_frame);
     const trailer_action = try runtime.receiveFrame(
+        &test_pending_response_headers_storage,
         trailer_header,
         trailer_frame[h2.frame_header_size_bytes .. h2.frame_header_size_bytes + trailer_header.length],
     );
@@ -1273,6 +1304,7 @@ test "Runtime reassembles response HEADERS and trailers with CONTINUATION" {
     );
     const response_headers_header = try h2.parseFrameHeader(response_headers_frame);
     const first_headers_action = try runtime.receiveFrame(
+        &test_pending_response_headers_storage,
         response_headers_header,
         response_headers_frame[h2.frame_header_size_bytes .. h2.frame_header_size_bytes + response_headers_header.length],
     );
@@ -1289,6 +1321,7 @@ test "Runtime reassembles response HEADERS and trailers with CONTINUATION" {
     );
     const response_cont_header = try h2.parseFrameHeader(response_continuation);
     const second_headers_action = try runtime.receiveFrame(
+        &test_pending_response_headers_storage,
         response_cont_header,
         response_continuation[h2.frame_header_size_bytes .. h2.frame_header_size_bytes + response_cont_header.length],
     );
@@ -1319,6 +1352,7 @@ test "Runtime reassembles response HEADERS and trailers with CONTINUATION" {
     );
     const trailer_header = try h2.parseFrameHeader(trailer_frame);
     const first_trailer_action = try runtime.receiveFrame(
+        &test_pending_response_headers_storage,
         trailer_header,
         trailer_frame[h2.frame_header_size_bytes .. h2.frame_header_size_bytes + trailer_header.length],
     );
@@ -1335,6 +1369,7 @@ test "Runtime reassembles response HEADERS and trailers with CONTINUATION" {
     );
     const trailer_cont_header = try h2.parseFrameHeader(trailer_continuation);
     const second_trailer_action = try runtime.receiveFrame(
+        &test_pending_response_headers_storage,
         trailer_cont_header,
         trailer_continuation[h2.frame_header_size_bytes .. h2.frame_header_size_bytes + trailer_cont_header.length],
     );
@@ -1373,12 +1408,13 @@ test "Runtime rejects interleaved frame while waiting for response CONTINUATION"
     );
     const response_headers_header = try h2.parseFrameHeader(response_headers_frame);
     _ = try runtime.receiveFrame(
+        &test_pending_response_headers_storage,
         response_headers_header,
         response_headers_frame[h2.frame_header_size_bytes .. h2.frame_header_size_bytes + response_headers_header.length],
     );
 
     const data_header = h2.FrameHeader{ .length = 1, .frame_type = .data, .flags = h2.flags_end_stream, .stream_id = request_headers.stream_id };
-    try std.testing.expectError(error.UnsupportedContinuation, runtime.receiveFrame(data_header, "x"));
+    try std.testing.expectError(error.UnsupportedContinuation, runtime.receiveFrame(&test_pending_response_headers_storage, data_header, "x"));
 }
 
 test "Runtime rejects unexpected CONTINUATION without pending response headers" {
@@ -1397,6 +1433,7 @@ test "Runtime rejects unexpected CONTINUATION without pending response headers" 
     try std.testing.expectError(
         error.UnexpectedContinuation,
         runtime.receiveFrame(
+            &test_pending_response_headers_storage,
             continuation_header,
             continuation_frame[h2.frame_header_size_bytes .. h2.frame_header_size_bytes + continuation_header.length],
         ),
@@ -1428,6 +1465,7 @@ test "Runtime rejects unexpected CONTINUATION stream" {
     );
     const response_headers_header = try h2.parseFrameHeader(response_headers_frame);
     _ = try runtime.receiveFrame(
+        &test_pending_response_headers_storage,
         response_headers_header,
         response_headers_frame[h2.frame_header_size_bytes .. h2.frame_header_size_bytes + response_headers_header.length],
     );
@@ -1445,6 +1483,7 @@ test "Runtime rejects unexpected CONTINUATION stream" {
     try std.testing.expectError(
         error.ContinuationStreamMismatch,
         runtime.receiveFrame(
+            &test_pending_response_headers_storage,
             continuation_header,
             continuation_frame[h2.frame_header_size_bytes .. h2.frame_header_size_bytes + continuation_header.length],
         ),
@@ -1468,6 +1507,7 @@ test "Runtime rejects response CONTINUATION with invalid flags" {
     );
     const response_headers_header = try h2.parseFrameHeader(response_headers_frame);
     _ = try runtime.receiveFrame(
+        &test_pending_response_headers_storage,
         response_headers_header,
         response_headers_frame[h2.frame_header_size_bytes .. h2.frame_header_size_bytes + response_headers_header.length],
     );
@@ -1485,6 +1525,7 @@ test "Runtime rejects response CONTINUATION with invalid flags" {
     try std.testing.expectError(
         error.UnsupportedContinuation,
         runtime.receiveFrame(
+            &test_pending_response_headers_storage,
             continuation_header,
             continuation_frame[h2.frame_header_size_bytes .. h2.frame_header_size_bytes + continuation_header.length],
         ),
@@ -1508,6 +1549,7 @@ test "Runtime enforces response continuation frame bound" {
     );
     const response_headers_header = try h2.parseFrameHeader(response_headers_frame);
     _ = try runtime.receiveFrame(
+        &test_pending_response_headers_storage,
         response_headers_header,
         response_headers_frame[h2.frame_header_size_bytes .. h2.frame_header_size_bytes + response_headers_header.length],
     );
@@ -1524,6 +1566,7 @@ test "Runtime enforces response continuation frame bound" {
         );
         const continuation_header = try h2.parseFrameHeader(continuation_frame);
         const result = runtime.receiveFrame(
+            &test_pending_response_headers_storage,
             continuation_header,
             continuation_frame[h2.frame_header_size_bytes .. h2.frame_header_size_bytes + continuation_header.length],
         );
@@ -1548,7 +1591,7 @@ test "Runtime handles upstream RST_STREAM and clears stream state" {
     var rst_buf: [h2.frame_header_size_bytes + h2.control.rst_stream_payload_size_bytes]u8 = undefined;
     const rst_frame = try h2.buildRstStreamFrame(&rst_buf, request_headers.stream_id, @intFromEnum(h2.ErrorCode.cancel));
     const rst_header = try h2.parseFrameHeader(rst_frame);
-    const action = try runtime.receiveFrame(rst_header, rst_frame[h2.frame_header_size_bytes..]);
+    const action = try runtime.receiveFrame(&test_pending_response_headers_storage, rst_header, rst_frame[h2.frame_header_size_bytes..]);
 
     switch (action) {
         .stream_reset => |reset| {
@@ -1576,7 +1619,7 @@ test "Runtime ignores duplicate upstream RST_STREAM for retired known stream" {
         .stream_id = 0,
     });
     const settings_header = try h2.parseFrameHeader(settings[0..h2.frame_header_size_bytes]);
-    const settings_action = try runtime.receiveFrame(settings_header, settings[h2.frame_header_size_bytes..]);
+    const settings_action = try runtime.receiveFrame(&test_pending_response_headers_storage, settings_header, settings[h2.frame_header_size_bytes..]);
     try std.testing.expect(settings_action == .send_settings_ack);
 
     var header_buf: [h2.header_block_capacity_bytes]u8 = undefined;
@@ -1587,7 +1630,7 @@ test "Runtime ignores duplicate upstream RST_STREAM for retired known stream" {
     const rst_frame = try h2.buildRstStreamFrame(&rst_buf, request_write.stream_id, @intFromEnum(h2.ErrorCode.cancel));
     const rst_header = try h2.parseFrameHeader(rst_frame[0..h2.frame_header_size_bytes]);
 
-    const first_action = try runtime.receiveFrame(rst_header, rst_frame[h2.frame_header_size_bytes..]);
+    const first_action = try runtime.receiveFrame(&test_pending_response_headers_storage, rst_header, rst_frame[h2.frame_header_size_bytes..]);
     switch (first_action) {
         .stream_reset => |reset| {
             try std.testing.expectEqual(request_write.stream_id, reset.stream_id);
@@ -1596,7 +1639,7 @@ test "Runtime ignores duplicate upstream RST_STREAM for retired known stream" {
         else => return error.TestUnexpectedResult,
     }
 
-    const second_action = try runtime.receiveFrame(rst_header, rst_frame[h2.frame_header_size_bytes..]);
+    const second_action = try runtime.receiveFrame(&test_pending_response_headers_storage, rst_header, rst_frame[h2.frame_header_size_bytes..]);
     try std.testing.expect(second_action == .none);
 }
 
@@ -1615,7 +1658,7 @@ test "Runtime tracks GOAWAY bound and rejects new streams above last_stream_id" 
         &[_]u8{},
     );
     const goaway_header = try h2.parseFrameHeader(goaway_frame);
-    const goaway_action = try runtime.receiveFrame(goaway_header, goaway_frame[h2.frame_header_size_bytes..]);
+    const goaway_action = try runtime.receiveFrame(&test_pending_response_headers_storage, goaway_header, goaway_frame[h2.frame_header_size_bytes..]);
 
     switch (goaway_action) {
         .connection_close => |goaway| try std.testing.expectEqual(@as(u32, 1), goaway.last_stream_id),
@@ -1642,13 +1685,13 @@ test "Runtime applies WINDOW_UPDATE increments to send windows" {
     var connection_update_buf: [h2.frame_header_size_bytes + h2.control.window_update_payload_size_bytes]u8 = undefined;
     const connection_update_frame = try h2.buildWindowUpdateFrame(&connection_update_buf, 0, 32);
     const connection_update_header = try h2.parseFrameHeader(connection_update_frame);
-    const connection_action = try runtime.receiveFrame(connection_update_header, connection_update_frame[h2.frame_header_size_bytes..]);
+    const connection_action = try runtime.receiveFrame(&test_pending_response_headers_storage, connection_update_header, connection_update_frame[h2.frame_header_size_bytes..]);
     try std.testing.expect(connection_action == .none);
 
     var stream_update_buf: [h2.frame_header_size_bytes + h2.control.window_update_payload_size_bytes]u8 = undefined;
     const stream_update_frame = try h2.buildWindowUpdateFrame(&stream_update_buf, request_headers.stream_id, 16);
     const stream_update_header = try h2.parseFrameHeader(stream_update_frame);
-    const stream_action = try runtime.receiveFrame(stream_update_header, stream_update_frame[h2.frame_header_size_bytes..]);
+    const stream_action = try runtime.receiveFrame(&test_pending_response_headers_storage, stream_update_header, stream_update_frame[h2.frame_header_size_bytes..]);
     try std.testing.expect(stream_action == .none);
 
     try std.testing.expectEqual(connection_send_before + 32, runtime.state.flow.send_window.available_bytes);
@@ -1667,7 +1710,7 @@ test "Runtime emits ping ACK action and frame" {
         .flags = 0,
         .stream_id = 0,
     };
-    const action = try runtime.receiveFrame(ping_header, &[_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    const action = try runtime.receiveFrame(&test_pending_response_headers_storage, ping_header, &[_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 });
 
     switch (action) {
         .send_ping_ack => |opaque_data| {

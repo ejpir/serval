@@ -38,7 +38,8 @@ COPY ${ZIG_ARCHIVE} /tmp/zig.tar.xz
 COPY integration/toolchains/zig-0.16.0-dev.3039+b490412cd-uring.patch /tmp/zig-uring.patch
 
 RUN tar -C /usr/local -xf /tmp/zig.tar.xz && \
-    if ! grep -q "const BatchNetReceivePending" "/usr/local/zig-x86_64-linux-${ZIG_VERSION}/lib/std/Io/Uring.zig"; then \
+    if ! grep -q "fn posixConnectWithTimeout" "/usr/local/zig-x86_64-linux-${ZIG_VERSION}/lib/std/Io/Threaded.zig" || \
+       ! grep -q "\\.netConnectIp = netConnectIp," "/usr/local/zig-x86_64-linux-${ZIG_VERSION}/lib/std/Io/Uring.zig"; then \
         patch -p0 -d /usr/local < /tmp/zig-uring.patch; \
     fi && \
     ln -s /usr/local/zig-x86_64-linux-${ZIG_VERSION}/zig /usr/local/bin/zig && \

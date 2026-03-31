@@ -237,6 +237,7 @@ pub const ClientError = error{
 pub const H2SessionState = serval_client.H2SessionState;
 pub const H2Runtime = serval_client.H2Runtime;
 pub const H2ClientConnection = serval_client.H2ClientConnection;
+pub const H2ClientConnectionStorage = serval_client.H2ClientConnectionStorage;
 pub const H2UpstreamSessionPool = serval_client.H2UpstreamSessionPool;
 
 // Session state only (settings, windows, stream table)
@@ -246,7 +247,8 @@ var session = try H2SessionState.init();
 var runtime = try H2Runtime.init();
 
 // Socket-owning prior-knowledge h2c driver
-var h2_conn = try H2ClientConnection.init(&socket);
+var h2_storage = H2ClientConnectionStorage{};
+var h2_conn = try H2ClientConnection.init(&socket, .{}, &h2_storage);
 
 // Fixed-capacity per-upstream reusable session pool
 var h2_pool = H2UpstreamSessionPool.init();

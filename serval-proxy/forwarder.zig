@@ -76,6 +76,10 @@ const Connection = pool_mod.Connection;
 const max_stale_retries: u8 = 2;
 const connect_timeout_ns: u64 = 30 * 1000 * 1000 * 1000;
 const h2c_tunnel_poll_timeout_ms: i32 = 1000;
+/// Owner-local scratch/write chunk size for raw proxy h2 DATA forwarding.
+/// This bounds local stack storage and write batching, but does not cap the
+/// configured HTTP/2 `MAX_FRAME_SIZE`; larger configured values are emitted as
+/// multiple smaller DATA frames on this path.
 const h2_proxy_frame_capacity_bytes: u32 = 64 * 1024;
 const h2_proxy_frame_capacity_usize: usize = h2_proxy_frame_capacity_bytes;
 
@@ -124,7 +128,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             assert(@intFromPtr(p) != 0);
             assert(@intFromPtr(t) != 0);
             assert(h2_cfg.max_frame_size_bytes >= serval_h2.settings.min_max_frame_size_bytes);
-            assert(h2_cfg.max_frame_size_bytes <= h2_proxy_frame_capacity_bytes);
+            assert(h2_cfg.max_frame_size_bytes <= serval_h2.settings.max_max_frame_size_bytes);
             assert(h2_cfg.tunnel_idle_timeout_ns > 0);
 
             var dns_resolver: DnsResolver = undefined;
@@ -844,7 +848,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             initial_client_bytes_after_body: []const u8,
         ) tunnel_mod.TunnelStats {
             assert(runtime_cfg.max_frame_size_bytes >= serval_h2.settings.min_max_frame_size_bytes);
-            assert(runtime_cfg.max_frame_size_bytes <= h2_proxy_frame_capacity_bytes);
+            assert(runtime_cfg.max_frame_size_bytes <= serval_h2.settings.max_max_frame_size_bytes);
             assert(runtime_cfg.tunnel_idle_timeout_ns > 0);
             const start_ns = time.monotonicNanos();
             var stats = tunnel_mod.TunnelStats{};
@@ -882,13 +886,13 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
         ) ?tunnel_mod.Termination {
             assert(remaining_body_bytes > 0);
             assert(max_frame_size_bytes >= serval_h2.settings.min_max_frame_size_bytes);
-            assert(max_frame_size_bytes <= h2_proxy_frame_capacity_bytes);
+            assert(max_frame_size_bytes <= serval_h2.settings.max_max_frame_size_bytes);
 
             var body_buf: [h2_proxy_frame_capacity_usize]u8 = undefined;
             var remaining = remaining_body_bytes;
 
             while (remaining > 0) {
-                const to_read: usize = @intCast(@min(remaining, max_frame_size_bytes));
+                const to_read: usize = @intCast(@min(remaining, @as(u64, effectiveProxyH2DataChunkSizeBytes(max_frame_size_bytes))));
                 const bytes_read = client_socket.read(body_buf[0..to_read]) catch |err| {
                     return mapClientReadTermination(err);
                 };
@@ -912,22 +916,30 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             max_frame_size_bytes: u32,
         ) serval_socket.SocketError!void {
             assert(max_frame_size_bytes >= serval_h2.settings.min_max_frame_size_bytes);
-            assert(max_frame_size_bytes <= h2_proxy_frame_capacity_bytes);
+            assert(max_frame_size_bytes <= serval_h2.settings.max_max_frame_size_bytes);
             if (payload.len == 0) {
                 if (end_stream) try sendH2Frame(upstream_socket, .data, serval_h2.flags_end_stream, H2C_UPGRADE_STREAM_ID, &[_]u8{});
                 return;
             }
 
+            const chunk_limit = effectiveProxyH2DataChunkSizeBytes(max_frame_size_bytes);
             var cursor: usize = 0;
             while (cursor < payload.len) {
                 const remaining = payload.len - cursor;
-                const chunk_len: usize = @intCast(@min(remaining, max_frame_size_bytes));
+                const chunk_len: usize = @intCast(@min(remaining, chunk_limit));
                 const chunk = payload[cursor .. cursor + chunk_len];
                 const is_last_chunk = cursor + chunk_len == payload.len;
                 const flags: u8 = if (end_stream and is_last_chunk) serval_h2.flags_end_stream else 0;
                 try sendH2Frame(upstream_socket, .data, flags, H2C_UPGRADE_STREAM_ID, chunk);
                 cursor += chunk_len;
             }
+        }
+
+        fn effectiveProxyH2DataChunkSizeBytes(max_frame_size_bytes: u32) u32 {
+            assert(max_frame_size_bytes >= serval_h2.settings.min_max_frame_size_bytes);
+            assert(max_frame_size_bytes <= serval_h2.settings.max_max_frame_size_bytes);
+
+            return @min(max_frame_size_bytes, h2_proxy_frame_capacity_bytes);
         }
 
         fn sendH2Frame(

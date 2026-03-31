@@ -3462,7 +3462,7 @@ fn terminatedH2ServerMainImpl(config: TerminatedH2ServerConfig) !void {
         .expected_request_payload = config.expected_request_payload,
         .response_payload = config.response_payload,
     };
-    serval.server.servePlainH2Connection(TerminatedH2UnaryHandler, &handler, conn, evented.io(), 1) catch |err| {
+    serval.server.servePlainH2Connection(TerminatedH2UnaryHandler, &handler, .{}, conn, evented.io(), 1) catch |err| {
         // Allow the peer to drain fail-closed control frames (GOAWAY) before close.
         posix.nanosleep(0, 10 * std.time.ns_per_ms);
         return err;
@@ -3664,7 +3664,7 @@ fn terminatedH2ResetServerMainImpl(config: TerminatedH2ResetServerConfig) !void 
         .expected_request_payload = config.expected_request_payload,
         .response_payload = config.response_payload,
     };
-    try serval.server.servePlainH2Connection(TerminatedH2ResetHandler, &handler, conn, evented.io(), 2);
+    try serval.server.servePlainH2Connection(TerminatedH2ResetHandler, &handler, .{}, conn, evented.io(), 2);
 
     var request_msg_buf: [H2_TEST_BUFFER_SIZE_BYTES]u8 = undefined;
     const request_message = try serval_grpc.buildMessage(&request_msg_buf, false, config.expected_request_payload);
@@ -3727,7 +3727,7 @@ fn terminatedH2MultiServerMainImpl(config: TerminatedH2MultiServerConfig) !void 
         .first_response_payload = config.first_response_payload,
         .second_response_payload = config.second_response_payload,
     };
-    try serval.server.servePlainH2Connection(TerminatedH2MultiHandler, &handler, conn, evented.io(), 3);
+    try serval.server.servePlainH2Connection(TerminatedH2MultiHandler, &handler, .{}, conn, evented.io(), 3);
 }
 
 fn startTerminatedH2MultiServer(config: TerminatedH2MultiServerConfig) !std.Thread {
@@ -3759,7 +3759,7 @@ fn terminatedH2ChurnServerMainImpl(config: TerminatedH2ChurnServerConfig) !void 
         .response_payload = config.response_payload,
         .expected_stream_count = config.expected_stream_count,
     };
-    try serval.server.servePlainH2Connection(TerminatedH2ChurnHandler, &handler, conn, evented.io(), 5);
+    try serval.server.servePlainH2Connection(TerminatedH2ChurnHandler, &handler, .{}, conn, evented.io(), 5);
 
     try testing.expectEqual(config.expected_stream_count, handler.completed_stream_count);
 }
@@ -3791,7 +3791,7 @@ fn terminatedH2FlowControlServerMainImpl(config: TerminatedH2FlowControlServerCo
         .path = config.path,
         .expected_total_bytes = config.expected_total_bytes,
     };
-    try serval.server.servePlainH2Connection(TerminatedH2FlowControlHandler, &handler, conn, evented.io(), 4);
+    try serval.server.servePlainH2Connection(TerminatedH2FlowControlHandler, &handler, .{}, conn, evented.io(), 4);
 }
 
 fn startTerminatedH2FlowControlServer(config: TerminatedH2FlowControlServerConfig) !std.Thread {
@@ -6943,7 +6943,8 @@ test "integration: serval-client h2 connection driver interoperates with termina
     defer posix.close(sock);
 
     var socket = serval.Socket.Plain.init_client(sock);
-    var h2_conn = try serval_client.H2ClientConnection.init(&socket);
+    var h2_conn_storage = serval_client.H2ClientConnectionStorage{};
+    var h2_conn = try serval_client.H2ClientConnection.init(&socket, .{}, &h2_conn_storage);
     try h2_conn.completeHandshake();
 
     var authority_buf: [32]u8 = undefined;
@@ -7022,7 +7023,7 @@ test "integration: serval-client h2 upstream session pool reuses connected sessi
     serval_net.DnsResolver.init(&dns_resolver, .{});
     var http_client = serval_client.Client.init(testing.allocator, &dns_resolver, null, false);
 
-    var session_pool = serval_client.H2UpstreamSessionPool.init();
+    var session_pool = serval_client.H2UpstreamSessionPool.init(.{});
     defer session_pool.deinit();
 
     var evented: std.Io.Evented = undefined;
@@ -7083,7 +7084,7 @@ test "integration: serval-proxy h2 stream bridge binds downstream to upstream st
     serval_net.DnsResolver.init(&dns_resolver, .{});
     var http_client = serval_client.Client.init(testing.allocator, &dns_resolver, null, false);
 
-    var session_pool = serval_client.H2UpstreamSessionPool.init();
+    var session_pool = serval_client.H2UpstreamSessionPool.init(.{});
     defer session_pool.deinit();
 
     var bridge = serval.proxy.H2StreamBridge.init(&http_client, &session_pool);

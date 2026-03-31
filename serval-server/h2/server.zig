@@ -527,11 +527,12 @@ fn flushResponseStatePendingData(
     );
     if (allowed_bytes == 0) return false;
 
+    const local_payload_capacity_bytes = effectiveLocalResponseDataChunkSizeBytes(peer_max_frame_size_bytes);
     const small_window_mode = stream_window_bytes <= 3 or conn_window_bytes <= 3;
     const chunk_len = if (small_window_mode)
-        @min(allowed_bytes, response_send_chunk_size_bytes)
+        @min(allowed_bytes, local_payload_capacity_bytes)
     else
-        allowed_bytes;
+        @min(allowed_bytes, local_payload_capacity_bytes);
     const start: usize = @intCast(state.pending_payload_sent);
     const end = start + chunk_len;
     const finished_payload = end == state.pending_payload_len;
@@ -570,6 +571,17 @@ fn responsePeerMaxFrameSizeBytes(runtime: *const runtime_mod.Runtime) usize {
     assert(peer_max_frame_size_bytes >= h2.settings.min_max_frame_size_bytes);
     assert(peer_max_frame_size_bytes <= h2.settings.max_max_frame_size_bytes);
     return @intCast(peer_max_frame_size_bytes);
+}
+
+fn effectiveLocalResponseDataChunkSizeBytes(peer_max_frame_size_bytes: usize) usize {
+    assert(peer_max_frame_size_bytes >= h2.settings.min_max_frame_size_bytes);
+    assert(peer_max_frame_size_bytes <= h2.settings.max_max_frame_size_bytes);
+    assert(response_send_chunk_size_bytes > 0);
+
+    const effective = @min(peer_max_frame_size_bytes, response_send_chunk_size_bytes);
+    assert(effective > 0);
+    assert(effective <= response_send_chunk_size_bytes);
+    return effective;
 }
 
 /// Validate that `Handler` satisfies the HTTP/2 handler contract at comptime.
@@ -1300,7 +1312,8 @@ fn serveConnectionWithInitialBytesOptions(
     assert(@intFromPtr(io_conn) != 0);
     assert(initial_bytes.len <= read_buffer_size_bytes);
 
-    var runtime = try runtime_mod.Runtime.init(runtime_cfg);
+    var pending_request_headers_storage: [h2.header_block_capacity_bytes]u8 = undefined;
+    var runtime = try runtime_mod.Runtime.init(runtime_cfg, &pending_request_headers_storage);
     var response_states = ResponseStateTable{};
     var stream_trackers = StreamTrackerTable{};
     var connection_mutex: Io.Mutex = .init;
@@ -1464,7 +1477,8 @@ pub fn serveUpgradedConnection(
     var plain_read_buf: [config.STREAM_READ_BUFFER_SIZE_BYTES]u8 = undefined;
     var plain_reader = rawStreamForFd(fd).reader(io, &plain_read_buf);
 
-    var runtime = try runtime_mod.Runtime.init(.{});
+    var pending_request_headers_storage: [h2.header_block_capacity_bytes]u8 = undefined;
+    var runtime = try runtime_mod.Runtime.init(.{}, &pending_request_headers_storage);
     var response_states = ResponseStateTable{};
     var stream_trackers = StreamTrackerTable{};
     var connection_mutex: Io.Mutex = .init;
@@ -2038,9 +2052,12 @@ fn processUpgradeBody(
 
     var initial_cursor: usize = 0;
     var remaining: u64 = remaining_body_bytes;
+    const local_data_chunk_size_bytes = effectiveLocalResponseDataChunkSizeBytes(
+        responsePeerMaxFrameSizeBytes(runtime),
+    );
 
     while (initial_cursor < initial_body.len) {
-        const chunk_len = @min(initial_body.len - initial_cursor, h2.frame_payload_capacity_bytes);
+        const chunk_len = @min(initial_body.len - initial_cursor, local_data_chunk_size_bytes);
         const is_last_chunk = (initial_cursor + chunk_len == initial_body.len) and (remaining == 0);
 
         try processUpgradeBodyChunk(
@@ -2062,7 +2079,7 @@ fn processUpgradeBody(
 
     var body_buf: [h2.frame_payload_capacity_bytes]u8 = undefined;
     while (remaining > 0) {
-        const max_read: usize = @intCast(@min(remaining, h2.frame_payload_capacity_bytes));
+        const max_read: usize = @intCast(@min(remaining, local_data_chunk_size_bytes));
         const n = try readSome(io_conn, plain_reader, io, body_buf[0..max_read]);
         if (n == 0) return error.ConnectionClosed;
 
@@ -2746,6 +2763,7 @@ fn appendHeaderBlockFrames(
 fn appendFrame(out: []u8, frame_type: h2.FrameType, flags: u8, stream_id: u32, payload: []const u8) Error![]const u8 {
     assert(out.len >= h2.frame_header_size_bytes);
     assert(payload.len <= h2.frame_payload_capacity_bytes);
+    assert(out.len >= h2.frame_header_size_bytes + payload.len);
 
     const header = try h2.buildFrameHeader(out[0..h2.frame_header_size_bytes], .{
         .length = @intCast(payload.len),
@@ -2828,4 +2846,15 @@ test "mapGoAwayError maps flow-control violations distinctly" {
     try std.testing.expectEqual(h2.ErrorCode.flow_control_error, mapGoAwayError(error.WindowOverflow));
     try std.testing.expectEqual(h2.ErrorCode.flow_control_error, mapGoAwayError(error.StreamFlowControlError));
     try std.testing.expectEqual(h2.ErrorCode.protocol_error, mapGoAwayError(error.InvalidPreface));
+}
+
+test "effectiveLocalResponseDataChunkSizeBytes clamps peer max to local capacity" {
+    try std.testing.expectEqual(
+        response_send_chunk_size_bytes,
+        effectiveLocalResponseDataChunkSizeBytes(h2.settings.max_max_frame_size_bytes),
+    );
+    try std.testing.expectEqual(
+        @as(usize, h2.settings.min_max_frame_size_bytes),
+        effectiveLocalResponseDataChunkSizeBytes(h2.settings.min_max_frame_size_bytes),
+    );
 }

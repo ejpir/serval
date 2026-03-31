@@ -15,6 +15,8 @@ pub const max_settings_per_frame = limits.max_settings_per_frame;
 pub const frame_payload_capacity_bytes = limits.frame_payload_capacity_bytes;
 /// Fixed compile-time header-block storage capacity used by current h2 helpers.
 pub const header_block_capacity_bytes = limits.header_block_capacity_bytes;
+/// Maximum payload length encodable in the HTTP/2 24-bit frame-length field.
+pub const max_frame_payload_size_bytes = frame.max_frame_payload_size_bytes;
 
 /// Namespace for HTTP/2 frame header helpers and related constants.
 /// Re-exports the frame types, error set, flags, and encode/parse functions used by the h2 layer.

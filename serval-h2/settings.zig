@@ -23,10 +23,10 @@ pub const default_header_table_size_bytes: u32 = 4096;
 const unbounded_limit_u32: u32 = std.math.maxInt(u32);
 /// Minimum legal HTTP/2 `MAX_FRAME_SIZE` value in bytes.
 /// This is the protocol lower bound for the `max_frame_size_bytes` setting.
-pub const min_max_frame_size_bytes: u32 = limits.frame_payload_capacity_bytes;
+pub const min_max_frame_size_bytes: u32 = 16_384;
 /// Maximum legal HTTP/2 `MAX_FRAME_SIZE` value in bytes.
 /// This is the protocol upper bound for the `max_frame_size_bytes` setting.
-pub const max_max_frame_size_bytes: u32 = 16_777_215;
+pub const max_max_frame_size_bytes: u32 = frame.max_frame_payload_size_bytes;
 
 /// Named HTTP/2 SETTINGS identifiers defined by the protocol.
 /// These values are encoded on the wire as `u16` identifiers and are used by `Setting.knownId` and validation helpers.
@@ -128,7 +128,7 @@ pub fn parseFrame(
 /// On success, returns the initialized prefix of `out_settings` containing the decoded settings.
 pub fn parsePayload(payload: []const u8, out_settings: []Setting) Error![]const Setting {
     assert(out_settings.len >= limits.max_settings_per_frame or out_settings.len > 0);
-    assert(payload.len <= limits.frame_payload_capacity_bytes);
+    assert(payload.len <= frame.max_frame_payload_size_bytes);
 
     if (!isPayloadLengthValid(payload.len)) return error.InvalidPayloadLength;
 
@@ -240,7 +240,7 @@ fn decodeSettingId(raw_id: u16) ?SettingId {
 }
 
 fn isPayloadLengthValid(payload_len: usize) bool {
-    assert(payload_len <= limits.frame_payload_capacity_bytes);
+    assert(payload_len <= frame.max_frame_payload_size_bytes);
     assert(setting_size_bytes == 6);
     return payload_len % setting_size_bytes == 0;
 }

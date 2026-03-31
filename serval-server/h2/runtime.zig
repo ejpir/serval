@@ -88,7 +88,7 @@ const PendingRequestHeaders = struct {
     end_stream: bool = false,
     continuation_frames: u8 = 0,
     block_len: u32 = 0,
-    block_buf: [h2.header_block_capacity_bytes]u8 = undefined,
+    block_buf: []u8 = &[_]u8{},
 };
 
 const request_body_tracker_capacity: usize = config.H2_MAX_CONCURRENT_STREAMS;
@@ -103,7 +103,8 @@ const RequestBodyTracker = struct {
 const priority_field_size_bytes: usize = 5;
 
 /// Fixed-capacity HTTP/2 server runtime state used to validate inbound frames and build outbound control frames.
-/// The struct owns no sockets or heap allocations; it reuses internal buffers for request decoding and body tracking.
+/// The struct owns no sockets or heap allocations; callers provide the continuation header-block scratch storage explicitly,
+/// while the runtime reuses internal request-decoding and body-tracking state.
 /// Create it with `init()` before calling the frame-processing or frame-writing methods.
 pub const Runtime = struct {
     runtime_cfg: config.H2Config,
@@ -115,17 +116,22 @@ pub const Runtime = struct {
     last_peer_reset_stream_id: u32 = 0,
 
     /// Construct a fresh HTTP/2 server runtime with a new connection state and HPACK decoder.
+    /// `pending_request_headers_storage` is caller-owned scratch space used while assembling HEADERS/CONTINUATION fragments.
     /// Fixed-capacity request-header storage and request-body trackers start in their default internal state.
     /// Returns initialization errors from the underlying connection state constructor.
-    pub fn init(runtime_cfg: config.H2Config) Error!Runtime {
+    pub fn init(runtime_cfg: config.H2Config, pending_request_headers_storage: []u8) Error!Runtime {
         assert(request_body_tracker_capacity > 0);
         assert(h2.request_stable_storage_size_bytes > 0);
         assert(runtime_cfg.max_frame_size_bytes <= h2.frame_payload_capacity_bytes);
-        assert(runtime_cfg.max_header_block_size_bytes <= h2.header_block_capacity_bytes);
+        assert(runtime_cfg.max_header_block_size_bytes <= pending_request_headers_storage.len);
+        assert(pending_request_headers_storage.len <= h2.header_block_capacity_bytes);
         return .{
             .runtime_cfg = runtime_cfg,
             .state = try connection.ConnectionState.init(runtime_cfg),
             .header_decoder = h2.HpackDecoder.init(),
+            .pending_request_headers = .{
+                .block_buf = pending_request_headers_storage,
+            },
         };
     }
 
@@ -442,7 +448,7 @@ fn appendPendingHeaderFragment(self: *Runtime, payload: []const u8) Error!void {
     assert(self.pending_request_headers.active);
 
     const current_len: usize = @intCast(self.pending_request_headers.block_len);
-    if (current_len + payload.len > h2.header_block_capacity_bytes) {
+    if (current_len + payload.len > self.pending_request_headers.block_buf.len) {
         return error.HeadersTooLarge;
     }
 
@@ -483,7 +489,7 @@ fn finishPendingRequestHeaders(self: *Runtime) Error!ReceiveAction {
 
 fn resetPendingRequestHeaders(self: *Runtime) void {
     assert(@intFromPtr(self) != 0);
-    assert(self.pending_request_headers.block_len <= h2.header_block_capacity_bytes);
+    assert(self.pending_request_headers.block_len <= self.pending_request_headers.block_buf.len);
 
     self.pending_request_headers.active = false;
     self.pending_request_headers.stream_id = 0;
@@ -761,13 +767,15 @@ fn appendFrame(out: []u8, frame_type: h2.FrameType, flags: u8, stream_id: u32, p
 }
 
 test "Runtime requires preface before frames" {
-    var runtime = try Runtime.init(.{});
+    var pending_request_headers_storage: [h2.header_block_capacity_bytes]u8 = undefined;
+    var runtime = try Runtime.init(.{}, &pending_request_headers_storage);
     const header = h2.FrameHeader{ .length = 0, .frame_type = .settings, .flags = 0, .stream_id = 0 };
     try std.testing.expectError(error.PrefaceNotReceived, runtime.receiveFrame(header, &[_]u8{}));
 }
 
 test "Runtime writes initial settings and requires peer settings before headers" {
-    var runtime = try Runtime.init(.{});
+    var pending_request_headers_storage: [h2.header_block_capacity_bytes]u8 = undefined;
+    var runtime = try Runtime.init(.{}, &pending_request_headers_storage);
     var settings_buf: [initial_settings_frame_buffer_size_bytes]u8 = undefined;
     const encoded = try runtime.writeInitialSettingsFrame(&settings_buf);
     const header = try h2.parseFrameHeader(encoded);
@@ -790,7 +798,8 @@ test "Runtime writes initial settings and requires peer settings before headers"
 }
 
 test "Runtime decodes request headers and data on one stream" {
-    var runtime = try Runtime.init(.{});
+    var pending_request_headers_storage: [h2.header_block_capacity_bytes]u8 = undefined;
+    var runtime = try Runtime.init(.{}, &pending_request_headers_storage);
     var settings_out: [initial_settings_frame_buffer_size_bytes]u8 = undefined;
     _ = try runtime.writeInitialSettingsFrame(&settings_out);
     try runtime.receiveClientPreface();
@@ -842,7 +851,8 @@ test "Runtime decodes request headers and data on one stream" {
 }
 
 test "Runtime ignores PRIORITY frame after initial settings" {
-    var runtime = try Runtime.init(.{});
+    var pending_request_headers_storage: [h2.header_block_capacity_bytes]u8 = undefined;
+    var runtime = try Runtime.init(.{}, &pending_request_headers_storage);
     var settings_out: [initial_settings_frame_buffer_size_bytes]u8 = undefined;
     _ = try runtime.writeInitialSettingsFrame(&settings_out);
     try runtime.receiveClientPreface();
@@ -868,7 +878,8 @@ test "Runtime ignores PRIORITY frame after initial settings" {
 }
 
 test "Runtime decodes HEADERS with PRIORITY flag" {
-    var runtime = try Runtime.init(.{});
+    var pending_request_headers_storage: [h2.header_block_capacity_bytes]u8 = undefined;
+    var runtime = try Runtime.init(.{}, &pending_request_headers_storage);
     var settings_out: [initial_settings_frame_buffer_size_bytes]u8 = undefined;
     _ = try runtime.writeInitialSettingsFrame(&settings_out);
     try runtime.receiveClientPreface();
@@ -908,7 +919,8 @@ test "Runtime decodes HEADERS with PRIORITY flag" {
 }
 
 test "Runtime decodes padded HEADERS" {
-    var runtime = try Runtime.init(.{});
+    var pending_request_headers_storage: [h2.header_block_capacity_bytes]u8 = undefined;
+    var runtime = try Runtime.init(.{}, &pending_request_headers_storage);
     var settings_out: [initial_settings_frame_buffer_size_bytes]u8 = undefined;
     _ = try runtime.writeInitialSettingsFrame(&settings_out);
     try runtime.receiveClientPreface();
@@ -946,7 +958,8 @@ test "Runtime decodes padded HEADERS" {
 }
 
 test "Runtime rejects self-dependent PRIORITY as stream protocol error" {
-    var runtime = try Runtime.init(.{});
+    var pending_request_headers_storage: [h2.header_block_capacity_bytes]u8 = undefined;
+    var runtime = try Runtime.init(.{}, &pending_request_headers_storage);
     var settings_out: [initial_settings_frame_buffer_size_bytes]u8 = undefined;
     _ = try runtime.writeInitialSettingsFrame(&settings_out);
     try runtime.receiveClientPreface();
@@ -966,7 +979,8 @@ test "Runtime rejects self-dependent PRIORITY as stream protocol error" {
 }
 
 test "Runtime rejects idle RST_STREAM as connection protocol error" {
-    var runtime = try Runtime.init(.{});
+    var pending_request_headers_storage: [h2.header_block_capacity_bytes]u8 = undefined;
+    var runtime = try Runtime.init(.{}, &pending_request_headers_storage);
     var settings_out: [initial_settings_frame_buffer_size_bytes]u8 = undefined;
     _ = try runtime.writeInitialSettingsFrame(&settings_out);
     try runtime.receiveClientPreface();
@@ -985,7 +999,8 @@ test "Runtime rejects idle RST_STREAM as connection protocol error" {
 }
 
 test "Runtime reassembles request HEADERS with CONTINUATION" {
-    var runtime = try Runtime.init(.{});
+    var pending_request_headers_storage: [h2.header_block_capacity_bytes]u8 = undefined;
+    var runtime = try Runtime.init(.{}, &pending_request_headers_storage);
     var settings_out: [initial_settings_frame_buffer_size_bytes]u8 = undefined;
     _ = try runtime.writeInitialSettingsFrame(&settings_out);
     try runtime.receiveClientPreface();
@@ -1041,7 +1056,8 @@ test "Runtime reassembles request HEADERS with CONTINUATION" {
 }
 
 test "Runtime rejects interleaved frame while waiting for CONTINUATION" {
-    var runtime = try Runtime.init(.{});
+    var pending_request_headers_storage: [h2.header_block_capacity_bytes]u8 = undefined;
+    var runtime = try Runtime.init(.{}, &pending_request_headers_storage);
     var settings_out: [initial_settings_frame_buffer_size_bytes]u8 = undefined;
     _ = try runtime.writeInitialSettingsFrame(&settings_out);
     try runtime.receiveClientPreface();
@@ -1063,7 +1079,8 @@ test "Runtime rejects interleaved frame while waiting for CONTINUATION" {
 }
 
 test "Runtime rejects unexpected CONTINUATION without pending headers" {
-    var runtime = try Runtime.init(.{});
+    var pending_request_headers_storage: [h2.header_block_capacity_bytes]u8 = undefined;
+    var runtime = try Runtime.init(.{}, &pending_request_headers_storage);
     var settings_out: [initial_settings_frame_buffer_size_bytes]u8 = undefined;
     _ = try runtime.writeInitialSettingsFrame(&settings_out);
     try runtime.receiveClientPreface();
@@ -1091,7 +1108,8 @@ test "Runtime rejects unexpected CONTINUATION without pending headers" {
 }
 
 test "Runtime rejects CONTINUATION stream mismatch" {
-    var runtime = try Runtime.init(.{});
+    var pending_request_headers_storage: [h2.header_block_capacity_bytes]u8 = undefined;
+    var runtime = try Runtime.init(.{}, &pending_request_headers_storage);
     var settings_out: [initial_settings_frame_buffer_size_bytes]u8 = undefined;
     _ = try runtime.writeInitialSettingsFrame(&settings_out);
     try runtime.receiveClientPreface();
@@ -1122,7 +1140,8 @@ test "Runtime rejects CONTINUATION stream mismatch" {
 }
 
 test "Runtime rejects CONTINUATION with invalid flags" {
-    var runtime = try Runtime.init(.{});
+    var pending_request_headers_storage: [h2.header_block_capacity_bytes]u8 = undefined;
+    var runtime = try Runtime.init(.{}, &pending_request_headers_storage);
     var settings_out: [initial_settings_frame_buffer_size_bytes]u8 = undefined;
     _ = try runtime.writeInitialSettingsFrame(&settings_out);
     try runtime.receiveClientPreface();
@@ -1158,7 +1177,8 @@ test "Runtime rejects CONTINUATION with invalid flags" {
 }
 
 test "Runtime enforces continuation frame bound" {
-    var runtime = try Runtime.init(.{});
+    var pending_request_headers_storage: [h2.header_block_capacity_bytes]u8 = undefined;
+    var runtime = try Runtime.init(.{}, &pending_request_headers_storage);
     var settings_out: [initial_settings_frame_buffer_size_bytes]u8 = undefined;
     _ = try runtime.writeInitialSettingsFrame(&settings_out);
     try runtime.receiveClientPreface();
@@ -1192,7 +1212,8 @@ test "Runtime enforces continuation frame bound" {
 }
 
 test "Runtime emits ping acknowledgements" {
-    var runtime = try Runtime.init(.{});
+    var pending_request_headers_storage: [h2.header_block_capacity_bytes]u8 = undefined;
+    var runtime = try Runtime.init(.{}, &pending_request_headers_storage);
     try runtime.receiveClientPreface();
     const settings_header = h2.FrameHeader{ .length = 0, .frame_type = .settings, .flags = 0, .stream_id = 0 };
     _ = try runtime.receiveFrame(settings_header, &[_]u8{});
@@ -1217,7 +1238,8 @@ test "Runtime emits ping acknowledgements" {
 }
 
 test "Runtime applies WINDOW_UPDATE and RST_STREAM" {
-    var runtime = try Runtime.init(.{});
+    var pending_request_headers_storage: [h2.header_block_capacity_bytes]u8 = undefined;
+    var runtime = try Runtime.init(.{}, &pending_request_headers_storage);
     try runtime.receiveClientPreface();
     const settings_header = h2.FrameHeader{ .length = 0, .frame_type = .settings, .flags = 0, .stream_id = 0 };
     _ = try runtime.receiveFrame(settings_header, &[_]u8{});
@@ -1249,7 +1271,8 @@ test "Runtime applies WINDOW_UPDATE and RST_STREAM" {
 }
 
 test "Runtime classifies stream DATA window underflow as StreamFlowControlError" {
-    var runtime = try Runtime.init(.{});
+    var pending_request_headers_storage: [h2.header_block_capacity_bytes]u8 = undefined;
+    var runtime = try Runtime.init(.{}, &pending_request_headers_storage);
     try runtime.receiveClientPreface();
     const settings_header = h2.FrameHeader{ .length = 0, .frame_type = .settings, .flags = 0, .stream_id = 0 };
     _ = try runtime.receiveFrame(settings_header, &[_]u8{});
@@ -1280,7 +1303,8 @@ test "Runtime classifies stream DATA window underflow as StreamFlowControlError"
 }
 
 test "Runtime randomized frame sequence preserves bounded invariants" {
-    var runtime = try Runtime.init(.{});
+    var pending_request_headers_storage: [h2.header_block_capacity_bytes]u8 = undefined;
+    var runtime = try Runtime.init(.{}, &pending_request_headers_storage);
     try runtime.receiveClientPreface();
     const settings_header = h2.FrameHeader{ .length = 0, .frame_type = .settings, .flags = 0, .stream_id = 0 };
     _ = try runtime.receiveFrame(settings_header, &[_]u8{});
@@ -1335,7 +1359,8 @@ test "Runtime randomized frame sequence preserves bounded invariants" {
 }
 
 test "Runtime tracks peer GOAWAY and rejects higher streams" {
-    var runtime = try Runtime.init(.{});
+    var pending_request_headers_storage: [h2.header_block_capacity_bytes]u8 = undefined;
+    var runtime = try Runtime.init(.{}, &pending_request_headers_storage);
     try runtime.receiveClientPreface();
     const settings_header = h2.FrameHeader{ .length = 0, .frame_type = .settings, .flags = 0, .stream_id = 0 };
     _ = try runtime.receiveFrame(settings_header, &[_]u8{});
@@ -1360,7 +1385,8 @@ test "Runtime tracks peer GOAWAY and rejects higher streams" {
 }
 
 test "Runtime request-body tracker insertion fails closed when capacity is exhausted" {
-    var runtime = try Runtime.init(.{});
+    var pending_request_headers_storage: [h2.header_block_capacity_bytes]u8 = undefined;
+    var runtime = try Runtime.init(.{}, &pending_request_headers_storage);
     var request = types.Request{
         .method = .POST,
         .path = "/tracker-capacity",

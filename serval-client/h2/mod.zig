@@ -46,6 +46,9 @@ pub const connection = @import("connection.zig");
 /// The socket is borrowed; the caller keeps ownership and must keep it valid for the life of the connection.
 /// Use this type to send frames, drive handshakes, and receive peer actions.
 pub const ClientConnection = connection.ClientConnection;
+/// Caller-owned fixed storage required by `ClientConnection`.
+/// Keep the storage alive for at least as long as the associated connection.
+pub const ConnectionStorage = connection.ConnectionStorage;
 /// Error set returned by the HTTP/2 client connection driver.
 /// Covers connection setup, frame I/O, protocol sequencing, and flow-control failures.
 /// Use this alias when propagating errors from `ClientConnection` methods.

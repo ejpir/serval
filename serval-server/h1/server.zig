@@ -867,7 +867,8 @@ pub fn Server(
             assert(@intFromPtr(io) != 0);
             assert(stream.socket.handle >= 0);
 
-            var runtime = h2_runtime.Runtime.init(runtime_cfg) catch return false;
+            var pending_request_headers_storage: [serval_h2.header_block_capacity_bytes]u8 = undefined;
+            var runtime = h2_runtime.Runtime.init(runtime_cfg, &pending_request_headers_storage) catch return false;
             var settings_buf: [h2_runtime.initial_settings_frame_buffer_size_bytes]u8 = undefined;
             const settings_frame = runtime.writeInitialSettingsFrame(&settings_buf) catch return false;
             connectionWrite(maybe_tls, io, stream, settings_frame) catch return false;
