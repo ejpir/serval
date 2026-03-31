@@ -192,6 +192,7 @@ const ResponseStateTable = struct {
 const ConnectionStorage = struct {
     pending_request_headers_storage: [h2.header_block_capacity_bytes]u8 = undefined,
     recv_buf: [read_buffer_size_bytes]u8 = undefined,
+    upgrade_body_buf: [h2.frame_payload_capacity_bytes]u8 = undefined,
 };
 
 const StreamTracker = struct {
@@ -691,10 +692,11 @@ fn readInboundFrame(
     io: Io,
     connection_id: u64,
     frame_count: u32,
-    recv_buf: *[read_buffer_size_bytes]u8,
+    recv_buf: []u8,
     buffer_len: *usize,
 ) Error!?InboundFrame {
     assert(@intFromPtr(io_conn) != 0);
+    assert(recv_buf.len == read_buffer_size_bytes);
     assert(buffer_len.* <= recv_buf.len);
 
     log.debug("server: conn={d} h2 waiting for frame frame_count={d} buffered_bytes={d}", .{
@@ -734,11 +736,12 @@ fn processInboundFrame(
     runtime: *runtime_mod.Runtime,
     response_states: *ResponseStateTable,
     stream_trackers: *StreamTrackerTable,
-    recv_buf: *[read_buffer_size_bytes]u8,
+    recv_buf: []u8,
     buffer_len: *usize,
     frame: InboundFrame,
 ) Error!bool {
     assert(@intFromPtr(handler) != 0);
+    assert(recv_buf.len == read_buffer_size_bytes);
     assert(frame.frame_len <= recv_buf.len);
 
     const action = runtime.receiveFrame(frame.header, frame.payload) catch |err| {
@@ -805,11 +808,12 @@ fn runConnectionFrameLoop(
     response_states: *ResponseStateTable,
     stream_trackers: *StreamTrackerTable,
     connection_mutex: *Io.Mutex,
-    recv_buf: *[read_buffer_size_bytes]u8,
+    recv_buf: []u8,
     buffer_len: *usize,
 ) Error!void {
     assert(@intFromPtr(handler) != 0);
     assert(@intFromPtr(connection_mutex) != 0);
+    assert(recv_buf.len == read_buffer_size_bytes);
 
     var frame_count: u32 = 0;
     while (frame_count < config.H2_SERVER_MAX_FRAME_COUNT) : (frame_count += 1) {
@@ -897,12 +901,13 @@ fn consumeClientPrefaceFromBuffer(
     maybe_plain_reader: ?*Io.net.Stream.Reader,
     io: Io,
     runtime: *runtime_mod.Runtime,
-    recv_buf: *[read_buffer_size_bytes]u8,
+    recv_buf: []u8,
     buffer_len: *usize,
     connection_id: u64,
 ) Error!void {
     assert(@intFromPtr(io_conn) != 0);
     assert(@intFromPtr(runtime) != 0);
+    assert(recv_buf.len == read_buffer_size_bytes);
     assert(buffer_len.* <= recv_buf.len);
 
     try fillBuffer(io_conn, maybe_plain_reader, io, recv_buf, buffer_len, h2.client_connection_preface.len);
@@ -912,7 +917,7 @@ fn consumeClientPrefaceFromBuffer(
     log.debug("server: conn={d} h2 consumed client preface buffered_bytes={d}", .{ connection_id, buffer_len.* });
 }
 
-fn initReceiveBuffer(recv_buf: *[read_buffer_size_bytes]u8, buffer_len: *usize, initial_bytes: []const u8) void {
+fn initReceiveBuffer(recv_buf: []u8, buffer_len: *usize, initial_bytes: []const u8) void {
     assert(initial_bytes.len <= recv_buf.len);
     assert(@intFromPtr(buffer_len) != 0);
 
@@ -933,7 +938,7 @@ fn initConnectionStorage(
     assert(initial_bytes.len <= storage.recv_buf.len);
     assert(runtime_cfg.max_header_block_size_bytes <= storage.pending_request_headers_storage.len);
 
-    initReceiveBuffer(&storage.recv_buf, buffer_len, initial_bytes);
+    initReceiveBuffer(storage.recv_buf[0..], buffer_len, initial_bytes);
 
     assert(buffer_len.* == initial_bytes.len);
     assert(buffer_len.* <= storage.recv_buf.len);
@@ -1008,9 +1013,11 @@ fn processUpgradeSyntheticRequestAndBody(
     settings_payload: []const u8,
     initial_body: []const u8,
     remaining_body_bytes: u64,
+    body_buf: []u8,
 ) Error!void {
     assert(@intFromPtr(handler) != 0);
     assert(@intFromPtr(request) != 0);
+    assert(body_buf.len == h2.frame_payload_capacity_bytes);
 
     const total_body_bytes: u64 = @as(u64, @intCast(initial_body.len)) + remaining_body_bytes;
     try applyUpgradeSyntheticHeaders(
@@ -1038,6 +1045,7 @@ fn processUpgradeSyntheticRequestAndBody(
         stream_trackers,
         initial_body,
         remaining_body_bytes,
+        body_buf,
     );
 }
 
@@ -1373,7 +1381,7 @@ fn serveConnectionWithInitialBytesOptions(
         maybe_plain_reader,
         io,
         &runtime,
-        &connection_storage.recv_buf,
+        connection_storage.recv_buf[0..],
         &buffer_len,
         connection_id,
     );
@@ -1401,7 +1409,7 @@ fn serveConnectionWithInitialBytesOptions(
         &response_states,
         &stream_trackers,
         &connection_mutex,
-        &connection_storage.recv_buf,
+        connection_storage.recv_buf[0..],
         &buffer_len,
     );
 }
@@ -1592,6 +1600,7 @@ fn runUpgradedBodyAndFrameLoop(
         settings_payload,
         initial_body,
         remaining_body_bytes,
+        connection_storage.upgrade_body_buf[0..],
     ) catch |err| {
         closeTrackedStreamsForFatalError(Handler, handler, connection_id, stream_trackers, err);
         return err;
@@ -1599,7 +1608,7 @@ fn runUpgradedBodyAndFrameLoop(
 
     var buffer_len: usize = undefined;
     initConnectionStorage(runtime_cfg, connection_storage, &buffer_len, initial_client_h2_bytes);
-    consumeOptionalUpgradeClientPreface(io_conn, plain_reader, io, &connection_storage.recv_buf, &buffer_len) catch |err| {
+    consumeOptionalUpgradeClientPreface(io_conn, plain_reader, io, connection_storage.recv_buf[0..], &buffer_len) catch |err| {
         try sendRuntimeErrorGoAway(runtime, io_conn, io, 0, err);
         closeTrackedStreamsForFatalError(Handler, handler, connection_id, stream_trackers, err);
         return err;
@@ -1615,7 +1624,7 @@ fn runUpgradedBodyAndFrameLoop(
         response_states,
         stream_trackers,
         connection_mutex,
-        &connection_storage.recv_buf,
+        connection_storage.recv_buf[0..],
         &buffer_len,
     );
 }
@@ -2086,10 +2095,12 @@ fn processUpgradeBody(
     stream_trackers: *StreamTrackerTable,
     initial_body: []const u8,
     remaining_body_bytes: u64,
+    body_buf: []u8,
 ) Error!void {
     assert(@intFromPtr(handler) != 0);
     assert(@intFromPtr(io_conn) != 0);
     assert(@intFromPtr(plain_reader) != 0);
+    assert(body_buf.len == h2.frame_payload_capacity_bytes);
 
     var initial_cursor: usize = 0;
     var remaining: u64 = remaining_body_bytes;
@@ -2118,7 +2129,6 @@ fn processUpgradeBody(
 
     if (remaining == 0) return;
 
-    var body_buf: [h2.frame_payload_capacity_bytes]u8 = undefined;
     while (remaining > 0) {
         const max_read: usize = @intCast(@min(remaining, local_data_chunk_size_bytes));
         const n = try readSome(io_conn, plain_reader, io, body_buf[0..max_read]);
@@ -2377,10 +2387,11 @@ fn consumeOptionalUpgradeClientPreface(
     io_conn: *ConnectionIo,
     maybe_plain_reader: ?*Io.net.Stream.Reader,
     io: Io,
-    recv_buf: *[read_buffer_size_bytes]u8,
+    recv_buf: []u8,
     buffer_len: *usize,
 ) Error!void {
     assert(@intFromPtr(io_conn) != 0);
+    assert(recv_buf.len == read_buffer_size_bytes);
     assert(buffer_len.* <= recv_buf.len);
 
     if (buffer_len.* == 0) {
@@ -2404,11 +2415,11 @@ fn ensureFrame(
     io_conn: *ConnectionIo,
     maybe_plain_reader: ?*Io.net.Stream.Reader,
     io: Io,
-    recv_buf: *[read_buffer_size_bytes]u8,
+    recv_buf: []u8,
     buffer_len: *usize,
 ) Error!bool {
     assert(@intFromPtr(io_conn) != 0);
-    assert(@intFromPtr(recv_buf) != 0);
+    assert(recv_buf.len == read_buffer_size_bytes);
 
     if (buffer_len.* == 0) {
         const n = try readIntoBuffer(io_conn, maybe_plain_reader, io, recv_buf, buffer_len);
@@ -2426,7 +2437,7 @@ fn fillBuffer(
     io_conn: *ConnectionIo,
     maybe_plain_reader: ?*Io.net.Stream.Reader,
     io: Io,
-    recv_buf: *[read_buffer_size_bytes]u8,
+    recv_buf: []u8,
     buffer_len: *usize,
     needed_len: usize,
 ) Error!void {
@@ -2446,7 +2457,7 @@ fn readIntoBuffer(
     io_conn: *ConnectionIo,
     maybe_plain_reader: ?*Io.net.Stream.Reader,
     io: Io,
-    recv_buf: *[read_buffer_size_bytes]u8,
+    recv_buf: []u8,
     buffer_len: *usize,
 ) Error!usize {
     assert(@intFromPtr(io_conn) != 0);
@@ -2457,7 +2468,7 @@ fn readIntoBuffer(
     return n;
 }
 
-fn discardPrefix(recv_buf: *[read_buffer_size_bytes]u8, buffer_len: *usize, prefix_len: usize) void {
+fn discardPrefix(recv_buf: []u8, buffer_len: *usize, prefix_len: usize) void {
     assert(prefix_len <= buffer_len.*);
     assert(buffer_len.* <= recv_buf.len);
 
