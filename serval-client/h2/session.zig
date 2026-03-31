@@ -8,6 +8,7 @@ const assert = std.debug.assert;
 
 const config = @import("serval-core").config;
 const h2 = @import("serval-h2");
+const default_h2_cfg = config.H2Config{};
 
 /// Errors returned by session state transitions and peer frame handling.
 /// These cover invalid preface sequencing, unexpected SETTINGS acknowledgements, stream-limit failures, and connection shutdown.
@@ -24,11 +25,12 @@ pub const Error = error{
 /// It tracks preface and GOAWAY state, peer and local settings, stream allocation, and connection-level flow control.
 /// Instances are intended to be initialized with `init` and then mutated in place by the session helpers.
 pub const SessionState = struct {
+    runtime_cfg: config.H2Config,
     preface_sent: bool = false,
     next_local_stream_id: u32 = 1,
     peer_settings_received: bool = false,
     peer_settings: h2.Settings = .{},
-    local_settings: h2.Settings = defaultLocalSettings(),
+    local_settings: h2.Settings,
     peer_settings_ack_pending: bool = false,
     local_settings_ack_pending: bool = false,
     goaway_received: bool = false,
@@ -41,11 +43,15 @@ pub const SessionState = struct {
     /// Initializes a new session state with connection flow control sized from the configured HTTP/2 connection window.
     /// The configuration window must be positive and no larger than the configured maximum window size.
     /// Returns a fully initialized `SessionState` whose other fields use their default values.
-    pub fn init() Error!SessionState {
-        assert(config.H2_CONNECTION_WINDOW_SIZE_BYTES > 0);
-        assert(config.H2_CONNECTION_WINDOW_SIZE_BYTES <= config.H2_MAX_WINDOW_SIZE_BYTES);
-        const flow = try h2.ConnectionFlowControl.init(config.H2_CONNECTION_WINDOW_SIZE_BYTES);
-        return .{ .flow = flow };
+    pub fn init(runtime_cfg: config.H2Config) Error!SessionState {
+        assert(runtime_cfg.connection_window_size_bytes > 0);
+        assert(runtime_cfg.connection_window_size_bytes <= config.H2_MAX_WINDOW_SIZE_BYTES);
+        const flow = try h2.ConnectionFlowControl.init(runtime_cfg.connection_window_size_bytes);
+        return .{
+            .runtime_cfg = runtime_cfg,
+            .local_settings = defaultLocalSettings(runtime_cfg),
+            .flow = flow,
+        };
     }
 
     /// Records that the client connection preface has been sent.
@@ -273,15 +279,15 @@ pub const SessionState = struct {
     }
 };
 
-fn defaultLocalSettings() h2.Settings {
-    assert(config.H2_MAX_CONCURRENT_STREAMS > 0);
-    assert(config.H2_INITIAL_WINDOW_SIZE_BYTES <= config.H2_MAX_WINDOW_SIZE_BYTES);
+fn defaultLocalSettings(runtime_cfg: config.H2Config) h2.Settings {
+    assert(runtime_cfg.max_concurrent_streams > 0);
+    assert(runtime_cfg.initial_window_size_bytes <= config.H2_MAX_WINDOW_SIZE_BYTES);
 
     const defaults: h2.Settings = .{
         .enable_push = false,
-        .max_concurrent_streams = config.H2_MAX_CONCURRENT_STREAMS,
-        .initial_window_size_bytes = config.H2_INITIAL_WINDOW_SIZE_BYTES,
-        .max_frame_size_bytes = config.H2_MAX_FRAME_SIZE_BYTES,
+        .max_concurrent_streams = runtime_cfg.max_concurrent_streams,
+        .initial_window_size_bytes = runtime_cfg.initial_window_size_bytes,
+        .max_frame_size_bytes = runtime_cfg.max_frame_size_bytes,
     };
     assert(defaults.max_frame_size_bytes >= h2.settings.min_max_frame_size_bytes);
     return defaults;
@@ -296,19 +302,19 @@ fn peerConcurrentStreamLimitReached(self: *const SessionState) bool {
 }
 
 test "SessionState marks preface only once" {
-    var state = try SessionState.init();
+    var state = try SessionState.init(.{});
     try state.markPrefaceSent();
     try std.testing.expect(state.local_settings_ack_pending);
     try std.testing.expectError(error.PrefaceAlreadySent, state.markPrefaceSent());
 }
 
 test "SessionState rejects stream open before preface" {
-    var state = try SessionState.init();
+    var state = try SessionState.init(.{});
     try std.testing.expectError(error.PrefaceNotSent, state.openRequestStream(false));
 }
 
 test "SessionState opens odd-numbered local streams" {
-    var state = try SessionState.init();
+    var state = try SessionState.init(.{});
     try state.markPrefaceSent();
     state.peer_settings.initial_window_size_bytes = 4096;
     state.local_settings.initial_window_size_bytes = 2048;
@@ -336,7 +342,7 @@ test "SessionState applies peer settings and marks ack pending" {
         .stream_id = 0,
     };
 
-    var state = try SessionState.init();
+    var state = try SessionState.init(.{});
     try state.receivePeerSettings(header, built);
 
     try std.testing.expectEqual(@as(u32, 32), state.peer_settings.max_concurrent_streams);
@@ -353,7 +359,7 @@ test "SessionState validates ack ordering" {
         .stream_id = 0,
     };
 
-    var state = try SessionState.init();
+    var state = try SessionState.init(.{});
     try std.testing.expectError(error.UnexpectedSettingsAck, state.receivePeerSettings(ack_header, &[_]u8{}));
     try state.markPrefaceSent();
     try state.receivePeerSettings(ack_header, &[_]u8{});
@@ -361,7 +367,7 @@ test "SessionState validates ack ordering" {
 }
 
 test "SessionState enforces peer max concurrent streams" {
-    var state = try SessionState.init();
+    var state = try SessionState.init(.{});
     try state.markPrefaceSent();
     state.peer_settings.max_concurrent_streams = 1;
 
@@ -370,7 +376,7 @@ test "SessionState enforces peer max concurrent streams" {
 }
 
 test "SessionState GOAWAY bounds new streams" {
-    var state = try SessionState.init();
+    var state = try SessionState.init(.{});
     try state.markPrefaceSent();
 
     _ = try state.openRequestStream(false);
@@ -380,7 +386,7 @@ test "SessionState GOAWAY bounds new streams" {
 }
 
 test "SessionState window helpers delegate to flow control" {
-    var state = try SessionState.init();
+    var state = try SessionState.init(.{});
     try state.markPrefaceSent();
     _ = try state.openRequestStream(false);
 
@@ -393,8 +399,8 @@ test "SessionState window helpers delegate to flow control" {
     try state.incrementRecvWindow(1);
     try state.incrementStreamRecvWindow(1, 3);
 
-    try std.testing.expectEqual(config.H2_CONNECTION_WINDOW_SIZE_BYTES, state.flow.send_window.available_bytes);
-    try std.testing.expectEqual(config.H2_CONNECTION_WINDOW_SIZE_BYTES, state.flow.recv_window.available_bytes);
-    try std.testing.expectEqual(config.H2_INITIAL_WINDOW_SIZE_BYTES + 1, state.getStream(1).?.send_window.available_bytes);
-    try std.testing.expectEqual(config.H2_INITIAL_WINDOW_SIZE_BYTES + 1, state.getStream(1).?.recv_window.available_bytes);
+    try std.testing.expectEqual(default_h2_cfg.connection_window_size_bytes, state.flow.send_window.available_bytes);
+    try std.testing.expectEqual(default_h2_cfg.connection_window_size_bytes, state.flow.recv_window.available_bytes);
+    try std.testing.expectEqual(default_h2_cfg.initial_window_size_bytes + 1, state.getStream(1).?.send_window.available_bytes);
+    try std.testing.expectEqual(default_h2_cfg.initial_window_size_bytes + 1, state.getStream(1).?.recv_window.available_bytes);
 }

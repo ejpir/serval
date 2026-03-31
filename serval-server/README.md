@@ -6,6 +6,12 @@ Provides generic HTTP server infrastructure with protocol-specific implementatio
 
 The terminated `h2/server.zig` path receives `std.Io` from downstream h2 entry points and keeps plain h2 transport on `std.Io` stream reader/writer operations so connection fibers yield naturally under backpressure and cancellation. TLS h2 reads use readiness-yield + retry rather than blocking `SSL_read()` directly, and h1 plain-socket reads stay on `std.Io` for consistent fiber behavior. Downstream terminated h2 connections use the long-lived `serval-core.config.H2_SERVER_IDLE_TIMEOUT_NS` readiness bound instead of a hardcoded 30 second stall window, so quiet mobile gRPC clients are not forced to reconnect during normal idle periods. When this readiness timeout is hit, the affected terminated h2 TLS connection is closed fail-closed instead of waiting indefinitely.
 
+Runtime protocol policy now comes from nested server config sections rather than ad-hoc top-level constants:
+
+- `Config.h2` controls deploy-time HTTP/2 settings such as advertised frame/window limits and downstream idle timeouts.
+- `Config.websocket` controls native WebSocket session limits such as message size, fragment count, and close/idle timeouts.
+- Fixed compile-time capacities still stay in owner modules or shared core invariants; runtime settings are validated against those bounds.
+
 ## Module Structure
 
 ```

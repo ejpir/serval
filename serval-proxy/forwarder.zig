@@ -75,6 +75,8 @@ const Method = types.Method;
 const Connection = pool_mod.Connection;
 const max_stale_retries: u8 = 2;
 const connect_timeout_ns: u64 = 30 * 1000 * 1000 * 1000;
+const h2_proxy_frame_capacity_bytes: u32 = 64 * 1024;
+const h2_proxy_frame_capacity_usize: usize = h2_proxy_frame_capacity_bytes;
 
 // =============================================================================
 // Forwarder
@@ -95,6 +97,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
         pool: *Pool,
         tracer: *Tracer,
         verify_upstream_tls: bool,
+        h2_cfg: config.H2Config,
         /// Optional SSL context for upstream TLS connections.
         /// Caller provides and owns lifecycle; null means no TLS to upstreams.
         /// TigerStyle: Explicit ownership, caller manages context.
@@ -113,11 +116,15 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             t: *Tracer,
             verify_upstream_tls: bool,
             client_ctx: ?*ssl.SSL_CTX,
+            h2_cfg: config.H2Config,
             dns_config: DnsConfig,
         ) Self {
             // S1: preconditions - pointers must be valid
             assert(@intFromPtr(p) != 0);
             assert(@intFromPtr(t) != 0);
+            assert(h2_cfg.max_frame_size_bytes >= config.H2_MAX_FRAME_SIZE_BYTES);
+            assert(h2_cfg.max_frame_size_bytes <= h2_proxy_frame_capacity_bytes);
+            assert(h2_cfg.tunnel_idle_timeout_ns > 0);
 
             var dns_resolver: DnsResolver = undefined;
             DnsResolver.init(&dns_resolver, dns_config);
@@ -126,6 +133,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
                 .pool = p,
                 .tracer = t,
                 .verify_upstream_tls = verify_upstream_tls,
+                .h2_cfg = h2_cfg,
                 .client_ctx = client_ctx,
                 .dns_resolver = dns_resolver,
             };
@@ -675,7 +683,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
                 &upstream_socket,
                 initial_client_bytes,
                 &[_]u8{},
-                config.H2C_TUNNEL_IDLE_TIMEOUT_NS,
+                self.h2_cfg.tunnel_idle_timeout_ns,
                 config.H2C_TUNNEL_POLL_TIMEOUT_MS,
             );
             self.tracer.setIntAttribute(tunnel_span, "duration_ns", @intCast(tunnel_stats.duration_ns));
@@ -708,7 +716,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
         const H2C_UPGRADE_PREAMBLE_BUFFER_SIZE_BYTES: usize =
             serval_h2.client_connection_preface.len +
             (2 * serval_h2.frame_header_size_bytes) +
-            config.H2_MAX_FRAME_SIZE_BYTES +
+            h2_proxy_frame_capacity_usize +
             config.H2_MAX_HEADER_BLOCK_SIZE_BYTES;
 
         /// Forward an HTTP/1.1 `Upgrade: h2c` gRPC request by translating the
@@ -729,7 +737,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             effective_path: ?[]const u8,
         ) ForwardError!ForwardResult {
             assert(upstream.port > 0);
-            assert(decoded_settings_payload.len <= config.H2_MAX_FRAME_SIZE_BYTES);
+            assert(decoded_settings_payload.len <= h2_proxy_frame_capacity_usize);
 
             if (client_tls != null) return ForwardError.UnsupportedProtocol;
             if (upstream.http_protocol != .h2c) return ForwardError.UnsupportedProtocol;
@@ -785,6 +793,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
                     &upstream_socket,
                     body_info.initial_body,
                     remaining_body_bytes == 0,
+                    self.h2_cfg.max_frame_size_bytes,
                 ) catch return ForwardError.SendFailed;
             }
 
@@ -792,6 +801,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
 
             const tunnel_span = self.tracer.startSpan("grpc_h2c_upgrade_tunnel", forward_span);
             const tunnel_stats = relayGrpcH2cUpgradeSession(
+                self.h2_cfg,
                 io,
                 &client_socket,
                 &upstream_socket,
@@ -825,17 +835,21 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
         }
 
         fn relayGrpcH2cUpgradeSession(
+            runtime_cfg: config.H2Config,
             io: Io,
             client_socket: *Socket,
             upstream_socket: *Socket,
             remaining_body_bytes: u64,
             initial_client_bytes_after_body: []const u8,
         ) tunnel_mod.TunnelStats {
+            assert(runtime_cfg.max_frame_size_bytes >= config.H2_MAX_FRAME_SIZE_BYTES);
+            assert(runtime_cfg.max_frame_size_bytes <= h2_proxy_frame_capacity_bytes);
+            assert(runtime_cfg.tunnel_idle_timeout_ns > 0);
             const start_ns = time.monotonicNanos();
             var stats = tunnel_mod.TunnelStats{};
 
             if (remaining_body_bytes > 0) {
-                if (streamGrpcH2cUpgradeBody(client_socket, upstream_socket, remaining_body_bytes, &stats.client_to_upstream_bytes)) |termination| {
+                if (streamGrpcH2cUpgradeBody(client_socket, upstream_socket, remaining_body_bytes, runtime_cfg.max_frame_size_bytes, &stats.client_to_upstream_bytes)) |termination| {
                     stats.duration_ns = @intCast(time.elapsedNanos(start_ns, time.monotonicNanos()));
                     stats.termination = termination;
                     return stats;
@@ -848,7 +862,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
                 upstream_socket,
                 initial_client_bytes_after_body,
                 &[_]u8{},
-                config.H2C_TUNNEL_IDLE_TIMEOUT_NS,
+                runtime_cfg.tunnel_idle_timeout_ns,
                 config.H2C_TUNNEL_POLL_TIMEOUT_MS,
             );
             stats.client_to_upstream_bytes += tunnel_stats.client_to_upstream_bytes;
@@ -862,22 +876,25 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             client_socket: *Socket,
             upstream_socket: *Socket,
             remaining_body_bytes: u64,
+            max_frame_size_bytes: u32,
             counter_bytes: *u64,
         ) ?tunnel_mod.Termination {
             assert(remaining_body_bytes > 0);
+            assert(max_frame_size_bytes >= config.H2_MAX_FRAME_SIZE_BYTES);
+            assert(max_frame_size_bytes <= h2_proxy_frame_capacity_bytes);
 
-            var body_buf: [config.H2_MAX_FRAME_SIZE_BYTES]u8 = undefined;
+            var body_buf: [h2_proxy_frame_capacity_usize]u8 = undefined;
             var remaining = remaining_body_bytes;
 
             while (remaining > 0) {
-                const to_read: usize = @intCast(@min(remaining, config.H2_MAX_FRAME_SIZE_BYTES));
+                const to_read: usize = @intCast(@min(remaining, max_frame_size_bytes));
                 const bytes_read = client_socket.read(body_buf[0..to_read]) catch |err| {
                     return mapClientReadTermination(err);
                 };
                 if (bytes_read == 0) return .client_closed;
 
                 const end_stream = remaining == bytes_read;
-                sendH2DataFrames(upstream_socket, body_buf[0..bytes_read], end_stream) catch |err| {
+                sendH2DataFrames(upstream_socket, body_buf[0..bytes_read], end_stream, max_frame_size_bytes) catch |err| {
                     return mapUpstreamWriteTermination(err);
                 };
                 counter_bytes.* += bytes_read;
@@ -891,7 +908,10 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             upstream_socket: *Socket,
             payload: []const u8,
             end_stream: bool,
+            max_frame_size_bytes: u32,
         ) serval_socket.SocketError!void {
+            assert(max_frame_size_bytes >= config.H2_MAX_FRAME_SIZE_BYTES);
+            assert(max_frame_size_bytes <= h2_proxy_frame_capacity_bytes);
             if (payload.len == 0) {
                 if (end_stream) try sendH2Frame(upstream_socket, .data, serval_h2.flags_end_stream, H2C_UPGRADE_STREAM_ID, &[_]u8{});
                 return;
@@ -900,7 +920,7 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             var cursor: usize = 0;
             while (cursor < payload.len) {
                 const remaining = payload.len - cursor;
-                const chunk_len: usize = @intCast(@min(remaining, config.H2_MAX_FRAME_SIZE_BYTES));
+                const chunk_len: usize = @intCast(@min(remaining, max_frame_size_bytes));
                 const chunk = payload[cursor .. cursor + chunk_len];
                 const is_last_chunk = cursor + chunk_len == payload.len;
                 const flags: u8 = if (end_stream and is_last_chunk) serval_h2.flags_end_stream else 0;
@@ -917,14 +937,36 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             payload: []const u8,
         ) serval_socket.SocketError!void {
             var header_buf: [serval_h2.frame_header_size_bytes]u8 = undefined;
-            const header = serval_h2.buildFrameHeader(&header_buf, .{
+            const header = buildProxyH2FrameHeader(&header_buf, .{
                 .length = @intCast(payload.len),
                 .frame_type = frame_type,
                 .flags = flags,
                 .stream_id = stream_id,
-            }) catch return serval_socket.SocketError.Unexpected;
+            });
             try upstream_socket.write_all(header);
             if (payload.len > 0) try upstream_socket.write_all(payload);
+        }
+
+        fn buildProxyH2FrameHeader(
+            out: *[serval_h2.frame_header_size_bytes]u8,
+            header: serval_h2.FrameHeader,
+        ) []const u8 {
+            assert(@intFromPtr(out) != 0);
+            assert(header.length <= h2_proxy_frame_capacity_bytes);
+            assert(header.stream_id <= 0x7fff_ffff);
+
+            out[0] = @truncate((header.length >> 16) & 0xff);
+            out[1] = @truncate((header.length >> 8) & 0xff);
+            out[2] = @truncate(header.length & 0xff);
+            out[3] = @intFromEnum(header.frame_type);
+            out[4] = header.flags;
+
+            const stream_id = header.stream_id & 0x7fff_ffff;
+            out[5] = @truncate((stream_id >> 24) & 0x7f);
+            out[6] = @truncate((stream_id >> 16) & 0xff);
+            out[7] = @truncate((stream_id >> 8) & 0xff);
+            out[8] = @truncate(stream_id & 0xff);
+            return out[0..];
         }
 
         fn mapClientReadTermination(err: serval_socket.SocketError) tunnel_mod.Termination {
@@ -1125,7 +1167,7 @@ test "Forwarder init with NoPool" {
     var tracer = serval_tracing.NoopTracer{};
     // TigerStyle: null client_ctx for tests without TLS upstreams.
     // DnsConfig{} uses default TTL and timeout values.
-    const forwarder = Forwarder(pool_mod.NoPool, serval_tracing.NoopTracer).init(&no_pool, &tracer, true, null, DnsConfig{});
+    const forwarder = Forwarder(pool_mod.NoPool, serval_tracing.NoopTracer).init(&no_pool, &tracer, true, null, .{}, DnsConfig{});
     // S1: postcondition - dns_resolver is initialized with default config
     try std.testing.expectEqual(serval_core.config.DNS_DEFAULT_TTL_NS, forwarder.dns_resolver.cfg.ttl_ns);
 }
@@ -1135,7 +1177,7 @@ test "Forwarder init with SimplePool" {
     var tracer = serval_tracing.NoopTracer{};
     // TigerStyle: null client_ctx for tests without TLS upstreams.
     // DnsConfig{} uses default TTL and timeout values.
-    const forwarder = Forwarder(pool_mod.SimplePool, serval_tracing.NoopTracer).init(&simple_pool, &tracer, true, null, DnsConfig{});
+    const forwarder = Forwarder(pool_mod.SimplePool, serval_tracing.NoopTracer).init(&simple_pool, &tracer, true, null, .{}, DnsConfig{});
     // S1: postcondition - dns_resolver is initialized with default config
     try std.testing.expectEqual(serval_core.config.DNS_DEFAULT_TTL_NS, forwarder.dns_resolver.cfg.ttl_ns);
 }

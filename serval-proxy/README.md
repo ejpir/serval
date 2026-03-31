@@ -218,6 +218,10 @@ The current h2 implementation is intentionally bounded and focused:
 - the active stream-aware bridge is gRPC-focused
 - downstream streams are mapped to upstream stream ids through a fixed-capacity
   binding table
+- raw gRPC h2 tunnel relay now takes deploy-time `Config.h2` runtime policy for
+  idle timeout and outbound DATA frame sizing, but the proxy forwarder still
+  enforces its own bounded internal frame capacity (`64 KiB`) for that raw
+  upgrade/tunnel path
 - upstream receive events are converted into explicit actions for downstream
   response headers, DATA, trailers, resets, or connection-close handling
 - upstream GOAWAY handling is session-generation-aware and respects

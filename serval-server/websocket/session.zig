@@ -14,6 +14,7 @@ const types = serval_core.types;
 const serval_websocket = @import("serval-websocket");
 const frame = serval_websocket.frame;
 const close_mod = serval_websocket.close;
+const default_websocket_cfg = config.WebSocketConfig{};
 
 /// High-level classification of a WebSocket message payload.
 /// `text` messages are expected to contain valid UTF-8, while `binary` messages carry opaque bytes.
@@ -38,9 +39,32 @@ pub const WebSocketMessage = struct {
 pub const WebSocketAccept = struct {
     subprotocol: ?[]const u8 = null,
     extra_headers: []const u8 = "",
-    max_message_size_bytes: u32 = config.WEBSOCKET_MAX_MESSAGE_SIZE_BYTES,
-    idle_timeout_ns: u64 = config.WEBSOCKET_SESSION_IDLE_TIMEOUT_NS,
+    max_message_size_bytes: u32 = default_websocket_cfg.max_message_size_bytes,
+    max_fragments_per_message: u32 = default_websocket_cfg.max_fragments_per_message,
+    idle_timeout_ns: u64 = default_websocket_cfg.session_idle_timeout_ns,
+    close_timeout_ns: u64 = default_websocket_cfg.close_timeout_ns,
     auto_pong: bool = true,
+
+    /// Applies server defaults from `runtime_cfg` while preserving explicit route-level overrides.
+    pub fn withRuntimeDefaults(self: WebSocketAccept, runtime_cfg: config.WebSocketConfig) WebSocketAccept {
+        assert(runtime_cfg.max_message_size_bytes > 0);
+        assert(runtime_cfg.max_fragments_per_message > 0);
+
+        var merged = self;
+        if (merged.max_message_size_bytes == default_websocket_cfg.max_message_size_bytes) {
+            merged.max_message_size_bytes = runtime_cfg.max_message_size_bytes;
+        }
+        if (merged.max_fragments_per_message == default_websocket_cfg.max_fragments_per_message) {
+            merged.max_fragments_per_message = runtime_cfg.max_fragments_per_message;
+        }
+        if (merged.idle_timeout_ns == default_websocket_cfg.session_idle_timeout_ns) {
+            merged.idle_timeout_ns = runtime_cfg.session_idle_timeout_ns;
+        }
+        if (merged.close_timeout_ns == default_websocket_cfg.close_timeout_ns) {
+            merged.close_timeout_ns = runtime_cfg.close_timeout_ns;
+        }
+        return merged;
+    }
 };
 
 /// Result of routing a WebSocket request.
@@ -163,7 +187,9 @@ pub const WebSocketSession = struct {
         initial_input: []const u8,
     ) WebSocketSession {
         assert(accept.max_message_size_bytes > 0);
+        assert(accept.max_fragments_per_message > 0);
         assert(accept.idle_timeout_ns > 0);
+        assert(accept.close_timeout_ns > 0);
 
         return .{
             .transport = transport,
@@ -193,7 +219,7 @@ pub const WebSocketSession = struct {
         var fragmented = false;
         var message_opcode: ?frame.Opcode = null;
 
-        while (fragments < config.WEBSOCKET_MAX_FRAGMENTS_PER_MESSAGE) {
+        while (fragments < self.accept.max_fragments_per_message) {
             const header = try self.readFrameHeader(self.accept.idle_timeout_ns);
             var control_buf: [config.WEBSOCKET_MAX_CONTROL_PAYLOAD_SIZE_BYTES]u8 = undefined;
 
@@ -320,10 +346,10 @@ pub const WebSocketSession = struct {
         if (self.state_value != .close_sent) return;
 
         const start_ns = time.monotonicNanos();
-        const deadline_ns = start_ns + config.WEBSOCKET_CLOSE_TIMEOUT_NS;
+        const deadline_ns = start_ns + self.accept.close_timeout_ns;
         var control_buf: [config.WEBSOCKET_MAX_CONTROL_PAYLOAD_SIZE_BYTES]u8 = undefined;
 
-        while (time.elapsedNanos(start_ns, time.monotonicNanos()) <= config.WEBSOCKET_CLOSE_TIMEOUT_NS) {
+        while (time.elapsedNanos(start_ns, time.monotonicNanos()) <= self.accept.close_timeout_ns) {
             const header = self.readFrameHeaderUntil(deadline_ns) catch |err| {
                 return switch (err) {
                     error.Timeout => error.CloseHandshakeTimeout,

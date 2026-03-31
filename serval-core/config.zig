@@ -575,6 +575,42 @@ pub const UdpTransportConfig = struct {
     probe_mode: UdpProbeMode = .passive_only,
 };
 
+/// HTTP/2 runtime configuration for server, proxy, and client paths.
+/// These fields are deploy-time policy knobs and are validated by `validateTransportConfig`.
+pub const H2Config = struct {
+    /// Advertised max frame size for local SETTINGS and the largest runtime payload accepted from peers.
+    max_frame_size_bytes: u32 = 16_384,
+    /// Max assembled header block accepted before treating the request/response as oversized.
+    max_header_block_size_bytes: u32 = 8 * 1024,
+    /// Advertised concurrent stream limit for local SETTINGS.
+    max_concurrent_streams: u16 = 128,
+    /// Advertised per-stream receive window.
+    initial_window_size_bytes: u32 = 65_535,
+    /// Initial connection-level receive window.
+    connection_window_size_bytes: u32 = 65_535,
+    /// Maximum frames the terminated downstream server path will process before closing.
+    server_max_frame_count: u32 = 1_048_576,
+    /// Maximum frames the outbound client path will process before closing.
+    client_max_frame_count: u32 = 1_048_576,
+    /// Idle timeout for h2c/gRPC tunnels.
+    tunnel_idle_timeout_ns: u64 = time.secondsToNanos(3600),
+    /// Idle timeout for terminated downstream HTTP/2 sessions.
+    server_idle_timeout_ns: u64 = time.secondsToNanos(3600),
+};
+
+/// Native WebSocket runtime configuration.
+/// These fields are deploy-time policy knobs and are validated by `validateTransportConfig`.
+pub const WebSocketConfig = struct {
+    /// Maximum application message size accepted by native WebSocket sessions.
+    max_message_size_bytes: u32 = 1024 * 1024,
+    /// Maximum fragments allowed in one message reassembly sequence.
+    max_fragments_per_message: u32 = 1024,
+    /// Idle timeout for native WebSocket sessions.
+    session_idle_timeout_ns: u64 = time.secondsToNanos(60),
+    /// Maximum time to wait for the peer's closing frame after sending our close frame.
+    close_timeout_ns: u64 = time.secondsToNanos(5),
+};
+
 /// Top-level runtime configuration for the HTTP server and optional transport subsystems.
 /// String slices such as `listen_host` borrow caller-owned storage and must remain valid for use.
 /// Optional fields leave the corresponding subsystem disabled when set to `null`.
@@ -606,6 +642,12 @@ pub const Config = struct {
 
     /// TLS configuration (optional - null means plaintext HTTP)
     tls: ?TlsConfig = null,
+
+    /// HTTP/2 runtime policy knobs for frontend, proxy, and client paths.
+    h2: H2Config = .{},
+
+    /// Native WebSocket runtime policy knobs for upgraded sessions.
+    websocket: WebSocketConfig = .{},
 
     /// When true, plaintext listeners only accept HTTP/2 prior-knowledge preface.
     /// Non-h2c bytes are closed without HTTP/1.1 parsing.
@@ -707,6 +749,19 @@ pub const TransportConfigError = error{
     UdpTargetPortInvalid,
     UdpMaxSessionsInvalid,
     UdpSessionIdleTimeoutInvalid,
+    H2MaxFrameSizeInvalid,
+    H2HeaderBlockSizeInvalid,
+    H2ConcurrentStreamsInvalid,
+    H2InitialWindowInvalid,
+    H2ConnectionWindowInvalid,
+    H2ServerFrameCountInvalid,
+    H2ClientFrameCountInvalid,
+    H2TunnelIdleTimeoutInvalid,
+    H2ServerIdleTimeoutInvalid,
+    WebSocketMaxMessageSizeInvalid,
+    WebSocketMaxFragmentsInvalid,
+    WebSocketSessionIdleTimeoutInvalid,
+    WebSocketCloseTimeoutInvalid,
 };
 
 /// Validate the optional transport sub-configurations attached to `cfg`.
@@ -715,6 +770,9 @@ pub const TransportConfigError = error{
 /// Returns the first `TransportConfigError` reported by a nested validator.
 pub fn validateTransportConfig(cfg: *const Config) TransportConfigError!void {
     assert(@intFromPtr(cfg) != 0);
+
+    try validateH2Config(&cfg.h2);
+    try validateWebSocketConfig(&cfg.websocket);
 
     if (cfg.tcp_transport) |tcp_cfg| {
         try validateTcpTransportConfig(&tcp_cfg);
@@ -760,18 +818,73 @@ fn validateUdpTransportConfig(cfg: *const UdpTransportConfig) TransportConfigErr
     }
 }
 
+fn validateH2Config(cfg: *const H2Config) TransportConfigError!void {
+    assert(@intFromPtr(cfg) != 0);
+
+    if (cfg.max_frame_size_bytes < 16_384 or cfg.max_frame_size_bytes > 16_777_215) {
+        return error.H2MaxFrameSizeInvalid;
+    }
+    if (cfg.max_header_block_size_bytes == 0) return error.H2HeaderBlockSizeInvalid;
+    if (cfg.max_concurrent_streams == 0) return error.H2ConcurrentStreamsInvalid;
+    if (cfg.initial_window_size_bytes == 0 or cfg.initial_window_size_bytes > H2_MAX_WINDOW_SIZE_BYTES) {
+        return error.H2InitialWindowInvalid;
+    }
+    if (cfg.connection_window_size_bytes == 0 or cfg.connection_window_size_bytes > H2_MAX_WINDOW_SIZE_BYTES) {
+        return error.H2ConnectionWindowInvalid;
+    }
+    if (cfg.server_max_frame_count == 0) return error.H2ServerFrameCountInvalid;
+    if (cfg.client_max_frame_count == 0) return error.H2ClientFrameCountInvalid;
+    if (cfg.tunnel_idle_timeout_ns == 0) return error.H2TunnelIdleTimeoutInvalid;
+    if (cfg.server_idle_timeout_ns == 0) return error.H2ServerIdleTimeoutInvalid;
+}
+
+fn validateWebSocketConfig(cfg: *const WebSocketConfig) TransportConfigError!void {
+    assert(@intFromPtr(cfg) != 0);
+
+    if (cfg.max_message_size_bytes == 0) return error.WebSocketMaxMessageSizeInvalid;
+    if (cfg.max_fragments_per_message == 0) return error.WebSocketMaxFragmentsInvalid;
+    if (cfg.session_idle_timeout_ns == 0) return error.WebSocketSessionIdleTimeoutInvalid;
+    if (cfg.close_timeout_ns == 0) return error.WebSocketCloseTimeoutInvalid;
+}
+
 test "Config has sensible defaults" {
     const cfg = Config{};
     try std.testing.expectEqualStrings("0.0.0.0", cfg.listen_host);
     try std.testing.expectEqual(@as(u16, 8080), cfg.port);
     try std.testing.expectEqual(@as(u32, 15_000), cfg.keepalive_timeout_ms);
     try std.testing.expect(cfg.tls == null);
+    try std.testing.expectEqual(@as(u32, 16_384), cfg.h2.max_frame_size_bytes);
+    try std.testing.expectEqual(@as(u32, 8 * 1024), cfg.h2.max_header_block_size_bytes);
+    try std.testing.expectEqual(@as(u16, 128), cfg.h2.max_concurrent_streams);
+    try std.testing.expectEqual(time.secondsToNanos(60), cfg.websocket.session_idle_timeout_ns);
     try std.testing.expect(!cfg.h2c_prior_knowledge_only);
     try std.testing.expectEqual(TlsH2FrontendMode.terminated_only, cfg.tls_h2_frontend_mode);
     try std.testing.expectEqual(AlpnMixedOfferPolicy.prefer_http11, cfg.alpn_mixed_offer_policy);
     try std.testing.expect(cfg.acme == null);
     try std.testing.expect(cfg.tcp_transport == null);
     try std.testing.expect(cfg.udp_transport == null);
+}
+
+test "validateTransportConfig rejects invalid h2 config" {
+    var cfg = Config{ .h2 = .{ .max_frame_size_bytes = 1024 } };
+    try std.testing.expectError(error.H2MaxFrameSizeInvalid, validateTransportConfig(&cfg));
+
+    cfg.h2.max_frame_size_bytes = 16_384;
+    cfg.h2.max_header_block_size_bytes = 0;
+    try std.testing.expectError(error.H2HeaderBlockSizeInvalid, validateTransportConfig(&cfg));
+
+    cfg.h2.max_header_block_size_bytes = 1024;
+    cfg.h2.max_concurrent_streams = 0;
+    try std.testing.expectError(error.H2ConcurrentStreamsInvalid, validateTransportConfig(&cfg));
+}
+
+test "validateTransportConfig rejects invalid websocket config" {
+    var cfg = Config{ .websocket = .{ .max_message_size_bytes = 0 } };
+    try std.testing.expectError(error.WebSocketMaxMessageSizeInvalid, validateTransportConfig(&cfg));
+
+    cfg.websocket.max_message_size_bytes = 1024;
+    cfg.websocket.max_fragments_per_message = 0;
+    try std.testing.expectError(error.WebSocketMaxFragmentsInvalid, validateTransportConfig(&cfg));
 }
 
 test "AcmeConfig has sensible defaults" {

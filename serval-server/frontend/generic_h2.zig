@@ -1106,6 +1106,7 @@ pub fn tryServeTlsAlpnConnection(
     handler: *Handler,
     forwarder: *forwarder_mod.Forwarder(Pool, Tracer),
     connection_ctx: *Context,
+    runtime_cfg: config.H2Config,
     maybe_tls: ?*TLSStream,
     io: Io,
     connection_id: u64,
@@ -1139,7 +1140,7 @@ pub fn tryServeTlsAlpnConnection(
         log.err("server: conn={d} generic h2 bridge pool allocation failed", .{connection_id});
         return false;
     };
-    bridge_sessions.* = serval_client.H2UpstreamSessionPool.init();
+    bridge_sessions.* = serval_client.H2UpstreamSessionPool.init(runtime_cfg);
     defer {
         bridge_sessions.deinit();
         std.heap.page_allocator.destroy(bridge_sessions);
@@ -1168,6 +1169,7 @@ pub fn tryServeTlsAlpnConnection(
     h2_server.serveTlsConnection(
         @TypeOf(generic_handler),
         &generic_handler,
+        runtime_cfg,
         tls_stream,
         io,
         connection_id,

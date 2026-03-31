@@ -995,20 +995,34 @@ fn processUpgradeSyntheticRequestAndBody(
 /// Equivalent to calling `servePlainConnectionWithInitialBytes(..., &[_]u8{})`.
 /// `fd` must be a valid non-negative descriptor and remains owned by the caller.
 /// Propagates any error from the underlying plain connection driver.
-pub fn servePlainConnection(comptime Handler: type, handler: *Handler, fd: i32, io: Io, connection_id: u64) Error!void {
+pub fn servePlainConnection(
+    comptime Handler: type,
+    handler: *Handler,
+    runtime_cfg: config.H2Config,
+    fd: i32,
+    io: Io,
+    connection_id: u64,
+) Error!void {
     assert(@intFromPtr(handler) != 0);
     assert(fd >= 0);
-    return servePlainConnectionWithInitialBytes(Handler, handler, fd, io, connection_id, &[_]u8{});
+    return servePlainConnectionWithInitialBytes(Handler, handler, runtime_cfg, fd, io, connection_id, &[_]u8{});
 }
 
 /// Serve a TLS connection without any extra initial bytes.
 /// Equivalent to calling `serveTlsConnectionWithInitialBytes(..., &[_]u8{})`.
 /// `tls_stream` is borrowed for the call and is not closed by this helper.
 /// Propagates any error from the underlying TLS connection driver.
-pub fn serveTlsConnection(comptime Handler: type, handler: *Handler, tls_stream: *TLSStream, io: Io, connection_id: u64) Error!void {
+pub fn serveTlsConnection(
+    comptime Handler: type,
+    handler: *Handler,
+    runtime_cfg: config.H2Config,
+    tls_stream: *TLSStream,
+    io: Io,
+    connection_id: u64,
+) Error!void {
     assert(@intFromPtr(handler) != 0);
     assert(@intFromPtr(tls_stream) != 0);
-    return serveTlsConnectionWithInitialBytes(Handler, handler, tls_stream, io, connection_id, &[_]u8{});
+    return serveTlsConnectionWithInitialBytes(Handler, handler, runtime_cfg, tls_stream, io, connection_id, &[_]u8{});
 }
 
 /// Error set returned by `run`.
@@ -1103,7 +1117,7 @@ pub fn run(
         next_connection_id +%= 1;
         if (next_connection_id == 0) next_connection_id = 1;
 
-        group.concurrent(io, handleAcceptedConnection, .{ Handler, handler, stream, io, connection_id, server_tls_ctx }) catch |err| {
+        group.concurrent(io, handleAcceptedConnection, .{ Handler, handler, cfg.h2, stream, io, connection_id, server_tls_ctx }) catch |err| {
             log.err("h2 server: failed to spawn connection task: {s}", .{@errorName(err)});
             stream.close(io);
         };
@@ -1113,6 +1127,7 @@ pub fn run(
 fn handleAcceptedConnection(
     comptime Handler: type,
     handler: *Handler,
+    runtime_cfg: config.H2Config,
     stream: Io.net.Stream,
     io: Io,
     connection_id: u64,
@@ -1132,14 +1147,14 @@ fn handleAcceptedConnection(
         };
         defer tls_stream.close();
 
-        serveTlsConnection(Handler, handler, &tls_stream, io, connection_id) catch |err| switch (err) {
+        serveTlsConnection(Handler, handler, runtime_cfg, &tls_stream, io, connection_id) catch |err| switch (err) {
             error.ConnectionClosed => {},
             else => log.warn("h2 server: conn={d} tls driver failed: {s}", .{ connection_id, @errorName(err) }),
         };
         return;
     }
 
-    servePlainConnection(Handler, handler, @intCast(stream.socket.handle), io, connection_id) catch |err| switch (err) {
+    servePlainConnection(Handler, handler, runtime_cfg, @intCast(stream.socket.handle), io, connection_id) catch |err| switch (err) {
         error.ConnectionClosed => {},
         else => log.warn("h2 server: conn={d} plain driver failed: {s}", .{ connection_id, @errorName(err) }),
     };
@@ -1162,6 +1177,7 @@ pub const PlainConnectionOptions = struct {
 pub fn servePlainConnectionWithInitialBytes(
     comptime Handler: type,
     handler: *Handler,
+    runtime_cfg: config.H2Config,
     fd: i32,
     io: Io,
     connection_id: u64,
@@ -1173,6 +1189,7 @@ pub fn servePlainConnectionWithInitialBytes(
     return servePlainConnectionWithInitialBytesOptions(
         Handler,
         handler,
+        runtime_cfg,
         fd,
         io,
         connection_id,
@@ -1188,6 +1205,7 @@ pub fn servePlainConnectionWithInitialBytes(
 pub fn serveTlsConnectionWithInitialBytes(
     comptime Handler: type,
     handler: *Handler,
+    runtime_cfg: config.H2Config,
     tls_stream: *TLSStream,
     io: Io,
     connection_id: u64,
@@ -1199,6 +1217,7 @@ pub fn serveTlsConnectionWithInitialBytes(
     return serveTlsConnectionWithInitialBytesOptions(
         Handler,
         handler,
+        runtime_cfg,
         tls_stream,
         io,
         connection_id,
@@ -1214,6 +1233,7 @@ pub fn serveTlsConnectionWithInitialBytes(
 pub fn servePlainConnectionWithInitialBytesOptions(
     comptime Handler: type,
     handler: *Handler,
+    runtime_cfg: config.H2Config,
     fd: i32,
     io: Io,
     connection_id: u64,
@@ -1226,6 +1246,7 @@ pub fn servePlainConnectionWithInitialBytesOptions(
     return serveConnectionWithInitialBytesOptions(
         Handler,
         handler,
+        runtime_cfg,
         &io_conn,
         io,
         connection_id,
@@ -1241,6 +1262,7 @@ pub fn servePlainConnectionWithInitialBytesOptions(
 pub fn serveTlsConnectionWithInitialBytesOptions(
     comptime Handler: type,
     handler: *Handler,
+    runtime_cfg: config.H2Config,
     tls_stream: *TLSStream,
     io: Io,
     connection_id: u64,
@@ -1253,6 +1275,7 @@ pub fn serveTlsConnectionWithInitialBytesOptions(
     return serveConnectionWithInitialBytesOptions(
         Handler,
         handler,
+        runtime_cfg,
         &io_conn,
         io,
         connection_id,
@@ -1264,6 +1287,7 @@ pub fn serveTlsConnectionWithInitialBytesOptions(
 fn serveConnectionWithInitialBytesOptions(
     comptime Handler: type,
     handler: *Handler,
+    runtime_cfg: config.H2Config,
     io_conn: *ConnectionIo,
     io: Io,
     connection_id: u64,
@@ -1276,7 +1300,7 @@ fn serveConnectionWithInitialBytesOptions(
     assert(@intFromPtr(io_conn) != 0);
     assert(initial_bytes.len <= read_buffer_size_bytes);
 
-    var runtime = try runtime_mod.Runtime.init();
+    var runtime = try runtime_mod.Runtime.init(runtime_cfg);
     var response_states = ResponseStateTable{};
     var stream_trackers = StreamTrackerTable{};
     var connection_mutex: Io.Mutex = .init;
@@ -1440,7 +1464,7 @@ pub fn serveUpgradedConnection(
     var plain_read_buf: [config.STREAM_READ_BUFFER_SIZE_BYTES]u8 = undefined;
     var plain_reader = rawStreamForFd(fd).reader(io, &plain_read_buf);
 
-    var runtime = try runtime_mod.Runtime.init();
+    var runtime = try runtime_mod.Runtime.init(.{});
     var response_states = ResponseStateTable{};
     var stream_trackers = StreamTrackerTable{};
     var connection_mutex: Io.Mutex = .init;

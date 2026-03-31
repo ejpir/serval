@@ -322,7 +322,7 @@ pub fn Server(
                 .metrics = metrics,
                 .tracer = tracer,
                 .config = cfg,
-                .forwarder = forwarder_mod.Forwarder(Pool, Tracer).init(pool, tracer, verify_upstream, client_ctx, dns_config),
+                .forwarder = forwarder_mod.Forwarder(Pool, Tracer).init(pool, tracer, verify_upstream, client_ctx, cfg.h2, dns_config),
                 .client_ctx = client_ctx,
                 .dns_config = dns_config,
             };
@@ -860,13 +860,14 @@ pub fn Server(
 
         fn sendH2InitialSettings(
             maybe_tls: ?*const TLSStream,
+            runtime_cfg: config.H2Config,
             io: *Io,
             stream: Io.net.Stream,
         ) bool {
             assert(@intFromPtr(io) != 0);
             assert(stream.socket.handle >= 0);
 
-            var runtime = h2_runtime.Runtime.init() catch return false;
+            var runtime = h2_runtime.Runtime.init(runtime_cfg) catch return false;
             var settings_buf: [h2_runtime.initial_settings_frame_buffer_size_bytes]u8 = undefined;
             const settings_frame = runtime.writeInitialSettingsFrame(&settings_buf) catch return false;
             connectionWrite(maybe_tls, io, stream, settings_frame) catch return false;
@@ -2000,6 +2001,7 @@ pub fn Server(
         fn forwardH2cWithBridge(
             handler: *Handler,
             forwarder: *forwarder_mod.Forwarder(Pool, Tracer),
+            runtime_cfg: config.H2Config,
             io: Io,
             stream: Io.net.Stream,
             ctx: *Context,
@@ -2022,7 +2024,7 @@ pub fn Server(
                 return forwarder_mod.ForwardError.InvalidResponse;
             };
             defer std.heap.page_allocator.destroy(bridge_sessions);
-            bridge_sessions.* = serval_client.H2UpstreamSessionPool.init();
+            bridge_sessions.* = serval_client.H2UpstreamSessionPool.init(runtime_cfg);
             defer bridge_sessions.deinit();
 
             var bridge_handler = H2cBridgeHandler.init(
@@ -2038,6 +2040,7 @@ pub fn Server(
             h2_server.servePlainConnectionWithInitialBytesOptions(
                 H2cBridgeHandler,
                 &bridge_handler,
+                runtime_cfg,
                 @intCast(stream.socket.handle),
                 io,
                 connection_id,
@@ -2117,7 +2120,7 @@ pub fn Server(
                 return forwarder_mod.ForwardError.InvalidResponse;
             };
             defer std.heap.page_allocator.destroy(bridge_sessions);
-            bridge_sessions.* = serval_client.H2UpstreamSessionPool.init();
+            bridge_sessions.* = serval_client.H2UpstreamSessionPool.init(.{});
             defer bridge_sessions.deinit();
 
             var bridge_handler = H2cBridgeHandler.init(
@@ -2167,6 +2170,7 @@ pub fn Server(
             metrics: *Metrics,
             tracer: *Tracer,
             ctx: *const Context,
+            runtime_cfg: config.H2Config,
             maybe_tls: ?*TLSStream,
             io: Io,
             connection_id: u64,
@@ -2199,6 +2203,7 @@ pub fn Server(
             h2_server.serveTlsConnection(
                 @TypeOf(telemetry_handler),
                 &telemetry_handler,
+                runtime_cfg,
                 tls_stream,
                 io,
                 connection_id,
@@ -2214,6 +2219,7 @@ pub fn Server(
             metrics: *Metrics,
             tracer: *Tracer,
             ctx: *const Context,
+            runtime_cfg: config.H2Config,
             maybe_tls: ?*const TLSStream,
             io: Io,
             stream: Io.net.Stream,
@@ -2257,6 +2263,7 @@ pub fn Server(
             h2_server.servePlainConnectionWithInitialBytes(
                 @TypeOf(telemetry_handler),
                 &telemetry_handler,
+                runtime_cfg,
                 @intCast(stream.socket.handle),
                 io,
                 connection_id,
@@ -2375,6 +2382,7 @@ pub fn Server(
             forwarder: *forwarder_mod.Forwarder(Pool, Tracer),
             metrics: *Metrics,
             tracer: *Tracer,
+            runtime_cfg: config.H2Config,
             maybe_tls: ?*TLSStream,
             io: *Io,
             stream: Io.net.Stream,
@@ -2412,7 +2420,7 @@ pub fn Server(
                             buffer_len.* >= serval_h2.client_connection_preface.len and
                             serval_h2.looksLikeClientConnectionPreface(recv_buf[0..buffer_len.*]))
                         {
-                            if (!sendH2InitialSettings(maybe_tls, io, stream)) {
+                            if (!sendH2InitialSettings(maybe_tls, runtime_cfg, io, stream)) {
                                 sendH2GoAway(maybe_tls, io, stream, 0, H2_ERROR_INTERNAL);
                                 return true;
                             }
@@ -2487,6 +2495,7 @@ pub fn Server(
                 forwardH2cWithBridge(
                     handler,
                     forwarder,
+                    runtime_cfg,
                     io.*,
                     stream,
                     ctx,
@@ -2687,6 +2696,7 @@ pub fn Server(
                         handler,
                         forwarder,
                         &ctx,
+                        cfg.h2,
                         maybe_tls_ptr,
                         io,
                         connection_id,
@@ -2699,6 +2709,7 @@ pub fn Server(
                         metrics,
                         tracer,
                         &ctx,
+                        cfg.h2,
                         maybe_tls_ptr,
                         io_mut,
                         connection_id,
@@ -2753,6 +2764,7 @@ pub fn Server(
                     metrics,
                     tracer,
                     &ctx,
+                    cfg.h2,
                     maybe_tls_ptr,
                     io_mut,
                     stream,
@@ -2767,6 +2779,7 @@ pub fn Server(
                     forwarder,
                     metrics,
                     tracer,
+                    cfg.h2,
                     maybe_tls_ptr,
                     &io_mut,
                     stream,
@@ -3117,6 +3130,7 @@ pub fn Server(
                                 return;
                             },
                             .accept => |accept_cfg| {
+                                const effective_accept_cfg = accept_cfg.withRuntimeDefaults(cfg.websocket);
                                 var transport_ctx = websocket_server.ConnectionTransportContext{
                                     .fd = @intCast(stream.socket.handle),
                                     .maybe_tls = maybe_tls_ptr,
@@ -3127,7 +3141,7 @@ pub fn Server(
                                 const handshake_bytes = websocket_server.sendSwitchingProtocols(
                                     &transport,
                                     &parser.request,
-                                    accept_cfg,
+                                    effective_accept_cfg,
                                 ) catch |err| {
                                     if (err != error.WriteFailed) {
                                         sendErrorResponseTls(maybe_tls_ptr, &io_mut, stream, 500, "WebSocket Accept Failed");
@@ -3171,8 +3185,8 @@ pub fn Server(
 
                                 var ws_session = websocket_server.WebSocketSession.init(
                                     transport,
-                                    accept_cfg,
-                                    accept_cfg.subprotocol,
+                                    effective_accept_cfg,
+                                    effective_accept_cfg.subprotocol,
                                     initial_client_bytes,
                                 );
                                 var websocket_error_name: ?[]const u8 = null;

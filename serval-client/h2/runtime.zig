@@ -123,6 +123,7 @@ const PendingResponseHeaders = struct {
 /// Use `init()` to create a fresh instance before sending or receiving frames.
 /// Public methods on this type expose explicit frame-building and frame-receive actions.
 pub const Runtime = struct {
+    runtime_cfg: config.H2Config,
     state: session.SessionState,
     header_decoder: h2.HpackDecoder = h2.HpackDecoder.init(),
     response_states: ResponseStateTable = .{},
@@ -131,11 +132,12 @@ pub const Runtime = struct {
     /// Constructs a fresh runtime with an initialized session state and HPACK decoder.
     /// The configuration must provide a positive connection window and header block capacity.
     /// Returns any error raised while initializing the underlying session state.
-    pub fn init() Error!Runtime {
-        assert(config.H2_CONNECTION_WINDOW_SIZE_BYTES > 0);
-        assert(config.H2_MAX_HEADER_BLOCK_SIZE_BYTES > 0);
+    pub fn init(runtime_cfg: config.H2Config) Error!Runtime {
+        assert(runtime_cfg.connection_window_size_bytes > 0);
+        assert(runtime_cfg.max_header_block_size_bytes > 0);
         return .{
-            .state = try session.SessionState.init(),
+            .runtime_cfg = runtime_cfg,
+            .state = try session.SessionState.init(runtime_cfg),
             .header_decoder = h2.HpackDecoder.init(),
         };
     }
@@ -242,7 +244,7 @@ pub const Runtime = struct {
 
         const stream = try self.state.openRequestStream(end_stream);
         const peer_max_frame_size_bytes: usize = @intCast(self.state.peer_settings.max_frame_size_bytes);
-        const max_payload_size_bytes: usize = @min(@as(usize, config.H2_MAX_FRAME_SIZE_BYTES), peer_max_frame_size_bytes);
+        const max_payload_size_bytes: usize = @min(@as(usize, self.runtime_cfg.max_frame_size_bytes), peer_max_frame_size_bytes);
         const frame = try appendHeaderBlockFrames(
             out,
             stream.id,
@@ -1004,7 +1006,7 @@ fn initRuntimeReadyForStreams() !Runtime {
     assert(config.H2_MAX_SETTINGS_PER_FRAME > 0);
     assert(h2.client_connection_preface.len > 0);
 
-    var runtime = try Runtime.init();
+    var runtime = try Runtime.init(.{});
 
     var preface_buf: [h2.client_connection_preface.len + h2.frame_header_size_bytes + (4 * h2.setting_size_bytes)]u8 = undefined;
     _ = try runtime.writeClientPrefaceAndSettings(&preface_buf);
@@ -1027,7 +1029,7 @@ fn initRuntimeReadyForStreams() !Runtime {
 }
 
 test "Runtime writes client preface and SETTINGS" {
-    var runtime = try Runtime.init();
+    var runtime = try Runtime.init(.{});
 
     var out: [h2.client_connection_preface.len + h2.frame_header_size_bytes + (4 * h2.setting_size_bytes)]u8 = undefined;
     const encoded = try runtime.writeClientPrefaceAndSettings(&out);
@@ -1041,7 +1043,7 @@ test "Runtime writes client preface and SETTINGS" {
 }
 
 test "Runtime requires peer settings before non-settings frames" {
-    var runtime = try Runtime.init();
+    var runtime = try Runtime.init(.{});
 
     var preface_buf: [h2.client_connection_preface.len + h2.frame_header_size_bytes + (4 * h2.setting_size_bytes)]u8 = undefined;
     _ = try runtime.writeClientPrefaceAndSettings(&preface_buf);
@@ -1060,7 +1062,7 @@ test "Runtime requires peer settings before non-settings frames" {
 }
 
 test "Runtime receives peer settings, sends ACK, and accepts SETTINGS ACK" {
-    var runtime = try Runtime.init();
+    var runtime = try Runtime.init(.{});
 
     var preface_buf: [h2.client_connection_preface.len + h2.frame_header_size_bytes + (4 * h2.setting_size_bytes)]u8 = undefined;
     _ = try runtime.writeClientPrefaceAndSettings(&preface_buf);
@@ -1558,7 +1560,7 @@ test "Runtime handles upstream RST_STREAM and clears stream state" {
 }
 
 test "Runtime ignores duplicate upstream RST_STREAM for retired known stream" {
-    var runtime = try Runtime.init();
+    var runtime = try Runtime.init(.{});
     var request = try makeGrpcRequest("/svc.Method/Foo");
 
     var preface_buf: [256]u8 = undefined;

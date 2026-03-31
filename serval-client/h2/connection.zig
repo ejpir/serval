@@ -50,6 +50,7 @@ pub const Error = error{
 /// `init` and `initWithIo` initialize the runtime and can fail with `Error` if setup cannot be completed.
 /// Sending methods write directly to the underlying connection and propagate `Error` on I/O, protocol, or flow-control failures.
 pub const ClientConnection = struct {
+    runtime_cfg: config.H2Config,
     socket: *Socket,
     io: ?Io = null,
     runtime: runtime_mod.Runtime,
@@ -61,29 +62,30 @@ pub const ClientConnection = struct {
     /// Initialize a client connection that uses the socket's default I/O path.
     /// Requires a non-null socket pointer with an open file descriptor; the socket remains owned by the caller.
     /// Propagates any error returned by shared connection initialization.
-    pub fn init(socket: *Socket) Error!ClientConnection {
+    pub fn init(socket: *Socket, runtime_cfg: config.H2Config) Error!ClientConnection {
         assert(@intFromPtr(socket) != 0);
         assert(socket.get_fd() >= 0);
-        return initMaybeIo(socket, null);
+        return initMaybeIo(socket, null, runtime_cfg);
     }
 
     /// Initialize a client connection that uses the provided I/O object for network operations.
     /// Requires a non-null socket pointer with an open file descriptor; the socket remains owned by the caller.
     /// Propagates any error returned by shared connection initialization.
-    pub fn initWithIo(socket: *Socket, io: Io) Error!ClientConnection {
+    pub fn initWithIo(socket: *Socket, io: Io, runtime_cfg: config.H2Config) Error!ClientConnection {
         assert(@intFromPtr(socket) != 0);
         assert(socket.get_fd() >= 0);
-        return initMaybeIo(socket, io);
+        return initMaybeIo(socket, io, runtime_cfg);
     }
 
-    fn initMaybeIo(socket: *Socket, io: ?Io) Error!ClientConnection {
+    fn initMaybeIo(socket: *Socket, io: ?Io, runtime_cfg: config.H2Config) Error!ClientConnection {
         assert(@intFromPtr(socket) != 0);
         assert(socket.get_fd() >= 0);
 
         return .{
+            .runtime_cfg = runtime_cfg,
             .socket = socket,
             .io = io,
-            .runtime = try runtime_mod.Runtime.init(),
+            .runtime = try runtime_mod.Runtime.init(runtime_cfg),
         };
     }
 
@@ -221,7 +223,7 @@ pub const ClientConnection = struct {
         var sent: u32 = 0;
         var frames: u32 = 0;
 
-        while (sent < payload_len and frames < config.H2_CLIENT_MAX_FRAME_COUNT) : (frames += 1) {
+        while (sent < payload_len and frames < self.runtime_cfg.client_max_frame_count) : (frames += 1) {
             const stream = self.runtime.state.getStream(stream_id) orelse return logAndReturnMissingStream(self, stream_id, sent, payload_len, frames);
             if (self.runtime.state.goaway_received and stream_id > self.runtime.state.peer_goaway_last_stream_id) {
                 return error.ConnectionClosing;
@@ -374,7 +376,7 @@ pub const ClientConnection = struct {
         assert(self.pending_discard_len <= self.recv_len);
 
         self.finalizePendingFrame();
-        if (self.frame_count >= config.H2_CLIENT_MAX_FRAME_COUNT) return error.FrameLimitExceeded;
+        if (self.frame_count >= self.runtime_cfg.client_max_frame_count) return error.FrameLimitExceeded;
         if (!try self.ensureFrame(maybe_io, timeout)) return error.ConnectionClosed;
 
         const header = try h2.parseFrameHeader(self.recv_buf[0..h2.frame_header_size_bytes]);
@@ -393,7 +395,7 @@ pub const ClientConnection = struct {
     /// Returns `error.FrameLimitExceeded` if the control-frame bound is reached, and otherwise propagates receive or runtime errors.
     pub fn receiveActionHandlingControl(self: *ClientConnection) Error!runtime_mod.ReceiveAction {
         assert(@intFromPtr(self) != 0);
-        assert(config.H2_CLIENT_MAX_FRAME_COUNT > 0);
+        assert(self.runtime_cfg.client_max_frame_count > 0);
         return self.receiveActionHandlingControlTimeout(null, .none);
     }
 
@@ -415,10 +417,10 @@ pub const ClientConnection = struct {
         timeout: Io.Timeout,
     ) Error!runtime_mod.ReceiveAction {
         assert(@intFromPtr(self) != 0);
-        assert(config.H2_CLIENT_MAX_FRAME_COUNT > 0);
+        assert(self.runtime_cfg.client_max_frame_count > 0);
 
         var frames: u32 = 0;
-        while (frames < config.H2_CLIENT_MAX_FRAME_COUNT) : (frames += 1) {
+        while (frames < self.runtime_cfg.client_max_frame_count) : (frames += 1) {
             const action = try self.receiveActionTimeout(maybe_io, timeout);
             if (try self.handleControlAction(action)) continue;
             return action;
@@ -828,10 +830,10 @@ test "ClientConnection sends client preface and initial settings" {
     defer _ = std.c.close(fds[1]);
 
     var socket = Socket.Plain.init_client(fds[0]);
-    var conn = try ClientConnection.init(&socket);
+    var conn = try ClientConnection.init(&socket, .{});
     try conn.sendClientPrefaceAndSettings();
 
-    var expected_runtime = try runtime_mod.Runtime.init();
+    var expected_runtime = try runtime_mod.Runtime.init(.{});
     var expected_buf: [preface_settings_buffer_size_bytes]u8 = undefined;
     const expected = try expected_runtime.writeClientPrefaceAndSettings(&expected_buf);
 
@@ -850,10 +852,10 @@ test "ClientConnection completeHandshake sends settings ACK" {
     try writeAllFd(fds[1], peer_settings);
 
     var socket = Socket.Plain.init_client(fds[0]);
-    var conn = try ClientConnection.init(&socket);
+    var conn = try ClientConnection.init(&socket, .{});
     try conn.completeHandshake();
 
-    var expected_runtime = try runtime_mod.Runtime.init();
+    var expected_runtime = try runtime_mod.Runtime.init(.{});
     var expected_preface_buf: [preface_settings_buffer_size_bytes]u8 = undefined;
     const expected_preface = try expected_runtime.writeClientPrefaceAndSettings(&expected_preface_buf);
 
@@ -879,10 +881,10 @@ test "ClientConnection replenishes receive windows for active stream" {
     try writeAllFd(fds[1], peer_settings);
 
     var socket = Socket.Plain.init_client(fds[0]);
-    var conn = try ClientConnection.init(&socket);
+    var conn = try ClientConnection.init(&socket, .{});
     try conn.completeHandshake();
 
-    var expected_runtime = try runtime_mod.Runtime.init();
+    var expected_runtime = try runtime_mod.Runtime.init(.{});
     var expected_preface_buf: [preface_settings_buffer_size_bytes]u8 = undefined;
     const expected_preface = try expected_runtime.writeClientPrefaceAndSettings(&expected_preface_buf);
     var handshake_wire: [preface_settings_buffer_size_bytes + h2.frame_header_size_bytes]u8 = undefined;
@@ -936,10 +938,10 @@ test "ClientConnection request send and response receive round-trip" {
     try writeAllFd(fds[1], peer_settings);
 
     var socket = Socket.Plain.init_client(fds[0]);
-    var conn = try ClientConnection.init(&socket);
+    var conn = try ClientConnection.init(&socket, .{});
     try conn.completeHandshake();
 
-    var expected_runtime = try runtime_mod.Runtime.init();
+    var expected_runtime = try runtime_mod.Runtime.init(.{});
     var expected_preface_buf: [preface_settings_buffer_size_bytes]u8 = undefined;
     const expected_preface = try expected_runtime.writeClientPrefaceAndSettings(&expected_preface_buf);
     var handshake_wire: [preface_settings_buffer_size_bytes + h2.frame_header_size_bytes]u8 = undefined;
