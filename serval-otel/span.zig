@@ -233,12 +233,61 @@ pub const Span = struct {
         kind: SpanKind,
         scope: InstrumentationScope,
     ) Self {
+        var span: Self = undefined;
+        initInto(&span, span_context, name, kind, scope);
+        return span;
+    }
+
+    /// Initialize a recording span directly into caller-provided storage.
+    /// Use this in constrained-stack hot paths to avoid constructing a large `Span` value on the stack and then copying it.
+    pub fn initInto(
+        span: *Self,
+        span_context: SpanContext,
+        name: []const u8,
+        kind: SpanKind,
+        scope: InstrumentationScope,
+    ) void {
+        initWithIdsInto(
+            span,
+            span_context.trace_id,
+            span_context.span_id,
+            null,
+            name,
+            kind,
+            scope,
+        );
+        span.span_context.trace_flags = span_context.trace_flags;
+        span.span_context.trace_state = span_context.trace_state;
+        span.span_context.is_remote = span_context.is_remote;
+    }
+
+    /// Initialize a recording span directly from trace/span identifiers.
+    /// This variant avoids constructing a temporary `SpanContext` with inline trace-state on the caller stack.
+    pub fn initWithIdsInto(
+        span: *Self,
+        trace_id: TraceID,
+        span_id: SpanID,
+        parent_span_id: ?SpanID,
+        name: []const u8,
+        kind: SpanKind,
+        scope: InstrumentationScope,
+    ) void {
         // TigerStyle: assertion on name length
         assert(name.len <= MAX_NAME_LEN);
+        assert(@intFromPtr(span) != 0);
 
-        var span = Self{
-            .span_context = span_context,
-            .parent_span_id = null,
+        span.* = Self{
+            .span_context = .{
+                .trace_id = trace_id,
+                .span_id = span_id,
+                .trace_flags = TraceFlags.default(),
+                .trace_state = .{
+                    .entries = undefined,
+                    .count = 0,
+                },
+                .is_remote = false,
+            },
+            .parent_span_id = parent_span_id,
             .name_buf = [_]u8{0} ** MAX_NAME_LEN, // Zero for defense-in-depth
             .name_len = 0,
             .kind = kind,
@@ -258,7 +307,6 @@ pub const Span = struct {
         const copy_len: usize = @min(name.len, MAX_NAME_LEN);
         @memcpy(span.name_buf[0..copy_len], name[0..copy_len]);
         span.name_len = @intCast(copy_len);
-        return span;
     }
 
     /// Create a non-recording (disabled) span

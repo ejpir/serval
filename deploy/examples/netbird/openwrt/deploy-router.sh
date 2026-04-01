@@ -90,7 +90,7 @@ log_info "Building netbird_proxy for $TARGET..."
 cd "$REPO_ROOT"
 $ZIG_BIN build clean 2>/dev/null || true
 if ! "$ZIG_BIN" build build-netbird-proxy \
-    -Doptimize=ReleaseFast \
+    -Doptimize=Debug \
     -Dtarget="$TARGET" \
     -Dopenssl-include-dir="$STAGING_DIR/usr/include" \
     -Dopenssl-lib-dir="$STAGING_DIR/usr/lib" \

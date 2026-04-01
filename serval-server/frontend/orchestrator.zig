@@ -163,11 +163,15 @@ const UdpRuntimeThreadContext = struct {
     shutdown: *std.atomic.Value(bool),
 };
 
+const io_task_stack_size_bytes: usize = 64 * 1024 * 1024;
+
 fn tcpRuntimeThreadMain(ctx: *TcpRuntimeThreadContext) void {
     assert(@intFromPtr(ctx) != 0);
     assert(@intFromPtr(ctx.shutdown) != 0);
 
-    var io_runtime = Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_runtime = Io.Threaded.init(std.heap.page_allocator, .{
+        .stack_size = io_task_stack_size_bytes,
+    });
     defer io_runtime.deinit();
 
     ctx.runtime.run(io_runtime.io(), ctx.shutdown, null) catch |err| {
@@ -179,7 +183,9 @@ fn udpRuntimeThreadMain(ctx: *UdpRuntimeThreadContext) void {
     assert(@intFromPtr(ctx) != 0);
     assert(@intFromPtr(ctx.shutdown) != 0);
 
-    var io_runtime = Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_runtime = Io.Threaded.init(std.heap.page_allocator, .{
+        .stack_size = io_task_stack_size_bytes,
+    });
     defer io_runtime.deinit();
 
     ctx.runtime.run(io_runtime.io(), ctx.shutdown, null) catch |err| {

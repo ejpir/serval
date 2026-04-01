@@ -19,12 +19,9 @@ const tracer_mod = @import("tracer.zig");
 const id_gen_mod = @import("id_generator.zig");
 
 const Span = span_mod.Span;
-const SpanContext = types.SpanContext;
 const SpanKind = types.SpanKind;
 const TraceID = types.TraceID;
 const SpanID = types.SpanID;
-const TraceFlags = types.TraceFlags;
-const TraceState = types.TraceState;
 const InstrumentationScope = types.InstrumentationScope;
 const SpanProcessor = tracer_mod.SpanProcessor;
 const RandomIDGenerator = id_gen_mod.RandomIDGenerator;
@@ -115,8 +112,10 @@ pub const OtelTracer = struct {
     /// Start a new span, optionally as a child of parent.
     /// Returns a SpanHandle that can be used to reference the span.
     pub fn startSpan(self: *Self, name: []const u8, parent: ?SpanHandle) SpanHandle {
+        log.debug("otel tracer: startSpan enter name_len={d}", .{name.len});
         self.mutex.lockUncancelable(std.Options.debug_io);
         defer self.mutex.unlock(std.Options.debug_io);
+        log.debug("otel tracer: mutex locked", .{});
 
         // Find a free slot
         const slot_index = self.findFreeSlot() orelse {
@@ -124,6 +123,7 @@ pub const OtelTracer = struct {
             log.warn("OtelTracer: span pool exhausted, dropping span '{s}'", .{name});
             return .{};
         };
+        log.debug("otel tracer: free slot={d}", .{slot_index});
 
         // Generate IDs
         const trace_id: TraceID = if (parent) |p|
@@ -132,30 +132,23 @@ pub const OtelTracer = struct {
             self.id_generator.newTraceId();
 
         const span_id = self.id_generator.newSpanId();
+        log.debug("otel tracer: ids generated", .{});
 
-        // Create span context
-        const span_context = SpanContext.init(
+        // Initialize the span in-place to avoid constructing large local OTEL values on constrained runtime stacks.
+        Span.initWithIdsInto(
+            &self.spans[slot_index].span,
             trace_id,
             span_id,
-            TraceFlags.default(),
-            TraceState.init(),
-            false, // not remote
+            if (parent) |p| SpanID.init(p.span_id) else null,
+            name,
+            .Server,
+            self.scope,
         );
+        log.debug("otel tracer: span initialized in-place", .{});
 
-        // Create the span
-        var span = Span.init(span_context, name, .Server, self.scope);
-
-        // Set parent if provided
-        if (parent) |p| {
-            span.parent_span_id = SpanID.init(p.span_id);
-        }
-
-        // Store in slot
-        self.spans[slot_index] = .{
-            .span = span,
-            .in_use = true,
-        };
+        self.spans[slot_index].in_use = true;
         self.active_count += 1;
+        log.debug("otel tracer: slot activated active_count={d}", .{self.active_count});
 
         // Return handle
         return .{

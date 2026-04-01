@@ -104,6 +104,7 @@ pub const Error = error{
     WriteFailed,
     WouldBlock,
     ConnectionClosed,
+    OutOfMemory,
     HeadersAlreadySent,
     HeadersNotSent,
     ResponseClosed,
@@ -1416,15 +1417,26 @@ fn serveConnectionWithInitialBytesOptions(
     assert(@intFromPtr(io_conn) != 0);
     assert(initial_bytes.len <= read_buffer_size_bytes);
 
-    var connection_storage = ConnectionStorage{};
+    const connection_storage = try std.heap.page_allocator.create(ConnectionStorage);
+    errdefer std.heap.page_allocator.destroy(connection_storage);
+    connection_storage.* = .{};
     var runtime = try runtime_mod.Runtime.init(
         runtime_cfg,
         &connection_storage.pending_request_headers_storage,
         &connection_storage.request_header_storage,
         &connection_storage.request_fields_storage,
     );
-    var response_states = ResponseStateTable{};
-    var stream_trackers = StreamTrackerTable{};
+    const response_states = try std.heap.page_allocator.create(ResponseStateTable);
+    errdefer std.heap.page_allocator.destroy(response_states);
+    response_states.* = .{};
+    const stream_trackers = try std.heap.page_allocator.create(StreamTrackerTable);
+    errdefer std.heap.page_allocator.destroy(stream_trackers);
+    stream_trackers.* = .{};
+    defer {
+        std.heap.page_allocator.destroy(stream_trackers);
+        std.heap.page_allocator.destroy(response_states);
+        std.heap.page_allocator.destroy(connection_storage);
+    }
     var connection_mutex: Io.Mutex = .init;
     var plain_reader: Io.net.Stream.Reader = undefined;
     const maybe_plain_reader = initMaybePlainReader(io_conn, io, &connection_storage.plain_read_buf, &plain_reader);
@@ -1437,7 +1449,7 @@ fn serveConnectionWithInitialBytesOptions(
     try sendInitialServerSettings(io_conn, io, connection_id, &runtime, options.local_settings_already_sent);
 
     var buffer_len: usize = undefined;
-    initConnectionStorage(runtime_cfg, &connection_storage, &buffer_len, initial_bytes);
+    initConnectionStorage(runtime_cfg, connection_storage, &buffer_len, initial_bytes);
     try consumeClientPrefaceFromBuffer(
         io_conn,
         maybe_plain_reader,
@@ -1454,8 +1466,8 @@ fn serveConnectionWithInitialBytesOptions(
         .connection_id = connection_id,
         .stream_id = 0,
         .runtime = &runtime,
-        .states = &response_states,
-        .stream_trackers = &stream_trackers,
+        .states = response_states,
+        .stream_trackers = stream_trackers,
     };
     startBackgroundTasksIfPresent(Handler, handler, &background_writer, &connection_mutex, connection_id);
     defer stopBackgroundTasksIfPresent(Handler, handler);
@@ -1468,10 +1480,10 @@ fn serveConnectionWithInitialBytesOptions(
         io,
         connection_id,
         &runtime,
-        &response_states,
-        &stream_trackers,
+        response_states,
+        stream_trackers,
         &connection_mutex,
-        &connection_storage,
+        connection_storage,
         connection_storage.recv_buf[0..],
         &buffer_len,
     );
@@ -1586,7 +1598,9 @@ pub fn serveUpgradedConnection(
     assert(initial_client_h2_bytes.len <= read_buffer_size_bytes);
 
     var io_conn = ConnectionIo.initPlain(fd);
-    var connection_storage = ConnectionStorage{};
+    const connection_storage = try std.heap.page_allocator.create(ConnectionStorage);
+    errdefer std.heap.page_allocator.destroy(connection_storage);
+    connection_storage.* = .{};
     var plain_reader = rawStreamForFd(fd).reader(io, &connection_storage.plain_read_buf);
     var runtime = try runtime_mod.Runtime.init(
         .{},
@@ -1594,8 +1608,17 @@ pub fn serveUpgradedConnection(
         &connection_storage.request_header_storage,
         &connection_storage.request_fields_storage,
     );
-    var response_states = ResponseStateTable{};
-    var stream_trackers = StreamTrackerTable{};
+    const response_states = try std.heap.page_allocator.create(ResponseStateTable);
+    errdefer std.heap.page_allocator.destroy(response_states);
+    response_states.* = .{};
+    const stream_trackers = try std.heap.page_allocator.create(StreamTrackerTable);
+    errdefer std.heap.page_allocator.destroy(stream_trackers);
+    stream_trackers.* = .{};
+    defer {
+        std.heap.page_allocator.destroy(stream_trackers);
+        std.heap.page_allocator.destroy(response_states);
+        std.heap.page_allocator.destroy(connection_storage);
+    }
     var connection_mutex: Io.Mutex = .init;
     try bootstrapUpgradedConnection(
         Handler,
@@ -1604,9 +1627,9 @@ pub fn serveUpgradedConnection(
         io,
         connection_id,
         &runtime,
-        &response_states,
-        &stream_trackers,
-        &connection_storage,
+        response_states,
+        stream_trackers,
+        connection_storage,
         settings_payload,
     );
 
@@ -1616,8 +1639,8 @@ pub fn serveUpgradedConnection(
         .connection_id = connection_id,
         .stream_id = 0,
         .runtime = &runtime,
-        .states = &response_states,
-        .stream_trackers = &stream_trackers,
+        .states = response_states,
+        .stream_trackers = stream_trackers,
     };
     startBackgroundTasksIfPresent(Handler, handler, &background_writer, &connection_mutex, connection_id);
     defer stopBackgroundTasksIfPresent(Handler, handler);
@@ -1630,8 +1653,8 @@ pub fn serveUpgradedConnection(
         io,
         connection_id,
         &runtime,
-        &response_states,
-        &stream_trackers,
+        response_states,
+        stream_trackers,
         request,
         settings_payload,
         initial_body,
@@ -1639,7 +1662,7 @@ pub fn serveUpgradedConnection(
         &connection_mutex,
         initial_client_h2_bytes,
         .{},
-        &connection_storage,
+        connection_storage,
     );
 }
 

@@ -97,7 +97,7 @@ pub fn GenericTlsH2FrontendHandler(
         io: Io,
         forwarder: *Forwarder,
         connection_ctx: *Context,
-        grpc_handler: BridgeHandler,
+        grpc_handler: *BridgeHandler,
         tracked_grpc_streams: [config.H2_MAX_CONCURRENT_STREAMS]u32 = [_]u32{0} ** config.H2_MAX_CONCURRENT_STREAMS,
         tracked_grpc_stream_count: u16 = 0,
         tracked_h2_bridge_streams: [config.H2_MAX_CONCURRENT_STREAMS]u32 = [_]u32{0} ** config.H2_MAX_CONCURRENT_STREAMS,
@@ -112,27 +112,42 @@ pub fn GenericTlsH2FrontendHandler(
         generic_request_streams: [generic_request_stream_capacity]GenericRequestStreamState = [_]GenericRequestStreamState{.{}} ** generic_request_stream_capacity,
         tracked_generic_request_stream_count: u16 = 0,
 
-        /// Initializes a generic h2 frontend handler around an existing handler and bridge handler.
+        /// Initializes a generic h2 frontend handler directly into caller-owned storage.
         /// Stores the provided pointers and I/O handle without taking ownership of them.
-        /// The referenced handler, forwarder, and connection context must outlive the returned value.
-        pub fn init(
+        /// The referenced handler, forwarder, and connection context must outlive `self`.
+        pub fn initInto(
+            self: *Self,
             inner: *Handler,
             io: Io,
             forwarder: *Forwarder,
             connection_ctx: *Context,
-            grpc_handler: BridgeHandler,
-        ) Self {
+            grpc_handler: *BridgeHandler,
+        ) void {
+            assert(@intFromPtr(self) != 0);
             assert(@intFromPtr(inner) != 0);
             assert(@intFromPtr(forwarder) != 0);
             assert(@intFromPtr(connection_ctx) != 0);
+            assert(@intFromPtr(grpc_handler) != 0);
 
-            return .{
-                .inner = inner,
-                .io = io,
-                .forwarder = forwarder,
-                .connection_ctx = connection_ctx,
-                .grpc_handler = grpc_handler,
-            };
+            self.inner = inner;
+            self.io = io;
+            self.forwarder = forwarder;
+            self.connection_ctx = connection_ctx;
+            self.grpc_handler = grpc_handler;
+
+            @memset(self.tracked_grpc_streams[0..], 0);
+            self.tracked_grpc_stream_count = 0;
+            @memset(self.tracked_h2_bridge_streams[0..], 0);
+            self.tracked_h2_bridge_stream_count = 0;
+            self.websocket_mutex = .init;
+            self.websocket_reader_group = .init;
+            self.websocket_reader_started = false;
+            self.writer_template = null;
+            self.connection_mutex = null;
+            for (self.websocket_streams[0..]) |*slot| resetWebSocketStreamState(slot);
+            self.tracked_websocket_stream_count = 0;
+            for (self.generic_request_streams[0..]) |*slot| resetGenericRequestStreamState(slot);
+            self.tracked_generic_request_stream_count = 0;
         }
 
         /// Releases all background-task state and then deinitializes the embedded bridge handler.
@@ -185,7 +200,7 @@ pub fn GenericTlsH2FrontendHandler(
             while (index < self.websocket_streams.len) : (index += 1) {
                 if (!self.websocket_streams[index].used) continue;
                 self.websocket_streams[index].upstream_conn.close();
-                self.websocket_streams[index] = .{};
+                resetWebSocketStreamState(&self.websocket_streams[index]);
             }
             self.tracked_websocket_stream_count = 0;
 
@@ -193,7 +208,7 @@ pub fn GenericTlsH2FrontendHandler(
             while (index < self.generic_request_streams.len) : (index += 1) {
                 if (!self.generic_request_streams[index].used) continue;
                 self.generic_request_streams[index].upstream_conn.close();
-                self.generic_request_streams[index] = .{};
+                resetGenericRequestStreamState(&self.generic_request_streams[index]);
             }
             self.tracked_generic_request_stream_count = 0;
         }
@@ -648,7 +663,7 @@ pub fn GenericTlsH2FrontendHandler(
             while (index < self.generic_request_streams.len) : (index += 1) {
                 if (!self.generic_request_streams[index].used) continue;
                 if (self.generic_request_streams[index].stream_id != stream_id) continue;
-                self.generic_request_streams[index] = .{};
+                resetGenericRequestStreamState(&self.generic_request_streams[index]);
                 if (self.tracked_generic_request_stream_count > 0) self.tracked_generic_request_stream_count -= 1;
                 return;
             }
@@ -662,7 +677,7 @@ pub fn GenericTlsH2FrontendHandler(
                 if (!self.generic_request_streams[index].used) continue;
                 if (self.generic_request_streams[index].stream_id != stream_id) continue;
                 self.generic_request_streams[index].upstream_conn.close();
-                self.generic_request_streams[index] = .{};
+                resetGenericRequestStreamState(&self.generic_request_streams[index]);
                 if (self.tracked_generic_request_stream_count > 0) self.tracked_generic_request_stream_count -= 1;
                 return;
             }
@@ -846,10 +861,26 @@ pub fn GenericTlsH2FrontendHandler(
                 if (!self.websocket_streams[index].used) continue;
                 if (self.websocket_streams[index].stream_id != stream_id) continue;
                 self.websocket_streams[index].upstream_conn.close();
-                self.websocket_streams[index] = .{};
+                resetWebSocketStreamState(&self.websocket_streams[index]);
                 if (self.tracked_websocket_stream_count > 0) self.tracked_websocket_stream_count -= 1;
                 return;
             }
+        }
+
+        fn resetWebSocketStreamState(slot: *WebSocketStreamState) void {
+            assert(@intFromPtr(slot) != 0);
+            slot.used = false;
+            slot.closing = false;
+            slot.stream_id = 0;
+        }
+
+        fn resetGenericRequestStreamState(slot: *GenericRequestStreamState) void {
+            assert(@intFromPtr(slot) != 0);
+            slot.used = false;
+            slot.stream_id = 0;
+            slot.body_mode = .content_length;
+            slot.expected_content_length = 0;
+            slot.forwarded_body_bytes = 0;
         }
 
         fn getWebSocketStreamState(self: *Self, stream_id: u32) ?*WebSocketStreamState {
@@ -1147,7 +1178,11 @@ pub fn tryServeTlsAlpnConnection(
         std.heap.page_allocator.destroy(bridge_sessions);
     }
 
-    const bridge_handler = BridgeHandler.init(
+    const bridge_handler = std.heap.page_allocator.create(BridgeHandler) catch {
+        log.err("server: conn={d} generic h2 bridge handler allocation failed", .{connection_id});
+        return false;
+    };
+    bridge_handler.* = BridgeHandler.init(
         handler,
         io,
         &bridge_client,
@@ -1156,20 +1191,30 @@ pub fn tryServeTlsAlpnConnection(
     );
 
     const GenericHandler = GenericTlsH2FrontendHandler(Handler, Pool, Tracer, BridgeHandler);
-    var generic_handler = GenericHandler.init(
+    const generic_handler = std.heap.page_allocator.create(GenericHandler) catch {
+        std.heap.page_allocator.destroy(bridge_handler);
+        log.err("server: conn={d} generic frontend h2 handler allocation failed", .{connection_id});
+        return false;
+    };
+    GenericHandler.initInto(
+        generic_handler,
         handler,
         io,
         forwarder,
         connection_ctx,
         bridge_handler,
     );
-    defer generic_handler.deinit();
+    defer {
+        generic_handler.deinit();
+        std.heap.page_allocator.destroy(generic_handler);
+        std.heap.page_allocator.destroy(bridge_handler);
+    }
 
     log.debug("server: conn={d} dispatching ALPN h2 to generic frontend h2 driver", .{connection_id});
 
     h2_server.serveTlsConnection(
-        @TypeOf(generic_handler),
-        &generic_handler,
+        GenericHandler,
+        generic_handler,
         runtime_cfg,
         tls_stream,
         io,

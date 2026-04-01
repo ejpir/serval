@@ -289,6 +289,7 @@ pub const RuntimeTracer = struct {
     /// The returned handle belongs to the active tracer and should be used with the matching RuntimeTracer methods.
     pub fn startSpan(self: *RuntimeTracer, name: []const u8, parent: ?tracing_mod.SpanHandle) tracing_mod.SpanHandle {
         assert(@intFromPtr(self) != 0);
+        std.log.debug("runtime tracer: startSpan kind={s} name_len={d}", .{ @tagName(self.kind), name.len });
         return switch (self.kind) {
             .noop => self.noop.startSpan(name, parent),
             .otel => self.otel_tracer.?.startSpan(name, parent),

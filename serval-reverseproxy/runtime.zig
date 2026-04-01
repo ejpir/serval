@@ -238,7 +238,9 @@ const ProxyHandler = struct {
 pub fn load(options: LoadOptions) !Runtime {
     assert(options.config_file.len > 0);
 
-    var io_threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    var io_threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{
+        .stack_size = 64 * 1024 * 1024,
+    });
     errdefer io_threaded.deinit();
     const io = io_threaded.io();
 
