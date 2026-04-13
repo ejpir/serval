@@ -882,7 +882,8 @@ pub fn Server(
             assert(@intFromPtr(storage) != 0);
             assert(stream.socket.handle >= 0);
 
-            var runtime = h2_runtime.Runtime.init(
+            var runtime: h2_runtime.Runtime = undefined;
+            runtime.initInto(
                 runtime_cfg,
                 &storage.pending_request_headers_storage,
                 &storage.request_header_storage,

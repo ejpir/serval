@@ -40,7 +40,7 @@ pub const preflightAndResolveListenAddress = bootstrap.preflightAndResolveListen
 pub const runtime = @import("runtime.zig");
 /// Fixed-capacity HTTP/2 server runtime state used to validate inbound frames and build outbound control frames.
 /// The struct owns no sockets or heap allocations and reuses internal buffers for request decoding and body tracking.
-/// Create it with `init()` before calling the frame-processing or frame-writing methods.
+/// Initialize caller-owned storage with `initInto()` before calling the frame-processing or frame-writing methods.
 pub const Runtime = runtime.Runtime;
 /// Errors returned by the runtime's frame-receive and control-frame write APIs.
 /// Covers protocol and state violations, flow-control failures, unsupported frame handling, and errors propagated from connection and HTTP/2 helpers.

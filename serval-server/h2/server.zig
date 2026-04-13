@@ -1420,7 +1420,8 @@ fn serveConnectionWithInitialBytesOptions(
     const connection_storage = try std.heap.page_allocator.create(ConnectionStorage);
     errdefer std.heap.page_allocator.destroy(connection_storage);
     connection_storage.* = .{};
-    var runtime = try runtime_mod.Runtime.init(
+    var runtime: runtime_mod.Runtime = undefined;
+    try runtime.initInto(
         runtime_cfg,
         &connection_storage.pending_request_headers_storage,
         &connection_storage.request_header_storage,
@@ -1602,7 +1603,8 @@ pub fn serveUpgradedConnection(
     errdefer std.heap.page_allocator.destroy(connection_storage);
     connection_storage.* = .{};
     var plain_reader = rawStreamForFd(fd).reader(io, &connection_storage.plain_read_buf);
-    var runtime = try runtime_mod.Runtime.init(
+    var runtime: runtime_mod.Runtime = undefined;
+    try runtime.initInto(
         .{},
         &connection_storage.pending_request_headers_storage,
         &connection_storage.request_header_storage,
