@@ -23,7 +23,7 @@ pub const SessionError = session.Error;
 pub const runtime = @import("runtime.zig");
 /// HTTP/2 client runtime state for prior-knowledge upstream sessions.
 /// The runtime does not own sockets; it tracks session state, HPACK decoding, and per-stream response bookkeeping.
-/// Initialize it with `Runtime.init()` before sending or receiving frames.
+/// Initialize it with `Runtime.init(runtime_cfg, response_fields_storage)` before sending or receiving frames.
 pub const Runtime = runtime.Runtime;
 /// Error set returned by the HTTP/2 runtime.
 /// Covers invalid headers, unsupported frame features, stream-state mismatches, and protocol sequencing failures.

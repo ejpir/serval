@@ -125,23 +125,26 @@ pub const Runtime = struct {
     runtime_cfg: config.H2Config,
     state: session.SessionState,
     header_decoder: h2.HpackDecoder = h2.HpackDecoder.init(),
-    response_fields_storage: [config.MAX_HEADERS]h2.HeaderField = undefined,
+    response_fields_storage: []h2.HeaderField,
     response_states: ResponseStateTable = .{},
     pending_response_headers: PendingResponseHeaders = .{},
 
     /// Constructs a fresh runtime with an initialized session state, HPACK decoder,
-    /// and bounded response/trailer decode scratch owned by the runtime value.
-    /// The configuration must provide a positive connection window and header block capacity.
+    /// and caller-owned bounded response/trailer decode scratch.
+    /// The configuration must provide a positive connection window and header block capacity,
+    /// and `response_fields_storage` must have room for `config.MAX_HEADERS` decoded fields.
     /// Returns any error raised while initializing the underlying session state.
-    pub fn init(runtime_cfg: config.H2Config) Error!Runtime {
+    pub fn init(runtime_cfg: config.H2Config, response_fields_storage: []h2.HeaderField) Error!Runtime {
         assert(runtime_cfg.connection_window_size_bytes > 0);
         assert(runtime_cfg.max_header_block_size_bytes > 0);
         assert(runtime_cfg.max_frame_size_bytes <= h2.frame_payload_capacity_bytes);
         assert(runtime_cfg.max_header_block_size_bytes <= h2.header_block_capacity_bytes);
+        assert(response_fields_storage.len >= config.MAX_HEADERS);
         return .{
             .runtime_cfg = runtime_cfg,
             .state = try session.SessionState.init(runtime_cfg),
             .header_decoder = h2.HpackDecoder.init(),
+            .response_fields_storage = response_fields_storage,
         };
     }
 
@@ -853,7 +856,7 @@ fn decodeResponseHeaderBlock(self: *Runtime, header_block: []const u8) Error!Res
     const fields = try h2.decodeHeaderBlockWithDecoder(
         &self.header_decoder,
         header_block,
-        &self.response_fields_storage,
+        self.response_fields_storage,
     );
 
     var response = Response{
@@ -897,7 +900,7 @@ fn decodeTrailerHeaderBlock(self: *Runtime, header_block: []const u8) Error!Head
     const fields = try h2.decodeHeaderBlockWithDecoder(
         &self.header_decoder,
         header_block,
-        &self.response_fields_storage,
+        self.response_fields_storage,
     );
 
     var trailers = HeaderMap.init();
@@ -1045,11 +1048,12 @@ fn makeGrpcRequest(path: []const u8) !Request {
 
 var test_pending_response_headers_storage: [h2.header_block_capacity_bytes]u8 = undefined;
 
-fn initRuntimeReadyForStreams() !Runtime {
+fn initRuntimeReadyForStreams(response_fields_storage: []h2.HeaderField) !Runtime {
     assert(h2.max_settings_per_frame > 0);
     assert(h2.client_connection_preface.len > 0);
+    assert(response_fields_storage.len >= config.MAX_HEADERS);
 
-    var runtime = try Runtime.init(.{});
+    var runtime = try Runtime.init(.{}, response_fields_storage);
 
     var preface_buf: [h2.client_connection_preface.len + h2.frame_header_size_bytes + (4 * h2.setting_size_bytes)]u8 = undefined;
     _ = try runtime.writeClientPrefaceAndSettings(&preface_buf);
@@ -1072,7 +1076,8 @@ fn initRuntimeReadyForStreams() !Runtime {
 }
 
 test "Runtime writes client preface and SETTINGS" {
-    var runtime = try Runtime.init(.{});
+    var response_fields_storage: [config.MAX_HEADERS]h2.HeaderField = undefined;
+    var runtime = try Runtime.init(.{}, &response_fields_storage);
 
     var out: [h2.client_connection_preface.len + h2.frame_header_size_bytes + (4 * h2.setting_size_bytes)]u8 = undefined;
     const encoded = try runtime.writeClientPrefaceAndSettings(&out);
@@ -1086,7 +1091,8 @@ test "Runtime writes client preface and SETTINGS" {
 }
 
 test "Runtime requires peer settings before non-settings frames" {
-    var runtime = try Runtime.init(.{});
+    var response_fields_storage: [config.MAX_HEADERS]h2.HeaderField = undefined;
+    var runtime = try Runtime.init(.{}, &response_fields_storage);
 
     var preface_buf: [h2.client_connection_preface.len + h2.frame_header_size_bytes + (4 * h2.setting_size_bytes)]u8 = undefined;
     _ = try runtime.writeClientPrefaceAndSettings(&preface_buf);
@@ -1105,7 +1111,8 @@ test "Runtime requires peer settings before non-settings frames" {
 }
 
 test "Runtime receives peer settings, sends ACK, and accepts SETTINGS ACK" {
-    var runtime = try Runtime.init(.{});
+    var response_fields_storage: [config.MAX_HEADERS]h2.HeaderField = undefined;
+    var runtime = try Runtime.init(.{}, &response_fields_storage);
 
     var preface_buf: [h2.client_connection_preface.len + h2.frame_header_size_bytes + (4 * h2.setting_size_bytes)]u8 = undefined;
     _ = try runtime.writeClientPrefaceAndSettings(&preface_buf);
@@ -1143,7 +1150,8 @@ test "Runtime receives peer settings, sends ACK, and accepts SETTINGS ACK" {
 }
 
 test "Runtime writes request HEADERS and DATA with stream lifecycle" {
-    var runtime = try initRuntimeReadyForStreams();
+    var response_fields_storage: [config.MAX_HEADERS]h2.HeaderField = undefined;
+    var runtime = try initRuntimeReadyForStreams(&response_fields_storage);
     var request = try makeGrpcRequest("/grpc.test.Echo/Unary");
 
     var header_block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
@@ -1166,7 +1174,8 @@ test "Runtime writes request HEADERS and DATA with stream lifecycle" {
 }
 
 test "Runtime fragments outbound request HEADERS with CONTINUATION when peer max frame is reduced" {
-    var runtime = try initRuntimeReadyForStreams();
+    var response_fields_storage: [config.MAX_HEADERS]h2.HeaderField = undefined;
+    var runtime = try initRuntimeReadyForStreams(&response_fields_storage);
     runtime.state.peer_settings.max_frame_size_bytes = 64;
 
     var request = try makeGrpcRequest("/grpc.test.Echo/Unary");
@@ -1211,7 +1220,8 @@ test "Runtime fragments outbound request HEADERS with CONTINUATION when peer max
 }
 
 test "Runtime decodes response HEADERS, DATA, and trailers" {
-    var runtime = try initRuntimeReadyForStreams();
+    var response_fields_storage: [config.MAX_HEADERS]h2.HeaderField = undefined;
+    var runtime = try initRuntimeReadyForStreams(&response_fields_storage);
     var request = try makeGrpcRequest("/grpc.test.Echo/Unary");
 
     var request_header_block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
@@ -1293,7 +1303,8 @@ test "Runtime decodes response HEADERS, DATA, and trailers" {
 }
 
 test "Runtime reassembles response HEADERS and trailers with CONTINUATION" {
-    var runtime = try initRuntimeReadyForStreams();
+    var response_fields_storage: [config.MAX_HEADERS]h2.HeaderField = undefined;
+    var runtime = try initRuntimeReadyForStreams(&response_fields_storage);
     var request = try makeGrpcRequest("/grpc.test.Echo/Unary");
 
     var header_block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
@@ -1401,7 +1412,8 @@ test "Runtime reassembles response HEADERS and trailers with CONTINUATION" {
 }
 
 test "Runtime rejects interleaved frame while waiting for response CONTINUATION" {
-    var runtime = try initRuntimeReadyForStreams();
+    var response_fields_storage: [config.MAX_HEADERS]h2.HeaderField = undefined;
+    var runtime = try initRuntimeReadyForStreams(&response_fields_storage);
     var request = try makeGrpcRequest("/grpc.test.Echo/Unary");
 
     var header_block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
@@ -1435,7 +1447,8 @@ test "Runtime rejects interleaved frame while waiting for response CONTINUATION"
 }
 
 test "Runtime rejects unexpected CONTINUATION without pending response headers" {
-    var runtime = try initRuntimeReadyForStreams();
+    var response_fields_storage: [config.MAX_HEADERS]h2.HeaderField = undefined;
+    var runtime = try initRuntimeReadyForStreams(&response_fields_storage);
 
     var continuation_frame_buf: [h2.frame_header_size_bytes + 1]u8 = undefined;
     const continuation_frame = try appendFrame(
@@ -1458,7 +1471,8 @@ test "Runtime rejects unexpected CONTINUATION without pending response headers" 
 }
 
 test "Runtime rejects unexpected CONTINUATION stream" {
-    var runtime = try initRuntimeReadyForStreams();
+    var response_fields_storage: [config.MAX_HEADERS]h2.HeaderField = undefined;
+    var runtime = try initRuntimeReadyForStreams(&response_fields_storage);
     var request = try makeGrpcRequest("/grpc.test.Echo/Unary");
 
     var header_block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
@@ -1509,7 +1523,8 @@ test "Runtime rejects unexpected CONTINUATION stream" {
 }
 
 test "Runtime rejects response CONTINUATION with invalid flags" {
-    var runtime = try initRuntimeReadyForStreams();
+    var response_fields_storage: [config.MAX_HEADERS]h2.HeaderField = undefined;
+    var runtime = try initRuntimeReadyForStreams(&response_fields_storage);
     var request = try makeGrpcRequest("/grpc.test.Echo/Unary");
 
     var header_block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
@@ -1552,7 +1567,8 @@ test "Runtime rejects response CONTINUATION with invalid flags" {
 }
 
 test "Runtime enforces response continuation frame bound" {
-    var runtime = try initRuntimeReadyForStreams();
+    var response_fields_storage: [config.MAX_HEADERS]h2.HeaderField = undefined;
+    var runtime = try initRuntimeReadyForStreams(&response_fields_storage);
     var request = try makeGrpcRequest("/grpc.test.Echo/Unary");
 
     var header_block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
@@ -1602,7 +1618,8 @@ test "Runtime enforces response continuation frame bound" {
 }
 
 test "Runtime handles upstream RST_STREAM and clears stream state" {
-    var runtime = try initRuntimeReadyForStreams();
+    var response_fields_storage: [config.MAX_HEADERS]h2.HeaderField = undefined;
+    var runtime = try initRuntimeReadyForStreams(&response_fields_storage);
     var request = try makeGrpcRequest("/grpc.test.Echo/Unary");
 
     var header_block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
@@ -1626,7 +1643,8 @@ test "Runtime handles upstream RST_STREAM and clears stream state" {
 }
 
 test "Runtime ignores duplicate upstream RST_STREAM for retired known stream" {
-    var runtime = try Runtime.init(.{});
+    var response_fields_storage: [config.MAX_HEADERS]h2.HeaderField = undefined;
+    var runtime = try Runtime.init(.{}, &response_fields_storage);
     var request = try makeGrpcRequest("/svc.Method/Foo");
 
     var preface_buf: [256]u8 = undefined;
@@ -1666,7 +1684,8 @@ test "Runtime ignores duplicate upstream RST_STREAM for retired known stream" {
 }
 
 test "Runtime tracks GOAWAY bound and rejects new streams above last_stream_id" {
-    var runtime = try initRuntimeReadyForStreams();
+    var response_fields_storage: [config.MAX_HEADERS]h2.HeaderField = undefined;
+    var runtime = try initRuntimeReadyForStreams(&response_fields_storage);
     var request = try makeGrpcRequest("/grpc.test.Echo/Unary");
 
     var header_block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
@@ -1696,7 +1715,8 @@ test "Runtime tracks GOAWAY bound and rejects new streams above last_stream_id" 
 }
 
 test "Runtime applies WINDOW_UPDATE increments to send windows" {
-    var runtime = try initRuntimeReadyForStreams();
+    var response_fields_storage: [config.MAX_HEADERS]h2.HeaderField = undefined;
+    var runtime = try initRuntimeReadyForStreams(&response_fields_storage);
     var request = try makeGrpcRequest("/grpc.test.Echo/Unary");
 
     var header_block_buf: [h2.header_block_capacity_bytes]u8 = undefined;
@@ -1726,7 +1746,8 @@ test "Runtime applies WINDOW_UPDATE increments to send windows" {
 }
 
 test "Runtime emits ping ACK action and frame" {
-    var runtime = try initRuntimeReadyForStreams();
+    var response_fields_storage: [config.MAX_HEADERS]h2.HeaderField = undefined;
+    var runtime = try initRuntimeReadyForStreams(&response_fields_storage);
 
     const ping_header = h2.FrameHeader{
         .length = h2.control.ping_payload_size_bytes,

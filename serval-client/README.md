@@ -244,7 +244,8 @@ pub const H2UpstreamSessionPool = serval_client.H2UpstreamSessionPool;
 var session = try H2SessionState.init();
 
 // Frame-level runtime (no socket ownership)
-var runtime = try H2Runtime.init();
+var response_fields_storage: [serval.config.MAX_HEADERS]serval_h2.HeaderField = undefined;
+var runtime = try H2Runtime.init(.{}, &response_fields_storage);
 
 // Socket-owning prior-knowledge h2c driver
 var h2_storage = H2ClientConnectionStorage{};
@@ -258,9 +259,10 @@ defer h2_pool.deinit();
 
 `H2ClientConnectionStorage` now owns both inbound receive/header scratch and
 the outbound preface, SETTINGS ACK, PING ACK, request-header-block, HEADERS,
-DATA, RST_STREAM, WINDOW_UPDATE, and plain-stream writer scratch used by the
-client H2 driver, so the connection hot path keeps its fixed-capacity buffers
-in one explicit caller-owned storage object.
+DATA, RST_STREAM, WINDOW_UPDATE, plain-stream writer scratch, and bounded
+response decode `HeaderField[MAX_HEADERS]` scratch used by the client H2
+driver, so the connection hot path keeps its fixed-capacity buffers in one
+explicit caller-owned storage object.
 
 `H2Runtime` currently provides bounded helpers for:
 - client preface + initial SETTINGS emission
@@ -268,7 +270,7 @@ in one explicit caller-owned storage object.
 - inbound response HEADERS/DATA/trailer decoding, including bounded HEADERS+CONTINUATION reassembly and bounded HPACK dynamic-table/Huffman decode
 - SETTINGS ACK, PING ACK, WINDOW_UPDATE, RST_STREAM, and GOAWAY handling
 
-The client runtime now also owns its bounded temporary `HeaderField[MAX_HEADERS]`
+The client runtime now borrows bounded caller-owned `HeaderField[MAX_HEADERS]`
 scratch for response/trailer decode, so the receive hot path does not rebuild
 that fixed-capacity array on the stack for each decoded header block.
 

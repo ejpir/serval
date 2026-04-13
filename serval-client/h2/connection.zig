@@ -35,6 +35,7 @@ const local_data_frame_payload_capacity_bytes: u32 = h2.frame_payload_capacity_b
 /// Keep this storage alive for at least as long as the associated connection.
 pub const ConnectionStorage = struct {
     pending_response_headers_storage: [h2.header_block_capacity_bytes]u8 = undefined,
+    response_fields_storage: [config.MAX_HEADERS]h2.HeaderField = undefined,
     request_header_block_buf: [h2.header_block_capacity_bytes]u8 = undefined,
     recv_buf: [read_buffer_size_bytes]u8 = undefined,
     plain_write_buf: [config.STREAM_WRITE_BUFFER_SIZE_BYTES]u8 = undefined,
@@ -115,6 +116,7 @@ pub const ClientConnection = struct {
         assert(runtime_cfg.max_frame_size_bytes <= h2.frame_payload_capacity_bytes);
         assert(runtime_cfg.max_header_block_size_bytes <= h2.header_block_capacity_bytes);
         assert(storage.pending_response_headers_storage.len >= runtime_cfg.max_header_block_size_bytes);
+        assert(storage.response_fields_storage.len >= config.MAX_HEADERS);
         assert(storage.request_header_block_buf.len >= runtime_cfg.max_header_block_size_bytes);
         assert(storage.recv_buf.len == read_buffer_size_bytes);
         assert(storage.plain_write_buf.len == config.STREAM_WRITE_BUFFER_SIZE_BYTES);
@@ -131,7 +133,7 @@ pub const ClientConnection = struct {
             .runtime_cfg = runtime_cfg,
             .socket = socket,
             .io = io,
-            .runtime = try runtime_mod.Runtime.init(runtime_cfg),
+            .runtime = try runtime_mod.Runtime.init(runtime_cfg, &storage.response_fields_storage),
             .pending_response_headers_storage = &storage.pending_response_headers_storage,
             .request_header_block_buf = &storage.request_header_block_buf,
             .recv_buf = &storage.recv_buf,
@@ -911,7 +913,8 @@ test "ClientConnection sends client preface and initial settings" {
     var conn = try ClientConnection.init(&socket, .{}, &storage);
     try conn.sendClientPrefaceAndSettings();
 
-    var expected_runtime = try runtime_mod.Runtime.init(.{});
+    var expected_response_fields_storage: [config.MAX_HEADERS]h2.HeaderField = undefined;
+    var expected_runtime = try runtime_mod.Runtime.init(.{}, &expected_response_fields_storage);
     var expected_buf: [preface_settings_buffer_size_bytes]u8 = undefined;
     const expected = try expected_runtime.writeClientPrefaceAndSettings(&expected_buf);
 
@@ -934,7 +937,8 @@ test "ClientConnection completeHandshake sends settings ACK" {
     var conn = try ClientConnection.init(&socket, .{}, &storage);
     try conn.completeHandshake();
 
-    var expected_runtime = try runtime_mod.Runtime.init(.{});
+    var expected_response_fields_storage: [config.MAX_HEADERS]h2.HeaderField = undefined;
+    var expected_runtime = try runtime_mod.Runtime.init(.{}, &expected_response_fields_storage);
     var expected_preface_buf: [preface_settings_buffer_size_bytes]u8 = undefined;
     const expected_preface = try expected_runtime.writeClientPrefaceAndSettings(&expected_preface_buf);
 
@@ -964,7 +968,8 @@ test "ClientConnection replenishes receive windows for active stream" {
     var conn = try ClientConnection.init(&socket, .{}, &storage);
     try conn.completeHandshake();
 
-    var expected_runtime = try runtime_mod.Runtime.init(.{});
+    var expected_response_fields_storage: [config.MAX_HEADERS]h2.HeaderField = undefined;
+    var expected_runtime = try runtime_mod.Runtime.init(.{}, &expected_response_fields_storage);
     var expected_preface_buf: [preface_settings_buffer_size_bytes]u8 = undefined;
     const expected_preface = try expected_runtime.writeClientPrefaceAndSettings(&expected_preface_buf);
     var handshake_wire: [preface_settings_buffer_size_bytes + h2.frame_header_size_bytes]u8 = undefined;
@@ -1022,7 +1027,8 @@ test "ClientConnection request send and response receive round-trip" {
     var conn = try ClientConnection.init(&socket, .{}, &storage);
     try conn.completeHandshake();
 
-    var expected_runtime = try runtime_mod.Runtime.init(.{});
+    var expected_response_fields_storage: [config.MAX_HEADERS]h2.HeaderField = undefined;
+    var expected_runtime = try runtime_mod.Runtime.init(.{}, &expected_response_fields_storage);
     var expected_preface_buf: [preface_settings_buffer_size_bytes]u8 = undefined;
     const expected_preface = try expected_runtime.writeClientPrefaceAndSettings(&expected_preface_buf);
     var handshake_wire: [preface_settings_buffer_size_bytes + h2.frame_header_size_bytes]u8 = undefined;
