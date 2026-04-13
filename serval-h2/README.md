@@ -85,7 +85,7 @@ Current responsibilities:
 | `FlowControlError` | Flow-control primitive errors |
 | `Window` | Per-window bookkeeping |
 | `ConnectionFlowControl` | Connection-level flow-control bookkeeping |
-| `StreamRole`, `StreamState`, `H2Stream`, `StreamTable`, `StreamError` | Stream state machine and fixed-capacity stream table |
+| `StreamRole`, `StreamState`, `H2Stream`, `StreamTable`, `StreamError` | Stream state machine and fixed-capacity stream table; initialize caller-owned table storage with `StreamTable.initInto(role)` |
 
 ### Request Decode / Upgrade
 

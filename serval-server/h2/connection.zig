@@ -36,7 +36,7 @@ pub const ConnectionState = struct {
     goaway_sent: bool = false,
     peer_goaway_last_stream_id: u32 = 0,
     local_goaway_last_stream_id: u32 = 0,
-    streams: h2.StreamTable = h2.StreamTable.init(.server),
+    streams: h2.StreamTable = undefined,
     flow: h2.ConnectionFlowControl,
 
     /// Initializes caller-owned connection-state storage in place with default flags and connection flow control.
@@ -58,7 +58,7 @@ pub const ConnectionState = struct {
         self.goaway_sent = false;
         self.peer_goaway_last_stream_id = 0;
         self.local_goaway_last_stream_id = 0;
-        self.streams = h2.StreamTable.init(.server);
+        self.streams.initInto(.server);
         self.flow = try h2.ConnectionFlowControl.init(runtime_cfg.connection_window_size_bytes);
     }
 

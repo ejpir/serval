@@ -37,7 +37,7 @@ pub const SessionState = struct {
     goaway_sent: bool = false,
     peer_goaway_last_stream_id: u32 = 0,
     local_goaway_last_stream_id: u32 = 0,
-    streams: h2.StreamTable = h2.StreamTable.init(.client),
+    streams: h2.StreamTable = undefined,
     flow: h2.ConnectionFlowControl,
 
     /// Initializes caller-owned session storage in place with connection flow control sized from the configured HTTP/2 connection window.
@@ -59,7 +59,7 @@ pub const SessionState = struct {
         self.goaway_sent = false;
         self.peer_goaway_last_stream_id = 0;
         self.local_goaway_last_stream_id = 0;
-        self.streams = h2.StreamTable.init(.client);
+        self.streams.initInto(.client);
         self.flow = try h2.ConnectionFlowControl.init(runtime_cfg.connection_window_size_bytes);
     }
 

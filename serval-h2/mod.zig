@@ -249,6 +249,7 @@ pub const StreamState = stream.State;
 pub const H2Stream = stream.Stream;
 /// Fixed-capacity table of HTTP/2 streams for one connection role.
 /// Stores stream lifecycle, per-stream flow-control state, and active-slot bookkeeping.
+/// Initialize caller-owned storage with `StreamTable.initInto(role)` before opening streams.
 /// Methods return borrowed pointers into internal storage; those pointers stay valid only while the table entry remains allocated.
 pub const StreamTable = stream.StreamTable;
 /// Errors returned by stream lifecycle, table, and flow-control helpers.

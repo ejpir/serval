@@ -305,13 +305,21 @@ pub const StreamTable = struct {
     last_local_stream_id: u32 = 0,
     last_remote_stream_id: u32 = 0,
 
-    /// Creates an empty stream table for `role`.
-    /// The returned table starts with no active streams and all slots unused.
+    /// Initializes caller-owned stream-table storage for `role`.
+    /// The table starts with no active streams and all slots unused.
     /// Debug builds assert that the table capacity and concurrent-stream limit are positive.
-    pub fn init(role: Role) StreamTable {
+    pub fn initInto(self: *StreamTable, role: Role) void {
         assert(table_capacity > 0);
         assert(config.H2_MAX_CONCURRENT_STREAMS > 0);
-        return .{ .role = role };
+        assert(@intFromPtr(self) != 0);
+        self.role = role;
+        for (&self.slots) |*slot| {
+            slot.* = .{};
+        }
+        self.active_count = 0;
+        self.last_local_stream_id = 0;
+        self.last_remote_stream_id = 0;
+        assert(self.active_count == 0);
     }
 
     /// Opens a local-initiated stream and returns a borrowed pointer to it.
@@ -519,13 +527,15 @@ fn expectedOddParity(role: Role, initiator: Initiator) bool {
 }
 
 test "client local stream ids are odd" {
-    var table = StreamTable.init(.client);
+    var table: StreamTable = undefined;
+    table.initInto(.client);
     _ = try table.openLocal(1, false);
     try std.testing.expectError(error.WrongStreamParity, table.openLocal(2, false));
 }
 
 test "server remote stream ids are odd" {
-    var table = StreamTable.init(.server);
+    var table: StreamTable = undefined;
+    table.initInto(.server);
     _ = try table.openRemote(1, false);
     try std.testing.expectError(error.WrongStreamParity, table.openRemote(2, false));
 }
@@ -565,7 +575,8 @@ test "stream window helpers enforce bounded accounting" {
 }
 
 test "stream table tracks send-window debt across settings deltas" {
-    var table = StreamTable.init(.client);
+    var table: StreamTable = undefined;
+    table.initInto(.client);
     _ = try table.openLocal(1, false);
 
     const decrease_bytes: i64 = @as(i64, config.H2_INITIAL_WINDOW_SIZE_BYTES) + 10;
@@ -586,7 +597,8 @@ test "stream table tracks send-window debt across settings deltas" {
 }
 
 test "stream table rejects overflow on positive settings delta" {
-    var table = StreamTable.init(.client);
+    var table: StreamTable = undefined;
+    table.initInto(.client);
     const stream = try table.openLocal(1, false);
 
     const growth = config.H2_MAX_WINDOW_SIZE_BYTES - config.H2_INITIAL_WINDOW_SIZE_BYTES;
@@ -597,13 +609,15 @@ test "stream table rejects overflow on positive settings delta" {
 }
 
 test "stream table enforces monotonic ids" {
-    var table = StreamTable.init(.client);
+    var table: StreamTable = undefined;
+    table.initInto(.client);
     _ = try table.openLocal(1, false);
     try std.testing.expectError(error.StreamIdRegression, table.openLocal(1, false));
 }
 
 test "stream table releases closed streams" {
-    var table = StreamTable.init(.server);
+    var table: StreamTable = undefined;
+    table.initInto(.server);
     _ = try table.openRemote(1, false);
     try table.endLocal(1);
     try std.testing.expectEqual(@as(u16, 1), table.active_count);
@@ -614,7 +628,8 @@ test "stream table releases closed streams" {
 }
 
 test "stream table rejects capacity overflow" {
-    var table = StreamTable.init(.client);
+    var table: StreamTable = undefined;
+    table.initInto(.client);
 
     var stream_id: u32 = 1;
     var opened: u16 = 0;
@@ -630,7 +645,8 @@ test "stream randomized operation corpus preserves invariants" {
     var prng = std.Random.DefaultPrng.init(0x57ee_0001);
     const random = prng.random();
 
-    var table = StreamTable.init(.client);
+    var table: StreamTable = undefined;
+    table.initInto(.client);
     var next_stream_id: u32 = 1;
 
     var iteration: u32 = 0;
