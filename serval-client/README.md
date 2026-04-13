@@ -268,6 +268,10 @@ in one explicit caller-owned storage object.
 - inbound response HEADERS/DATA/trailer decoding, including bounded HEADERS+CONTINUATION reassembly and bounded HPACK dynamic-table/Huffman decode
 - SETTINGS ACK, PING ACK, WINDOW_UPDATE, RST_STREAM, and GOAWAY handling
 
+The client runtime now also owns its bounded temporary `HeaderField[MAX_HEADERS]`
+scratch for response/trailer decode, so the receive hot path does not rebuild
+that fixed-capacity array on the stack for each decoded header block.
+
 `H2ClientConnection` adds fixed-buffer socket I/O around that runtime:
 - `completeHandshake()` for prior-knowledge preface + SETTINGS synchronization
 - `sendRequestHeaders()` / `sendRequestData()` on multiplexed stream ids

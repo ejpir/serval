@@ -125,10 +125,12 @@ pub const Runtime = struct {
     runtime_cfg: config.H2Config,
     state: session.SessionState,
     header_decoder: h2.HpackDecoder = h2.HpackDecoder.init(),
+    response_fields_storage: [config.MAX_HEADERS]h2.HeaderField = undefined,
     response_states: ResponseStateTable = .{},
     pending_response_headers: PendingResponseHeaders = .{},
 
-    /// Constructs a fresh runtime with an initialized session state and HPACK decoder.
+    /// Constructs a fresh runtime with an initialized session state, HPACK decoder,
+    /// and bounded response/trailer decode scratch owned by the runtime value.
     /// The configuration must provide a positive connection window and header block capacity.
     /// Returns any error raised while initializing the underlying session state.
     pub fn init(runtime_cfg: config.H2Config) Error!Runtime {
@@ -473,7 +475,7 @@ fn handleHeaders(
             return .none;
         }
 
-        const response = try decodeResponseHeaderBlock(&self.header_decoder, payload);
+        const response = try decodeResponseHeaderBlock(self, payload);
         state_entry.headers_received = true;
 
         if (end_stream) {
@@ -495,7 +497,7 @@ fn handleHeaders(
         return .none;
     }
 
-    const trailers = try decodeTrailerHeaderBlock(&self.header_decoder, payload);
+    const trailers = try decodeTrailerHeaderBlock(self, payload);
     try self.state.endRemoteStream(header.stream_id);
     self.response_states.remove(header.stream_id);
     return .{ .response_trailers = .{ .stream_id = header.stream_id, .trailers = trailers } };
@@ -580,7 +582,7 @@ fn finishPendingResponseHeaders(
 
     const block = pending_response_headers_storage[0..block_len];
     if (is_trailers) {
-        const trailers = try decodeTrailerHeaderBlock(&self.header_decoder, block);
+        const trailers = try decodeTrailerHeaderBlock(self, block);
         try self.state.endRemoteStream(stream_id);
         self.response_states.remove(stream_id);
         resetPendingResponseHeaders(self);
@@ -590,7 +592,7 @@ fn finishPendingResponseHeaders(
         } };
     }
 
-    const response = try decodeResponseHeaderBlock(&self.header_decoder, block);
+    const response = try decodeResponseHeaderBlock(self, block);
     const state_entry = try self.response_states.getOrInsert(stream_id);
     state_entry.headers_received = true;
 
@@ -843,12 +845,16 @@ fn methodToken(method: Method) []const u8 {
     return token;
 }
 
-fn decodeResponseHeaderBlock(decoder: *h2.HpackDecoder, header_block: []const u8) Error!Response {
-    assert(@intFromPtr(decoder) != 0);
+fn decodeResponseHeaderBlock(self: *Runtime, header_block: []const u8) Error!Response {
+    assert(@intFromPtr(self) != 0);
     assert(header_block.len <= h2.header_block_capacity_bytes);
+    assert(self.response_fields_storage.len >= config.MAX_HEADERS);
 
-    var fields_buf: [config.MAX_HEADERS]h2.HeaderField = undefined;
-    const fields = try h2.decodeHeaderBlockWithDecoder(decoder, header_block, &fields_buf);
+    const fields = try h2.decodeHeaderBlockWithDecoder(
+        &self.header_decoder,
+        header_block,
+        &self.response_fields_storage,
+    );
 
     var response = Response{
         .status = 200,
@@ -883,12 +889,16 @@ fn decodeResponseHeaderBlock(decoder: *h2.HpackDecoder, header_block: []const u8
     return response;
 }
 
-fn decodeTrailerHeaderBlock(decoder: *h2.HpackDecoder, header_block: []const u8) Error!HeaderMap {
-    assert(@intFromPtr(decoder) != 0);
+fn decodeTrailerHeaderBlock(self: *Runtime, header_block: []const u8) Error!HeaderMap {
+    assert(@intFromPtr(self) != 0);
     assert(header_block.len <= h2.header_block_capacity_bytes);
+    assert(self.response_fields_storage.len >= config.MAX_HEADERS);
 
-    var fields_buf: [config.MAX_HEADERS]h2.HeaderField = undefined;
-    const fields = try h2.decodeHeaderBlockWithDecoder(decoder, header_block, &fields_buf);
+    const fields = try h2.decodeHeaderBlockWithDecoder(
+        &self.header_decoder,
+        header_block,
+        &self.response_fields_storage,
+    );
 
     var trailers = HeaderMap.init();
     for (fields) |field| {
