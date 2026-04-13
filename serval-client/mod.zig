@@ -96,7 +96,7 @@ pub const h2_upstream_pool = @import("h2/upstream_pool.zig");
 pub const H2UpstreamSession = h2_upstream_pool.UpstreamSession;
 /// Root-level alias of `h2_upstream_pool.UpstreamSessionPool`, which manages reusable outbound HTTP/2 upstream sessions.
 /// The pool is slot-based by upstream index and can retain an active and (during rollover) a draining session per slot.
-/// Initialize with `init()` and release resources with `deinit()`/`close*()`; acquired `*UpstreamSession` pointers are borrowed from pool storage.
+/// Initialize caller-owned storage with `initInto()` and release resources with `deinit()`/`close*()`; acquired `*UpstreamSession` pointers are borrowed from pool storage.
 /// Those pointers become invalid when their slot is closed/replaced or when the pool is deinitialized.
 /// This alias itself has no error behavior; fallible operations on the type return `H2UpstreamSessionError`.
 pub const H2UpstreamSessionPool = h2_upstream_pool.UpstreamSessionPool;

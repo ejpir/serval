@@ -290,7 +290,7 @@ pub const UpstreamSessionPool = struct {
             slot.active_session = null;
         }
 
-        session.h2 = try connection_mod.ClientConnection.initWithIo(&session.connection.socket, io, self.h2_cfg, &session.h2_storage);
+        try session.h2.initWithIoInto(&session.connection.socket, io, self.h2_cfg, &session.h2_storage);
         try session.h2.sendClientPrefaceAndSettings();
         session.last_used_ns = time.monotonicNanos();
 
@@ -662,7 +662,8 @@ test "UpstreamSessionPool reuses healthy cached session" {
     };
 
     var h2_storage = connection_mod.ConnectionStorage{};
-    var h2_conn = try connection_mod.ClientConnection.init(&conn.socket, .{}, &h2_storage);
+    var h2_conn: connection_mod.ClientConnection = undefined;
+    try h2_conn.initInto(&conn.socket, .{}, &h2_storage);
     h2_conn.runtime.state.preface_sent = true;
     h2_conn.runtime.state.peer_settings_received = true;
     h2_conn.runtime.state.local_settings_ack_pending = false;
@@ -723,7 +724,8 @@ test "sessionNeedsReconnect defers goaway reconnect while active streams remain"
     };
 
     var h2_storage = connection_mod.ConnectionStorage{};
-    var h2_conn = try connection_mod.ClientConnection.init(&conn.socket, .{}, &h2_storage);
+    var h2_conn: connection_mod.ClientConnection = undefined;
+    try h2_conn.initInto(&conn.socket, .{}, &h2_storage);
     h2_conn.runtime.state.preface_sent = true;
     h2_conn.runtime.state.peer_settings_received = true;
     h2_conn.runtime.state.local_settings_ack_pending = false;
@@ -756,7 +758,8 @@ test "sessionNeedsReconnect reconnects goaway session after active streams drain
     };
 
     var h2_storage = connection_mod.ConnectionStorage{};
-    var h2_conn = try connection_mod.ClientConnection.init(&conn.socket, .{}, &h2_storage);
+    var h2_conn: connection_mod.ClientConnection = undefined;
+    try h2_conn.initInto(&conn.socket, .{}, &h2_storage);
     h2_conn.runtime.state.preface_sent = true;
     h2_conn.runtime.state.peer_settings_received = true;
     h2_conn.runtime.state.local_settings_ack_pending = false;
@@ -790,7 +793,8 @@ test "rotateActiveSessionForRollover keeps draining session for in-flight stream
     };
 
     var h2_storage = connection_mod.ConnectionStorage{};
-    var h2_conn = try connection_mod.ClientConnection.init(&conn.socket, .{}, &h2_storage);
+    var h2_conn: connection_mod.ClientConnection = undefined;
+    try h2_conn.initInto(&conn.socket, .{}, &h2_storage);
     h2_conn.runtime.state.preface_sent = true;
     h2_conn.runtime.state.peer_settings_received = true;
     h2_conn.runtime.state.local_settings_ack_pending = false;
@@ -839,12 +843,14 @@ test "UpstreamSessionPool getByGeneration resolves active and draining sessions"
     };
 
     var active_h2_storage = connection_mod.ConnectionStorage{};
-    var active_h2 = try connection_mod.ClientConnection.init(&active_conn.socket, .{}, &active_h2_storage);
+    var active_h2: connection_mod.ClientConnection = undefined;
+    try active_h2.initInto(&active_conn.socket, .{}, &active_h2_storage);
     active_h2.runtime.state.preface_sent = true;
     active_h2.runtime.state.peer_settings_received = true;
 
     var draining_h2_storage = connection_mod.ConnectionStorage{};
-    var draining_h2 = try connection_mod.ClientConnection.init(&draining_conn.socket, .{}, &draining_h2_storage);
+    var draining_h2: connection_mod.ClientConnection = undefined;
+    try draining_h2.initInto(&draining_conn.socket, .{}, &draining_h2_storage);
     draining_h2.runtime.state.preface_sent = true;
     draining_h2.runtime.state.peer_settings_received = true;
 
@@ -893,7 +899,8 @@ test "UpstreamSessionPool closeAll clears all slots" {
         .last_used_ns = time.monotonicNanos(),
     };
     var h2_storage = connection_mod.ConnectionStorage{};
-    const h2_conn = try connection_mod.ClientConnection.init(&conn.socket, .{}, &h2_storage);
+    var h2_conn: connection_mod.ClientConnection = undefined;
+    try h2_conn.initInto(&conn.socket, .{}, &h2_storage);
 
     var pool: UpstreamSessionPool = undefined;
     pool.initInto(.{});

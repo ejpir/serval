@@ -129,23 +129,24 @@ pub const Runtime = struct {
     response_states: ResponseStateTable = .{},
     pending_response_headers: PendingResponseHeaders = .{},
 
-    /// Constructs a fresh runtime with an initialized session state, HPACK decoder,
+    /// Initializes caller-owned runtime storage in place with a fresh session state, HPACK decoder,
     /// and caller-owned bounded response/trailer decode scratch.
     /// The configuration must provide a positive connection window and header block capacity,
     /// and `response_fields_storage` must have room for `config.MAX_HEADERS` decoded fields.
     /// Returns any error raised while initializing the underlying session state.
-    pub fn init(runtime_cfg: config.H2Config, response_fields_storage: []h2.HeaderField) Error!Runtime {
+    pub fn initInto(self: *Runtime, runtime_cfg: config.H2Config, response_fields_storage: []h2.HeaderField) Error!void {
         assert(runtime_cfg.connection_window_size_bytes > 0);
         assert(runtime_cfg.max_header_block_size_bytes > 0);
         assert(runtime_cfg.max_frame_size_bytes <= h2.frame_payload_capacity_bytes);
         assert(runtime_cfg.max_header_block_size_bytes <= h2.header_block_capacity_bytes);
         assert(response_fields_storage.len >= config.MAX_HEADERS);
-        return .{
-            .runtime_cfg = runtime_cfg,
-            .state = try session.SessionState.init(runtime_cfg),
-            .header_decoder = h2.HpackDecoder.init(),
-            .response_fields_storage = response_fields_storage,
-        };
+        assert(@intFromPtr(self) != 0);
+        self.runtime_cfg = runtime_cfg;
+        self.state = try session.SessionState.init(runtime_cfg);
+        self.header_decoder = h2.HpackDecoder.init();
+        self.response_fields_storage = response_fields_storage;
+        self.response_states = .{};
+        self.pending_response_headers = .{};
     }
 
     /// Writes the HTTP/2 client connection preface followed by the local SETTINGS frame.
@@ -1053,7 +1054,8 @@ fn initRuntimeReadyForStreams(response_fields_storage: []h2.HeaderField) !Runtim
     assert(h2.client_connection_preface.len > 0);
     assert(response_fields_storage.len >= config.MAX_HEADERS);
 
-    var runtime = try Runtime.init(.{}, response_fields_storage);
+    var runtime: Runtime = undefined;
+    try runtime.initInto(.{}, response_fields_storage);
 
     var preface_buf: [h2.client_connection_preface.len + h2.frame_header_size_bytes + (4 * h2.setting_size_bytes)]u8 = undefined;
     _ = try runtime.writeClientPrefaceAndSettings(&preface_buf);
@@ -1077,7 +1079,8 @@ fn initRuntimeReadyForStreams(response_fields_storage: []h2.HeaderField) !Runtim
 
 test "Runtime writes client preface and SETTINGS" {
     var response_fields_storage: [config.MAX_HEADERS]h2.HeaderField = undefined;
-    var runtime = try Runtime.init(.{}, &response_fields_storage);
+    var runtime: Runtime = undefined;
+    try runtime.initInto(.{}, &response_fields_storage);
 
     var out: [h2.client_connection_preface.len + h2.frame_header_size_bytes + (4 * h2.setting_size_bytes)]u8 = undefined;
     const encoded = try runtime.writeClientPrefaceAndSettings(&out);
@@ -1092,7 +1095,8 @@ test "Runtime writes client preface and SETTINGS" {
 
 test "Runtime requires peer settings before non-settings frames" {
     var response_fields_storage: [config.MAX_HEADERS]h2.HeaderField = undefined;
-    var runtime = try Runtime.init(.{}, &response_fields_storage);
+    var runtime: Runtime = undefined;
+    try runtime.initInto(.{}, &response_fields_storage);
 
     var preface_buf: [h2.client_connection_preface.len + h2.frame_header_size_bytes + (4 * h2.setting_size_bytes)]u8 = undefined;
     _ = try runtime.writeClientPrefaceAndSettings(&preface_buf);
@@ -1112,7 +1116,8 @@ test "Runtime requires peer settings before non-settings frames" {
 
 test "Runtime receives peer settings, sends ACK, and accepts SETTINGS ACK" {
     var response_fields_storage: [config.MAX_HEADERS]h2.HeaderField = undefined;
-    var runtime = try Runtime.init(.{}, &response_fields_storage);
+    var runtime: Runtime = undefined;
+    try runtime.initInto(.{}, &response_fields_storage);
 
     var preface_buf: [h2.client_connection_preface.len + h2.frame_header_size_bytes + (4 * h2.setting_size_bytes)]u8 = undefined;
     _ = try runtime.writeClientPrefaceAndSettings(&preface_buf);
@@ -1644,7 +1649,8 @@ test "Runtime handles upstream RST_STREAM and clears stream state" {
 
 test "Runtime ignores duplicate upstream RST_STREAM for retired known stream" {
     var response_fields_storage: [config.MAX_HEADERS]h2.HeaderField = undefined;
-    var runtime = try Runtime.init(.{}, &response_fields_storage);
+    var runtime: Runtime = undefined;
+    try runtime.initInto(.{}, &response_fields_storage);
     var request = try makeGrpcRequest("/svc.Method/Foo");
 
     var preface_buf: [256]u8 = undefined;

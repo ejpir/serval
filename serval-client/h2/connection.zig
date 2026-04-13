@@ -66,7 +66,7 @@ pub const Error = error{
 
 /// Client-side HTTP/2 connection state tied to one socket.
 /// The socket pointer is borrowed; the caller retains ownership and must keep it valid for the lifetime of the connection.
-/// `init` and `initWithIo` initialize the runtime and can fail with `Error` if setup cannot be completed.
+/// `initInto` and `initWithIoInto` initialize the runtime and can fail with `Error` if setup cannot be completed.
 /// Sending methods write directly to the underlying connection and propagate `Error` on I/O, protocol, or flow-control failures.
 pub const ClientConnection = struct {
     runtime_cfg: config.H2Config,
@@ -89,27 +89,36 @@ pub const ClientConnection = struct {
     pending_discard_len: usize = 0,
     frame_count: u32 = 0,
 
-    /// Initialize a client connection that uses the socket's default I/O path.
+    /// Initialize caller-owned client connection storage that uses the socket's default I/O path.
     /// Requires a non-null socket pointer with an open file descriptor; the socket remains owned by the caller.
     /// Propagates any error returned by shared connection initialization.
-    pub fn init(socket: *Socket, runtime_cfg: config.H2Config, storage: *ConnectionStorage) Error!ClientConnection {
+    pub fn initInto(self: *ClientConnection, socket: *Socket, runtime_cfg: config.H2Config, storage: *ConnectionStorage) Error!void {
         assert(@intFromPtr(socket) != 0);
         assert(socket.get_fd() >= 0);
+        assert(@intFromPtr(self) != 0);
         assert(@intFromPtr(storage) != 0);
-        return initMaybeIo(socket, null, runtime_cfg, storage);
+        try initMaybeIoInto(self, socket, null, runtime_cfg, storage);
     }
 
-    /// Initialize a client connection that uses the provided I/O object for network operations.
+    /// Initialize caller-owned client connection storage that uses the provided I/O object for network operations.
     /// Requires a non-null socket pointer with an open file descriptor; the socket remains owned by the caller.
     /// Propagates any error returned by shared connection initialization.
-    pub fn initWithIo(socket: *Socket, io: Io, runtime_cfg: config.H2Config, storage: *ConnectionStorage) Error!ClientConnection {
+    pub fn initWithIoInto(self: *ClientConnection, socket: *Socket, io: Io, runtime_cfg: config.H2Config, storage: *ConnectionStorage) Error!void {
         assert(@intFromPtr(socket) != 0);
         assert(socket.get_fd() >= 0);
+        assert(@intFromPtr(self) != 0);
         assert(@intFromPtr(storage) != 0);
-        return initMaybeIo(socket, io, runtime_cfg, storage);
+        try initMaybeIoInto(self, socket, io, runtime_cfg, storage);
     }
 
-    fn initMaybeIo(socket: *Socket, io: ?Io, runtime_cfg: config.H2Config, storage: *ConnectionStorage) Error!ClientConnection {
+    fn initMaybeIoInto(
+        self: *ClientConnection,
+        socket: *Socket,
+        io: ?Io,
+        runtime_cfg: config.H2Config,
+        storage: *ConnectionStorage,
+    ) Error!void {
+        assert(@intFromPtr(self) != 0);
         assert(@intFromPtr(socket) != 0);
         assert(socket.get_fd() >= 0);
         assert(@intFromPtr(storage) != 0);
@@ -129,24 +138,25 @@ pub const ClientConnection = struct {
         assert(storage.conn_window_update_buf.len == window_update_frame_size_bytes);
         assert(storage.stream_window_update_buf.len == window_update_frame_size_bytes);
 
-        return .{
-            .runtime_cfg = runtime_cfg,
-            .socket = socket,
-            .io = io,
-            .runtime = try runtime_mod.Runtime.init(runtime_cfg, &storage.response_fields_storage),
-            .pending_response_headers_storage = &storage.pending_response_headers_storage,
-            .request_header_block_buf = &storage.request_header_block_buf,
-            .recv_buf = &storage.recv_buf,
-            .plain_write_buf = &storage.plain_write_buf,
-            .preface_settings_buf = &storage.preface_settings_buf,
-            .settings_ack_buf = &storage.settings_ack_buf,
-            .ping_ack_buf = &storage.ping_ack_buf,
-            .request_headers_frame_buf = &storage.request_headers_frame_buf,
-            .data_frame_buf = &storage.data_frame_buf,
-            .rst_stream_buf = &storage.rst_stream_buf,
-            .conn_window_update_buf = &storage.conn_window_update_buf,
-            .stream_window_update_buf = &storage.stream_window_update_buf,
-        };
+        self.runtime_cfg = runtime_cfg;
+        self.socket = socket;
+        self.io = io;
+        self.pending_response_headers_storage = &storage.pending_response_headers_storage;
+        self.request_header_block_buf = &storage.request_header_block_buf;
+        self.recv_buf = &storage.recv_buf;
+        self.plain_write_buf = &storage.plain_write_buf;
+        self.preface_settings_buf = &storage.preface_settings_buf;
+        self.settings_ack_buf = &storage.settings_ack_buf;
+        self.ping_ack_buf = &storage.ping_ack_buf;
+        self.request_headers_frame_buf = &storage.request_headers_frame_buf;
+        self.data_frame_buf = &storage.data_frame_buf;
+        self.rst_stream_buf = &storage.rst_stream_buf;
+        self.conn_window_update_buf = &storage.conn_window_update_buf;
+        self.stream_window_update_buf = &storage.stream_window_update_buf;
+        self.recv_len = 0;
+        self.pending_discard_len = 0;
+        self.frame_count = 0;
+        try self.runtime.initInto(runtime_cfg, &storage.response_fields_storage);
     }
 
     /// Send the client connection preface followed by the initial SETTINGS frame.
@@ -910,11 +920,13 @@ test "ClientConnection sends client preface and initial settings" {
 
     var socket = Socket.Plain.init_client(fds[0]);
     var storage = ConnectionStorage{};
-    var conn = try ClientConnection.init(&socket, .{}, &storage);
+    var conn: ClientConnection = undefined;
+    try conn.initInto(&socket, .{}, &storage);
     try conn.sendClientPrefaceAndSettings();
 
     var expected_response_fields_storage: [config.MAX_HEADERS]h2.HeaderField = undefined;
-    var expected_runtime = try runtime_mod.Runtime.init(.{}, &expected_response_fields_storage);
+    var expected_runtime: runtime_mod.Runtime = undefined;
+    try expected_runtime.initInto(.{}, &expected_response_fields_storage);
     var expected_buf: [preface_settings_buffer_size_bytes]u8 = undefined;
     const expected = try expected_runtime.writeClientPrefaceAndSettings(&expected_buf);
 
@@ -934,11 +946,13 @@ test "ClientConnection completeHandshake sends settings ACK" {
 
     var socket = Socket.Plain.init_client(fds[0]);
     var storage = ConnectionStorage{};
-    var conn = try ClientConnection.init(&socket, .{}, &storage);
+    var conn: ClientConnection = undefined;
+    try conn.initInto(&socket, .{}, &storage);
     try conn.completeHandshake();
 
     var expected_response_fields_storage: [config.MAX_HEADERS]h2.HeaderField = undefined;
-    var expected_runtime = try runtime_mod.Runtime.init(.{}, &expected_response_fields_storage);
+    var expected_runtime: runtime_mod.Runtime = undefined;
+    try expected_runtime.initInto(.{}, &expected_response_fields_storage);
     var expected_preface_buf: [preface_settings_buffer_size_bytes]u8 = undefined;
     const expected_preface = try expected_runtime.writeClientPrefaceAndSettings(&expected_preface_buf);
 
@@ -965,11 +979,13 @@ test "ClientConnection replenishes receive windows for active stream" {
 
     var socket = Socket.Plain.init_client(fds[0]);
     var storage = ConnectionStorage{};
-    var conn = try ClientConnection.init(&socket, .{}, &storage);
+    var conn: ClientConnection = undefined;
+    try conn.initInto(&socket, .{}, &storage);
     try conn.completeHandshake();
 
     var expected_response_fields_storage: [config.MAX_HEADERS]h2.HeaderField = undefined;
-    var expected_runtime = try runtime_mod.Runtime.init(.{}, &expected_response_fields_storage);
+    var expected_runtime: runtime_mod.Runtime = undefined;
+    try expected_runtime.initInto(.{}, &expected_response_fields_storage);
     var expected_preface_buf: [preface_settings_buffer_size_bytes]u8 = undefined;
     const expected_preface = try expected_runtime.writeClientPrefaceAndSettings(&expected_preface_buf);
     var handshake_wire: [preface_settings_buffer_size_bytes + h2.frame_header_size_bytes]u8 = undefined;
@@ -1024,11 +1040,13 @@ test "ClientConnection request send and response receive round-trip" {
 
     var socket = Socket.Plain.init_client(fds[0]);
     var storage = ConnectionStorage{};
-    var conn = try ClientConnection.init(&socket, .{}, &storage);
+    var conn: ClientConnection = undefined;
+    try conn.initInto(&socket, .{}, &storage);
     try conn.completeHandshake();
 
     var expected_response_fields_storage: [config.MAX_HEADERS]h2.HeaderField = undefined;
-    var expected_runtime = try runtime_mod.Runtime.init(.{}, &expected_response_fields_storage);
+    var expected_runtime: runtime_mod.Runtime = undefined;
+    try expected_runtime.initInto(.{}, &expected_response_fields_storage);
     var expected_preface_buf: [preface_settings_buffer_size_bytes]u8 = undefined;
     const expected_preface = try expected_runtime.writeClientPrefaceAndSettings(&expected_preface_buf);
     var handshake_wire: [preface_settings_buffer_size_bytes + h2.frame_header_size_bytes]u8 = undefined;

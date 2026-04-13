@@ -245,11 +245,13 @@ var session = try H2SessionState.init();
 
 // Frame-level runtime (no socket ownership)
 var response_fields_storage: [serval.config.MAX_HEADERS]serval_h2.HeaderField = undefined;
-var runtime = try H2Runtime.init(.{}, &response_fields_storage);
+var runtime: H2Runtime = undefined;
+try runtime.initInto(.{}, &response_fields_storage);
 
 // Socket-owning prior-knowledge h2c driver
 var h2_storage = H2ClientConnectionStorage{};
-var h2_conn = try H2ClientConnection.init(&socket, .{}, &h2_storage);
+var h2_conn: H2ClientConnection = undefined;
+try h2_conn.initInto(&socket, .{}, &h2_storage);
 
 // Fixed-capacity per-upstream reusable session pool
 var h2_pool: H2UpstreamSessionPool = undefined;

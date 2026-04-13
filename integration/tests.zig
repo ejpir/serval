@@ -6968,7 +6968,8 @@ test "integration: serval-client h2 connection driver interoperates with termina
 
     var socket = serval.Socket.Plain.init_client(sock);
     var h2_conn_storage = serval_client.H2ClientConnectionStorage{};
-    var h2_conn = try serval_client.H2ClientConnection.init(&socket, .{}, &h2_conn_storage);
+    var h2_conn: serval_client.H2ClientConnection = undefined;
+    try h2_conn.initInto(&socket, .{}, &h2_conn_storage);
     try h2_conn.completeHandshake();
 
     var authority_buf: [32]u8 = undefined;
