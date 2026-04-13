@@ -22,7 +22,7 @@ pub const Error = error{
 
 /// Per-connection HTTP/2 state for the server-side connection lifecycle.
 /// Tracks preface, SETTINGS, GOAWAY, stream table, and connection-level flow-control state.
-/// Use `init()` to construct a valid instance before calling the transition methods on it.
+/// Use `initInto()` to construct a valid instance before calling the transition methods on it.
 pub const ConnectionState = struct {
     runtime_cfg: config.H2Config,
     preface_received: bool = false,
@@ -39,18 +39,27 @@ pub const ConnectionState = struct {
     streams: h2.StreamTable = h2.StreamTable.init(.server),
     flow: h2.ConnectionFlowControl,
 
-    /// Initializes a new `ConnectionState` with default flags and connection flow control.
+    /// Initializes caller-owned connection-state storage in place with default flags and connection flow control.
     /// Uses `config.H2_CONNECTION_WINDOW_SIZE_BYTES` as the initial connection receive window.
     /// Returns any error reported by `h2.ConnectionFlowControl.init` if the flow-control state cannot be created.
-    pub fn init(runtime_cfg: config.H2Config) Error!ConnectionState {
+    pub fn initInto(self: *ConnectionState, runtime_cfg: config.H2Config) Error!void {
         assert(runtime_cfg.connection_window_size_bytes > 0);
         assert(runtime_cfg.connection_window_size_bytes <= config.H2_MAX_WINDOW_SIZE_BYTES);
-        const flow = try h2.ConnectionFlowControl.init(runtime_cfg.connection_window_size_bytes);
-        return .{
-            .runtime_cfg = runtime_cfg,
-            .local_settings = defaultLocalSettings(runtime_cfg),
-            .flow = flow,
-        };
+        assert(@intFromPtr(self) != 0);
+        self.runtime_cfg = runtime_cfg;
+        self.preface_received = false;
+        self.peer_settings_received = false;
+        self.local_settings_sent = false;
+        self.peer_settings = .{};
+        self.local_settings = defaultLocalSettings(runtime_cfg);
+        self.peer_settings_ack_pending = false;
+        self.local_settings_ack_pending = false;
+        self.goaway_received = false;
+        self.goaway_sent = false;
+        self.peer_goaway_last_stream_id = 0;
+        self.local_goaway_last_stream_id = 0;
+        self.streams = h2.StreamTable.init(.server);
+        self.flow = try h2.ConnectionFlowControl.init(runtime_cfg.connection_window_size_bytes);
     }
 
     /// Records that the HTTP/2 connection preface has been received.
@@ -312,7 +321,8 @@ fn defaultLocalSettings(runtime_cfg: config.H2Config) h2.Settings {
 }
 
 test "ConnectionState accepts first preface only once" {
-    var state = try ConnectionState.init(.{});
+    var state: ConnectionState = undefined;
+    try state.initInto(.{});
     try state.markPrefaceReceived();
     try std.testing.expectError(error.DuplicatePreface, state.markPrefaceReceived());
 }
@@ -325,7 +335,8 @@ test "ConnectionState requires local settings to be sent before ack" {
         .stream_id = 0,
     };
 
-    var state = try ConnectionState.init(.{});
+    var state: ConnectionState = undefined;
+    try state.initInto(.{});
     try std.testing.expectError(error.UnexpectedSettingsAck, state.receivePeerSettings(header, &[_]u8{}));
     try state.markLocalSettingsSent();
     try state.receivePeerSettings(header, &[_]u8{});
@@ -345,7 +356,8 @@ test "ConnectionState applies peer settings and marks ack pending" {
         .stream_id = 0,
     };
 
-    var state = try ConnectionState.init(.{});
+    var state: ConnectionState = undefined;
+    try state.initInto(.{});
     try state.receivePeerSettings(header, built);
 
     try std.testing.expect(!state.peer_settings.enable_push);
@@ -356,7 +368,8 @@ test "ConnectionState applies peer settings and marks ack pending" {
 }
 
 test "ConnectionState opens odd-numbered remote streams with configured windows" {
-    var state = try ConnectionState.init(.{});
+    var state: ConnectionState = undefined;
+    try state.initInto(.{});
     try state.markPrefaceReceived();
     state.peer_settings.initial_window_size_bytes = 4096;
     state.local_settings.initial_window_size_bytes = 2048;
@@ -369,7 +382,8 @@ test "ConnectionState opens odd-numbered remote streams with configured windows"
 }
 
 test "ConnectionState window helpers delegate to flow control" {
-    var state = try ConnectionState.init(.{});
+    var state: ConnectionState = undefined;
+    try state.initInto(.{});
     try state.markPrefaceReceived();
     _ = try state.openRemoteStream(1, false);
 
@@ -387,7 +401,8 @@ test "ConnectionState window helpers delegate to flow control" {
 }
 
 test "ConnectionState tracks peer GOAWAY bound for new streams" {
-    var state = try ConnectionState.init(.{});
+    var state: ConnectionState = undefined;
+    try state.initInto(.{});
     try std.testing.expect(state.canAcceptRemoteStream(1));
     state.markGoAwayReceived(3);
     try std.testing.expect(state.canAcceptRemoteStream(1));

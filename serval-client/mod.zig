@@ -44,7 +44,7 @@ pub const Connection = client.Connection;
 pub const h2 = @import("h2/mod.zig");
 /// Public alias for `h2.SessionState`, the bounded in-memory HTTP/2 client session state type.
 /// It carries connection protocol state (preface/settings/GOAWAY), stream-table state, and flow-control state.
-/// Initialize with `H2SessionState.init()` and keep a valid `*H2SessionState` while invoking its mutating methods.
+/// Initialize caller-owned storage with `H2SessionState.initInto()` and keep a valid `*H2SessionState` while invoking its mutating methods.
 /// This alias itself has no error behavior; failures come from `H2SessionState` operations (via `H2SessionError`).
 pub const H2SessionState = h2.SessionState;
 /// Error set returned by Serval client HTTP/2 session state operations.

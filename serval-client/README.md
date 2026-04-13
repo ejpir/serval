@@ -241,7 +241,8 @@ pub const H2ClientConnectionStorage = serval_client.H2ClientConnectionStorage;
 pub const H2UpstreamSessionPool = serval_client.H2UpstreamSessionPool;
 
 // Session state only (settings, windows, stream table)
-var session = try H2SessionState.init();
+var session: H2SessionState = undefined;
+try session.initInto(.{});
 
 // Frame-level runtime (no socket ownership)
 var response_fields_storage: [serval.config.MAX_HEADERS]serval_h2.HeaderField = undefined;

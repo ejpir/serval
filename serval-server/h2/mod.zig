@@ -10,7 +10,7 @@
 pub const connection = @import("connection.zig");
 /// Per-connection HTTP/2 state for the server transport.
 /// Tracks preface, settings, GOAWAY, stream bookkeeping, and connection-level
-/// flow control; initialize instances with `ConnectionState.init()`.
+/// flow control; initialize caller-owned storage with `ConnectionState.initInto()`.
 pub const ConnectionState = connection.ConnectionState;
 /// Error set for HTTP/2 connection-state operations.
 /// Includes protocol-ordering errors such as duplicate preface and unexpected

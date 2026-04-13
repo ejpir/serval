@@ -10,7 +10,7 @@
 pub const session = @import("session.zig");
 /// Connection-scoped HTTP/2 session state for a client endpoint.
 /// Tracks preface and GOAWAY state, settings negotiation, stream allocation, and connection-level flow control.
-/// Initialize with `SessionState.init()` and then mutate in place through the session helpers.
+/// Initialize caller-owned storage with `SessionState.initInto()` and then mutate in place through the session helpers.
 pub const SessionState = session.SessionState;
 /// Error set returned by HTTP/2 client session state transitions.
 /// Covers preface sequencing, SETTINGS acknowledgement handling, stream allocation, and connection shutdown.

@@ -138,7 +138,7 @@ pub const Runtime = struct {
         assert(request_fields_storage.len >= config.MAX_HEADERS);
         assert(@intFromPtr(self) != 0);
         self.runtime_cfg = runtime_cfg;
-        self.state = try connection.ConnectionState.init(runtime_cfg);
+        try self.state.initInto(runtime_cfg);
         self.header_decoder = h2.HpackDecoder.init();
         self.request_header_storage_buf = request_header_storage;
         self.request_fields_storage_buf = request_fields_storage;

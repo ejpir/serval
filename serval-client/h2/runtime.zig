@@ -119,7 +119,7 @@ const PendingResponseHeaders = struct {
 
 /// Public HTTP/2 client runtime state for prior-knowledge upstream sessions.
 /// The runtime does not own sockets; it tracks session flow control, stream bookkeeping, and HPACK decoding state.
-/// Use `init()` to create a fresh instance before sending or receiving frames.
+/// Use `initInto()` to create a fresh instance before sending or receiving frames.
 /// Public methods on this type expose explicit frame-building and frame-receive actions.
 pub const Runtime = struct {
     runtime_cfg: config.H2Config,
@@ -142,7 +142,7 @@ pub const Runtime = struct {
         assert(response_fields_storage.len >= config.MAX_HEADERS);
         assert(@intFromPtr(self) != 0);
         self.runtime_cfg = runtime_cfg;
-        self.state = try session.SessionState.init(runtime_cfg);
+        try self.state.initInto(runtime_cfg);
         self.header_decoder = h2.HpackDecoder.init();
         self.response_fields_storage = response_fields_storage;
         self.response_states = .{};
