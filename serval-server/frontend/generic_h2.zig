@@ -1172,7 +1172,7 @@ pub fn tryServeTlsAlpnConnection(
         log.err("server: conn={d} generic h2 bridge pool allocation failed", .{connection_id});
         return false;
     };
-    bridge_sessions.* = serval_client.H2UpstreamSessionPool.init(runtime_cfg);
+    bridge_sessions.initInto(runtime_cfg);
     defer {
         bridge_sessions.deinit();
         std.heap.page_allocator.destroy(bridge_sessions);

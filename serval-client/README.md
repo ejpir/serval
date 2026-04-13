@@ -251,7 +251,8 @@ var h2_storage = H2ClientConnectionStorage{};
 var h2_conn = try H2ClientConnection.init(&socket, .{}, &h2_storage);
 
 // Fixed-capacity per-upstream reusable session pool
-var h2_pool = H2UpstreamSessionPool.init();
+var h2_pool: H2UpstreamSessionPool = undefined;
+h2_pool.initInto(.{});
 defer h2_pool.deinit();
 ```
 
@@ -275,6 +276,7 @@ in one explicit caller-owned storage object.
 - `receiveActionHandlingControl()` drains inbound control actions (`SETTINGS ACK`, `PING ACK`) before returning non-control actions to callers
 
 `H2UpstreamSessionPool` adds bounded session lifecycle management above the driver:
+- `initInto()` initializes caller-owned pool storage in place, which is the preferred entry point for heap-backed or stack-sensitive call sites
 - `acquireOrConnect()` validates `.http_protocol = .h2c`, opens a fresh upstream session on miss, or returns a healthy cached session on hit
 - GOAWAY-aware rollover: keep one draining session for in-flight streams while opening a fresh active session for new streams
 - reconnect-on-demand when cached sessions are stale, exhausted (`H2_CLIENT_MAX_FRAME_COUNT`), or otherwise unusable

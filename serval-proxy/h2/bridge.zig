@@ -658,7 +658,7 @@ test "StreamBridge bindingForDownstream returns stored mapping" {
 fn createTestSessionPool() !*serval_client.H2UpstreamSessionPool {
     const sessions = try std.testing.allocator.create(serval_client.H2UpstreamSessionPool);
     errdefer std.testing.allocator.destroy(sessions);
-    sessions.* = serval_client.H2UpstreamSessionPool.init(.{});
+    sessions.initInto(.{});
     return sessions;
 }
 

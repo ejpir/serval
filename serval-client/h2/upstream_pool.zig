@@ -212,7 +212,8 @@ const Slot = struct {
 };
 
 /// Pools at most one active HTTP/2 upstream session per `Upstream.idx` slot and tracks reusable sessions.
-/// `init()` returns a zeroed pool; `deinit()` requires a valid pool pointer and closes all managed sessions.
+/// Initialize caller-owned storage with `initInto()` so fixed-capacity slot state is always constructed in place.
+/// `deinit()` requires a valid pool pointer and closes all managed sessions.
 /// `acquireOrConnect()` requires non-null `self`/`client`, `upstream.port > 0`, and a valid `upstream` (via `validateUpstream`).
 /// On reuse it returns an existing session; otherwise it connects, initializes H2 preface/settings, and records timing metadata.
 /// Session/connection ownership is retained by the pool slot; callers receive a borrowed session pointer valid until pool lifecycle actions replace or close it.
@@ -220,15 +221,15 @@ pub const UpstreamSessionPool = struct {
     h2_cfg: config.H2Config,
     slots: [slot_count]Slot = [_]Slot{.{}} ** slot_count,
 
-    /// Initializes and returns a default `UpstreamSessionPool` value.
-    /// Preconditions: compile-time/runtime `slot_count` must be greater than 0.
-    /// Verifies the pool is constructed with exactly `slot_count` slots via assertions.
-    /// This function does not allocate or return errors; ownership is by-value to the caller.
-    pub fn init(h2_cfg: config.H2Config) UpstreamSessionPool {
+    /// Initializes caller-owned pool storage in place without creating a large by-value temporary.
+    /// Preconditions: `self` is valid and `slot_count > 0`; on return all slots are reset and the configured H2 runtime settings are stored.
+    /// Use this for heap-backed pools and other stack-sensitive call sites.
+    pub fn initInto(self: *UpstreamSessionPool, h2_cfg: config.H2Config) void {
+        assert(@intFromPtr(self) != 0);
         assert(slot_count > 0);
-        const pool: UpstreamSessionPool = .{ .h2_cfg = h2_cfg };
-        assert(pool.slots.len == slot_count);
-        return pool;
+        self.h2_cfg = h2_cfg;
+        self.slots = [_]Slot{.{}} ** slot_count;
+        assert(self.slots.len == slot_count);
     }
 
     /// Shuts down this `UpstreamSessionPool` by closing all pooled upstream sessions via `closeAll()`.
@@ -667,7 +668,8 @@ test "UpstreamSessionPool reuses healthy cached session" {
     h2_conn.runtime.state.local_settings_ack_pending = false;
     h2_conn.runtime.state.peer_settings_ack_pending = false;
 
-    var pool = UpstreamSessionPool.init(.{});
+    var pool: UpstreamSessionPool = undefined;
+    pool.initInto(.{});
     defer pool.deinit();
 
     const upstream_idx: config.UpstreamIndex = 5;
@@ -846,7 +848,8 @@ test "UpstreamSessionPool getByGeneration resolves active and draining sessions"
     draining_h2.runtime.state.preface_sent = true;
     draining_h2.runtime.state.peer_settings_received = true;
 
-    var pool = UpstreamSessionPool.init(.{});
+    var pool: UpstreamSessionPool = undefined;
+    pool.initInto(.{});
     defer pool.deinit();
 
     const upstream_idx: config.UpstreamIndex = 6;
@@ -892,7 +895,8 @@ test "UpstreamSessionPool closeAll clears all slots" {
     var h2_storage = connection_mod.ConnectionStorage{};
     const h2_conn = try connection_mod.ClientConnection.init(&conn.socket, .{}, &h2_storage);
 
-    var pool = UpstreamSessionPool.init(.{});
+    var pool: UpstreamSessionPool = undefined;
+    pool.initInto(.{});
     const upstream_idx: config.UpstreamIndex = 2;
     const slot_index: usize = @intCast(upstream_idx);
 

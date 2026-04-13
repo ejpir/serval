@@ -2056,7 +2056,7 @@ pub fn Server(
                 return forwarder_mod.ForwardError.InvalidResponse;
             };
             defer std.heap.page_allocator.destroy(bridge_sessions);
-            bridge_sessions.* = serval_client.H2UpstreamSessionPool.init(runtime_cfg);
+            bridge_sessions.initInto(runtime_cfg);
             defer bridge_sessions.deinit();
             log.debug("server: conn={d} h2c bridge session pool initialized", .{connection_id});
 
@@ -2160,7 +2160,7 @@ pub fn Server(
                 return forwarder_mod.ForwardError.InvalidResponse;
             };
             defer std.heap.page_allocator.destroy(bridge_sessions);
-            bridge_sessions.* = serval_client.H2UpstreamSessionPool.init(.{});
+            bridge_sessions.initInto(.{});
             defer bridge_sessions.deinit();
 
             var bridge_handler = H2cBridgeHandler.init(
