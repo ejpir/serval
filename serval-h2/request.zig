@@ -123,6 +123,8 @@ pub fn parseInitialRequestWithStorage(
 /// Returns an `InitialRequest` once the request header block has been fully assembled and decoded.
 /// `decoder` retains dynamic-table state across calls, so callers can keep it alive when they want to avoid constructing a large decoder on a small stack.
 /// The returned request uses slices backed by `request_storage_out`; those slices are valid only while that storage remains intact.
+/// This is the convenience variant for callers that want decoder reuse but are still comfortable with helper-local
+/// bounded header-block and decoded-field scratch.
 pub fn parseInitialRequestWithDecoder(
     decoder: *hpack.Decoder,
     input: []const u8,
@@ -491,6 +493,8 @@ fn buildInitialRequestInto(
 /// The same bounds and storage requirements apply: `stream_id` must be non-zero, the header block
 /// must fit within `limits.header_block_capacity_bytes`, and `request_storage_out` must be
 /// large enough for stable request storage.
+/// Use `decodeRequestHeaderBlockWithFieldStorage(...)` or
+/// `decodeRequestHeaderBlockWithDecoderAndFieldStorage(...)` on hot or stack-sensitive paths.
 pub fn decodeRequestHeaderBlock(
     header_block: []const u8,
     stream_id: u32,
@@ -546,6 +550,8 @@ const HeaderDecodeState = struct {
 /// Header names must already be lowercase and pseudo headers must satisfy HTTP/2 request rules.
 /// Slices stored in the returned request reference `request_storage_out` and remain valid until that
 /// storage is overwritten or reused.
+/// This is the convenience variant for callers that want decoder reuse but are still comfortable with helper-local
+/// bounded decoded-field scratch.
 pub fn decodeRequestHeaderBlockWithDecoder(
     decoder: *hpack.Decoder,
     header_block: []const u8,

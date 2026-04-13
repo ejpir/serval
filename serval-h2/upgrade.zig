@@ -124,6 +124,8 @@ pub fn buildUpgradeResponse(out: []u8) Error![]const u8 {
 /// Writes the client connection preface, a SETTINGS frame, and a HEADERS frame into `out` and returns the written slice.
 /// `request` must point to a valid request with a non-empty path and `Host` header; `effective_path` overrides `request.path` when present.
 /// `settings_payload` must already be a valid SETTINGS payload and fit within `limits.frame_payload_capacity_bytes`; returns `error.MissingPath` or `error.MissingAuthority` when required request data is absent.
+/// This is the convenience variant; use `buildPriorKnowledgePreambleFromUpgradeWithHeaderStorage(...)`
+/// when the caller needs explicit control over the temporary header-block encoding scratch.
 pub fn buildPriorKnowledgePreambleFromUpgrade(
     out: []u8,
     request: *const Request,

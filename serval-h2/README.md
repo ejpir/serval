@@ -42,7 +42,7 @@ Current responsibilities:
 | `FrameType` | HTTP/2 frame type enum |
 | `FrameHeader` | Parsed/encoded frame header |
 | `FrameError` | Frame-parse errors |
-| `max_initial_parse_frames`, `max_continuation_frames`, `max_settings_per_frame`, `frame_payload_capacity_bytes`, `header_block_capacity_bytes` | Owner-local bounded protocol/helper capacities |
+| `max_initial_parse_frames`, `max_continuation_frames`, `max_settings_per_frame`, `frame_payload_capacity_bytes`, `header_block_capacity_bytes` | Owner-local bounded protocol/helper capacities and current intentional runtime/storage bounds |
 | `max_frame_payload_size_bytes` | RFC wire-format 24-bit frame payload ceiling |
 | `parseFrameHeader(raw)` | Parse frame header |
 | `buildFrameHeader(out, header)` | Encode frame header |
@@ -95,20 +95,20 @@ Current responsibilities:
 | `InitialRequest` | Initial request + bootstrap parse result |
 | `InitialRequestError` | Request/initial parse errors |
 | `request_stable_storage_size_bytes` | Minimum caller-provided stable storage for decoded request strings |
-| `decodeRequestHeaderBlock(header_block, stream_id, storage_out)` | Decode request header block into caller-owned stable storage |
+| `decodeRequestHeaderBlock(header_block, stream_id, storage_out)` | Convenience decode wrapper that uses helper-local decoded-field scratch plus caller-owned stable storage |
 | `decodeRequestHeaderBlockWithFieldStorage(header_block, stream_id, fields_buf, storage_out)` | Decode request block with fresh decoder, caller-owned decoded-field scratch, and stable storage |
-| `decodeRequestHeaderBlockWithDecoder(decoder, header_block, stream_id, storage_out)` | Decode request block with caller-owned decoder and stable storage |
+| `decodeRequestHeaderBlockWithDecoder(decoder, header_block, stream_id, storage_out)` | Convenience decode wrapper with caller-owned decoder, helper-local decoded-field scratch, and stable storage |
 | `decodeRequestHeaderBlockWithDecoderAndFieldStorage(decoder, header_block, stream_id, fields_buf, storage_out)` | Decode request block with caller-owned decoder, decoded-field scratch, and stable storage |
-| `parseInitialRequest(input, storage_out)` | Parse initial request from prior-knowledge bytes into stable storage |
+| `parseInitialRequest(input, storage_out)` | Convenience parse wrapper that uses helper-local decoder/header scratch plus caller-owned stable storage |
 | `parseInitialRequestWithStorage(input, header_block_storage, fields_buf, storage_out)` | Parse initial request with fresh decoder plus caller-owned header-block and decoded-field scratch |
-| `parseInitialRequestWithDecoderAndHeaderStorage(decoder, input, header_block_storage, storage_out)` | Parse initial request with caller-owned decoder and temporary header-block assembly storage |
+| `parseInitialRequestWithDecoderAndHeaderStorage(decoder, input, header_block_storage, storage_out)` | Mixed mode parse helper with caller-owned decoder/header storage and helper-local decoded-field scratch |
 | `parseInitialRequestWithDecoderAndStorage(decoder, input, header_block_storage, fields_buf, storage_out)` | Parse initial request with caller-owned decoder, header-block scratch, decoded-field scratch, and stable storage |
 | `buildPriorKnowledgePreambleFromUpgradeWithHeaderStorage(out, request, path, settings, end_stream, header_block_storage)` | Build upgrade preamble with caller-owned temporary header-block storage |
 | `H2cUpgradeError` | h2c upgrade validation/build errors |
 | `looksLikeUpgradeRequest(request)` | Detect HTTP/1.1 `Upgrade: h2c` |
 | `validateUpgradeRequest(request)` | Strict upgrade request validation |
 | `buildUpgradeResponse(out)` | Build `101 Switching Protocols` response |
-| `buildPriorKnowledgePreambleFromUpgrade(...)` | Build upstream prior-knowledge preamble from upgrade request |
+| `buildPriorKnowledgePreambleFromUpgrade(...)` | Convenience upgrade-preamble builder that uses helper-local temporary header-block scratch |
 | `h2c_upgrade_response` | Static upgrade response bytes |
 
 ## File Layout
@@ -167,6 +167,19 @@ caller-provided header-block storage. The explicit request-decode and
 initial-request parse paths can now also keep the bounded temporary decoded
 `HeaderField[MAX_HEADERS]` scratch under caller control rather than allocating
 it inside the helper.
+
+The convenience wrappers are still available for low-friction call sites, but
+the preferred production/hot-path APIs are the explicit-storage variants:
+
+- `parseInitialRequestWithStorage(...)`
+- `parseInitialRequestWithDecoderAndStorage(...)`
+- `decodeRequestHeaderBlockWithFieldStorage(...)`
+- `decodeRequestHeaderBlockWithDecoderAndFieldStorage(...)`
+- `buildPriorKnowledgePreambleFromUpgradeWithHeaderStorage(...)`
+
+Likewise, `frame_payload_capacity_bytes` and `header_block_capacity_bytes` in
+`limits.zig` are now treated as intentional current runtime/storage bounds for
+the shared helper layer, not accidental drift from deployment config.
 
 ### Flow control and stream state
 
