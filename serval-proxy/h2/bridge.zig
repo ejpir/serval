@@ -121,21 +121,22 @@ fn goawayAffectsActiveTargetStream(upstream_stream_id: u32, goaway: h2.GoAway) b
 pub const StreamBridge = struct {
     client: *serval_client.Client,
     sessions: *serval_client.H2UpstreamSessionPool,
-    binding_table: bindings.BindingTable = bindings.BindingTable.init(),
+    binding_table: bindings.BindingTable = undefined,
     poll_scan_cursor: u16 = 0,
     debug_connection_id: u64 = 0,
 
-    /// Initializes a bridge around an existing client and upstream session pool.
+    /// Initializes caller-owned bridge storage around an existing client and upstream session pool.
     /// The pointers are borrowed; the bridge does not allocate or take ownership.
-    /// The returned bridge starts with an empty binding table and a zero poll cursor.
-    pub fn init(client: *serval_client.Client, sessions: *serval_client.H2UpstreamSessionPool) StreamBridge {
+    /// On success, the bridge starts with an empty binding table and a zero poll cursor.
+    pub fn initInto(self: *StreamBridge, client: *serval_client.Client, sessions: *serval_client.H2UpstreamSessionPool) void {
         assert(@intFromPtr(client) != 0);
         assert(@intFromPtr(sessions) != 0);
-
-        return .{
-            .client = client,
-            .sessions = sessions,
-        };
+        assert(@intFromPtr(self) != 0);
+        self.client = client;
+        self.sessions = sessions;
+        self.binding_table.initInto();
+        self.poll_scan_cursor = 0;
+        self.debug_connection_id = 0;
     }
 
     /// Clears the bridge's binding state and resets the poll cursor.
@@ -144,7 +145,7 @@ pub const StreamBridge = struct {
     pub fn deinit(self: *StreamBridge) void {
         assert(@intFromPtr(self) != 0);
 
-        self.binding_table = bindings.BindingTable.init();
+        self.binding_table.initInto();
         self.poll_scan_cursor = 0;
         self.sessions.closeAll();
     }
@@ -641,7 +642,8 @@ test "StreamBridge bindingForDownstream returns stored mapping" {
     const sessions = try createTestSessionPool();
     defer destroyTestSessionPool(sessions);
 
-    var bridge = StreamBridge.init(&client, sessions);
+    var bridge: StreamBridge = undefined;
+    bridge.initInto(&client, sessions);
     defer bridge.deinit();
 
     try bridge.binding_table.put(.{
@@ -675,7 +677,8 @@ test "StreamBridge maps response_data and removes binding on end_stream" {
     const sessions = try createTestSessionPool();
     defer destroyTestSessionPool(sessions);
 
-    var bridge = StreamBridge.init(&client, sessions);
+    var bridge: StreamBridge = undefined;
+    bridge.initInto(&client, sessions);
     defer bridge.deinit();
 
     const upstream_index: config.UpstreamIndex = 2;
@@ -711,7 +714,8 @@ test "StreamBridge maps stream_reset and clears binding" {
     const sessions = try createTestSessionPool();
     defer destroyTestSessionPool(sessions);
 
-    var bridge = StreamBridge.init(&client, sessions);
+    var bridge: StreamBridge = undefined;
+    bridge.initInto(&client, sessions);
     defer bridge.deinit();
 
     const upstream_index: config.UpstreamIndex = 3;
@@ -745,7 +749,8 @@ test "StreamBridge maps by upstream index when stream ids overlap" {
     const sessions = try createTestSessionPool();
     defer destroyTestSessionPool(sessions);
 
-    var bridge = StreamBridge.init(&client, sessions);
+    var bridge: StreamBridge = undefined;
+    bridge.initInto(&client, sessions);
     defer bridge.deinit();
 
     try bridge.binding_table.put(.{
@@ -783,7 +788,8 @@ test "StreamBridge maps by upstream session generation when ids overlap" {
     const sessions = try createTestSessionPool();
     defer destroyTestSessionPool(sessions);
 
-    var bridge = StreamBridge.init(&client, sessions);
+    var bridge: StreamBridge = undefined;
+    bridge.initInto(&client, sessions);
     defer bridge.deinit();
 
     const upstream_index: config.UpstreamIndex = 3;
@@ -822,7 +828,8 @@ test "StreamBridge keeps bindings on no-error connection_close" {
     const sessions = try createTestSessionPool();
     defer destroyTestSessionPool(sessions);
 
-    var bridge = StreamBridge.init(&client, sessions);
+    var bridge: StreamBridge = undefined;
+    bridge.initInto(&client, sessions);
     defer bridge.deinit();
 
     const upstream_index: config.UpstreamIndex = 7;
@@ -858,7 +865,8 @@ test "StreamBridge keeps all bindings on no-error connection_close" {
     const sessions = try createTestSessionPool();
     defer destroyTestSessionPool(sessions);
 
-    var bridge = StreamBridge.init(&client, sessions);
+    var bridge: StreamBridge = undefined;
+    bridge.initInto(&client, sessions);
     defer bridge.deinit();
 
     const upstream_index: config.UpstreamIndex = 9;
@@ -893,7 +901,8 @@ test "StreamBridge clears only matching generation bindings on error connection_
     const sessions = try createTestSessionPool();
     defer destroyTestSessionPool(sessions);
 
-    var bridge = StreamBridge.init(&client, sessions);
+    var bridge: StreamBridge = undefined;
+    bridge.initInto(&client, sessions);
     defer bridge.deinit();
 
     const upstream_index: config.UpstreamIndex = 8;
@@ -928,7 +937,8 @@ test "StreamBridge takeAffectedDownstreamsForConnectionClose removes only blocke
     const sessions = try createTestSessionPool();
     defer destroyTestSessionPool(sessions);
 
-    var bridge = StreamBridge.init(&client, sessions);
+    var bridge: StreamBridge = undefined;
+    bridge.initInto(&client, sessions);
     defer bridge.deinit();
 
     const upstream_index: config.UpstreamIndex = 2;
@@ -970,7 +980,8 @@ test "StreamBridge pollNextAction returns WouldBlock when no bindings are active
     const sessions = try createTestSessionPool();
     defer destroyTestSessionPool(sessions);
 
-    var bridge = StreamBridge.init(&client, sessions);
+    var bridge: StreamBridge = undefined;
+    bridge.initInto(&client, sessions);
     defer bridge.deinit();
 
     var evented: std.Io.Evented = undefined;

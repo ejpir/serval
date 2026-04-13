@@ -1182,7 +1182,7 @@ pub fn tryServeTlsAlpnConnection(
         log.err("server: conn={d} generic h2 bridge handler allocation failed", .{connection_id});
         return false;
     };
-    bridge_handler.* = BridgeHandler.init(
+    bridge_handler.initInto(
         handler,
         io,
         &bridge_client,

@@ -50,10 +50,15 @@ pub const BindingTable = struct {
     slots: [capacity]Slot = [_]Slot{.{}} ** capacity,
     count: u16 = 0,
 
-    /// Returns an empty binding table with all slots cleared.
-    /// This is a zero-allocation constructor equivalent to `.{};`.
-    pub fn init() BindingTable {
-        return .{};
+    /// Initializes caller-owned binding-table storage with all slots cleared.
+    /// This resets the active binding count to zero and leaves no live entries.
+    pub fn initInto(self: *BindingTable) void {
+        assert(@intFromPtr(self) != 0);
+        for (&self.slots) |*slot| {
+            slot.* = .{};
+        }
+        self.count = 0;
+        assert(self.count == 0);
     }
 
     /// Inserts `binding` into the table if both stream keys are unique.
@@ -271,7 +276,8 @@ pub const BindingTable = struct {
 };
 
 test "BindingTable stores and retrieves bindings" {
-    var table = BindingTable.init();
+    var table: BindingTable = undefined;
+    table.initInto();
     const binding = Binding{ .downstream_stream_id = 1, .upstream_stream_id = 11, .upstream_index = 3, .upstream_session_generation = 1 };
 
     try table.put(binding);
@@ -281,7 +287,8 @@ test "BindingTable stores and retrieves bindings" {
 }
 
 test "BindingTable getByUpstreamForIndex disambiguates equal stream ids" {
-    var table = BindingTable.init();
+    var table: BindingTable = undefined;
+    table.initInto();
     try table.put(.{ .downstream_stream_id = 1, .upstream_stream_id = 7, .upstream_index = 0, .upstream_session_generation = 1 });
     try table.put(.{ .downstream_stream_id = 3, .upstream_stream_id = 7, .upstream_index = 1, .upstream_session_generation = 1 });
 
@@ -293,7 +300,8 @@ test "BindingTable getByUpstreamForIndex disambiguates equal stream ids" {
 }
 
 test "BindingTable rejects duplicate downstream stream" {
-    var table = BindingTable.init();
+    var table: BindingTable = undefined;
+    table.initInto();
     try table.put(.{ .downstream_stream_id = 1, .upstream_stream_id = 11, .upstream_index = 0, .upstream_session_generation = 1 });
     try std.testing.expectError(
         error.DuplicateDownstreamStream,
@@ -302,7 +310,8 @@ test "BindingTable rejects duplicate downstream stream" {
 }
 
 test "BindingTable rejects duplicate upstream stream" {
-    var table = BindingTable.init();
+    var table: BindingTable = undefined;
+    table.initInto();
     try table.put(.{ .downstream_stream_id = 1, .upstream_stream_id = 11, .upstream_index = 0, .upstream_session_generation = 1 });
     try std.testing.expectError(
         error.DuplicateUpstreamStream,
@@ -311,7 +320,8 @@ test "BindingTable rejects duplicate upstream stream" {
 }
 
 test "BindingTable allows equal upstream stream ids across session generations" {
-    var table = BindingTable.init();
+    var table: BindingTable = undefined;
+    table.initInto();
     try table.put(.{ .downstream_stream_id = 1, .upstream_stream_id = 11, .upstream_index = 0, .upstream_session_generation = 1 });
     try table.put(.{ .downstream_stream_id = 3, .upstream_stream_id = 11, .upstream_index = 0, .upstream_session_generation = 2 });
 
@@ -322,7 +332,8 @@ test "BindingTable allows equal upstream stream ids across session generations" 
 }
 
 test "BindingTable removes bindings" {
-    var table = BindingTable.init();
+    var table: BindingTable = undefined;
+    table.initInto();
     const binding = Binding{ .downstream_stream_id = 1, .upstream_stream_id = 11, .upstream_index = 0, .upstream_session_generation = 1 };
     try table.put(binding);
 
@@ -332,7 +343,8 @@ test "BindingTable removes bindings" {
 }
 
 test "BindingTable removes by upstream stream id" {
-    var table = BindingTable.init();
+    var table: BindingTable = undefined;
+    table.initInto();
     const binding = Binding{ .downstream_stream_id = 3, .upstream_stream_id = 13, .upstream_index = 1, .upstream_session_generation = 1 };
     try table.put(binding);
 
@@ -343,7 +355,8 @@ test "BindingTable removes by upstream stream id" {
 }
 
 test "BindingTable removes all bindings for one upstream index" {
-    var table = BindingTable.init();
+    var table: BindingTable = undefined;
+    table.initInto();
     try table.put(.{ .downstream_stream_id = 1, .upstream_stream_id = 11, .upstream_index = 0, .upstream_session_generation = 1 });
     try table.put(.{ .downstream_stream_id = 3, .upstream_stream_id = 13, .upstream_index = 1, .upstream_session_generation = 1 });
     try table.put(.{ .downstream_stream_id = 5, .upstream_stream_id = 15, .upstream_index = 1, .upstream_session_generation = 2 });
@@ -357,7 +370,8 @@ test "BindingTable removes all bindings for one upstream index" {
 }
 
 test "BindingTable removes all bindings for one upstream session generation" {
-    var table = BindingTable.init();
+    var table: BindingTable = undefined;
+    table.initInto();
     try table.put(.{ .downstream_stream_id = 1, .upstream_stream_id = 11, .upstream_index = 1, .upstream_session_generation = 1 });
     try table.put(.{ .downstream_stream_id = 3, .upstream_stream_id = 11, .upstream_index = 1, .upstream_session_generation = 2 });
 
@@ -368,7 +382,8 @@ test "BindingTable removes all bindings for one upstream session generation" {
 }
 
 test "BindingTable removes only streams above GOAWAY last_stream_id for one session" {
-    var table = BindingTable.init();
+    var table: BindingTable = undefined;
+    table.initInto();
     try table.put(.{ .downstream_stream_id = 1, .upstream_stream_id = 1, .upstream_index = 2, .upstream_session_generation = 9 });
     try table.put(.{ .downstream_stream_id = 3, .upstream_stream_id = 3, .upstream_index = 2, .upstream_session_generation = 9 });
     try table.put(.{ .downstream_stream_id = 5, .upstream_stream_id = 5, .upstream_index = 2, .upstream_session_generation = 9 });

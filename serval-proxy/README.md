@@ -33,9 +33,9 @@ Top-level exports from [mod.zig](/home/nick/repos/serval/serval-proxy/mod.zig):
 | `h1` | HTTP/1 forwarding helpers |
 | `h2` | HTTP/2 bridge primitives |
 | `H2Binding` | Downstream/upstream stream binding record |
-| `H2BindingTable` | Fixed-capacity binding table |
+| `H2BindingTable` | Fixed-capacity binding table; initialize caller-owned storage with `initInto()` |
 | `H2BindingError` | Binding table error set |
-| `H2StreamBridge` | Stream-aware downstream-to-upstream h2 bridge |
+| `H2StreamBridge` | Stream-aware downstream-to-upstream h2 bridge; initialize caller-owned storage with `initInto(client, sessions)` |
 | `H2StreamBridgeError` | h2 bridge error set |
 | `H2StreamBridgeOpenResult` | Open-stream result from the bridge |
 | `H2StreamBridgeReceiveAction` | Mapped action returned from upstream receive |

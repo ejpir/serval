@@ -7116,7 +7116,8 @@ test "integration: serval-proxy h2 stream bridge binds downstream to upstream st
     session_pool.initInto(.{});
     defer session_pool.deinit();
 
-    var bridge = serval.proxy.H2StreamBridge.init(&http_client, session_pool);
+    var bridge: serval.proxy.H2StreamBridge = undefined;
+    bridge.initInto(&http_client, session_pool);
     defer bridge.deinit();
 
     var evented: std.Io.Evented = undefined;

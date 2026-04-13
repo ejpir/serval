@@ -1345,26 +1345,38 @@ pub fn Server(
             /// Stores the supplied handler, I/O runtime, bridge client, session pool, and connection context without taking ownership.
             /// The bridge is initialized immediately and tagged with the connection ID for debug logging.
             /// All input pointers must remain valid for the lifetime of the returned instance.
-            pub fn init(
+            pub fn initInto(
+                self: *@This(),
                 inner: *Handler,
                 io: Io,
                 bridge_client: *serval_client.Client,
                 bridge_sessions: *serval_client.H2UpstreamSessionPool,
                 connection_ctx: *Context,
-            ) @This() {
+            ) void {
+                assert(@intFromPtr(self) != 0);
                 assert(@intFromPtr(inner) != 0);
                 assert(@intFromPtr(bridge_client) != 0);
                 assert(@intFromPtr(bridge_sessions) != 0);
                 assert(@intFromPtr(connection_ctx) != 0);
-
-                var instance = @This(){
-                    .inner = inner,
-                    .io = io,
-                    .bridge = serval_proxy.H2StreamBridge.init(bridge_client, bridge_sessions),
-                    .connection_ctx = connection_ctx,
-                };
-                instance.bridge.setDebugConnectionId(connection_ctx.connection_id);
-                return instance;
+                self.inner = inner;
+                self.io = io;
+                self.bridge.initInto(bridge_client, bridge_sessions);
+                self.connection_ctx = connection_ctx;
+                self.response_status = 200;
+                self.response_bytes = 0;
+                self.connection_reused = false;
+                self.dns_duration_ns = 0;
+                self.tcp_connect_duration_ns = 0;
+                self.upstream_local_port = 0;
+                self.bridge_mutex = .init;
+                self.connection_mutex = null;
+                self.writer_template = null;
+                self.upstream_reader_group = .init;
+                self.upstream_reader_started = false;
+                self.upstream_reader_stop = false;
+                self.pending_resets = [_]PendingReset{.{}} ** pending_reset_capacity;
+                self.grpc_completion_policy = .{};
+                self.bridge.setDebugConnectionId(connection_ctx.connection_id);
             }
 
             /// Shuts down bridge background work and deinitializes the stream bridge.
@@ -2065,7 +2077,7 @@ pub fn Server(
                 return forwarder_mod.ForwardError.InvalidResponse;
             };
             defer std.heap.page_allocator.destroy(bridge_handler);
-            bridge_handler.* = H2cBridgeHandler.init(
+            bridge_handler.initInto(
                 handler,
                 io,
                 &bridge_client,
@@ -2164,7 +2176,8 @@ pub fn Server(
             bridge_sessions.initInto(.{});
             defer bridge_sessions.deinit();
 
-            var bridge_handler = H2cBridgeHandler.init(
+            var bridge_handler: H2cBridgeHandler = undefined;
+            bridge_handler.initInto(
                 handler,
                 io,
                 &bridge_client,

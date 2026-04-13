@@ -59,7 +59,7 @@ pub const h2 = @import("h2/mod.zig");
 pub const H2Binding = h2.Binding;
 /// Public alias of `h2.BindingTable`, the HTTP/2 downstream-to-upstream stream binding map.
 /// The table is fixed-capacity (`serval-core.config.H2_MAX_CONCURRENT_STREAMS`) and stores bindings by value.
-/// Construct and mutate it via the underlying `h2.BindingTable` API (for example, `init`, `put`, and remove/lookups).
+/// Construct caller-owned storage with the underlying `h2.BindingTable.initInto()` API, then mutate it via `put` and the remove/lookup helpers.
 /// This alias has no runtime behavior or error path; method-level failures come from `h2.BindingTable` operations.
 pub const H2BindingTable = h2.BindingTable;
 /// Re-export of `h2.BindingError` for proxy-facing HTTP/2 binding APIs.
@@ -68,7 +68,7 @@ pub const H2BindingTable = h2.BindingTable;
 pub const H2BindingError = h2.BindingError;
 /// Public re-export of [`h2.StreamBridge`](h2/mod.zig), the HTTP/2 stream-bridging state machine used by the proxy.
 /// Use this alias when opening, binding, and polling downstream/upstream H2 stream pairs via the `serval-proxy` API.
-/// Ownership/lifetime rules are defined by `h2.StreamBridge`: it is initialized with caller-owned `Client` and `H2UpstreamSessionPool` pointers and does not take ownership of them.
+/// Ownership/lifetime rules are defined by `h2.StreamBridge`: initialize caller-owned storage with `initInto(client, sessions)`, and keep those borrowed `Client` and `H2UpstreamSessionPool` pointers valid for the bridge lifetime.
 /// This declaration is a pure type alias and introduces no additional allocation or error behavior by itself.
 pub const H2StreamBridge = h2.StreamBridge;
 /// Canonical error set returned by `H2StreamBridge` operations in `serval-proxy`.
