@@ -2694,7 +2694,7 @@ fn readSome(
             var retry_count: u32 = 0;
             while (retry_count < read_max_retry_count) : (retry_count += 1) {
                 if (!tls_stream.hasPendingRead()) {
-                    try waitUntilReadableTls(tls_stream.fd, io, readiness_timeout);
+                    try waitUntilReadable(tls_stream.fd, io, readiness_timeout);
                 }
 
                 const n: u32 = tls_stream.read(out) catch |err| switch (err) {
@@ -2737,45 +2737,6 @@ fn waitUntilReadable(fd: i32, io: Io, timeout: Io.Timeout) Error!void {
         => return error.ConnectionClosed,
         else => return error.ReadFailed,
     };
-}
-
-const tls_readiness_poll_sleep_ms: i64 = 1;
-const tls_readiness_max_poll_iterations: u32 = 120_000;
-
-fn waitUntilReadableTls(fd: i32, io: Io, timeout: Io.Timeout) Error!void {
-    assert(fd >= 0);
-    assert(tls_readiness_max_poll_iterations > 0);
-
-    var poll_fds = [_]posix.pollfd{
-        .{
-            .fd = fd,
-            .events = posix.POLL.IN,
-            .revents = 0,
-        },
-    };
-    const maybe_deadline = timeout.toTimestamp(io);
-    var iterations: u32 = 0;
-    while (iterations < tls_readiness_max_poll_iterations) : (iterations += 1) {
-        poll_fds[0].revents = 0;
-        const polled = posix.poll(&poll_fds, 0) catch return error.ReadFailed;
-        if (polled > 0) {
-            const revents = poll_fds[0].revents;
-            if ((revents & (posix.POLL.ERR | posix.POLL.NVAL)) != 0) return error.ReadFailed;
-            if ((revents & posix.POLL.HUP) != 0) return error.ConnectionClosed;
-            if ((revents & posix.POLL.IN) != 0) return;
-        }
-
-        if (maybe_deadline) |deadline| {
-            const remaining = deadline.durationFromNow(io);
-            if (remaining.raw.toNanoseconds() <= 0) return error.ConnectionClosed;
-        }
-
-        std.Io.sleep(io, Io.Duration.fromMilliseconds(tls_readiness_poll_sleep_ms), .awake) catch {
-            return error.ReadFailed;
-        };
-    }
-
-    return error.ReadFailed;
 }
 
 fn writeSome(io_conn: *ConnectionIo, io: Io, out: []const u8) Error!usize {
@@ -3009,6 +2970,37 @@ fn appendFrame(out: []u8, frame_type: h2.FrameType, flags: u8, stream_id: u32, p
     });
     @memcpy(out[header.len..][0..payload.len], payload);
     return out[0 .. header.len + payload.len];
+}
+
+test "waitUntilReadable returns ConnectionClosed when timeout expires" {
+    const fds = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    const timeout: Io.Timeout = .{ .duration = .{
+        .raw = Io.Duration.fromMilliseconds(20),
+        .clock = .awake,
+    } };
+    try std.testing.expectError(error.ConnectionClosed, waitUntilReadable(fds[0], std.Options.debug_io, timeout));
+}
+
+test "waitUntilReadable preserves peeked data" {
+    const fds = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    const payload = [_]u8{0x24};
+    try std.testing.expectEqual(@as(usize, 1), try posix.write(fds[1], &payload));
+
+    const timeout: Io.Timeout = .{ .duration = .{
+        .raw = Io.Duration.fromMilliseconds(50),
+        .clock = .awake,
+    } };
+    try waitUntilReadable(fds[0], std.Options.debug_io, timeout);
+
+    var out: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try posix.read(fds[0], &out));
+    try std.testing.expectEqual(payload[0], out[0]);
 }
 
 test "buildResponseHeaderBlock encodes :status and application headers" {
