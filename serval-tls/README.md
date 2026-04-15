@@ -17,7 +17,7 @@ No business logic, only protocol implementation. Sits alongside serval-http and 
 **Phase 1 - Complete**
 - Userspace TLS via OpenSSL/BoringSSL
 - Socket BIO approach (not Memory BIO)
-- Non-blocking handshakes via io_uring poll
+- Bounded non-blocking handshakes via fd readiness waits
 - Manual SSL bindings (avoids @cImport macro issues)
 
 **Phase 2 - Complete**
@@ -36,10 +36,12 @@ No business logic, only protocol implementation. Sits alongside serval-http and 
   - Installs process-wide `SIGPIPE` ignore before OpenSSL socket-BIO use on Linux
 
 - `TLSStream` - Unified TLS stream interface
-  - `initServer()` - Server-side TLS termination (accepts client connections)
-  - `initClient()` - Client-side TLS origination (connects to HTTPS backends)
-  - `read()` - TLS read (decrypts incoming data, returns `error.WantRead` / `error.WantWrite` on nonblocking SSL backpressure)
-  - `write()` - TLS write (encrypts outgoing data)
+  - `initServer()` / `initClient()` - Server/client TLS setup with default handshake + I/O timeouts from `serval-core.config.TlsConfig`
+  - `initServerWithTimeouts()` / `initClientWithTimeouts()` - Server/client TLS setup with explicit handshake + I/O timeouts
+  - `read()` - Non-blocking TLS read primitive (returns `error.WantRead` / `error.WantWrite` on SSL backpressure)
+  - `readBounded()` / `readWithTimeout()` - TLS read with stored or explicit timeout enforcement
+  - `write()` - Non-blocking TLS write primitive
+  - `writeBounded()` / `writeWithTimeout()` - TLS write with stored or explicit timeout enforcement
   - `close()` - Quiet TLS shutdown for deterministic teardown without peer-close `SIGPIPE`
   - `isKtls()` - Check if kTLS kernel offload is active (zero overhead)
   - `queryKtlsStatus()` - Get detailed kTLS TX/RX status (for diagnostics)
@@ -69,11 +71,11 @@ No business logic, only protocol implementation. Sits alongside serval-http and 
 
 ### Phase 1 (Complete)
 - [x] Manual SSL bindings (ssl.zig)
-- [x] TLS handshake (async via io_uring poll)
+- [x] TLS handshake with bounded readiness waits and explicit timeout enforcement
 - [x] Server certificate loading
 - [x] Client SNI support
 - [x] Upstream certificate verification (optional via `verify_upstream`)
-- [x] Non-blocking read/write (SSL WANT_READ/WANT_WRITE mapped to retryable backpressure)
+- [x] Non-blocking read/write primitives plus bounded timeout-enforcing wrappers
 - [x] Explicit `WantRead` vs `WantWrite` TLS read signaling for callers that
   need direction-aware readiness handling
 - [x] Graceful shutdown (close_notify)

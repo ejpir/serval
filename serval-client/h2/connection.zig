@@ -660,7 +660,7 @@ fn readSome(socket: *Socket, maybe_io: ?Io, timeout: Io.Timeout, out: []u8) Erro
             }
 
             if (maybe_io) |io| {
-                try waitUntilReadableTls(tls_socket.fd, io, timeout);
+                try waitUntilReadable(tls_socket.fd, io, timeout);
             }
             const n = tls_socket.stream.read(out) catch |err| switch (err) {
                 error.WantRead, error.WantWrite => return error.WouldBlock,
@@ -689,45 +689,6 @@ fn waitUntilReadable(fd: i32, io: Io, timeout: Io.Timeout) Error!void {
         error.ConnectionResetByPeer => return error.ConnectionClosed,
         else => return error.ReadFailed,
     };
-}
-
-const tls_readiness_poll_sleep_ms: i64 = 1;
-const tls_readiness_max_poll_iterations: u32 = 120_000;
-
-fn waitUntilReadableTls(fd: i32, io: Io, timeout: Io.Timeout) Error!void {
-    assert(fd >= 0);
-    assert(tls_readiness_max_poll_iterations > 0);
-
-    var poll_fds = [_]posix.pollfd{
-        .{
-            .fd = fd,
-            .events = posix.POLL.IN,
-            .revents = 0,
-        },
-    };
-    const maybe_deadline = timeout.toTimestamp(io);
-    var iterations: u32 = 0;
-    while (iterations < tls_readiness_max_poll_iterations) : (iterations += 1) {
-        poll_fds[0].revents = 0;
-        const polled = posix.poll(&poll_fds, 0) catch return error.ReadFailed;
-        if (polled > 0) {
-            const revents = poll_fds[0].revents;
-            if ((revents & (posix.POLL.ERR | posix.POLL.NVAL)) != 0) return error.ReadFailed;
-            if ((revents & posix.POLL.HUP) != 0) return error.ConnectionClosed;
-            if ((revents & posix.POLL.IN) != 0) return;
-        }
-
-        if (maybe_deadline) |deadline| {
-            const remaining = deadline.durationFromNow(io);
-            if (remaining.raw.toNanoseconds() <= 0) return error.WouldBlock;
-        }
-
-        std.Io.sleep(io, Io.Duration.fromMilliseconds(tls_readiness_poll_sleep_ms), .awake) catch {
-            return error.ReadFailed;
-        };
-    }
-
-    return error.ReadFailed;
 }
 
 fn rawStreamForFd(fd: i32) Io.net.Stream {
@@ -911,6 +872,37 @@ fn makeGrpcRequest(path: []const u8) !Request {
     try request.headers.put("te", "trailers");
     assert(request.headers.get("te") != null);
     return request;
+}
+
+test "waitUntilReadable returns WouldBlock when timeout expires" {
+    const fds = try testSocketPair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+
+    const timeout: Io.Timeout = .{ .duration = .{
+        .raw = Io.Duration.fromMilliseconds(20),
+        .clock = .awake,
+    } };
+    try std.testing.expectError(error.WouldBlock, waitUntilReadable(fds[0], std.Options.debug_io, timeout));
+}
+
+test "waitUntilReadable preserves peeked data" {
+    const fds = try testSocketPair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+
+    const payload = [_]u8{0x42};
+    try std.testing.expectEqual(@as(usize, 1), try posix.write(fds[1], &payload));
+
+    const timeout: Io.Timeout = .{ .duration = .{
+        .raw = Io.Duration.fromMilliseconds(50),
+        .clock = .awake,
+    } };
+    try waitUntilReadable(fds[0], std.Options.debug_io, timeout);
+
+    var out: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try posix.read(fds[0], &out));
+    try std.testing.expectEqual(payload[0], out[0]);
 }
 
 test "ClientConnection sends client preface and initial settings" {

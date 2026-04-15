@@ -741,7 +741,7 @@ fn readInboundFrame(
     if (!have_frame) return null;
 
     const header = try h2.parseFrameHeader(recv_buf[0..h2.frame_header_size_bytes]);
-    const frame_len: usize = h2.frame_header_size_bytes + header.length;
+    const frame_len = try inboundFrameLengthForStorage(header);
     try fillBuffer(io_conn, maybe_plain_reader, io, recv_buf, buffer_len, frame_len);
     log.debug("server: conn={d} h2 parsed frame count={d} type={s} stream={d} flags=0x{x} payload_bytes={d} buffered_bytes={d}", .{
         connection_id,
@@ -2516,7 +2516,7 @@ fn sendRuntimeErrorGoAway(
 
 fn logRuntimeFrameError(connection_id: u64, header: h2.FrameHeader, err: anyerror) void {
     assert(header.stream_id <= 0x7fff_ffff);
-    assert(header.length <= h2.frame_payload_capacity_bytes);
+    assert(header.length <= h2.max_frame_payload_size_bytes);
 
     log.warn(
         "h2: conn={d} frame_err frame_type={s} stream_id={d} flags=0x{x} length={d} err={s} goaway={s}",
@@ -2596,6 +2596,18 @@ fn consumeOptionalUpgradeClientPreface(
     discardPrefix(recv_buf, buffer_len, h2.client_connection_preface.len);
 }
 
+fn inboundFrameLengthForStorage(header: h2.FrameHeader) Error!usize {
+    assert(header.stream_id <= 0x7fff_ffff);
+    assert(header.length <= h2.max_frame_payload_size_bytes);
+
+    if (header.length > h2.frame_payload_capacity_bytes) return error.FrameTooLarge;
+
+    const payload_len_bytes: usize = @intCast(header.length);
+    const frame_len: usize = h2.frame_header_size_bytes + payload_len_bytes;
+    assert(frame_len <= frame_buffer_size_bytes);
+    return frame_len;
+}
+
 fn ensureFrame(
     io_conn: *ConnectionIo,
     maybe_plain_reader: ?*Io.net.Stream.Reader,
@@ -2613,7 +2625,7 @@ fn ensureFrame(
 
     try fillBuffer(io_conn, maybe_plain_reader, io, recv_buf, buffer_len, h2.frame_header_size_bytes);
     const header = try h2.parseFrameHeader(recv_buf[0..h2.frame_header_size_bytes]);
-    const frame_len: usize = h2.frame_header_size_bytes + header.length;
+    const frame_len = try inboundFrameLengthForStorage(header);
     try fillBuffer(io_conn, maybe_plain_reader, io, recv_buf, buffer_len, frame_len);
     return true;
 }
@@ -2694,7 +2706,7 @@ fn readSome(
             var retry_count: u32 = 0;
             while (retry_count < read_max_retry_count) : (retry_count += 1) {
                 if (!tls_stream.hasPendingRead()) {
-                    try waitUntilReadableTls(tls_stream.fd, io, readiness_timeout);
+                    try waitUntilReadable(tls_stream.fd, io, readiness_timeout);
                 }
 
                 const n: u32 = tls_stream.read(out) catch |err| switch (err) {
@@ -2739,45 +2751,6 @@ fn waitUntilReadable(fd: i32, io: Io, timeout: Io.Timeout) Error!void {
     };
 }
 
-const tls_readiness_poll_sleep_ms: i64 = 1;
-const tls_readiness_max_poll_iterations: u32 = 120_000;
-
-fn waitUntilReadableTls(fd: i32, io: Io, timeout: Io.Timeout) Error!void {
-    assert(fd >= 0);
-    assert(tls_readiness_max_poll_iterations > 0);
-
-    var poll_fds = [_]posix.pollfd{
-        .{
-            .fd = fd,
-            .events = posix.POLL.IN,
-            .revents = 0,
-        },
-    };
-    const maybe_deadline = timeout.toTimestamp(io);
-    var iterations: u32 = 0;
-    while (iterations < tls_readiness_max_poll_iterations) : (iterations += 1) {
-        poll_fds[0].revents = 0;
-        const polled = posix.poll(&poll_fds, 0) catch return error.ReadFailed;
-        if (polled > 0) {
-            const revents = poll_fds[0].revents;
-            if ((revents & (posix.POLL.ERR | posix.POLL.NVAL)) != 0) return error.ReadFailed;
-            if ((revents & posix.POLL.HUP) != 0) return error.ConnectionClosed;
-            if ((revents & posix.POLL.IN) != 0) return;
-        }
-
-        if (maybe_deadline) |deadline| {
-            const remaining = deadline.durationFromNow(io);
-            if (remaining.raw.toNanoseconds() <= 0) return error.ConnectionClosed;
-        }
-
-        std.Io.sleep(io, Io.Duration.fromMilliseconds(tls_readiness_poll_sleep_ms), .awake) catch {
-            return error.ReadFailed;
-        };
-    }
-
-    return error.ReadFailed;
-}
-
 fn writeSome(io_conn: *ConnectionIo, io: Io, out: []const u8) Error!usize {
     assert(@intFromPtr(io_conn) != 0);
     assert(out.len > 0);
@@ -2812,7 +2785,7 @@ fn writeSome(io_conn: *ConnectionIo, io: Io, out: []const u8) Error!usize {
         },
         .tls_stream => |tls_stream| blk: {
             const n: u32 = tls_stream.write(out) catch |err| switch (err) {
-                error.WouldBlock => return error.WouldBlock,
+                error.WantRead, error.WantWrite => return error.WouldBlock,
                 error.ConnectionReset => return error.ConnectionClosed,
                 else => {
                     log.warn(
@@ -3011,6 +2984,37 @@ fn appendFrame(out: []u8, frame_type: h2.FrameType, flags: u8, stream_id: u32, p
     return out[0 .. header.len + payload.len];
 }
 
+test "waitUntilReadable returns ConnectionClosed when timeout expires" {
+    const fds = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    const timeout: Io.Timeout = .{ .duration = .{
+        .raw = Io.Duration.fromMilliseconds(20),
+        .clock = .awake,
+    } };
+    try std.testing.expectError(error.ConnectionClosed, waitUntilReadable(fds[0], std.Options.debug_io, timeout));
+}
+
+test "waitUntilReadable preserves peeked data" {
+    const fds = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    const payload = [_]u8{0x24};
+    try std.testing.expectEqual(@as(usize, 1), try posix.write(fds[1], &payload));
+
+    const timeout: Io.Timeout = .{ .duration = .{
+        .raw = Io.Duration.fromMilliseconds(50),
+        .clock = .awake,
+    } };
+    try waitUntilReadable(fds[0], std.Options.debug_io, timeout);
+
+    var out: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try posix.read(fds[0], &out));
+    try std.testing.expectEqual(payload[0], out[0]);
+}
+
 test "buildResponseHeaderBlock encodes :status and application headers" {
     var out: [h2.header_block_capacity_bytes]u8 = undefined;
     const block = try buildResponseHeaderBlock(200, &.{.{ .name = "content-type", .value = "application/grpc" }}, &out);
@@ -3078,7 +3082,39 @@ test "ResponseStateTable inserts and removes response state" {
     try std.testing.expect(table.get(1) == null);
 }
 
+test "inboundFrameLengthForStorage enforces fixed payload capacity" {
+    const frame_len = try inboundFrameLengthForStorage(.{
+        .length = h2.frame_payload_capacity_bytes,
+        .frame_type = .data,
+        .flags = 0,
+        .stream_id = 1,
+    });
+    try std.testing.expectEqual(
+        @as(usize, h2.frame_header_size_bytes) + @as(usize, h2.frame_payload_capacity_bytes),
+        frame_len,
+    );
+    try std.testing.expectError(
+        error.FrameTooLarge,
+        inboundFrameLengthForStorage(.{
+            .length = h2.frame_payload_capacity_bytes + 1,
+            .frame_type = .data,
+            .flags = 0,
+            .stream_id = 1,
+        }),
+    );
+}
+
+test "logRuntimeFrameError tolerates oversized frame headers" {
+    logRuntimeFrameError(51, .{
+        .length = h2.frame_payload_capacity_bytes + 1,
+        .frame_type = .data,
+        .flags = h2.flags_end_stream,
+        .stream_id = 1,
+    }, error.FrameTooLarge);
+}
+
 test "mapGoAwayError maps flow-control violations distinctly" {
+    try std.testing.expectEqual(h2.ErrorCode.frame_size_error, mapGoAwayError(error.FrameTooLarge));
     try std.testing.expectEqual(h2.ErrorCode.flow_control_error, mapGoAwayError(error.WindowOverflow));
     try std.testing.expectEqual(h2.ErrorCode.flow_control_error, mapGoAwayError(error.StreamFlowControlError));
     try std.testing.expectEqual(h2.ErrorCode.protocol_error, mapGoAwayError(error.InvalidPreface));
