@@ -1,6 +1,6 @@
 # Zig io_uring + Threaded Patch Quality Plan
 
-**Goal:** Bring the current Zig toolchain patch set for `zig-0.16.0-dev.3039+b490412cd` to a quality level that is defensible against Zig stdlib expectations while keeping both fixes we need:
+**Goal:** Bring the current Zig toolchain patch set for `zig-0.16.0-dev.3153+d6f43caad` to a quality level that is defensible against Zig stdlib expectations while keeping both fixes we need:
 
 - `Threaded` backend connect timeout support
 - `Uring` backend networking support
@@ -11,7 +11,7 @@ This plan assumes we want production-worthy behavior first and "closest possible
 
 Target patch:
 
-- `integration/toolchains/zig-0.16.0-dev.3039+b490412cd-uring.patch`
+- `integration/toolchains/zig-0.16.0-dev.3153+d6f43caad-uring.patch`
 
 Primary stdlib files affected by the patch:
 
@@ -451,7 +451,7 @@ This is adjacent cleanup, not the primary feature, but it should be included in 
 ### Findings from applied 3039 validation
 
 These findings came from applying the current patch to the installed
-`/usr/local/zig-x86_64-linux-0.16.0-dev.3039+b490412cd` toolchain and then
+`/usr/local/zig-x86_64-linux-0.16.0-dev.3153+d6f43caad` toolchain and then
 running the targeted integration suites.
 
 1. **The repo patch is canonical against a pristine toolchain tarball, not an
@@ -461,7 +461,7 @@ running the targeted integration suites.
      reported context drift and `Uring.zig` reported reversed or previously
      applied hunks.
    - Fix: keep
-     `integration/toolchains/zig-0.16.0-dev.3039+b490412cd-uring.patch` as the
+     `integration/toolchains/zig-0.16.0-dev.3153+d6f43caad-uring.patch` as the
      canonical patch against the pristine `tar.xz` contents, and use an
      incremental patch only when bringing an already-mutated local toolchain to
      the desired final state.
@@ -501,8 +501,8 @@ running the targeted integration suites.
      - `test-integration-udp-runtime`: 6/6 passed
      - `test-integration-h2c-cancel-propagation`: 1/1 passed
    - Remaining gap: full
-     `/usr/local/zig-x86_64-linux-0.16.0-dev.3039+b490412cd/zig build` and
-     `/usr/local/zig-x86_64-linux-0.16.0-dev.3039+b490412cd/zig build test`
+     `/usr/local/zig-x86_64-linux-0.16.0-dev.3153+d6f43caad/zig build` and
+     `/usr/local/zig-x86_64-linux-0.16.0-dev.3153+d6f43caad/zig build test`
      have not been run yet against the patched toolchain.
 
 ### Verification matrix
@@ -510,8 +510,8 @@ running the targeted integration suites.
 Run at least:
 
 ```bash
-/usr/local/zig-x86_64-linux-0.16.0-dev.3039+b490412cd/zig build
-/usr/local/zig-x86_64-linux-0.16.0-dev.3039+b490412cd/zig build test
+/usr/local/zig-x86_64-linux-0.16.0-dev.3153+d6f43caad/zig build
+/usr/local/zig-x86_64-linux-0.16.0-dev.3153+d6f43caad/zig build test
 ```
 
 If stdlib-targeted verification is wired in the repo, also run the patch-application and integration path that exercises the patched toolchain.
@@ -519,13 +519,13 @@ If stdlib-targeted verification is wired in the repo, also run the patch-applica
 Targeted verification already completed:
 
 ```bash
-/usr/local/zig-x86_64-linux-0.16.0-dev.3039+b490412cd/zig build test-integration-tcp-runtime
+/usr/local/zig-x86_64-linux-0.16.0-dev.3153+d6f43caad/zig build test-integration-tcp-runtime
 # All 5 tests passed
 
-/usr/local/zig-x86_64-linux-0.16.0-dev.3039+b490412cd/zig build test-integration-udp-runtime
+/usr/local/zig-x86_64-linux-0.16.0-dev.3153+d6f43caad/zig build test-integration-udp-runtime
 # All 6 tests passed
 
-/usr/local/zig-x86_64-linux-0.16.0-dev.3039+b490412cd/zig build test-integration-h2c-cancel-propagation
+/usr/local/zig-x86_64-linux-0.16.0-dev.3153+d6f43caad/zig build test-integration-h2c-cancel-propagation
 # All 1 tests passed
 ```
 

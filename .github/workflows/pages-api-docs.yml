@@ -29,16 +29,17 @@ jobs:
       - name: Download Zig toolchain
         run: |
           set -euxo pipefail
-          curl -L "https://ziglang.org/builds/zig-x86_64-linux-0.16.0-dev.3039+b490412cd.tar.xz" \
-            -o "${RUNNER_TEMP}/zig-x86_64-linux-0.16.0-dev.3039+b490412cd.tar.xz"
-          tar -C "${RUNNER_TEMP}" -xf "${RUNNER_TEMP}/zig-x86_64-linux-0.16.0-dev.3039+b490412cd.tar.xz"
-          echo "${RUNNER_TEMP}/zig-x86_64-linux-0.16.0-dev.3039+b490412cd" >> "${GITHUB_PATH}"
+          curl -L "https://ziglang.org/builds/zig-x86_64-linux-0.16.0-dev.3153+d6f43caad.tar.xz" \
+            -o "${RUNNER_TEMP}/zig-x86_64-linux-0.16.0-dev.3153+d6f43caad.tar.xz"
+          tar -C "${RUNNER_TEMP}" -xf "${RUNNER_TEMP}/zig-x86_64-linux-0.16.0-dev.3153+d6f43caad.tar.xz"
+          patch -p0 -d "${RUNNER_TEMP}" < integration/toolchains/zig-0.16.0-dev.3153+d6f43caad-uring.patch
+          echo "${RUNNER_TEMP}/zig-x86_64-linux-0.16.0-dev.3153+d6f43caad" >> "${GITHUB_PATH}"
 
       - name: Generate API docs
         run: |
           set -euxo pipefail
           bash scripts/generate_module_api_docs.sh \
-            --zig "${RUNNER_TEMP}/zig-x86_64-linux-0.16.0-dev.3039+b490412cd/zig" \
+            --zig "${RUNNER_TEMP}/zig-x86_64-linux-0.16.0-dev.3153+d6f43caad/zig" \
             --output-dir "public"
           touch public/.nojekyll
 

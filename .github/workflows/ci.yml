@@ -15,8 +15,8 @@ jobs:
       - name: Download Zig toolchain archive for Docker build
         run: |
           set -euxo pipefail
-          curl -L "https://ziglang.org/builds/zig-x86_64-linux-0.16.0-dev.3039+b490412cd.tar.xz" \
-            -o "${RUNNER_TEMP}/zig-x86_64-linux-0.16.0-dev.3039+b490412cd.tar.xz"
+          curl -L "https://ziglang.org/builds/zig-x86_64-linux-0.16.0-dev.3153+d6f43caad.tar.xz" \
+            -o "${RUNNER_TEMP}/zig-x86_64-linux-0.16.0-dev.3153+d6f43caad.tar.xz"
 
       - name: Show Docker runtime
         run: |
@@ -25,7 +25,7 @@ jobs:
 
       - name: Run build, integration, and conformance gates in Docker
         env:
-          SERVAL_CUSTOM_ZIG_ARCHIVE: ${{ runner.temp }}/zig-x86_64-linux-0.16.0-dev.3039+b490412cd.tar.xz
+          SERVAL_CUSTOM_ZIG_ARCHIVE: ${{ runner.temp }}/zig-x86_64-linux-0.16.0-dev.3153+d6f43caad.tar.xz
         run: |
           set -euxo pipefail
           bash integration/run_in_docker.sh

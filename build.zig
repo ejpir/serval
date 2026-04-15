@@ -1,4 +1,132 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+const max_toolchain_file_bytes: u32 = 2 * 1024 * 1024;
+const required_zig_version = "0.16.0-dev.3153+d6f43caad";
+const required_zig_path = "/usr/local/zig-x86_64-linux-0.16.0-dev.3153+d6f43caad/zig";
+const required_patch_file = "integration/toolchains/zig-0.16.0-dev.3153+d6f43caad-uring.patch";
+const required_threaded_patch_marker = "fn posixConnectWithTimeout(";
+const required_uring_network_patch_marker = ".netConnectIp = netConnectIp,";
+const required_uring_null_guard_patch_marker = "if (batch_userdata[0] == 0) break :ready_fiber null;";
+
+fn toolchainFileContains(
+    io: anytype,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    marker: []const u8,
+) !bool {
+    std.debug.assert(path.len > 0);
+    std.debug.assert(marker.len > 0);
+
+    const contents = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        path,
+        allocator,
+        .limited(max_toolchain_file_bytes),
+    );
+    defer allocator.free(contents);
+
+    return std.mem.indexOf(u8, contents, marker) != null;
+}
+
+fn enforce_required_zig_toolchain(b: *std.Build) void {
+    const zig_exe_path = b.graph.zig_exe;
+    std.debug.assert(zig_exe_path.len > 0);
+    std.debug.assert(required_patch_file.len > 0);
+
+    if (!std.mem.eql(u8, builtin.zig_version_string, required_zig_version)) {
+        std.log.err(
+            \\Serval requires Zig {s}.
+            \\Current compiler: {s} ({s})
+            \\Re-run with:
+            \\  {s} build ...
+            \\Reason: Serval's Threaded/io_uring runtime paths depend on the locally patched stdlib shipped by `{s}`.
+        , .{
+            required_zig_version,
+            zig_exe_path,
+            builtin.zig_version_string,
+            required_zig_path,
+            required_patch_file,
+        });
+        std.process.exit(1);
+    }
+
+    const io = b.graph.io;
+
+    const toolchain_dir = std.fs.path.dirname(zig_exe_path) orelse {
+        std.log.err("failed to derive Zig toolchain directory from compiler path: {s}", .{zig_exe_path});
+        std.process.exit(1);
+    };
+
+    var threaded_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const threaded_path = std.fmt.bufPrint(
+        &threaded_path_buffer,
+        "{s}/lib/std/Io/Threaded.zig",
+        .{toolchain_dir},
+    ) catch |err| {
+        std.log.err("failed to construct Threaded stdlib path: {s}", .{@errorName(err)});
+        std.process.exit(1);
+    };
+
+    var uring_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const uring_path = std.fmt.bufPrint(
+        &uring_path_buffer,
+        "{s}/lib/std/Io/Uring.zig",
+        .{toolchain_dir},
+    ) catch |err| {
+        std.log.err("failed to construct Uring stdlib path: {s}", .{@errorName(err)});
+        std.process.exit(1);
+    };
+
+    const has_threaded_patch = toolchainFileContains(
+        io,
+        b.allocator,
+        threaded_path,
+        required_threaded_patch_marker,
+    ) catch |err| {
+        std.log.err("failed to verify Threaded stdlib patch marker: {s}", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    const has_uring_network_patch = toolchainFileContains(
+        io,
+        b.allocator,
+        uring_path,
+        required_uring_network_patch_marker,
+    ) catch |err| {
+        std.log.err("failed to verify Uring networking patch marker: {s}", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    const has_uring_null_guard_patch = toolchainFileContains(
+        io,
+        b.allocator,
+        uring_path,
+        required_uring_null_guard_patch_marker,
+    ) catch |err| {
+        std.log.err("failed to verify Uring null-guard patch marker: {s}", .{@errorName(err)});
+        std.process.exit(1);
+    };
+
+    if (has_threaded_patch and has_uring_network_patch and has_uring_null_guard_patch) return;
+
+    std.log.err(
+        \\Serval requires the patched Zig {s} stdlib.
+        \\Current compiler: {s} ({s})
+        \\Missing patch markers:
+        \\  Threaded connect timeout helper: {s}
+        \\  Uring networking hooks: {s}
+        \\  Uring batch null guard: {s}
+        \\Apply: patch -p0 -d /usr/local < {s}
+    , .{
+        required_zig_version,
+        zig_exe_path,
+        builtin.zig_version_string,
+        if (has_threaded_patch) "present" else "missing",
+        if (has_uring_network_patch) "present" else "missing",
+        if (has_uring_null_guard_patch) "present" else "missing",
+        required_patch_file,
+    });
+    std.process.exit(1);
+}
 
 fn force_llvm_lld(compile_step: *std.Build.Step.Compile) void {
     compile_step.use_llvm = true;
@@ -23,6 +151,8 @@ fn apply_optional_openssl_paths(
 /// Optional `openssl-include-dir` and `openssl-lib-dir` values are forwarded to TLS-related compilation units.
 /// `b` must be a valid build context supplied by Zig's build system; this function mutates the graph and does not return an error.
 pub fn build(b: *std.Build) void {
+    enforce_required_zig_toolchain(b);
+
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const openssl_include_dir = b.option(

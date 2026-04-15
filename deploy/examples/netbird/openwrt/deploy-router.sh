@@ -5,7 +5,7 @@ set -euo pipefail
 # Usage: ./deploy-router.sh [router-ip] [optional: zig-version-tag] [acme-domain] [acme-email]
 
 ROUTER_IP="${1:-192.168.1.1}"
-ZIG_VERSION="${2:-0.16.0-dev.3039+b490412cd}"
+ZIG_VERSION="${2:-0.16.0-dev.3153+d6f43caad}"
 ACME_DOMAIN="${3:-netbird.coreworks.be}"
 ACME_EMAIL="${4:-ops@coreworks.be}"
 ZIG_BIN="/usr/local/zig-x86_64-linux-${ZIG_VERSION}/zig"

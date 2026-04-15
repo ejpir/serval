@@ -64,7 +64,7 @@ Usage:
 ```sh
 deploy/examples/netbird/openwrt/deploy-router.sh \
   192.168.1.1 \
-  0.16.0-dev.3039+b490412cd \
+  0.16.0-dev.3153+d6f43caad \
   netbird.coreworks.be \
   ops@coreworks.be
 ```
@@ -72,7 +72,7 @@ deploy/examples/netbird/openwrt/deploy-router.sh \
 Arguments:
 
 1. router IP (default `192.168.1.1`)
-2. zig version tag (default `0.16.0-dev.3039+b490412cd`)
+2. zig version tag (default `0.16.0-dev.3153+d6f43caad`)
 3. ACME domain (default `netbird.coreworks.be`)
 4. ACME contact email (default `ops@coreworks.be`)
 

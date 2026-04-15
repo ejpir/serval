@@ -78,7 +78,7 @@ Detailed references moved to:
   - `zig build run-router-example`
 
 Compiler path:
-- `/usr/local/zig-x86_64-linux-0.16.0-dev.3039+b490412cd/zig`
+- `/usr/local/zig-x86_64-linux-0.16.0-dev.3153+d6f43caad/zig`
 
 ---
 

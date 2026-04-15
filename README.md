@@ -166,6 +166,12 @@ pub fn handleWebSocket(self: *@This(), ctx: *serval.Context, req: *const serval.
 
 ## Building
 
+Serval's build graph requires Zig `0.16.0-dev.3153+d6f43caad` (typically
+`/usr/local/zig-x86_64-linux-0.16.0-dev.3153+d6f43caad/zig`). The repo depends
+on the patched Threaded/io_uring stdlib carried in
+`integration/toolchains/zig-0.16.0-dev.3153+d6f43caad-uring.patch`; the build
+now verifies the required stdlib patch markers before compiling.
+
 ```bash
 zig build                       # Build all examples
 zig build run-lb-example        # Run load balancer

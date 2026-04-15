@@ -6,6 +6,12 @@ HTTP/HTTPS/WebSocket/gRPC-over-h2c requests.
 
 ## Running Tests
 
+Use Zig `0.16.0-dev.3153+d6f43caad` for these steps. The build graph now fails
+fast when another compiler is used and also verifies the required stdlib patch
+markers because the h2/integration path depends on Serval's patched
+Threaded/io_uring stdlib in
+`integration/toolchains/zig-0.16.0-dev.3153+d6f43caad-uring.patch`.
+
 ```bash
 # Run all integration tests
 zig build test-integration
@@ -49,7 +55,7 @@ integration image at [integration/Dockerfile](/home/nick/repos/serval/integratio
 The image installs the toolchain and external helpers required by the current
 integration and conformance suites:
 
-- your local custom Zig `0.16.0-dev.3039+b490412cd` build, bundled from the
+- your local custom Zig `0.16.0-dev.3153+d6f43caad` build, bundled from the
   host tarball so container runs use the same modified stdlib as local runs
 - Go `1.26.x`
 - `grpcurl`
@@ -59,8 +65,8 @@ integration and conformance suites:
 - OpenSSL build dependencies for Serval's TLS-linked binaries
 
 The repository also carries the required stdlib patch for
-`lib/std/Io/Uring.zig` at
-[zig-0.16.0-dev.3039+b490412cd-uring.patch](/home/nick/repos/serval/integration/toolchains/zig-0.16.0-dev.3039+b490412cd-uring.patch).
+`lib/std/Io/Threaded.zig` and `lib/std/Io/Uring.zig` at
+[zig-0.16.0-dev.3153+d6f43caad-uring.patch](/home/nick/repos/serval/integration/toolchains/zig-0.16.0-dev.3153+d6f43caad-uring.patch).
 The Docker image build applies that patch if the bundled Zig archive does not
 already contain it, so the pipeline does not depend on an accidentally
 pre-patched host install.
@@ -93,14 +99,14 @@ seccomp or by low memlock allowance.
 By default it expects the custom Zig archive at:
 
 ```bash
-/usr/local/zig-x86_64-linux-0.16.0-dev.3039+b490412cd.tar.xz
+/usr/local/zig-x86_64-linux-0.16.0-dev.3153+d6f43caad.tar.xz
 ```
 
 But if the installed toolchain directory exists, the wrapper now prefers
 repacking the live directory tree:
 
 ```bash
-/usr/local/zig-x86_64-linux-0.16.0-dev.3039+b490412cd
+/usr/local/zig-x86_64-linux-0.16.0-dev.3153+d6f43caad
 ```
 
 That avoids stale-archive drift when the local Zig stdlib has been patched after

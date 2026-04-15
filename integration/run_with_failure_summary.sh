@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
-ZIG_BIN="${SERVAL_ZIG_BIN:-/usr/local/zig-x86_64-linux-0.16.0-dev.3039+b490412cd/zig}"
+ZIG_BIN="${SERVAL_ZIG_BIN:-/usr/local/zig-x86_64-linux-0.16.0-dev.3153+d6f43caad/zig}"
 GLOBAL_CACHE_DIR="${SERVAL_GLOBAL_CACHE_DIR:-/tmp/serval-zig-global-cache-debug}"
 STEP="${1:-test-integration}"
 

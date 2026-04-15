@@ -171,7 +171,7 @@ The controller serves a small admin surface intended for probes and inspection:
 From the repository root:
 
 ```bash
-/usr/local/zig-x86_64-linux-0.16.0-dev.3039+b490412cd/zig build build-gateway-example
+/usr/local/zig-x86_64-linux-0.16.0-dev.3153+d6f43caad/zig build build-gateway-example
 ```
 
 Or with the repo-default `zig` on your `PATH`:

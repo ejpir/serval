@@ -1,6 +1,6 @@
---- zig-x86_64-linux-0.16.0-dev.3039+b490412cd/lib/std/Io/Threaded.zig
-+++ zig-x86_64-linux-0.16.0-dev.3039+b490412cd/lib/std/Io/Threaded.zig
-@@ -12069,19 +12069,174 @@
+--- zig-x86_64-linux-0.16.0-dev.3153+d6f43caad/lib/std/Io/Threaded.zig
++++ zig-x86_64-linux-0.16.0-dev.3153+d6f43caad/lib/std/Io/Threaded.zig
+@@ -12078,19 +12078,174 @@
      options: IpAddress.ConnectOptions,
  ) IpAddress.ConnectError!net.Socket {
      if (!have_networking) return error.NetworkDown;
@@ -178,7 +178,7 @@
  fn netConnectIpWindows(
      userdata: ?*anyopaque,
      address: *const IpAddress,
-@@ -13034,34 +13189,40 @@
+@@ -13044,34 +13199,40 @@
          .flags = 0,
      };
      addBuf(&iovecs, &msg.iovlen, header);
@@ -243,9 +243,9 @@
      const flags = posix.MSG.NOSIGNAL;
  
      const syscall: Syscall = try .start();
- --- zig-x86_64-linux-0.16.0-dev.3039+b490412cd/lib/std/Io/Uring.zig
- +++ zig-x86_64-linux-0.16.0-dev.3039+b490412cd/lib/std/Io/Uring.zig
- @@ -771,16 +771,16 @@
+--- zig-x86_64-linux-0.16.0-dev.3153+d6f43caad/lib/std/Io/Uring.zig
++++ zig-x86_64-linux-0.16.0-dev.3153+d6f43caad/lib/std/Io/Uring.zig
+@@ -771,16 +771,16 @@
              .random = random,
              .randomSecure = randomSecure,
  
@@ -268,32 +268,50 @@
              .netWriteFile = netWriteFileUnavailable,
              .netClose = netClose,
              .netShutdown = netShutdown,
-@@ -1215,7 +1215,18 @@
-                    },
-                    0b10 => {
-                        const batch_userdata: *Io.Operation.Storage.Pending.Userdata =
-                            @ptrFromInt(cqe.user_data & ~@as(usize, 0b11));
+@@ -1217,6 +1217,7 @@
+                     0b10 => {
+                         const batch_userdata: *Io.Operation.Storage.Pending.Userdata =
+                             @ptrFromInt(cqe.user_data & ~@as(usize, 0b11));
 +                        if (batch_userdata[0] == 0) break :ready_fiber null;
-                        const batch: *Io.Batch = @ptrFromInt(batch_userdata[0]);
-                        var next: usize = 0b00;
-                        batch_userdata[0..3].* = .{ next, @as(u32, @bitCast(cqe.res)), cqe.flags };
-                        while (true) {
-                            next = @cmpxchgWeak(
-                                usize,
-                                @as(*usize, @ptrCast(&batch.userdata)),
-                                next,
-                                cqe.user_data,
-                                .release,
-                                .acquire,
-                            ) orelse break;
-                            batch_userdata[0] = next;
-                        }
-                        break :ready_fiber switch (@as(u2, @truncate(next))) {
-                            0b00, 0b01 => @ptrFromInt(next & ~@as(usize, 0b11)),
-                            0b10, 0b11 => null,
-                        };
-                    },
- @@ -2308,6 +2308,192 @@
+                         const batch: *Io.Batch = @ptrFromInt(batch_userdata[0]);
+                         var next: usize = 0b00;
+                         batch_userdata[0..3].* = .{ next, @as(u32, @bitCast(cqe.res)), cqe.flags };
+@@ -2198,7 +2199,7 @@
+     };
+     maybe_sync.leaveSync(ev);
+     while (true) {
+-        batchDrainReady(batch) catch |err| switch (err) {
++        batchDrainReady(ev, batch) catch |err| switch (err) {
+             error.Timeout => unreachable, // no timeout
+         };
+         if (batch.completed.head != .none or batch.pending.head == .none) return;
+@@ -2217,7 +2218,7 @@
+     try ev.batchDrainSubmitted(&maybe_sync, batch, true);
+     maybe_sync.leaveSync(ev);
+     const timespec: linux.kernel_timespec, const clock: Io.Clock, const timeout_flags: u32 = while (true) {
+-        batchDrainReady(batch) catch |err| switch (err) {
++        batchDrainReady(ev, batch) catch |err| switch (err) {
+             error.Timeout => unreachable, // no timeout
+         };
+         if (batch.completed.head != .none or batch.pending.head == .none) return;
+@@ -2272,7 +2273,7 @@
+     }
+     while (batch.completed.head == .none and batch.pending.head != .none) {
+         ev.yield(null, .{ .batch_await = batch });
+-        batchDrainReady(batch) catch |err| switch (err) {
++        batchDrainReady(ev, batch) catch |err| switch (err) {
+             error.Timeout => |e| return if (batch.completed.head == .none and
+                 batch.pending.head != .none) e,
+         };
+@@ -2301,13 +2302,199 @@
+         else => |err| unexpectedErrno(err) catch {},
+     }
+     while (true) {
+-        batchDrainReady(batch) catch |err| switch (err) {
++        batchDrainReady(ev, batch) catch |err| switch (err) {
+             error.Timeout => return,
+         };
+         ev.yield(null, .{ .batch_await = batch });
      }
  }
  
@@ -316,11 +334,11 @@
 +};
 +
 +fn batchNetReceiveContextCreate(ev: *Evented, len: usize) Allocator.Error!*BatchNetReceiveContext {
-+    const allocator = ev.allocator();
-+    const context = try allocator.create(BatchNetReceiveContext);
-+    errdefer allocator.destroy(context);
-+    const states = try allocator.alloc(BatchNetReceiveState, len);
-+    errdefer allocator.free(states);
++    const backing_allocator = ev.allocator();
++    const context = try backing_allocator.create(BatchNetReceiveContext);
++    errdefer backing_allocator.destroy(context);
++    const states = try backing_allocator.alloc(BatchNetReceiveState, len);
++    errdefer backing_allocator.free(states);
 +    for (states) |*state| state.* = .{
 +        .active = false,
 +        .socket_handle = undefined,
@@ -341,9 +359,9 @@
 +}
 +
 +fn batchNetReceiveContextDestroy(ev: *Evented, context: *BatchNetReceiveContext) void {
-+    const allocator = ev.allocator();
-+    allocator.free(context.states);
-+    allocator.destroy(context);
++    const backing_allocator = ev.allocator();
++    backing_allocator.free(context.states);
++    backing_allocator.destroy(context);
 +}
 +
 +fn batchNetReceiveContextRelease(
@@ -486,7 +504,7 @@
  /// If `concurrency` is false, `error.ConcurrencyUnavailable` is unreachable.
  fn batchDrainSubmitted(
      ev: *Evented,
-@@ -2318,6 +2504,10 @@
+@@ -2318,6 +2505,10 @@
      var index = batch.submitted.head;
      if (index == .none) return;
      const thread = try maybe_sync.cancelRegion().awaitIoUring();
@@ -497,7 +515,7 @@
      errdefer batch.submitted.head = index;
      while (index != .none) {
          const storage = &batch.storage[index.toIndex()];
-@@ -2388,9 +2578,62 @@
+@@ -2388,9 +2579,62 @@
                  return error.ConcurrencyUnavailable
              else
                  .{ .device_io_control = try ev.deviceIoControl(try maybe_sync.enterSync(ev), o) },
@@ -563,7 +581,16 @@
              },
          })) |result| {
              switch (batch.completed.tail) {
-@@ -2492,7 +2735,25 @@
+@@ -2412,7 +2656,7 @@
+     batch.submitted = .{ .head = .none, .tail = .none };
+ }
+ 
+-fn batchDrainReady(batch: *Io.Batch) Io.Timeout.Error!void {
++fn batchDrainReady(ev: *Evented, batch: *Io.Batch) Io.Timeout.Error!void {
+     while (@atomicRmw(?*anyopaque, &batch.userdata, .Xchg, null, .acquire)) |head| {
+         var next: usize = @intFromPtr(head);
+         var timeout = false;
+@@ -2492,7 +2736,25 @@
                      },
                  },
                  .device_io_control => unreachable,
@@ -590,7 +617,42 @@
              })) |result| {
                  switch (batch.completed.tail) {
                      .none => batch.completed.head = index,
-@@ -4953,28 +5214,88 @@
+@@ -2515,8 +2777,7 @@
+ 
+ fn batchCancel(userdata: ?*anyopaque, batch: *Io.Batch) void {
+     const ev: *Evented = @ptrCast(@alignCast(userdata));
+-    _ = ev;
+-    batchDrainReady(batch) catch |err| switch (err) {
++    batchDrainReady(ev, batch) catch |err| switch (err) {
+         error.Timeout => unreachable, // no timeout
+     };
+     var index = batch.pending.head;
+@@ -2546,7 +2807,7 @@
+         };
+         index = pending.node.next;
+     }
+-    while (batch.pending.head != .none) batchDrainReady(batch) catch |err| switch (err) {
++    while (batch.pending.head != .none) batchDrainReady(ev, batch) catch |err| switch (err) {
+         error.Timeout => unreachable, // no timeout
+     };
+ }
+@@ -2728,6 +2989,7 @@
+             error.DeviceBusy => return errnoBug(.BUSY), // EXCL unset.
+             error.FileBusy => return errnoBug(.TXTBSY),
+             error.PathAlreadyExists => return errnoBug(.EXIST), // Not creating.
++            error.ReadOnlyFileSystem => return errnoBug(.ROFS),
+             error.OperationUnsupported => return errnoBug(.OPNOTSUPP), // No TMPFILE, no locks.
+             else => |e| return e,
+         },
+@@ -3153,6 +3415,7 @@
+         .PATH = true,
+     }, 0) catch |err| switch (err) {
+         error.WouldBlock => return errnoBug(.AGAIN),
++        error.ReadOnlyFileSystem => return errnoBug(.ROFS),
+         error.OperationUnsupported => return errnoBug(.OPNOTSUPP), // Not asking for locks.
+         else => |e| return e,
+     };
+@@ -4953,28 +5216,88 @@
      };
  }
  
@@ -688,7 +750,7 @@
  }
  
  fn netBindIp(
-@@ -4996,16 +5317,27 @@
+@@ -4996,16 +5319,27 @@
      return .{ .handle = socket_fd, .address = addressFromPosix(&storage) };
  }
  
@@ -721,7 +783,7 @@
  }
  
  fn netListenUnixUnavailable(
-@@ -5039,18 +5371,98 @@
+@@ -5039,18 +5373,98 @@
      return error.OperationUnsupported;
  }
  
@@ -826,7 +888,7 @@
  }
  
  fn netReceive(
-@@ -5066,6 +5478,7 @@
+@@ -5066,6 +5480,7 @@
  
      while (true) {
          if (message_buffer.len - message_i == 0) return .{ null, message_i };
@@ -834,7 +896,7 @@
          const message = &message_buffer[message_i];
          const remaining_data_buffer = data_buffer[data_i..];
          var storage: PosixAddress = undefined;
-@@ -5089,10 +5502,7 @@
+@@ -5089,10 +5504,7 @@
              .off = 0,
              .addr = @intFromPtr(&msg),
              .len = 0,
@@ -846,7 +908,7 @@
              .user_data = @intFromPtr(cancel_region.fiber),
              .buf_index = 0,
              .personality = 0,
-@@ -5104,7 +5514,8 @@
+@@ -5104,7 +5516,8 @@
          const completion = cancel_region.completion();
          switch (completion.errno()) {
              .SUCCESS => {
@@ -856,7 +918,7 @@
                  data_i += data.len;
                  message.* = .{
                      .from = addressFromPosix(&storage),
-@@ -5119,6 +5530,7 @@
+@@ -5119,6 +5532,7 @@
                      },
                  };
                  message_i += 1;
@@ -864,7 +926,7 @@
                  continue;
              },
              .AGAIN => unreachable,
-@@ -5142,19 +5554,97 @@
+@@ -5142,19 +5556,97 @@
      }
  }
  
@@ -968,7 +1030,7 @@
      userdata: ?*anyopaque,
      handle: net.Socket.Handle,
      header: []const u8,
-@@ -5162,12 +5652,68 @@
+@@ -5162,12 +5654,68 @@
      splat: usize,
  ) net.Stream.Writer.Error!usize {
      const ev: *Evented = @ptrCast(@alignCast(userdata));
@@ -1043,7 +1105,7 @@
  }
  
  fn netWriteFileUnavailable(
-@@ -5308,6 +5854,59 @@
+@@ -5308,6 +5856,59 @@
      }
  }
  
@@ -1103,7 +1165,7 @@
  fn chdir(sync: *CancelRegion.Sync, path: [*:0]const u8) ChdirError!void {
      while (true) {
          try sync.cancel_region.await(.nothing);
-@@ -5533,6 +6132,43 @@
+@@ -5533,6 +6134,43 @@
      }
  }
  
@@ -1147,7 +1209,7 @@
  fn linkat(
      ev: *Evented,
      cancel_region: *CancelRegion,
-@@ -5688,6 +6324,8 @@
+@@ -5689,6 +6327,8 @@
  ) File.Reader.Error!usize {
      if (iov.len == 0) return 0;
      const gather = iov.len > 1 or iov[0].len > 0xfffff000;
@@ -1156,7 +1218,7 @@
      while (true) {
          const thread = try cancel_region.awaitIoUring();
          thread.enqueue().* = .{
-@@ -5709,12 +6347,15 @@
+@@ -5710,12 +6350,15 @@
          ev.yield(null, .nothing);
          const completion = cancel_region.completion();
          switch (completion.errno()) {
