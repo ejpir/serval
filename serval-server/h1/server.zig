@@ -2992,19 +2992,8 @@ pub fn Server(
             var buffer_offset: usize = 0;
             var buffer_len: usize = 0;
 
-            // Direct response buffer - only allocated if handler has onRequest hook.
-            // TigerStyle: Comptime conditional eliminates overhead for pure proxy handlers.
-            // Heap-allocated to support large payloads (128MB+) without stack overflow.
             const has_on_request = comptime hooks.hasHook(Handler, "onRequest");
             const has_select_websocket = comptime websocket_server.hasHook(Handler, "selectWebSocket");
-            const response_buf: []u8 = if (has_on_request)
-                std.heap.page_allocator.alloc(u8, DIRECT_RESPONSE_BUFFER_SIZE_BYTES) catch {
-                    log.err("server: conn={d} failed to allocate response buffer", .{connection_id});
-                    return;
-                }
-            else
-                &[_]u8{};
-            defer if (has_on_request) std.heap.page_allocator.free(response_buf);
 
             // Note: Request body buffer removed - handlers use ctx.readBody() with their own buffer.
             // This enables lazy body reading - body only read when handler explicitly requests it.
@@ -3113,6 +3102,14 @@ pub fn Server(
 
                 // Call onRequest hook if present
                 if (comptime has_on_request) {
+                    // Direct response buffer is allocated per-request, not per-connection.
+                    // This avoids reserving large memory for idle keep-alive connections.
+                    const response_buf = std.heap.page_allocator.alloc(u8, DIRECT_RESPONSE_BUFFER_SIZE_BYTES) catch {
+                        log.err("server: conn={d} failed to allocate response buffer", .{connection_id});
+                        return;
+                    };
+                    defer std.heap.page_allocator.free(response_buf);
+
                     // Set up lazy body reader for handlers to read body on demand.
                     // Industry standard pattern: body only read when handler explicitly requests it.
                     // TigerStyle: No eager reading, bounded by Content-Length when read.
