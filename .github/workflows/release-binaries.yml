@@ -17,14 +17,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download Zig toolchain
+      - name: Setup Zig toolchain
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0-dev.3039+b490412cd
+
+      - name: Patch Zig stdlib for io_uring fix
         run: |
           set -euxo pipefail
-          curl -L "https://ziglang.org/builds/zig-x86_64-linux-0.16.0-dev.3039+b490412cd.tar.xz" \
-            -o "${RUNNER_TEMP}/zig-x86_64-linux-0.16.0-dev.3039+b490412cd.tar.xz"
-          tar -C "${RUNNER_TEMP}" -xf "${RUNNER_TEMP}/zig-x86_64-linux-0.16.0-dev.3039+b490412cd.tar.xz"
-          patch -p0 -d "${RUNNER_TEMP}" < integration/toolchains/zig-0.16.0-dev.3039+b490412cd-uring.patch
-          echo "${RUNNER_TEMP}/zig-x86_64-linux-0.16.0-dev.3039+b490412cd" >> "${GITHUB_PATH}"
+          ZIG_BIN="$(command -v zig)"
+          ZIG_DIR="$(cd "$(dirname "${ZIG_BIN}")/.." && pwd)"
+
+          if ! grep -q "fn posixConnectWithTimeout" "${ZIG_DIR}/lib/std/Io/Threaded.zig" || \
+             ! grep -q "\\.netConnectIp = netConnectIp," "${ZIG_DIR}/lib/std/Io/Uring.zig"; then
+            patch -p1 -d "${ZIG_DIR}" < integration/toolchains/zig-0.16.0-dev.3039+b490412cd-uring.patch
+          fi
 
       - name: Build release binaries
         run: |
