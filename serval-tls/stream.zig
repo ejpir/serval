@@ -5,16 +5,19 @@
 //! - Userspace mode: TLS via BoringSSL SSL object (default after handshake)
 //! - kTLS mode: Kernel TLS offload for symmetric crypto (upgrade from userspace)
 //!
-//! This module uses blocking SSL operations. The underlying socket is managed
-//! by std.Io's async layer, so SSL can safely use blocking calls.
-//! - initServer: Server-side TLS termination (client connections)
-//! - initClient: Client-side TLS origination (upstream connections) with SNI
-//! - read/write: Blocking TLS I/O (socket-level timeouts via std.Io)
+//! This module keeps TLS sockets non-blocking and layers explicit readiness
+//! waits plus bounded handshake/I/O timeouts on top of OpenSSL/BoringSSL.
+//! - initServer/initClient: timed TLS handshakes for server/client use
+//! - read/write: low-level non-blocking TLS primitives
+//! - readBounded/writeBounded: timeout-enforcing TLS I/O helpers
 //! - close: Graceful TLS shutdown
 
 const std = @import("std");
-const log = @import("serval-core").log.scoped(.tls);
-const closeFd = @import("serval-core").closeFd;
+const serval_core = @import("serval-core");
+const log = serval_core.log.scoped(.tls);
+const closeFd = serval_core.closeFd;
+const config = serval_core.config;
+const time = serval_core.time;
 const assert = std.debug.assert;
 const posix = std.posix;
 const ssl = @import("ssl.zig");
@@ -40,11 +43,28 @@ pub const Mode = union(enum) {
 };
 
 /// Get monotonic timestamp in nanoseconds for timing measurements.
-/// TigerStyle: Local helper to avoid serval-core dependency (layer isolation).
+/// TigerStyle: Centralize clock access through serval-core.time.
+const default_tls_cfg = config.TlsConfig{};
+const default_tls_handshake_timeout_ns: u64 = default_tls_cfg.handshake_timeout_ns;
+const default_tls_io_timeout_ns: u64 = default_tls_cfg.io_timeout_ns;
+const tls_handshake_max_iterations: u32 = 4096;
+const tls_io_max_iterations: u32 = 131_072;
+
+const ReadinessDirection = enum {
+    read,
+    write,
+};
+
+const WaitForReadyError = error{
+    Timeout,
+    ConnectionReset,
+    ReadinessWaitFailed,
+};
+
 fn monotonicNanos() u64 {
-    const ts = std.Io.Clock.awake.now(std.Options.debug_io);
-    assert(ts.nanoseconds >= 0);
-    return @intCast(ts.nanoseconds);
+    const now_ns = time.monotonicNanos();
+    assert(now_ns > 0);
+    return now_ns;
 }
 
 /// Represents an established TLS stream on `fd`, with runtime state for either userspace TLS or manual kTLS I/O.
@@ -55,6 +75,7 @@ pub const TLSStream = struct {
     fd: c_int,
     mode: Mode,
     allocator: Allocator,
+    io_timeout_ns: u64,
     info: HandshakeInfo,
 
     /// Check if stream is using kTLS (kernel TLS offload).
@@ -127,20 +148,38 @@ pub const TLSStream = struct {
         log.info("TLS handshake ({s}): ktls={s}, cipher={s}", .{ role, ktls_status, info.cipher() });
     }
 
-    /// Server-side TLS handshake (client termination).
-    /// Uses blocking SSL operations - socket timeouts handled by std.Io.
+    /// Server-side TLS handshake (client termination) using default handshake and I/O timeouts.
     pub fn initServer(
         ctx: *ssl.SSL_CTX,
         fd: c_int,
         allocator: Allocator,
     ) !TLSStream {
-        // S1: preconditions
-        assert(@intFromPtr(ctx) != 0); // S1: precondition - ctx is valid pointer
-        assert(fd > 0); // S1: precondition
+        return initServerWithTimeouts(
+            ctx,
+            fd,
+            default_tls_handshake_timeout_ns,
+            default_tls_io_timeout_ns,
+            allocator,
+        );
+    }
+
+    /// Server-side TLS handshake (client termination) with explicit timeouts.
+    pub fn initServerWithTimeouts(
+        ctx: *ssl.SSL_CTX,
+        fd: c_int,
+        handshake_timeout_ns: u64,
+        io_timeout_ns: u64,
+        allocator: Allocator,
+    ) !TLSStream {
+        assert(@intFromPtr(ctx) != 0);
+        assert(fd > 0);
+        assert(handshake_timeout_ns > 0);
+        assert(io_timeout_ns > 0);
 
         const ssl_conn = ssl.SSL_new(ctx) orelse return error.SslNew;
         errdefer ssl.SSL_free(ssl_conn);
 
+        try setNonblocking(fd);
         if (ssl.SSL_set_fd(ssl_conn, fd) != 1) return error.SslSetFd;
 
         const enable_ktls: bool = ktls.isKtlsRuntimeAvailable();
@@ -149,28 +188,17 @@ pub const TLSStream = struct {
         }
         ssl.SSL_set_accept_state(ssl_conn);
 
-        // Capture handshake timing
         const start_ns: u64 = monotonicNanos();
-
-        // Blocking handshake - std.Io handles socket-level async
-        const ret = ssl.SSL_accept(ssl_conn);
-        if (ret != 1) {
-            ssl.printErrors();
-            return error.HandshakeFailed;
-        }
-
+        try doHandshake(ssl_conn, fd, handshake_timeout_ns);
         const end_ns: u64 = monotonicNanos();
-        assert(end_ns >= start_ns); // S1: monotonic clock invariant
+        assert(end_ns >= start_ns);
+        assert(ssl.SSL_is_init_finished(ssl_conn) == 1);
 
-        assert(ssl.SSL_is_init_finished(ssl_conn) == 1); // S1: postcondition
-
-        // Populate handshake info
         var info = HandshakeInfo{};
         info.client_mode = false;
         info.handshake_duration_ns = @intCast(end_ns - start_ns);
         populateHandshakeInfo(ssl_conn, &info);
 
-        // Setup kTLS and get appropriate mode
         const mode = setupKtlsAfterHandshake(ssl_conn, &info, enable_ktls);
         logKtlsStatus(&info, true);
 
@@ -178,12 +206,12 @@ pub const TLSStream = struct {
             .fd = fd,
             .mode = mode,
             .allocator = allocator,
+            .io_timeout_ns = io_timeout_ns,
             .info = info,
         };
     }
 
-    /// Client-side TLS handshake (upstream origination) with SNI.
-    /// Uses blocking SSL operations - socket timeouts handled by std.Io.
+    /// Client-side TLS handshake (upstream origination) with SNI using default handshake and I/O timeouts.
     /// TigerStyle S5: Caller must provide null-terminated SNI to avoid runtime allocation.
     pub fn initClient(
         ctx: *ssl.SSL_CTX,
@@ -194,20 +222,47 @@ pub const TLSStream = struct {
         desired_alpn: ?[]const u8,
         verify_peer: bool,
     ) !TLSStream {
-        // S1: preconditions
-        assert(@intFromPtr(ctx) != 0); // S1: precondition - ctx is valid pointer
-        assert(fd > 0); // S1: precondition
+        return initClientWithTimeouts(
+            ctx,
+            fd,
+            sni_z,
+            default_tls_handshake_timeout_ns,
+            default_tls_io_timeout_ns,
+            allocator,
+            enable_ktls,
+            desired_alpn,
+            verify_peer,
+        );
+    }
+
+    /// Client-side TLS handshake (upstream origination) with SNI and explicit timeouts.
+    /// TigerStyle S5: Caller must provide null-terminated SNI to avoid runtime allocation.
+    pub fn initClientWithTimeouts(
+        ctx: *ssl.SSL_CTX,
+        fd: c_int,
+        sni_z: [*:0]const u8,
+        handshake_timeout_ns: u64,
+        io_timeout_ns: u64,
+        allocator: Allocator,
+        enable_ktls: bool,
+        desired_alpn: ?[]const u8,
+        verify_peer: bool,
+    ) !TLSStream {
+        assert(@intFromPtr(ctx) != 0);
+        assert(fd > 0);
+        assert(handshake_timeout_ns > 0);
+        assert(io_timeout_ns > 0);
 
         const ssl_conn = ssl.SSL_new(ctx) orelse return error.SslNew;
         errdefer ssl.SSL_free(ssl_conn);
 
+        try setNonblocking(fd);
         if (ssl.SSL_set_fd(ssl_conn, fd) != 1) return error.SslSetFd;
 
         const should_enable_ktls: bool = enable_ktls and ktls.isKtlsRuntimeAvailable();
         if (should_enable_ktls) {
             _ = ssl.SSL_set_options(ssl_conn, ssl.SSL_OP_ENABLE_KTLS);
         }
-        // Set SNI (caller provides null-terminated string - no allocation)
         if (ssl.SSL_set_tlsext_host_name(ssl_conn, sni_z) != 1) return error.SslSetSni;
 
         if (desired_alpn) |protocol| {
@@ -221,28 +276,17 @@ pub const TLSStream = struct {
         }
         ssl.SSL_set_connect_state(ssl_conn);
 
-        // Capture handshake timing
         const start_ns: u64 = monotonicNanos();
-
-        // Blocking handshake - std.Io handles socket-level async
-        const ret = ssl.SSL_connect(ssl_conn);
-        if (ret != 1) {
-            ssl.printErrors();
-            return error.HandshakeFailed;
-        }
-
+        try doHandshake(ssl_conn, fd, handshake_timeout_ns);
         const end_ns: u64 = monotonicNanos();
-        assert(end_ns >= start_ns); // S1: monotonic clock invariant
+        assert(end_ns >= start_ns);
+        assert(ssl.SSL_is_init_finished(ssl_conn) == 1);
 
-        assert(ssl.SSL_is_init_finished(ssl_conn) == 1); // S1: postcondition
-
-        // Populate handshake info
         var info = HandshakeInfo{};
         info.client_mode = true;
         info.handshake_duration_ns = @intCast(end_ns - start_ns);
         populateHandshakeInfo(ssl_conn, &info);
 
-        // Setup kTLS and get appropriate mode (only if enabled and runtime support exists)
         const mode: Mode = if (should_enable_ktls) blk: {
             const m = setupKtlsAfterHandshake(ssl_conn, &info, true);
             logKtlsStatus(&info, false);
@@ -258,36 +302,34 @@ pub const TLSStream = struct {
             .fd = fd,
             .mode = mode,
             .allocator = allocator,
+            .io_timeout_ns = io_timeout_ns,
             .info = info,
         };
     }
 
-    /// Blocking TLS read.
+    /// Non-blocking TLS read primitive.
     /// Returns number of bytes read, or 0 on clean shutdown.
     /// TigerStyle: Explicit switch on mode (no default case).
     pub fn read(self: *TLSStream, buf: []u8) !u32 {
-        assert(buf.len > 0); // S1: precondition
-        assert(self.fd > 0); // S1: precondition - fd is valid
+        assert(buf.len > 0);
+        assert(self.fd > 0);
 
         switch (self.mode) {
             .ktls => {
-                // kTLS: read directly from kernel (kernel handles TLS decryption)
                 const result = posix.read(self.fd, buf);
                 const n = result catch |err| {
-                    // Map posix errors to TLS errors for consistent API
                     return switch (err) {
+                        error.WouldBlock => error.WantRead,
                         error.ConnectionResetByPeer => error.ConnectionReset,
                         else => error.KtlsRead,
                     };
                 };
-                if (n == 0) return 0; // Clean shutdown (EOF)
+                if (n == 0) return 0;
                 const bytes_read: u32 = @intCast(n);
-                assert(bytes_read <= buf.len); // S1: postcondition
+                assert(bytes_read <= buf.len);
                 return bytes_read;
             },
             .userspace => |ssl_conn| {
-                // Userspace mode: read through OpenSSL (may use kTLS internally via BIO)
-                // When kTLS is active, OpenSSL's BIO layer uses kernel TLS transparently
                 const n = ssl.SSL_read(ssl_conn, buf.ptr, @intCast(buf.len));
                 if (n <= 0) {
                     const err = ssl.SSL_get_error(ssl_conn, n);
@@ -328,47 +370,88 @@ pub const TLSStream = struct {
                     }
                 }
                 const bytes_read: u32 = @intCast(n);
-                assert(bytes_read <= buf.len); // S1: postcondition
+                assert(bytes_read <= buf.len);
                 return bytes_read;
             },
         }
+    }
+
+    /// TLS read with the stream's configured I/O timeout.
+    pub fn readBounded(self: *TLSStream, buf: []u8) !u32 {
+        assert(self.io_timeout_ns > 0);
+        return self.readWithTimeout(buf, self.io_timeout_ns);
+    }
+
+    /// TLS read with explicit timeout.
+    pub fn readWithTimeout(self: *TLSStream, buf: []u8, timeout_ns: u64) !u32 {
+        assert(buf.len > 0);
+        assert(self.fd > 0);
+        assert(timeout_ns > 0);
+
+        const readiness_wait_failed = switch (self.mode) {
+            .ktls => error.KtlsRead,
+            .userspace => error.SslRead,
+        };
+        const deadline_ns = deadlineFromTimeout(timeout_ns);
+        var iterations: u32 = 0;
+        while (iterations < tls_io_max_iterations) : (iterations += 1) {
+            const n = self.read(buf) catch |err| switch (err) {
+                error.WantRead => {
+                    waitForReady(self.fd, .read, deadline_ns) catch |wait_err| switch (wait_err) {
+                        error.Timeout => return error.Timeout,
+                        error.ConnectionReset => return error.ConnectionReset,
+                        error.ReadinessWaitFailed => return readiness_wait_failed,
+                    };
+                    continue;
+                },
+                error.WantWrite => {
+                    waitForReady(self.fd, .write, deadline_ns) catch |wait_err| switch (wait_err) {
+                        error.Timeout => return error.Timeout,
+                        error.ConnectionReset => return error.ConnectionReset,
+                        error.ReadinessWaitFailed => return readiness_wait_failed,
+                    };
+                    continue;
+                },
+                else => return err,
+            };
+            assert(n <= buf.len);
+            return n;
+        }
+
+        return error.Timeout;
     }
 
     /// TLS write with nonblocking-aware error mapping.
     /// Returns number of bytes written.
     /// TigerStyle: Explicit switch on mode (no default case).
     pub fn write(self: *TLSStream, data: []const u8) !u32 {
-        assert(data.len > 0); // S1: precondition
-        assert(self.fd > 0); // S1: precondition - fd is valid
+        assert(data.len > 0);
+        assert(self.fd > 0);
 
         switch (self.mode) {
             .ktls => {
-                // kTLS: write directly to kernel (kernel handles TLS encryption)
                 const file: std.Io.File = .{
                     .handle = self.fd,
                     .flags = .{ .nonblocking = true },
                 };
                 const n = file.writeStreaming(std.Options.debug_io, &.{}, &.{data}, 1) catch |err| {
-                    // Map write errors to TLS errors for consistent API.
-                    // Nonblocking write can legitimately stall; caller retries with bounds.
                     return switch (err) {
                         error.BrokenPipe => error.ConnectionReset,
-                        error.WouldBlock => error.WantRead,
+                        error.WouldBlock => error.WantWrite,
                         else => error.KtlsWrite,
                     };
                 };
                 const bytes_written: u32 = @intCast(n);
-                assert(bytes_written <= data.len); // S1: postcondition
+                assert(bytes_written <= data.len);
                 return bytes_written;
             },
             .userspace => |ssl_conn| {
-                // Userspace: write through OpenSSL/BoringSSL.
-                // On nonblocking fds, WANT_READ/WANT_WRITE are retryable, not fatal.
                 const n = ssl.SSL_write(ssl_conn, data.ptr, @intCast(data.len));
                 if (n <= 0) {
                     const ssl_err = ssl.SSL_get_error(ssl_conn, n);
                     switch (ssl_err) {
-                        ssl.SSL_ERROR_WANT_READ, ssl.SSL_ERROR_WANT_WRITE => return error.WouldBlock,
+                        ssl.SSL_ERROR_WANT_READ => return error.WantRead,
+                        ssl.SSL_ERROR_WANT_WRITE => return error.WantWrite,
                         ssl.SSL_ERROR_ZERO_RETURN => return error.ConnectionReset,
                         ssl.SSL_ERROR_SYSCALL => return error.ConnectionReset,
                         else => return error.SslWrite,
@@ -376,10 +459,55 @@ pub const TLSStream = struct {
                 }
 
                 const bytes_written: u32 = @intCast(n);
-                assert(bytes_written <= data.len); // S1: postcondition
+                assert(bytes_written <= data.len);
                 return bytes_written;
             },
         }
+    }
+
+    /// TLS write with the stream's configured I/O timeout.
+    pub fn writeBounded(self: *TLSStream, data: []const u8) !u32 {
+        assert(self.io_timeout_ns > 0);
+        return self.writeWithTimeout(data, self.io_timeout_ns);
+    }
+
+    /// TLS write with explicit timeout.
+    pub fn writeWithTimeout(self: *TLSStream, data: []const u8, timeout_ns: u64) !u32 {
+        assert(data.len > 0);
+        assert(self.fd > 0);
+        assert(timeout_ns > 0);
+
+        const readiness_wait_failed = switch (self.mode) {
+            .ktls => error.KtlsWrite,
+            .userspace => error.SslWrite,
+        };
+        const deadline_ns = deadlineFromTimeout(timeout_ns);
+        var iterations: u32 = 0;
+        while (iterations < tls_io_max_iterations) : (iterations += 1) {
+            const n = self.write(data) catch |err| switch (err) {
+                error.WantRead => {
+                    waitForReady(self.fd, .read, deadline_ns) catch |wait_err| switch (wait_err) {
+                        error.Timeout => return error.Timeout,
+                        error.ConnectionReset => return error.ConnectionReset,
+                        error.ReadinessWaitFailed => return readiness_wait_failed,
+                    };
+                    continue;
+                },
+                error.WantWrite => {
+                    waitForReady(self.fd, .write, deadline_ns) catch |wait_err| switch (wait_err) {
+                        error.Timeout => return error.Timeout,
+                        error.ConnectionReset => return error.ConnectionReset,
+                        error.ReadinessWaitFailed => return readiness_wait_failed,
+                    };
+                    continue;
+                },
+                else => return err,
+            };
+            assert(n <= data.len);
+            return n;
+        }
+
+        return error.Timeout;
     }
 
     /// Graceful TLS shutdown.
@@ -403,6 +531,112 @@ pub const TLSStream = struct {
         // Caller owns fd, don't close it here
     }
 };
+
+fn setNonblocking(fd: c_int) !void {
+    assert(fd > 0);
+
+    const flags_value = posix.system.fcntl(fd, posix.F.GETFL, @as(usize, 0));
+    if (flags_value < 0) return error.Unexpected;
+    const flags: usize = @intCast(flags_value);
+    const nonblocking_flags = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
+    if ((flags & nonblocking_flags) != 0) return;
+
+    const set_result = posix.system.fcntl(fd, posix.F.SETFL, flags | nonblocking_flags);
+    if (set_result < 0) return error.Unexpected;
+
+    const verify_flags_value = posix.system.fcntl(fd, posix.F.GETFL, @as(usize, 0));
+    if (verify_flags_value < 0) return error.Unexpected;
+    const verify_flags: usize = @intCast(verify_flags_value);
+    assert((verify_flags & nonblocking_flags) != 0);
+}
+
+fn deadlineFromTimeout(timeout_ns: u64) u64 {
+    assert(timeout_ns > 0);
+
+    const start_ns = monotonicNanos();
+    const deadline_ns, const overflow = @addWithOverflow(start_ns, timeout_ns);
+    const result = if (overflow == 0) deadline_ns else std.math.maxInt(u64);
+    assert(result >= start_ns);
+    return result;
+}
+
+fn remainingTimeoutMs(deadline_ns: u64) ?i32 {
+    const now_ns = monotonicNanos();
+    if (now_ns >= deadline_ns) return null;
+
+    const remaining_ns = deadline_ns - now_ns;
+    const remaining_ms_u64 = std.math.divCeil(u64, remaining_ns, time.ns_per_ms) catch unreachable;
+    const max_timeout_ms_u64: u64 = @intCast(std.math.maxInt(i32));
+    const clamped_ms_u64 = @min(remaining_ms_u64, max_timeout_ms_u64);
+    const timeout_ms: i32 = @intCast(@max(@as(u64, 1), clamped_ms_u64));
+    assert(timeout_ms > 0);
+    return timeout_ms;
+}
+
+fn waitForReady(fd: c_int, direction: ReadinessDirection, deadline_ns: u64) WaitForReadyError!void {
+    assert(fd > 0);
+
+    const timeout_ms = remainingTimeoutMs(deadline_ns) orelse return error.Timeout;
+    const events: i16 = switch (direction) {
+        .read => posix.POLL.IN,
+        .write => posix.POLL.OUT,
+    };
+
+    var poll_fds = [_]posix.pollfd{.{
+        .fd = fd,
+        .events = events,
+        .revents = 0,
+    }};
+    const polled = posix.poll(&poll_fds, timeout_ms) catch return error.ReadinessWaitFailed;
+    if (polled == 0) return error.Timeout;
+
+    const revents = poll_fds[0].revents;
+    if ((revents & (posix.POLL.ERR | posix.POLL.NVAL)) != 0) return error.ReadinessWaitFailed;
+    if ((revents & posix.POLL.HUP) != 0) return error.ConnectionReset;
+    if ((revents & events) == 0) return error.ReadinessWaitFailed;
+}
+
+fn doHandshake(ssl_conn: *ssl.SSL, fd: c_int, timeout_ns: u64) !void {
+    assert(@intFromPtr(ssl_conn) != 0);
+    assert(fd > 0);
+    assert(timeout_ns > 0);
+
+    const deadline_ns = deadlineFromTimeout(timeout_ns);
+    var iterations: u32 = 0;
+    while (iterations < tls_handshake_max_iterations) : (iterations += 1) {
+        const ret = ssl.SSL_do_handshake(ssl_conn);
+        if (ret == 1) {
+            assert(ssl.SSL_is_init_finished(ssl_conn) == 1);
+            return;
+        }
+
+        const handshake_err = ssl.SSL_get_error(ssl_conn, ret);
+        switch (handshake_err) {
+            ssl.SSL_ERROR_WANT_READ => {
+                waitForReady(fd, .read, deadline_ns) catch |wait_err| switch (wait_err) {
+                    error.Timeout => return error.HandshakeTimeout,
+                    error.ConnectionReset,
+                    error.ReadinessWaitFailed,
+                    => return error.HandshakeFailed,
+                };
+            },
+            ssl.SSL_ERROR_WANT_WRITE => {
+                waitForReady(fd, .write, deadline_ns) catch |wait_err| switch (wait_err) {
+                    error.Timeout => return error.HandshakeTimeout,
+                    error.ConnectionReset,
+                    error.ReadinessWaitFailed,
+                    => return error.HandshakeFailed,
+                };
+            },
+            else => {
+                ssl.printErrors();
+                return error.HandshakeFailed;
+            },
+        }
+    }
+
+    return error.HandshakeFailed;
+}
 
 /// Extract TLS session info from completed handshake.
 /// Populates version, cipher, resumed, ALPN, and peer certificate info.
@@ -468,6 +702,59 @@ fn populateHandshakeInfo(ssl_conn: *ssl.SSL, info: *HandshakeInfo) void {
 }
 
 // Tests
+test "waitForReady times out on idle readable fd" {
+    const fds = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer closeFd(fds[0]);
+    defer closeFd(fds[1]);
+
+    const deadline_ns = deadlineFromTimeout(time.millisToNanos(20));
+    try std.testing.expectError(error.Timeout, waitForReady(fds[0], .read, deadline_ns));
+}
+
+test "waitForReady detects writable fd" {
+    const fds = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer closeFd(fds[0]);
+    defer closeFd(fds[1]);
+
+    const deadline_ns = deadlineFromTimeout(time.millisToNanos(20));
+    try waitForReady(fds[0], .write, deadline_ns);
+}
+
+test "initServerWithTimeouts times out on idle peer" {
+    ssl.init();
+
+    const cert_path = "experiments/tls-poc/cert.pem";
+    const key_path = "experiments/tls-poc/key.pem";
+    const cert_fd = posix.openat(posix.AT.FDCWD, cert_path, .{ .ACCMODE = .RDONLY }, 0) catch |err| switch (err) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    closeFd(cert_fd);
+    const key_fd = posix.openat(posix.AT.FDCWD, key_path, .{ .ACCMODE = .RDONLY }, 0) catch |err| switch (err) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    closeFd(key_fd);
+
+    const server_ctx = try ssl.createServerCtxFromPemFiles(cert_path, key_path);
+    defer ssl.SSL_CTX_free(server_ctx);
+
+    const fds = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer closeFd(fds[0]);
+    defer closeFd(fds[1]);
+
+    try std.testing.expectError(
+        error.HandshakeTimeout,
+        TLSStream.initServerWithTimeouts(
+            server_ctx,
+            fds[0],
+            time.millisToNanos(20),
+            default_tls_io_timeout_ns,
+            std.testing.allocator,
+        ),
+    );
+}
+
 test "native kTLS BIO status after loopback handshake" {
     const builtin = @import("builtin");
 

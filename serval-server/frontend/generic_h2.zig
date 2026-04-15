@@ -1287,7 +1287,7 @@ fn writeAllConnection(conn: *Connection, io: Io, data: []const u8) WebSocketIoEr
             var iterations: u32 = 0;
             while (sent < data.len and iterations < Socket.max_write_iterations_count) : (iterations += 1) {
                 const n = tls_socket.stream.write(data[sent..]) catch |err| switch (err) {
-                    error.WouldBlock => {
+                    error.WantRead, error.WantWrite => {
                         std.Io.sleep(io, Io.Duration.fromMilliseconds(1), .awake) catch return error.WriteFailed;
                         continue;
                     },

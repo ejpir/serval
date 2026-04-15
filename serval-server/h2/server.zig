@@ -2773,7 +2773,7 @@ fn writeSome(io_conn: *ConnectionIo, io: Io, out: []const u8) Error!usize {
         },
         .tls_stream => |tls_stream| blk: {
             const n: u32 = tls_stream.write(out) catch |err| switch (err) {
-                error.WouldBlock => return error.WouldBlock,
+                error.WantRead, error.WantWrite => return error.WouldBlock,
                 error.ConnectionReset => return error.ConnectionClosed,
                 else => {
                     log.warn(

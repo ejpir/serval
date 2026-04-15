@@ -135,7 +135,7 @@ pub const TLSSocket = struct {
         assert(buf.len > 0); // S1: non-empty buffer
         assert(buf.len <= std.math.maxInt(u32)); // S2: buffer fits in u32
 
-        const n = self.stream.read(buf) catch |err| {
+        const n = self.stream.readBounded(buf) catch |err| {
             return map_tls_error(err);
         };
 
@@ -159,7 +159,7 @@ pub const TLSSocket = struct {
         assert(data.len > 0); // S1: non-empty data
         assert(data.len <= std.math.maxInt(u32)); // S2: data fits in u32
 
-        const n = self.stream.write(data) catch |err| {
+        const n = self.stream.writeBounded(data) catch |err| {
             return map_tls_error(err);
         };
 
@@ -211,6 +211,10 @@ pub const TLSSocket = struct {
 fn map_tls_error(err: anyerror) SocketError {
     assert(@errorName(err).len > 0);
     return switch (err) {
+        error.ConnectionReset => SocketError.ConnectionReset,
+        error.HandshakeTimeout,
+        error.Timeout,
+        => SocketError.Timeout,
         error.SslNew => SocketError.TLSError,
         error.SslSetFd => SocketError.TLSError,
         error.SslSetSni => SocketError.TLSError,
@@ -220,6 +224,8 @@ fn map_tls_error(err: anyerror) SocketError {
         error.SslRead => SocketError.TLSError,
         error.SslWrite => SocketError.TLSError,
         error.WouldBlock => SocketError.TLSError,
+        error.WantRead => SocketError.TLSError,
+        error.WantWrite => SocketError.TLSError,
         else => SocketError.Unexpected,
     };
 }
@@ -244,7 +250,10 @@ test "max_sni_length_chars matches RFC 6066 limit" {
     try std.testing.expectEqual(@as(u32, 253), max_sni_length_chars);
 }
 
-test "map_tls_error maps known errors to TLSError" {
+test "map_tls_error maps timeout reset and TLS failures" {
+    try std.testing.expectEqual(SocketError.ConnectionReset, map_tls_error(error.ConnectionReset));
+    try std.testing.expectEqual(SocketError.Timeout, map_tls_error(error.HandshakeTimeout));
+    try std.testing.expectEqual(SocketError.Timeout, map_tls_error(error.Timeout));
     try std.testing.expectEqual(SocketError.TLSError, map_tls_error(error.SslNew));
     try std.testing.expectEqual(SocketError.TLSError, map_tls_error(error.SslSetFd));
     try std.testing.expectEqual(SocketError.TLSError, map_tls_error(error.SslSetSni));
@@ -254,6 +263,8 @@ test "map_tls_error maps known errors to TLSError" {
     try std.testing.expectEqual(SocketError.TLSError, map_tls_error(error.SslRead));
     try std.testing.expectEqual(SocketError.TLSError, map_tls_error(error.SslWrite));
     try std.testing.expectEqual(SocketError.TLSError, map_tls_error(error.WouldBlock));
+    try std.testing.expectEqual(SocketError.TLSError, map_tls_error(error.WantRead));
+    try std.testing.expectEqual(SocketError.TLSError, map_tls_error(error.WantWrite));
 }
 
 test "map_tls_error maps unknown errors to Unexpected" {

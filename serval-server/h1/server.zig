@@ -504,10 +504,8 @@ pub fn Server(
             assert(@intFromPtr(io) != 0); // S1: precondition
 
             if (maybe_tls) |tls| {
-                // TLS read (blocking - std.Io handles socket-level async)
                 var mutable_tls = tls.*;
-                const n = mutable_tls.read(buf) catch |err| {
-                    // Log TLS errors (includes client disconnect, handshake issues, etc.)
+                const n = mutable_tls.readBounded(buf) catch |err| {
                     log.debug("server: conn={d} TLS read error: {s}", .{ conn_id, @errorName(err) });
                     return null;
                 };
@@ -560,9 +558,8 @@ pub fn Server(
             assert(data.len > 0); // S1: precondition
 
             if (maybe_tls) |tls| {
-                // TLS write (blocking - std.Io handles socket-level async)
                 var mutable_tls = tls.*;
-                _ = try mutable_tls.write(data);
+                _ = try mutable_tls.writeBounded(data);
             } else {
                 // Plain socket write (blocking - fiber yields to scheduler until send buffer accepts data)
                 var write_buf: [config.SERVER_WRITE_BUFFER_SIZE_BYTES]u8 =
@@ -2816,9 +2813,12 @@ pub fn Server(
             metrics.connectionOpened();
             defer metrics.connectionClosed();
 
-            // TLS: Perform handshake if TLS is configured
-            // TigerStyle: Blocking handshake - std.Io handles socket-level async
-            // TLS span stays open for connection lifetime - request spans are children
+            const tls_cfg = cfg.tls orelse config.TlsConfig{};
+            assert(tls_cfg.handshake_timeout_ns > 0);
+            assert(tls_cfg.io_timeout_ns > 0);
+
+            // TLS: Perform handshake if TLS is configured.
+            // TLS span stays open for connection lifetime - request spans are children.
             var tls_span: SpanHandle = .{};
             const maybe_tls_stream: ?*TLSStream = if (tls_ctx_manager) |manager| blk: {
                 const allocator = std.heap.c_allocator;
@@ -2832,9 +2832,11 @@ pub fn Server(
                 tls_span = tracer.startSpan("tls.handshake.server", null);
                 tracer.setIntAttribute(tls_span, "tls.ctx_generation", @intCast(tls_ctx_lease.generation));
 
-                const tls_stream_value = TLSStream.initServer(
+                const tls_stream_value = TLSStream.initServerWithTimeouts(
                     tls_ctx_lease.ctx,
                     @intCast(stream.socket.handle),
+                    tls_cfg.handshake_timeout_ns,
+                    tls_cfg.io_timeout_ns,
                     allocator,
                 ) catch |err| {
                     tracer.endSpan(tls_span, @errorName(err));
