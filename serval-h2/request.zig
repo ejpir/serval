@@ -591,6 +591,15 @@ pub fn decodeRequestHeaderBlockWithDecoderAndFieldStorage(
     return head;
 }
 
+/// Decodes an HPACK request header block into caller-provided `head_out` storage using caller-owned
+/// decoded-field and stable-request buffers.
+/// Preconditions: `decoder`/`head_out` must be valid pointers, `stream_id > 0`,
+/// `header_block.len <= limits.header_block_capacity_bytes`, and `fields_buf.len >= config.MAX_HEADERS`.
+/// `request_storage_out` must be at least `request_stable_storage_size_bytes`, otherwise
+/// `error.StableStorageTooSmall` is returned.
+/// On success, `head_out` is fully initialized with zero-copy slices into `request_storage_out`; callers
+/// must keep that storage alive and unchanged while those slices are in use.
+/// Returns `Error` for HPACK decode failures, invalid request header shape/order, or storage-limit violations.
 pub fn decodeRequestHeaderBlockWithDecoderInto(
     decoder: *hpack.Decoder,
     header_block: []const u8,

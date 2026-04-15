@@ -150,17 +150,21 @@ pub const StreamBridge = struct {
         self.sessions.closeAll();
     }
 
-    /// Stores a connection identifier used in bridge logging.
-    /// This value does not affect routing or stream mapping.
-    /// It only updates the debug field on the bridge.
+    /// Stores a debug connection identifier used only for bridge log correlation.
+    /// Preconditions: `self` is valid.
+    /// This mutates only local debug metadata and does not affect routing/binding decisions.
+    /// Infallible and ownership-neutral: no allocation or retained external references.
     pub fn setDebugConnectionId(self: *StreamBridge, connection_id: u64) void {
         assert(@intFromPtr(self) != 0);
         self.debug_connection_id = connection_id;
     }
 
-    /// Opens or reuses an upstream HTTP/2 session, sends request headers, and records the downstream-to-upstream binding.
-    /// Duplicate downstream stream ids fail with `error.DuplicateDownstreamStream`.
-    /// The bridge retries across at most `serval_client.h2_max_sessions_per_upstream` attempts and closes generations that become `ConnectionClosing`.
+    /// Opens/reuses an upstream HTTP/2 session, sends request headers, and records a downstream binding.
+    /// Preconditions: `self` valid, `downstream_stream_id > 0`, `upstream.port > 0`, and request path
+    /// non-empty.
+    /// Inputs (`request`, optional `effective_path`) are borrowed-only; ownership remains with caller.
+    /// Returns `error.DuplicateDownstreamStream` on duplicate mapping and propagates connect/header-send
+    /// failures; retries are bounded by `serval_client.h2_max_sessions_per_upstream`.
     pub fn openDownstreamStream(
         self: *StreamBridge,
         io: Io,
@@ -210,9 +214,12 @@ pub const StreamBridge = struct {
         return error.ConnectionClosing;
     }
 
-    /// Forwards DATA to the mapped upstream stream for a downstream request.
-    /// Missing bindings or sessions are returned as errors; some connection-closure cases keep the binding alive for a final response.
-    /// When forwarding fails on a non-terminal send, the binding is removed and the upstream generation is closed.
+    /// Forwards downstream DATA payload to the mapped upstream stream.
+    /// Preconditions: `self` valid and `downstream_stream_id > 0`; `payload` is borrowed input.
+    /// Missing binding/session paths return errors; selected terminal closure cases preserve mapping when
+    /// `end_stream` is true to allow in-flight response completion.
+    /// Returns `Error` for send/state failures and closes/removes generation mapping on non-terminal
+    /// failure paths.
     pub fn sendDownstreamData(
         self: *StreamBridge,
         downstream_stream_id: u32,
@@ -300,9 +307,10 @@ pub const StreamBridge = struct {
         };
     }
 
-    /// Looks up the stored binding for a downstream stream id.
-    /// Returns `null` when the bridge has no active mapping for that stream.
-    /// The returned binding is a copy of the table entry.
+    /// Looks up the binding for a downstream stream id and returns a value copy when present.
+    /// Preconditions: `self` is valid and `downstream_stream_id > 0`.
+    /// Returned `Binding` is copied from table storage (no pointer/lifetime coupling to bridge internals).
+    /// Returns `null` when no active mapping exists for that downstream stream.
     pub fn bindingForDownstream(self: *const StreamBridge, downstream_stream_id: u32) ?bindings.Binding {
         assert(@intFromPtr(self) != 0);
         assert(downstream_stream_id > 0);
@@ -310,9 +318,11 @@ pub const StreamBridge = struct {
         return self.binding_table.getByDownstream(downstream_stream_id);
     }
 
-    /// Removes the downstream binding and sends a reset to the mapped upstream stream.
-    /// A missing downstream binding is treated as a no-op; a missing upstream session returns `error.SessionNotFound`.
-    /// If the upstream stream is already gone, the reset is suppressed after the binding has been removed.
+    /// Cancels a downstream stream by removing its binding and issuing upstream `RST_STREAM`.
+    /// Preconditions: `self` valid and `downstream_stream_id > 0`.
+    /// Binding/session pointers are bridge-owned; caller ownership is unaffected.
+    /// Missing downstream binding is treated as no-op; returns `error.SessionNotFound` when mapped session
+    /// is absent and otherwise propagates reset-send failures.
     pub fn cancelDownstreamStream(
         self: *StreamBridge,
         downstream_stream_id: u32,
@@ -333,9 +343,11 @@ pub const StreamBridge = struct {
         };
     }
 
-    /// Fetches the upstream session for `upstream_index` and maps one receive action into a bridge `ReceiveAction`.
-    /// If no session exists for the requested upstream, returns `error.SessionNotFound`.
-    /// Any action that cannot be represented by the bridge is reported through the mapping error path.
+    /// Receives one upstream action for `upstream_index` and maps it into bridge-level `ReceiveAction`.
+    /// Preconditions: `self` is valid; `io` is a live borrowed runtime handle for receive polling.
+    /// Uses borrowed session/connection state from `sessions` and does not transfer ownership.
+    /// Returns `error.SessionNotFound` when no session exists, or mapping/receive errors when the upstream
+    /// action cannot be produced or represented by bridge semantics.
     pub fn receiveForUpstream(
         self: *StreamBridge,
         upstream_index: config.UpstreamIndex,
@@ -348,9 +360,13 @@ pub const StreamBridge = struct {
         return self.mapReceiveAction(upstream_index, session.generation, action);
     }
 
-    /// Looks up the downstream binding, waits for an upstream action, and maps the result back to the downstream stream id.
-    /// If the upstream stream has already disappeared, the stale binding is removed and a downstream `CANCEL` reset is returned.
-    /// `timeout` bounds the wait; stale bridge state is reported as `error.BindingNotFound` or `error.SessionNotFound`.
+    /// Waits for one upstream action corresponding to `downstream_stream_id` and maps it downstream.
+    /// Preconditions: `self` valid and `downstream_stream_id > 0`; `io`/`timeout` are borrowed polling
+    /// inputs.
+    /// Uses bridge-owned binding/session state; removes stale bindings when upstream stream disappears and
+    /// returns downstream `CANCEL` reset action.
+    /// Returns `error.BindingNotFound`/`error.SessionNotFound` for stale state and propagates receive/map
+    /// failures from upstream session handling.
     pub fn receiveForDownstream(
         self: *StreamBridge,
         io: Io,
@@ -539,9 +555,10 @@ pub const StreamBridge = struct {
         return downstream_count;
     }
 
-    /// Drops all bindings associated with `upstream_index` and closes the matching upstream sessions.
-    /// Bindings for other upstreams are left untouched.
-    /// This cleanup path does not return an error.
+    /// Closes one upstream target by clearing its bindings and closing pooled sessions for that index.
+    /// Preconditions: `self` is valid.
+    /// Mutates bridge-owned binding/session state only; bindings for other upstream indices remain intact.
+    /// Infallible cleanup helper (errors are intentionally suppressed at this boundary).
     pub fn closeUpstream(self: *StreamBridge, upstream_index: config.UpstreamIndex) void {
         assert(@intFromPtr(self) != 0);
 

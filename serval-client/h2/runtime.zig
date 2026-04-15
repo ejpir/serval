@@ -172,9 +172,11 @@ pub const Runtime = struct {
         return out[0 .. payload_offset + payload.len];
     }
 
-    /// Encodes a SETTINGS acknowledgement for a pending peer SETTINGS frame.
-    /// Callers must only use this after `peer_settings_ack_pending` has been set by the runtime.
-    /// The returned slice aliases `out`, and the runtime marks the peer SETTINGS ACK as sent before returning.
+    /// Encodes a SETTINGS ACK frame for a pending peer SETTINGS update.
+    /// Preconditions: `self` is valid and `peer_settings_ack_pending` is set; `out` is caller-owned frame
+    /// storage and must remain valid while the returned slice is used.
+    /// On success, returned bytes alias `out` and runtime state is advanced by clearing the pending ACK flag.
+    /// Returns `Error` for frame-encoding failures or invalid state transitions.
     pub fn writePendingSettingsAck(self: *Runtime, out: []u8) Error![]const u8 {
         assert(@intFromPtr(self) != 0);
         assert(self.state.peer_settings_ack_pending);

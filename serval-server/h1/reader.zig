@@ -21,9 +21,10 @@ const parseContentLengthValue = serval_http.parseContentLengthValue;
 /// Buffer size for reading HTTP requests (from centralized config).
 const REQUEST_BUFFER_SIZE_BYTES = config.REQUEST_BUFFER_SIZE_BYTES;
 
-/// Read request bytes from stream into buffer.
-/// Returns byte count or null on error/EOF.
-/// TigerStyle: Explicit parameters, no hidden state.
+/// Reads request bytes from `stream` into caller-owned fixed buffer `recv_buf`.
+/// Preconditions: `recv_buf` is a valid borrowed buffer pointer.
+/// This helper performs one read attempt and does not retain ownership of stream/buffer state.
+/// Returns byte count on success, or `null` on EOF/read error paths.
 pub fn readRequest(io: Io, stream: Io.net.Stream, recv_buf: *[REQUEST_BUFFER_SIZE_BYTES]u8) ?usize {
     // Precondition: buffer pointer must be valid
     assert(@intFromPtr(recv_buf) != 0);
@@ -43,10 +44,10 @@ pub fn readRequest(io: Io, stream: Io.net.Stream, recv_buf: *[REQUEST_BUFFER_SIZ
     return n;
 }
 
-/// Read additional data into remaining buffer space for partial header accumulation.
-/// Used when headers span multiple TCP segments (partial header reads).
-/// Returns byte count or null on error/EOF.
-/// TigerStyle: Standalone function for partial read accumulation.
+/// Reads additional bytes into `remaining_buf` during partial header accumulation.
+/// Preconditions: `remaining_buf.len > 0`; caller keeps buffer and stream alive for this read.
+/// Performs a single read attempt and does not retain ownership of any input state.
+/// Returns bytes read (possibly `0` on EOF) or `null` on read error paths.
 pub fn readMoreData(io: Io, stream: Io.net.Stream, remaining_buf: []u8) ?usize {
     // Precondition: buffer must have space for more data
     assert(remaining_buf.len > 0);
@@ -65,8 +66,10 @@ pub fn readMoreData(io: Io, stream: Io.net.Stream, remaining_buf: []u8) ?usize {
     return n;
 }
 
-/// Get body length from Content-Length header, or 0 if not present.
-/// TigerStyle: Explicit handling of missing header (no body).
+/// Parses `Content-Length` from `request` and returns body length in bytes.
+/// Preconditions: `request` is a valid borrowed pointer.
+/// Missing, invalid, or out-of-range values are treated as `0` (no body) rather than errors.
+/// Infallible helper: ownership remains with caller; no allocation or retained state.
 pub fn getBodyLength(request: *const Request) usize {
     // Precondition: request must be valid
     assert(@intFromPtr(request) != 0);

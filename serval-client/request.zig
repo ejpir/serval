@@ -156,10 +156,11 @@ pub fn buildRequestBuffer(buffer: []u8, request: *const Request, effective_path:
 // Request Sending
 // =============================================================================
 
-/// Send buffer to socket using Socket abstraction.
-/// Handles both TLS and plaintext transparently.
-/// TigerStyle: Bounded write loop with MAX_WRITE_ITERATIONS.
-/// This is the public version that can be called by other modules (e.g., serval-proxy).
+/// Sends all bytes from `data` to a borrowed `socket` (plain or TLS).
+/// Preconditions: `data.len > 0`, and `socket` must remain valid for the full write loop.
+/// Uses a bounded retry loop (`MAX_WRITE_ITERATIONS`) and advances only on positive write progress.
+/// Returns `ClientError.SendFailed` on transport/write failures or zero-byte progress, and
+/// `ClientError.SendTimeout` when the bounded iteration limit is reached.
 pub fn sendBufferToSocket(socket: *Socket, data: []const u8) ClientError!void {
     assert(data.len > 0); // S1: precondition - data must not be empty
 
@@ -180,9 +181,13 @@ pub fn sendBufferToSocket(socket: *Socket, data: []const u8) ClientError!void {
     }
 }
 
-/// Send complete HTTP request (headers + body) to socket.
-/// effective_path: If set, use this path instead of request.path (for path rewriting).
-/// TigerStyle: ~2 assertions per function.
+/// Sends one complete HTTP/1.1 request (headers plus optional body) to `socket`.
+/// Preconditions: effective path (`effective_path` or `request.path`) must be non-empty, and caller
+/// keeps borrowed `socket` and `request` inputs alive for the full send.
+/// Serializes headers into a fixed stack buffer, then writes header bytes and optional body bytes via
+/// `sendBufferToSocket`.
+/// Returns `ClientError.BufferTooSmall` when header serialization exceeds the configured bound, and
+/// propagates write failures/timeouts from `sendBufferToSocket`.
 pub fn sendRequest(socket: *Socket, request: *const Request, effective_path: ?[]const u8) ClientError!void {
     // Use effective_path if provided, otherwise use request.path
     const path = effective_path orelse request.path;

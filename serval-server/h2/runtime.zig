@@ -149,18 +149,23 @@ pub const Runtime = struct {
         self.last_peer_reset_stream_id = 0;
     }
 
-    /// Record that the HTTP/2 client connection preface has been received.
-    /// This must be called before normal frame processing; duplicate calls are rejected by the connection state.
-    /// No bytes are consumed and no output is produced.
+    /// Marks client-preface receipt in runtime connection state.
+    /// Preconditions: `self` must be valid and preface must not already be marked for this connection.
+    /// This mutates only in-memory state (no I/O); callers should invoke it once before regular frame
+    /// processing.
+    /// Returns `Error` (for example duplicate-preface/state errors) if the transition is invalid.
     pub fn receiveClientPreface(self: *Runtime) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(!self.state.preface_received);
         try self.state.markPrefaceReceived();
     }
 
-    /// Encode the server's initial SETTINGS frame into `out` and return the written slice.
-    /// The caller must provide enough space for the frame header and the encoded local SETTINGS payload.
-    /// On success, the runtime records that local settings were sent and that an ACK is now expected from the peer.
+    /// Encodes the server initial SETTINGS frame into caller-owned `out` and returns the written prefix.
+    /// Preconditions: `self` must be valid and `out` must have capacity for frame header plus encoded
+    /// local SETTINGS payload.
+    /// On success, marks local settings as sent and records that a peer ACK is expected.
+    /// Returns `Error` on payload/frame encoding failure or invalid state transition (for example duplicate
+    /// local-settings-send bookkeeping).
     pub fn writeInitialSettingsFrame(self: *Runtime, out: []u8) Error![]const u8 {
         assert(@intFromPtr(self) != 0);
         assert(out.len >= h2.frame_header_size_bytes);
@@ -176,9 +181,11 @@ pub const Runtime = struct {
         return out[0 .. header.len + payload.len];
     }
 
-    /// Encode the pending peer SETTINGS acknowledgement into `out` and return the written slice.
-    /// The runtime asserts that a peer SETTINGS ACK is actually pending before encoding.
-    /// On success, the pending-ACK flag is cleared so the ACK is not emitted twice.
+    /// Encodes a pending peer SETTINGS ACK frame into caller-owned `out`.
+    /// Preconditions: `self` is valid and peer-settings ACK is currently pending.
+    /// The returned slice aliases `out`; caller retains output-buffer ownership/lifetime.
+    /// Returns `Error` on frame encoding failure or invalid state transition; on success clears the
+    /// pending ACK flag to prevent duplicate emission.
     pub fn writePendingSettingsAck(self: *Runtime, out: []u8) Error![]const u8 {
         assert(@intFromPtr(self) != 0);
         assert(self.state.peer_settings_ack_pending);
@@ -188,18 +195,21 @@ pub const Runtime = struct {
         return frame;
     }
 
-    /// Encode a PING frame with the ACK flag set and return the written slice.
-    /// `opaque_data` is copied verbatim into the 8-byte ping payload.
-    /// `out` must be large enough for the HTTP/2 frame header plus the ping payload; this helper does not touch runtime state.
+    /// Encodes an ACK PING frame into caller-owned `out`.
+    /// Preconditions: `out` has capacity for frame header + fixed 8-byte ping payload.
+    /// `opaque_data` is borrowed input copied into the encoded frame; no ownership transfer occurs.
+    /// Returns `Error` on frame-encoding failures and otherwise returns a slice aliasing `out`.
     pub fn writePingAckFrame(out: []u8, opaque_data: [h2.control.ping_payload_size_bytes]u8) Error![]const u8 {
         assert(out.len >= h2.frame_header_size_bytes + h2.control.ping_payload_size_bytes);
         assert(h2.control.ping_payload_size_bytes == 8);
         return try h2.buildPingFrame(out, h2.flags_ack, opaque_data);
     }
 
-    /// Encode an outbound `GOAWAY` frame into `out` and return the written slice.
-    /// `goaway.last_stream_id` must fit the HTTP/2 31-bit stream-id range, and `goaway.debug_data` is copied into the frame buffer.
-    /// The runtime marks GOAWAY as sent using the provided last-stream bound before returning.
+    /// Encodes an outbound `GOAWAY` frame into caller-owned `out` and updates runtime close state.
+    /// Preconditions: `self` is valid and `goaway.last_stream_id` fits the 31-bit HTTP/2 stream-id range.
+    /// `goaway.debug_data` is borrowed input copied into the encoded frame; no ownership transfer occurs.
+    /// Returns `Error` on frame encoding/state-update failures; on success marks GOAWAY sent with the
+    /// provided last-stream bound and returns a slice aliasing `out`.
     pub fn writeGoAwayFrame(self: *Runtime, out: []u8, goaway: h2.GoAway) Error![]const u8 {
         assert(@intFromPtr(self) != 0);
         assert(goaway.last_stream_id <= 0x7fff_ffff);
@@ -209,9 +219,11 @@ pub const Runtime = struct {
         return frame;
     }
 
-    /// Encode an outbound `RST_STREAM` frame into `out` and return the written slice.
-    /// `reset.stream_id` must be non-zero; the runtime also clears local bookkeeping for that stream when possible.
-    /// If the stream is already gone, cleanup is skipped; encoding and state-update errors still propagate.
+    /// Encodes an outbound `RST_STREAM` frame into caller-owned `out` and updates runtime stream state.
+    /// Preconditions: `self` is valid and `reset.stream_id > 0`.
+    /// `reset` is borrowed input; on success stream bookkeeping is cleared when present.
+    /// Returns `Error` on frame encoding or non-ignorable state-update failures; missing-stream cleanup is
+    /// tolerated and the returned frame slice aliases `out`.
     pub fn writeRstStreamFrame(self: *Runtime, out: []u8, reset: StreamResetAction) Error![]const u8 {
         assert(@intFromPtr(self) != 0);
         assert(reset.stream_id > 0);
@@ -224,9 +236,12 @@ pub const Runtime = struct {
         return frame;
     }
 
-    /// Process one inbound HTTP/2 frame after the client preface and peer SETTINGS have been seen.
-    /// `header.length` must match `payload.len`, and the frame must not exceed the runtime's configured max frame size.
-    /// Returns a `ReceiveAction` for the caller to act on, or a protocol/state error such as missing preface, unsupported continuation, or unsupported push promise.
+    /// Processes one inbound HTTP/2 frame and maps it into runtime `ReceiveAction`.
+    /// Preconditions: `self` is valid, `header.length == payload.len`, and payload length is within local
+    /// max-frame-size limits.
+    /// `payload` is borrowed for this call only; runtime does not retain caller-owned slice storage.
+    /// Returns `ReceiveAction` on success, or `Error` for connection-state/protocol violations (for
+    /// example missing preface, invalid continuation sequence, unsupported push-promise, frame too large).
     pub fn receiveFrame(self: *Runtime, header: h2.FrameHeader, payload: []const u8) Error!ReceiveAction {
         assert(@intFromPtr(self) != 0);
         assert(header.length == payload.len);

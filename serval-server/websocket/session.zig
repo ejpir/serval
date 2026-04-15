@@ -140,9 +140,10 @@ pub const Transport = struct {
         return self.get_fd_fn(self.ctx);
     }
 
-    /// Returns whether the underlying transport reports unread input pending.
-    /// This is a thin delegation to the transport callback and does not consume data.
-    /// The result depends on the transport implementation and its current state.
+    /// Returns whether transport reports unread input pending.
+    /// Preconditions: `self` is a valid borrowed transport descriptor.
+    /// Infallible read-only delegation to transport callback; does not consume bytes or transfer ownership.
+    /// Result depends on current transport state.
     pub fn hasPendingRead(self: *const Transport) bool {
         return self.has_pending_read_fn(self.ctx);
     }
@@ -398,18 +399,18 @@ pub const WebSocketSession = struct {
         return self.selected_subprotocol;
     }
 
-    /// Returns the current websocket session state.
-    /// The value is read directly from the session and does not change state.
-    /// This is a cheap snapshot accessor with no allocation or I/O.
-    /// Use this to inspect lifecycle transitions before calling mutating methods.
+    /// Returns current websocket session lifecycle state.
+    /// Preconditions: `self` is a valid borrowed session pointer.
+    /// Infallible snapshot accessor: no allocation, I/O, or ownership transfer.
+    /// Useful for checking lifecycle before invoking mutating operations.
     pub fn state(self: *const WebSocketSession) SessionState {
         return self.state_value;
     }
 
-    /// Returns the current session statistics snapshot.
-    /// The returned value is read from the session's internal stats state.
-    /// This does not mutate the session or allocate.
-    /// The caller receives a copy of the stats structure.
+    /// Returns current session statistics as a value copy.
+    /// Preconditions: `self` is a valid borrowed session pointer.
+    /// Infallible read-only accessor with no allocation or session mutation.
+    /// Returned struct is copied out; caller owns the copy.
     pub fn stats(self: *const WebSocketSession) SessionStats {
         return self.stats_value;
     }

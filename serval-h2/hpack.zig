@@ -104,9 +104,12 @@ pub const Decoder = struct {
         }
     }
 
-    /// Decodes one HPACK header block using `self` and writes decoded fields into `out_fields`.
-    /// Supports indexed headers, literal headers with and without incremental indexing, and dynamic-table size updates.
-    /// Returns a slice of `out_fields`; mutates the decoder's dynamic table and may return `error.TooManyHeaders` or malformed-input errors.
+    /// Decodes one HPACK header block using this decoder instance into caller-provided `out_fields`.
+    /// Preconditions: `self` must be valid and `out_fields.len > 0`.
+    /// Mutates decoder dynamic-table state in place (including size updates and indexed/literal insertion);
+    /// caller keeps decoder ownership and may reuse it across blocks.
+    /// Returns a slice aliasing `out_fields`; errors include malformed/index/table-update failures and
+    /// `error.TooManyHeaders` when output capacity is exhausted.
     pub fn decodeHeaderBlock(self: *Decoder, input: []const u8, out_fields: []HeaderField) Error![]const HeaderField {
         assert(@intFromPtr(self) != 0);
         assert(out_fields.len > 0);
@@ -163,9 +166,12 @@ pub const Decoder = struct {
     }
 };
 
-/// Decodes an HPACK header block using a fresh decoder instance.
-/// This is a convenience wrapper for one-shot decoding when no decoder state needs to be reused.
-/// The returned slice aliases `out_fields`; decoder state is not retained after the call.
+/// Decodes one HPACK header block using a fresh temporary decoder.
+/// Use this one-shot helper when dynamic-table state does not need to be preserved across blocks.
+/// `out_fields` is caller-owned output storage; the returned slice aliases `out_fields` and remains
+/// valid while that storage is unchanged.
+/// Returns `Error` for malformed HPACK input, invalid indexing/table updates, or output-capacity
+/// exhaustion (`error.TooManyHeaders`).
 pub fn decodeHeaderBlock(input: []const u8, out_fields: []HeaderField) Error![]const HeaderField {
     assert(dynamic_entry_capacity > 0);
     assert(huffman_scratch_capacity_bytes >= dynamic_storage_capacity_bytes);
@@ -173,9 +179,12 @@ pub fn decodeHeaderBlock(input: []const u8, out_fields: []HeaderField) Error![]c
     return decoder.decodeHeaderBlock(input, out_fields);
 }
 
-/// Decodes `input` with the provided `decoder` and writes results into `out_fields`.
-/// The decoder's dynamic-table state is preserved and updated by the decode operation.
-/// The returned slice aliases `out_fields` and contains only the headers that were decoded.
+/// Decodes `input` with caller-owned `decoder` and writes decoded headers into `out_fields`.
+/// Preconditions: `decoder` must be a valid pointer; caller keeps it alive and reuses it when
+/// dynamic-table state continuity across header blocks is required.
+/// The returned slice aliases caller-owned `out_fields`; no ownership is transferred.
+/// Returns `Error` for malformed HPACK input, invalid table/index operations, or output-capacity
+/// exhaustion (`error.TooManyHeaders`).
 pub fn decodeHeaderBlockWithDecoder(
     decoder: *Decoder,
     input: []const u8,

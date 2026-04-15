@@ -361,9 +361,12 @@ pub const Client = struct {
         };
     }
 
-    /// Perform a complete HTTP request (connect + send + read headers).
-    /// Convenience function for simple request/response flows.
-    /// TigerStyle S1: Precondition assertions.
+    /// Performs a full request roundtrip (`connect` -> `sendRequest` -> `readResponseHeaders`).
+    /// Preconditions: `upstream.host` and `header_buf` must be non-empty; `req` is borrowed and must
+    /// remain valid for serialization during this call.
+    /// On success returns a `RequestResult` containing ownership of the established `conn`; callers must
+    /// return it to a pool or close it.
+    /// Returns `ClientError` for connect, request-write, or response-parse failures.
     pub fn request(
         self: *Client,
         upstream: Upstream,

@@ -113,8 +113,12 @@ pub fn getLocalPortFromSocket(socket: Socket) u16 {
 // TCP Connect
 // =============================================================================
 
-/// Connect to upstream using serval-client.
-/// TigerStyle: Delegates to serval-client, maps errors to ForwardError.
+/// Establishes an upstream connection via `serval-client` and returns normalized connect metadata.
+/// Preconditions: `upstream.host` non-empty, `upstream.port > 0`, `cfg.timeout_ns > 0`, and
+/// `dns_resolver` must be a valid borrowed pointer.
+/// `dns_resolver` and any TLS context in `cfg` are borrowed-only inputs; ownership is not transferred.
+/// Returns `ForwardError` mapped from client connect/DNS/TCP/TLS failures, or `ConnectResult` with
+/// socket, timing fields, and local-port/connect-timeout metadata on success.
 pub fn connectUpstream(
     upstream: *const Upstream,
     io: Io,

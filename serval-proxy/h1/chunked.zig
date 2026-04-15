@@ -37,11 +37,11 @@ const CHUNK_BUFFER_SIZE_BYTES = config.CHUNK_BUFFER_SIZE_BYTES;
 // Public API
 // =============================================================================
 
-/// Forward chunked body with pre-read data.
-/// pre_read contains bytes already read during header parsing that are part of the chunked body.
-/// Uses Socket abstraction for unified TLS/plaintext handling.
-/// Returns total bytes forwarded (including chunk framing).
-/// TigerStyle: Bounded main loop, explicit Socket read/write.
+/// Forwards an HTTP/1 chunked body with optional `pre_read` bytes already buffered from prior reads.
+/// Preconditions: `source` and `dest` are valid borrowed sockets that remain alive for this call.
+/// Preserves on-wire chunk framing and delegates to the bounded chunk parser/forwarder path.
+/// Returns `ForwardError` for chunk-parse or socket I/O failures; success returns total forwarded bytes
+/// including chunk headers, payload, CRLF delimiters, and trailer section.
 pub fn forwardChunkedBodyWithPreread(
     source: *Socket,
     dest: *Socket,
@@ -115,10 +115,11 @@ pub fn forwardChunkedBodyWithPrereadIo(
     return total_forwarded;
 }
 
-/// Forward chunked body preserving chunk format (no pre-read data).
-/// Convenience wrapper for forwardChunkedBodyWithPreread with empty pre-read.
-/// Uses Socket abstraction for unified TLS/plaintext handling.
-/// Returns total bytes forwarded (including chunk framing).
+/// Forwards an HTTP/1 chunked body from `source` to `dest` with no pre-read seed bytes.
+/// `source`/`dest` are borrowed socket handles; ownership is retained by the caller.
+/// Convenience wrapper over `forwardChunkedBodyWithPrereadIo(..., &.{}, null)` preserving original
+/// chunk framing.
+/// Returns `ForwardError` on parse/I/O failure or total forwarded bytes on success.
 pub fn forwardChunkedBody(
     source: *Socket,
     dest: *Socket,

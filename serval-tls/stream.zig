@@ -148,7 +148,12 @@ pub const TLSStream = struct {
         log.info("TLS handshake ({s}): ktls={s}, cipher={s}", .{ role, ktls_status, info.cipher() });
     }
 
-    /// Server-side TLS handshake (client termination) using default handshake and I/O timeouts.
+    /// Initializes a server-side `TLSStream` and performs the handshake using default timeouts.
+    /// Preconditions: `ctx` and `fd` must be valid borrowed handles; caller retains fd ownership.
+    /// On success returns an initialized stream with handshake metadata populated and optional kTLS
+    /// state detected; caller must eventually call `close()` to free SSL resources.
+    /// Returns handshake/setup errors (for example `SslNew`, `SslSetFd`, timeout/readiness failures)
+    /// from the underlying initialization path.
     pub fn initServer(
         ctx: *ssl.SSL_CTX,
         fd: c_int,
@@ -163,7 +168,11 @@ pub const TLSStream = struct {
         );
     }
 
-    /// Server-side TLS handshake (client termination) with explicit timeouts.
+    /// Initializes a server-side `TLSStream` with explicit handshake and I/O timeout bounds.
+    /// Preconditions: valid non-null `ctx`, `fd > 0`, and both timeout values > 0.
+    /// `ctx` is borrowed (not owned), and caller keeps fd ownership/responsibility for fd close.
+    /// Returns setup/handshake errors when TLS state cannot be created, configured, or completed
+    /// within the provided timeout bounds.
     pub fn initServerWithTimeouts(
         ctx: *ssl.SSL_CTX,
         fd: c_int,
@@ -211,8 +220,10 @@ pub const TLSStream = struct {
         };
     }
 
-    /// Client-side TLS handshake (upstream origination) with SNI using default handshake and I/O timeouts.
-    /// TigerStyle S5: Caller must provide null-terminated SNI to avoid runtime allocation.
+    /// Initializes a client-side `TLSStream` (upstream origination) using default timeout bounds.
+    /// Preconditions: valid `ctx`, `fd`, and null-terminated borrowed `sni_z`.
+    /// `ctx`/`sni_z` are borrowed inputs and are not owned by the returned stream; caller still owns fd.
+    /// Returns setup/handshake errors (including SNI/ALPN configuration and timeout/readiness failures).
     pub fn initClient(
         ctx: *ssl.SSL_CTX,
         fd: c_int,
@@ -235,8 +246,12 @@ pub const TLSStream = struct {
         );
     }
 
-    /// Client-side TLS handshake (upstream origination) with SNI and explicit timeouts.
-    /// TigerStyle S5: Caller must provide null-terminated SNI to avoid runtime allocation.
+    /// Initializes a client-side `TLSStream` with explicit handshake and I/O timeout bounds.
+    /// Preconditions: valid non-null `ctx`, `fd > 0`, null-terminated borrowed `sni_z`, and timeout
+    /// values > 0.
+    /// Uses borrowed context/SNI inputs and does not assume ownership of fd; caller manages fd lifetime.
+    /// Returns setup/handshake errors for SSL creation, fd binding, SNI/ALPN setup, verification, and
+    /// timeout/readiness failures.
     pub fn initClientWithTimeouts(
         ctx: *ssl.SSL_CTX,
         fd: c_int,
@@ -376,13 +391,21 @@ pub const TLSStream = struct {
         }
     }
 
-    /// TLS read with the stream's configured I/O timeout.
+    /// Reads TLS application bytes using the stream's configured I/O timeout.
+    /// Preconditions: `self.io_timeout_ns > 0`; `buf` is caller-owned output storage.
+    /// `self` is borrowed and remains owned by the caller.
+    /// Returns read-related TLS/socket errors (including timeout/reset/want-read-want-write mapping)
+    /// from `readWithTimeout`.
     pub fn readBounded(self: *TLSStream, buf: []u8) !u32 {
         assert(self.io_timeout_ns > 0);
         return self.readWithTimeout(buf, self.io_timeout_ns);
     }
 
-    /// TLS read with explicit timeout.
+    /// Reads TLS application bytes with an explicit timeout budget in nanoseconds.
+    /// Preconditions: `buf.len > 0`, `fd > 0`, and `timeout_ns > 0`.
+    /// `buf` is caller-owned storage; no ownership transfer occurs.
+    /// Returns `error.Timeout` on readiness deadline exhaustion, `error.ConnectionReset` on reset paths,
+    /// or mode-specific TLS read errors (`SslRead`/`KtlsRead`) and `WantRead`/`WantWrite`-driven wait failures.
     pub fn readWithTimeout(self: *TLSStream, buf: []u8, timeout_ns: u64) !u32 {
         assert(buf.len > 0);
         assert(self.fd > 0);
@@ -465,13 +488,20 @@ pub const TLSStream = struct {
         }
     }
 
-    /// TLS write with the stream's configured I/O timeout.
+    /// Writes TLS application bytes using the stream's configured I/O timeout.
+    /// Preconditions: `self.io_timeout_ns > 0`; `data` is borrowed caller-owned input.
+    /// `self` remains caller-owned and valid for the duration of the write.
+    /// Returns write-related TLS/socket errors from `writeWithTimeout`.
     pub fn writeBounded(self: *TLSStream, data: []const u8) !u32 {
         assert(self.io_timeout_ns > 0);
         return self.writeWithTimeout(data, self.io_timeout_ns);
     }
 
-    /// TLS write with explicit timeout.
+    /// Writes TLS application bytes with an explicit timeout budget in nanoseconds.
+    /// Preconditions: `data.len > 0`, `fd > 0`, and `timeout_ns > 0`.
+    /// `data` is borrowed input; no ownership is transferred or retained.
+    /// Returns `error.Timeout` when readiness deadline is exceeded, `error.ConnectionReset` for reset
+    /// paths, or mode-specific write failures (`SslWrite`/`KtlsWrite`).
     pub fn writeWithTimeout(self: *TLSStream, data: []const u8, timeout_ns: u64) !u32 {
         assert(data.len > 0);
         assert(self.fd > 0);

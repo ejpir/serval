@@ -18,10 +18,10 @@ pub const TlsDispatchAction = enum {
     terminated_h2,
 };
 
-/// Reads the negotiated ALPN from `maybe_tls` and dispatches from it.
-/// A `null` TLS stream is treated as having no ALPN and returns
-/// `continue_h1`.
-/// This function does not allocate or return errors.
+/// Selects frontend dispatch action from negotiated ALPN on optional TLS stream.
+/// Preconditions: `maybe_tls`, when present, is a valid borrowed pointer; no ownership is retained.
+/// `null` TLS stream is treated as no-ALPN and maps to `continue_h1`.
+/// Infallible, allocation-free helper returning `TlsDispatchAction`.
 pub fn selectTlsAlpnDispatchAction(
     maybe_tls: ?*TLSStream,
     frontend_mode: config.TlsH2FrontendMode,

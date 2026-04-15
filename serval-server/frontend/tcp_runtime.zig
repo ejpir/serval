@@ -121,10 +121,11 @@ pub const Runtime = struct {
         });
     }
 
-    /// Runs the accept loop for the configured TCP listener.
-    /// If `listener_fd_out` is provided, the opened socket handle is published there and reset to `-1` during shutdown.
-    /// Accepted connections are dispatched to the worker group until `shutdown` becomes true; connections are closed immediately when the runtime is at capacity.
-    /// Returns `InvalidAddress` if the listener address cannot be parsed and `ListenFailed` if the socket cannot be opened.
+    /// Runs TCP accept loop for this runtime until shutdown is signaled.
+    /// Preconditions: `self` valid, transport enabled, and `shutdown` points to live atomic flag.
+    /// `listener_fd_out`, when present, is a borrowed atomic slot used for cross-thread shutdown signaling.
+    /// Returns `RuntimeError` for address/listen failures and propagates runtime accept/dispatch setup
+    /// failures; capacity rejections are handled in-band without failing the loop.
     pub fn run(self: *Self, io: Io, shutdown: *std.atomic.Value(bool), listener_fd_out: ?*std.atomic.Value(i32)) RuntimeError!void {
         assert(@intFromPtr(self) != 0);
         assert(@intFromPtr(shutdown) != 0);
@@ -172,57 +173,64 @@ pub const Runtime = struct {
         }
     }
 
-    /// Returns the total number of connections rejected because the runtime was at capacity.
-    /// The value is read atomically with acquire ordering.
-    /// This method does not mutate the runtime.
+    /// Returns total connections rejected because runtime capacity was exhausted.
+    /// Preconditions: `self` is a valid borrowed runtime pointer.
+    /// Infallible read-only accessor; value is loaded atomically with acquire ordering.
+    /// No ownership transfer or runtime mutation occurs.
     pub fn rejectedCount(self: *const Self) u64 {
         assert(@intFromPtr(self) != 0);
         return self.rejected_at_capacity.load(.acquire);
     }
 
-    /// Returns the total number of accepted connections.
-    /// The value is read atomically with acquire ordering.
-    /// This method does not mutate the runtime.
+    /// Returns total accepted downstream connections observed by this runtime.
+    /// Preconditions: `self` is a valid borrowed runtime pointer.
+    /// Infallible read-only accessor backed by an acquire-ordered atomic load.
+    /// No ownership transfer or runtime mutation occurs.
     pub fn acceptedCount(self: *const Self) u64 {
         assert(@intFromPtr(self) != 0);
         return self.accepted_connections.load(.acquire);
     }
 
-    /// Returns the number of upstream connection failures observed so far.
-    /// The value is read atomically with acquire ordering.
-    /// This method does not mutate the runtime.
+    /// Returns cumulative upstream connection failures observed by this runtime.
+    /// Preconditions: `self` is a valid borrowed runtime pointer.
+    /// Infallible read-only accessor; counter is loaded atomically with acquire ordering.
+    /// No ownership transfer or runtime mutation occurs.
     pub fn connectFailureCount(self: *const Self) u64 {
         assert(@intFromPtr(self) != 0);
         return self.connect_failures.load(.acquire);
     }
 
-    /// Returns the number of connections closed because of timeout.
-    /// The value is read atomically with sequentially consistent ordering.
-    /// This method does not mutate the runtime.
+    /// Returns cumulative timeout-driven connection closures.
+    /// Preconditions: `self` is a valid borrowed runtime pointer.
+    /// Infallible read-only accessor using seq-cst atomic load.
+    /// No ownership transfer or runtime mutation occurs.
     pub fn timeoutClosureCount(self: *const Self) u64 {
         assert(@intFromPtr(self) != 0);
         return self.timeout_closures.load(.seq_cst);
     }
 
-    /// Returns the number of bytes forwarded from downstream to upstream.
-    /// The value is read atomically with acquire ordering.
-    /// This method does not mutate the runtime.
+    /// Returns cumulative bytes forwarded downstream -> upstream.
+    /// Preconditions: `self` is a valid borrowed runtime pointer.
+    /// Infallible read-only accessor using acquire-ordered atomic load.
+    /// No ownership transfer or runtime mutation occurs.
     pub fn upstreamBytes(self: *const Self) u64 {
         assert(@intFromPtr(self) != 0);
         return self.upstream_bytes.load(.acquire);
     }
 
-    /// Returns the number of bytes forwarded from upstream to downstream.
-    /// The value is read atomically with acquire ordering.
-    /// This method does not mutate the runtime.
+    /// Returns cumulative bytes forwarded upstream -> downstream.
+    /// Preconditions: `self` is a valid borrowed runtime pointer.
+    /// Infallible read-only accessor using acquire-ordered atomic load.
+    /// No ownership transfer or runtime mutation occurs.
     pub fn downstreamBytes(self: *const Self) u64 {
         assert(@intFromPtr(self) != 0);
         return self.downstream_bytes.load(.acquire);
     }
 
-    /// Returns the current number of active downstream connections.
-    /// The value is read atomically with acquire ordering.
-    /// This method does not mutate the runtime.
+    /// Returns current active downstream connection count.
+    /// Preconditions: `self` is a valid borrowed runtime pointer.
+    /// Infallible read-only accessor using acquire-ordered atomic load.
+    /// No ownership transfer or runtime mutation occurs.
     pub fn activeCount(self: *const Self) u32 {
         assert(@intFromPtr(self) != 0);
         return self.active_connections.load(.acquire);

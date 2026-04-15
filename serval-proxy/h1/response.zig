@@ -111,9 +111,13 @@ pub fn isChunkedResponse(header: []const u8) bool {
 /// TigerStyle S3: Bounded loop constant.
 const MAX_1XX_RESPONSES: u32 = 10;
 
-/// Forward upstream response to client.
-/// TigerStyle: Uses Socket abstraction for unified TLS/plaintext handling.
-/// upstream_socket and client_socket handle body forwarding.
+/// Forwards one upstream HTTP response (headers + body) to the downstream client.
+/// Preconditions: `upstream_conn`, `upstream_socket`, and `client_socket` must reference live borrowed
+/// sockets with valid fds for the full call.
+/// Handles bounded skipping of informational 1xx responses, then forwards body via content-length or
+/// chunked paths; close-delimited non-HEAD/204/304 responses are rejected.
+/// Returns `ForwardError` for invalid upstream response shape, header/body read failures, or downstream
+/// write/forwarding failures; on success returns `ForwardResult` with status/byte/timing metadata.
 pub fn forwardResponse(
     io: Io,
     upstream_conn: *Connection,
@@ -242,9 +246,13 @@ pub fn forwardResponse(
     };
 }
 
-/// Receive HTTP response headers from upstream using Socket abstraction.
-/// TigerStyle: Delegates to serval-client for header reading, maps errors for stale detection.
-/// Uses readHeaderBytes from serval-client for the core read loop.
+/// Receives and parses upstream HTTP response headers into caller-owned `buffer`.
+/// Preconditions: `conn` is a valid borrowed connection/socket and `buffer` is the fixed header buffer
+/// storage for this call.
+/// Delegates to `receiveHeadersWithPreread` with zero initial bytes and maps response/parser failures
+/// into `ForwardError` (including stale pooled-connection handling when `is_pooled` is true).
+/// Returns `ForwardError` on read/parse failures or `HeadersResult` (`header_len`, `header_end`) on
+/// success.
 pub fn receiveHeaders(
     conn: *Connection,
     io: Io,

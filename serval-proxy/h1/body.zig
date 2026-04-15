@@ -56,11 +56,14 @@ const SPLICE_POLL_TIMEOUT_MS: i32 = 250;
 // Platform-Specific Body Forwarding
 // =============================================================================
 
-/// Forward response body using zero-copy splice (Linux) or buffered copy.
-/// Uses Socket abstraction for unified TLS/plaintext handling.
-/// When Io is provided, uses fiber-safe copy (io_uring-backed netRead/netWrite)
-/// to avoid blocking the fiber scheduler during concurrent body streaming.
-/// TigerStyle: Explicit TLS check via is_tls(), splice only for both plain.
+/// Forwards exactly up to `length_bytes` from `upstream` to `client` and returns bytes forwarded.
+/// Preconditions: both sockets must hold valid file descriptors; callers must pass live, borrowed
+/// socket handles and keep them valid for the full call.
+/// Path selection: when `io` is provided, uses fiber-safe userspace copy (`netRead`/`netWrite`);
+/// without `io`, uses Linux splice only for plain/plain sockets and falls back to bounded copy for
+/// TLS or non-Linux paths.
+/// Returns `ForwardError` on read/write/splice/poll failures; success may return fewer bytes than
+/// requested if EOF is reached before `length_bytes`.
 pub fn forwardBody(
     upstream: *Socket,
     client: *Socket,
@@ -346,10 +349,12 @@ fn forwardBodyCopy(upstream: *Socket, client: *Socket, length_bytes: u64) Forwar
 // Request Body Streaming
 // =============================================================================
 
-/// Stream request body from client to upstream.
-/// Supports Content-Length bodies (known size) and chunked transfer encoding.
-/// Sends already-read bytes first, then streams remaining from client.
-/// TigerStyle: Uses Socket for unified TLS/plaintext handling.
+/// Streams request body bytes from `client` to `upstream` according to `body_info` framing.
+/// Preconditions: `client` and `upstream` must be valid borrowed sockets with live fds; caller keeps
+/// `upstream_conn`/`body_info` alive for the duration of the call.
+/// Dispatches `.content_length` and `.chunked` paths, forwarding any `initial_body` bytes first.
+/// Returns `ForwardError` on read/write/chunk-parse failures; success returns total body bytes forwarded
+/// (or `0` for `.none` framing).
 pub fn streamRequestBody(
     client: *Socket,
     upstream: *Socket,

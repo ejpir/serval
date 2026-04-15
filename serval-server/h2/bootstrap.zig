@@ -22,9 +22,11 @@ pub fn validateTransportReadiness(cfg: *const core_config.Config) H2BootstrapErr
     return frontend_bootstrap.validateTransportReadiness(cfg);
 }
 
-/// Resolves the listen address used by the HTTP/2 server bootstrap path.
-/// Delegates to the shared frontend bootstrap implementation, so it follows
-/// the same transport-readiness checks and address parsing rules.
+/// Runs HTTP/2 bootstrap preflight and resolves the listen `IpAddress` from `cfg`.
+/// Preconditions: `cfg` must be a valid non-null borrowed pointer.
+/// Delegates to shared frontend bootstrap logic, so transport-readiness validation and address parsing
+/// semantics are identical to HTTP/1 bootstrap.
+/// Returns `H2BootstrapError` when transport config is invalid or address resolution/parsing fails.
 pub fn preflightAndResolveListenAddress(cfg: *const core_config.Config) H2BootstrapError!Io.net.IpAddress {
     assert(@intFromPtr(cfg) != 0);
     return frontend_bootstrap.preflightAndResolveListenAddress(cfg);

@@ -59,40 +59,52 @@ pub const HandshakeInfo = struct {
     // kTLS status (kernel TLS offload)
     ktls_enabled: bool = false,
 
-    /// Returns the negotiated TLS version string (e.g., "TLSv1.3").
+    /// Returns the negotiated TLS version string (for example `"TLSv1.3"`).
+    /// The returned slice borrows from `self.version_buf` and remains valid while `self` is unchanged.
+    /// This accessor is infallible and performs no allocation.
     pub fn version(self: *const Self) []const u8 {
         assert(self.version_len <= VERSION_BUF_SIZE); // S1: postcondition
         return self.version_buf[0..self.version_len];
     }
 
-    /// Returns the negotiated cipher suite name (e.g., "TLS_AES_256_GCM_SHA384").
+    /// Returns the negotiated cipher suite name (for example `"TLS_AES_256_GCM_SHA384"`).
+    /// The returned slice borrows from `self.cipher_buf` and remains valid while `self` is unchanged.
+    /// This accessor is infallible and performs no allocation.
     pub fn cipher(self: *const Self) []const u8 {
         assert(self.cipher_len <= CIPHER_BUF_SIZE); // S1: postcondition
         return self.cipher_buf[0..self.cipher_len];
     }
 
-    /// Returns the negotiated ALPN protocol, or null if none.
+    /// Returns the negotiated ALPN protocol, or `null` when ALPN was not negotiated.
+    /// Any non-null slice borrows from `self.alpn_buf` and remains valid while `self` is unchanged.
+    /// This accessor is infallible and performs no allocation.
     pub fn alpn(self: *const Self) ?[]const u8 {
         assert(self.alpn_len <= ALPN_BUF_SIZE); // S1: postcondition
         if (self.alpn_len == 0) return null;
         return self.alpn_buf[0..self.alpn_len];
     }
 
-    /// Returns the peer certificate subject, or null if no peer cert.
+    /// Returns the peer certificate subject, or `null` when no peer certificate was captured.
+    /// Any non-null slice borrows from `self.cert_subject_buf` and remains valid while `self` is unchanged.
+    /// This accessor is infallible and performs no allocation.
     pub fn certSubject(self: *const Self) ?[]const u8 {
         assert(self.cert_subject_len <= CERT_NAME_BUF_SIZE); // S1: postcondition
         if (self.cert_subject_len == 0) return null;
         return self.cert_subject_buf[0..self.cert_subject_len];
     }
 
-    /// Returns the peer certificate issuer, or null if no peer cert.
+    /// Returns the peer certificate issuer, or `null` when no peer certificate was captured.
+    /// Any non-null slice borrows from `self.cert_issuer_buf` and remains valid while `self` is unchanged.
+    /// This accessor is infallible and performs no allocation.
     pub fn certIssuer(self: *const Self) ?[]const u8 {
         assert(self.cert_issuer_len <= CERT_NAME_BUF_SIZE); // S1: postcondition
         if (self.cert_issuer_len == 0) return null;
         return self.cert_issuer_buf[0..self.cert_issuer_len];
     }
 
-    /// Returns handshake duration in milliseconds (for span attributes).
+    /// Returns handshake duration converted from stored nanoseconds to whole milliseconds.
+    /// This is intended for telemetry attributes and does not mutate state.
+    /// Infallible conversion: no allocation and no error path.
     pub fn handshakeDurationMs(self: *const Self) i64 {
         const ns_per_ms: u64 = 1_000_000;
         return @intCast(self.handshake_duration_ns / ns_per_ms);

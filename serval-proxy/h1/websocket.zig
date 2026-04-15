@@ -63,9 +63,13 @@ pub const UpgradeResponseResult = struct {
     upgraded: bool,
 };
 
-/// Serializes an HTTP/1.1 WebSocket upgrade request into `buffer`.
-/// Hop-by-hop request headers are skipped, then the upgrade headers and any non-empty forwarded headers are appended.
-/// Returns the number of bytes written, or `null` if the request line or headers do not fit in the destination buffer.
+/// Serializes a WebSocket HTTP/1.1 upgrade request into caller-owned `buffer`.
+/// Preconditions: effective path (`effective_path` or `request.path`) must be non-empty; `request` and
+/// forwarded-header slices are borrowed and must stay valid during serialization.
+/// Hop-by-hop headers are skipped and required upgrade headers are appended, plus optional non-empty
+/// forwarded headers.
+/// Returns written byte count on success or `null` when the destination buffer cannot fit the full
+/// request line/header block.
 pub fn buildUpgradeRequestBuffer(
     buffer: []u8,
     request: *const Request,
@@ -125,9 +129,12 @@ pub fn buildUpgradeRequestBuffer(
     return pos;
 }
 
-/// Serializes and sends a WebSocket upgrade request on `conn`.
-/// `effective_path`, when provided, overrides `request.path`; the chosen path must be non-empty.
-/// Returns `ForwardError.SendFailed` if the request does not fit in the internal buffer, or any send error from `sendBuffer`.
+/// Serializes and sends one WebSocket upgrade request on `conn`.
+/// Preconditions: effective path (`effective_path` or `request.path`) must be non-empty, and caller
+/// keeps borrowed `conn`/`request`/forwarded-header inputs valid during serialization+send.
+/// Uses fixed stack buffer serialization (`buildUpgradeRequestBuffer`) and sends via `sendBuffer`.
+/// Returns `ForwardError.SendFailed` when request serialization does not fit buffer, and propagates
+/// transport send failures as `ForwardError`.
 pub fn sendUpgradeRequest(
     conn: *Connection,
     io: Io,
@@ -146,9 +153,13 @@ pub fn sendUpgradeRequest(
     try sendBuffer(conn, io, buffer[0..header_len]);
 }
 
-/// Reads an upstream response and forwards it to `client_socket`.
-/// `101` upgrade responses are validated and forwarded as received; other statuses forward the header block and any buffered body.
-/// The returned `response_bytes` counts the bytes forwarded from the buffered response, not ownership of either socket.
+/// Reads an upstream response and forwards it to `client_socket` for WebSocket upgrade handling.
+/// Preconditions: `upstream_conn`, `client_socket`, and `expected_accept_key` (fixed-size accept value)
+/// are valid borrowed inputs for this call.
+/// `101` responses are validated against `expected_accept_key` and forwarded; non-`101` responses forward
+/// header bytes plus any buffered/body remainder path.
+/// Returns `ForwardError` on invalid response shape/accept mismatch or I/O forwarding failures; success
+/// returns `UpgradeResponseResult` with status, forwarded byte count, and upgrade flag.
 pub fn forwardUpgradeResponse(
     io: Io,
     upstream_conn: *Connection,
@@ -197,9 +208,13 @@ pub fn forwardUpgradeResponse(
     };
 }
 
-/// Reads an upstream response and interprets it as a WebSocket upgrade response.
-/// Returns the upstream status code and whether the response successfully upgraded.
-/// `101` responses are validated against `expected_accept_key`; parse or validation failures return `ForwardError.InvalidResponse`.
+/// Reads an upstream response and interprets it as a WebSocket upgrade outcome.
+/// Preconditions: `upstream_conn` is a valid borrowed connection and `expected_accept_key` has fixed
+/// accept-key length.
+/// For `101`, validates server upgrade headers/accept key; non-`101` statuses are returned as
+/// non-upgraded outcomes.
+/// Returns `ForwardError` on read/parse/validation failures; success returns `UpgradeResponseResult`
+/// with status, consumed bytes, and upgrade flag.
 pub fn receiveUpgradeResponse(
     io: Io,
     upstream_conn: *Connection,
