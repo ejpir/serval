@@ -741,7 +741,7 @@ fn readInboundFrame(
     if (!have_frame) return null;
 
     const header = try h2.parseFrameHeader(recv_buf[0..h2.frame_header_size_bytes]);
-    const frame_len: usize = h2.frame_header_size_bytes + header.length;
+    const frame_len = try inboundFrameLengthForStorage(header);
     try fillBuffer(io_conn, maybe_plain_reader, io, recv_buf, buffer_len, frame_len);
     log.debug("server: conn={d} h2 parsed frame count={d} type={s} stream={d} flags=0x{x} payload_bytes={d} buffered_bytes={d}", .{
         connection_id,
@@ -2516,7 +2516,7 @@ fn sendRuntimeErrorGoAway(
 
 fn logRuntimeFrameError(connection_id: u64, header: h2.FrameHeader, err: anyerror) void {
     assert(header.stream_id <= 0x7fff_ffff);
-    assert(header.length <= h2.frame_payload_capacity_bytes);
+    assert(header.length <= h2.max_frame_payload_size_bytes);
 
     log.warn(
         "h2: conn={d} frame_err frame_type={s} stream_id={d} flags=0x{x} length={d} err={s} goaway={s}",
@@ -2596,6 +2596,18 @@ fn consumeOptionalUpgradeClientPreface(
     discardPrefix(recv_buf, buffer_len, h2.client_connection_preface.len);
 }
 
+fn inboundFrameLengthForStorage(header: h2.FrameHeader) Error!usize {
+    assert(header.stream_id <= 0x7fff_ffff);
+    assert(header.length <= h2.max_frame_payload_size_bytes);
+
+    if (header.length > h2.frame_payload_capacity_bytes) return error.FrameTooLarge;
+
+    const payload_len_bytes: usize = @intCast(header.length);
+    const frame_len: usize = h2.frame_header_size_bytes + payload_len_bytes;
+    assert(frame_len <= frame_buffer_size_bytes);
+    return frame_len;
+}
+
 fn ensureFrame(
     io_conn: *ConnectionIo,
     maybe_plain_reader: ?*Io.net.Stream.Reader,
@@ -2613,7 +2625,7 @@ fn ensureFrame(
 
     try fillBuffer(io_conn, maybe_plain_reader, io, recv_buf, buffer_len, h2.frame_header_size_bytes);
     const header = try h2.parseFrameHeader(recv_buf[0..h2.frame_header_size_bytes]);
-    const frame_len: usize = h2.frame_header_size_bytes + header.length;
+    const frame_len = try inboundFrameLengthForStorage(header);
     try fillBuffer(io_conn, maybe_plain_reader, io, recv_buf, buffer_len, frame_len);
     return true;
 }
@@ -3070,7 +3082,39 @@ test "ResponseStateTable inserts and removes response state" {
     try std.testing.expect(table.get(1) == null);
 }
 
+test "inboundFrameLengthForStorage enforces fixed payload capacity" {
+    const frame_len = try inboundFrameLengthForStorage(.{
+        .length = h2.frame_payload_capacity_bytes,
+        .frame_type = .data,
+        .flags = 0,
+        .stream_id = 1,
+    });
+    try std.testing.expectEqual(
+        @as(usize, h2.frame_header_size_bytes) + @as(usize, h2.frame_payload_capacity_bytes),
+        frame_len,
+    );
+    try std.testing.expectError(
+        error.FrameTooLarge,
+        inboundFrameLengthForStorage(.{
+            .length = h2.frame_payload_capacity_bytes + 1,
+            .frame_type = .data,
+            .flags = 0,
+            .stream_id = 1,
+        }),
+    );
+}
+
+test "logRuntimeFrameError tolerates oversized frame headers" {
+    logRuntimeFrameError(51, .{
+        .length = h2.frame_payload_capacity_bytes + 1,
+        .frame_type = .data,
+        .flags = h2.flags_end_stream,
+        .stream_id = 1,
+    }, error.FrameTooLarge);
+}
+
 test "mapGoAwayError maps flow-control violations distinctly" {
+    try std.testing.expectEqual(h2.ErrorCode.frame_size_error, mapGoAwayError(error.FrameTooLarge));
     try std.testing.expectEqual(h2.ErrorCode.flow_control_error, mapGoAwayError(error.WindowOverflow));
     try std.testing.expectEqual(h2.ErrorCode.flow_control_error, mapGoAwayError(error.StreamFlowControlError));
     try std.testing.expectEqual(h2.ErrorCode.protocol_error, mapGoAwayError(error.InvalidPreface));

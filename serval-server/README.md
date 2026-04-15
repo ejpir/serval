@@ -11,6 +11,7 @@ Runtime protocol policy now comes from nested server config sections rather than
 - `Config.h2` controls deploy-time HTTP/2 settings such as advertised frame/window limits and downstream idle timeouts.
 - `Config.websocket` controls native WebSocket session limits such as message size, fragment count, and close/idle timeouts.
 - Fixed compile-time capacities still stay in owner modules or shared core invariants; runtime settings are validated against those bounds.
+- The terminated server-side h2 receive path rejects inbound frame lengths above the shared fixed payload capacity before payload buffering, so oversize peers fail closed with `FRAME_SIZE_ERROR` instead of overrunning connection-owned scratch.
 - The terminated server-side h2 runtime now takes caller-owned HEADERS/CONTINUATION scratch storage for pending request-header assembly, so that scratch-buffer ownership stays with the connection driver instead of being embedded in the protocol runtime state.
 - The terminated server-side h2 driver now groups its per-connection receive buffer, decoded request stable storage, and temporary decoded request-field scratch in explicit connection-owned storage, so hot-path request-decode ownership is no longer split across unrelated helper allocations.
 - The terminated server-side h2 driver now also keeps response DATA, recoverable RST_STREAM, and upgrade preamble/header-block scratch in `ConnectionStorage`, leaving only per-writer response assembly scratch on `H2ResponseWriter`.
