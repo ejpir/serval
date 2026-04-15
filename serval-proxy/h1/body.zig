@@ -19,7 +19,7 @@ const request_mod = @import("request.zig");
 const sendBuffer = request_mod.sendBuffer;
 
 const chunked_transfer = @import("chunked.zig");
-const forwardChunkedBodyIo = chunked_transfer.forwardChunkedBodyIo;
+const forwardChunkedBodyWithPrereadIo = chunked_transfer.forwardChunkedBodyWithPrereadIo;
 
 const core = @import("serval-core");
 const closeFd = core.closeFd;
@@ -486,14 +486,10 @@ fn forwardBodyCopyFiber(
 }
 
 /// Stream chunked request body from client to upstream.
-/// Sends initial_body first (may contain partial chunk data), then streams
-/// remaining chunks using forwardChunkedBody.
+/// Seeds chunk parser with initial_body and forwards only validated chunked framing,
+/// then streams remaining chunks from the client socket.
 ///
-/// Design note: For chunked bodies, initial_body may contain partial chunk framing
-/// read during header parsing. We send this first via the async stream, then
-/// continue streaming the rest of the chunked body from the client socket.
-///
-/// TigerStyle: Bounded chunk iteration (in forwardChunkedBody), explicit error handling.
+/// TigerStyle: Bounded chunk iteration, explicit error handling.
 fn streamChunkedRequestBody(
     client: *Socket,
     upstream: *Socket,
@@ -504,23 +500,15 @@ fn streamChunkedRequestBody(
     // Precondition: valid socket file descriptors.
     assert(client.get_fd() >= 0);
     assert(upstream.get_fd() >= 0);
+    _ = upstream_conn;
 
-    var total_sent: u64 = 0;
+    // Forward chunked body with parser-seeded preread bytes.
+    // This prevents forwarding bytes beyond the chunked terminator that may
+    // already be buffered after header parsing.
+    const total_sent = try forwardChunkedBodyWithPrereadIo(client, upstream, initial_body, io);
 
-    // Send already-read chunk data via connection (TLS or plaintext).
-    // This may contain partial chunk headers/data read during request parsing.
-    if (initial_body.len > 0) {
-        try sendBuffer(upstream_conn, io, initial_body);
-        total_sent += initial_body.len;
-    }
-
-    // Stream remaining chunks from client to upstream using Socket abstraction.
-    // Direction: client (source) -> upstream (destination).
-    total_sent += try forwardChunkedBodyIo(client, upstream, io);
-
-    // Postcondition: total_sent includes initial_body plus chunked stream bytes.
-    // Minimum chunked body is "0\r\n\r\n" (5 bytes) if no initial_body.
-    assert(total_sent >= initial_body.len);
+    // Postcondition: minimum chunked body is "0\r\n\r\n" (5 bytes).
+    assert(total_sent >= 5);
     return total_sent;
 }
 
