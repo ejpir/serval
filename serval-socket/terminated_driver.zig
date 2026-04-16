@@ -103,27 +103,50 @@ fn remainingTimeoutMs(deadline_ns: u64) ?i32 {
     return timeout_ms;
 }
 
-fn waitForReady(fd: i32, direction: ReadinessDirection, deadline_ns: u64) WaitForReadyError!void {
+fn waitForReady(io: Io, fd: i32, direction: ReadinessDirection, deadline_ns: u64) WaitForReadyError!void {
     assert(fd >= 0);
 
     const timeout_ms = remainingTimeoutMs(deadline_ns) orelse return error.Timeout;
-    const events: i16 = switch (direction) {
-        .read => posix.POLL.IN,
-        .write => posix.POLL.OUT,
-    };
 
-    var poll_fds = [_]posix.pollfd{.{
-        .fd = fd,
-        .events = events,
-        .revents = 0,
-    }};
-    const polled = posix.poll(&poll_fds, timeout_ms) catch return error.ReadinessWaitFailed;
-    if (polled == 0) return error.Timeout;
+    switch (direction) {
+        .read => {
+            var messages: [1]Io.net.IncomingMessage = .{Io.net.IncomingMessage.init};
+            var peek_buf: [1]u8 = undefined;
+            const timeout: Io.Timeout = .{ .duration = .{
+                .raw = Io.Duration.fromMilliseconds(timeout_ms),
+                .clock = .awake,
+            } };
+            const maybe_err, _ = rawStreamForFd(fd).socket.receiveManyTimeout(
+                io,
+                &messages,
+                &peek_buf,
+                .{ .peek = true },
+                timeout,
+            );
+            if (maybe_err) |err| switch (err) {
+                error.Timeout => return error.Timeout,
+                error.ConnectionResetByPeer,
+                error.SocketUnconnected,
+                => return error.Closed,
+                else => return error.ReadinessWaitFailed,
+            };
+        },
+        .write => {
+            const events: i16 = posix.POLL.OUT;
+            var poll_fds = [_]posix.pollfd{.{
+                .fd = fd,
+                .events = events,
+                .revents = 0,
+            }};
+            const polled = posix.poll(&poll_fds, timeout_ms) catch return error.ReadinessWaitFailed;
+            if (polled == 0) return error.Timeout;
 
-    const revents = poll_fds[0].revents;
-    if ((revents & (posix.POLL.ERR | posix.POLL.NVAL)) != 0) return error.ReadinessWaitFailed;
-    if ((revents & posix.POLL.HUP) != 0) return error.Closed;
-    if ((revents & events) == 0) return error.ReadinessWaitFailed;
+            const revents = poll_fds[0].revents;
+            if ((revents & (posix.POLL.ERR | posix.POLL.NVAL)) != 0) return error.ReadinessWaitFailed;
+            if ((revents & posix.POLL.HUP) != 0) return error.Closed;
+            if ((revents & events) == 0) return error.ReadinessWaitFailed;
+        },
+    }
 }
 
 fn plainReadStep(socket: *PlainSocket, io: Io, out: []u8) DriverError!PlainReadStep {
@@ -164,6 +187,16 @@ fn plainWriteStep(socket: *PlainSocket, io: Io, data: []const u8) DriverError!Pl
     return .{ .bytes = bytes };
 }
 
+fn rawStreamForFd(fd: i32) Io.net.Stream {
+    assert(fd >= 0);
+    return .{
+        .socket = .{
+            .handle = fd,
+            .address = .{ .ip4 = .unspecified(0) },
+        },
+    };
+}
+
 /// Read bytes with a timeout budget in nanoseconds.
 ///
 /// Contract: `socket` must be open, `out` must be non-empty, `timeout_ns > 0`.
@@ -202,7 +235,7 @@ pub fn readWithDeadline(socket: *Socket, io: Io, out: []u8, deadline_ns: u64) Dr
                     .bytes => |n| return .{ .bytes = n },
                     .closed => return .closed,
                     .need_read => {
-                        waitForReady(fd, .read, deadline_ns) catch |wait_err| switch (wait_err) {
+                        waitForReady(io, fd, .read, deadline_ns) catch |wait_err| switch (wait_err) {
                             error.Timeout => return .timeout,
                             error.Closed => return .closed,
                             error.ReadinessWaitFailed => return error.TransportFailed,
@@ -221,14 +254,14 @@ pub fn readWithDeadline(socket: *Socket, io: Io, out: []u8, deadline_ns: u64) Dr
                     .bytes => |n| return .{ .bytes = n },
                     .closed => return .closed,
                     .need_read => {
-                        waitForReady(fd, .read, deadline_ns) catch |wait_err| switch (wait_err) {
+                        waitForReady(io, fd, .read, deadline_ns) catch |wait_err| switch (wait_err) {
                             error.Timeout => return .timeout,
                             error.Closed => return .closed,
                             error.ReadinessWaitFailed => return error.TransportFailed,
                         };
                     },
                     .need_write => {
-                        waitForReady(fd, .write, deadline_ns) catch |wait_err| switch (wait_err) {
+                        waitForReady(io, fd, .write, deadline_ns) catch |wait_err| switch (wait_err) {
                             error.Timeout => return .timeout,
                             error.Closed => return .closed,
                             error.ReadinessWaitFailed => return error.TransportFailed,
@@ -280,7 +313,7 @@ pub fn writeWithDeadline(socket: *Socket, io: Io, data: []const u8, deadline_ns:
                     .bytes => |n| return .{ .bytes = n },
                     .closed => return .closed,
                     .need_write => {
-                        waitForReady(fd, .write, deadline_ns) catch |wait_err| switch (wait_err) {
+                        waitForReady(io, fd, .write, deadline_ns) catch |wait_err| switch (wait_err) {
                             error.Timeout => return .timeout,
                             error.Closed => return .closed,
                             error.ReadinessWaitFailed => return error.TransportFailed,
@@ -299,14 +332,14 @@ pub fn writeWithDeadline(socket: *Socket, io: Io, data: []const u8, deadline_ns:
                     .bytes => |n| return .{ .bytes = n },
                     .closed => return .closed,
                     .need_read => {
-                        waitForReady(fd, .read, deadline_ns) catch |wait_err| switch (wait_err) {
+                        waitForReady(io, fd, .read, deadline_ns) catch |wait_err| switch (wait_err) {
                             error.Timeout => return .timeout,
                             error.Closed => return .closed,
                             error.ReadinessWaitFailed => return error.TransportFailed,
                         };
                     },
                     .need_write => {
-                        waitForReady(fd, .write, deadline_ns) catch |wait_err| switch (wait_err) {
+                        waitForReady(io, fd, .write, deadline_ns) catch |wait_err| switch (wait_err) {
                             error.Timeout => return .timeout,
                             error.Closed => return .closed,
                             error.ReadinessWaitFailed => return error.TransportFailed,

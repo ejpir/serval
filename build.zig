@@ -1642,6 +1642,21 @@ pub fn build(b: *std.Build) void {
     );
     integration_test_h2_generic_post_no_cl_step.dependOn(&run_integration_test_h2_generic_post_no_cl.step);
 
+    const integration_test_56 = b.addTest(.{
+        .name = "integration_test_56",
+        .root_module = integration_tests_mod,
+        .filters = &.{"integration: TLS ALPN h2 generic frontend forwards non-gRPC route to h2c upstream"},
+        .test_runner = .{ .path = b.path("integration/test_runner.zig"), .mode = .simple },
+    });
+    force_llvm_lld(integration_test_56);
+    const run_integration_test_56 = b.addRunArtifact(integration_test_56);
+
+    const integration_test_56_step = b.step(
+        "test-integration-56",
+        "Run integration test 56 (TLS ALPN h2 generic frontend forwards non-gRPC route to h2c upstream)",
+    );
+    integration_test_56_step.dependOn(&run_integration_test_56.step);
+
     const integration_test_h2_generic_post = b.addTest(.{
         .name = "integration_test_h2_generic_post",
         .root_module = integration_tests_mod,
@@ -2327,6 +2342,7 @@ pub fn build(b: *std.Build) void {
     run_integration_test_77.step.dependOn(&build_echo_backend.step);
     run_integration_test_78.step.dependOn(&build_echo_backend.step);
     run_integration_test_h2_generic_post_no_cl.step.dependOn(&build_echo_backend.step);
+    run_integration_test_56.step.dependOn(&build_echo_backend.step);
     run_integration_test_h2_generic_post.step.dependOn(&build_echo_backend.step);
     run_integration_test_h2_generic_invalid_te.step.dependOn(&build_echo_backend.step);
     run_integration_test_h2_generic_trailers_reset.step.dependOn(&build_echo_backend.step);
