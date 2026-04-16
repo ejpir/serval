@@ -164,8 +164,10 @@ The fix was to:
 
 - run the downstream relay reader with `std.Io.Group.concurrent()` when
   available
-- preserve `WantRead` vs `WantWrite` through `serval-tls` so the tunnel waits
-  on the correct readiness condition
+- preserve `WantRead` vs `WantWrite` through `serval-tls` and surface that
+  distinction through explicit `TLSSocket.read_relay()` /
+  `write_all_relay()` helpers so the tunnel waits on the correct readiness
+  condition
 - replace the plain upgraded upstream relay write path with a direct bounded
   nonblocking `write(2)` loop instead of Zig's buffered stream writer on a
   nonblocking fd
@@ -199,8 +201,12 @@ Fix:
 - keep one direction attached via `std.Io.Group.concurrent()` and the other on
   the current fiber, but with symmetric startup gating (no directional startup
   race)
-- keep plain-socket relay I/O fiber-safe (`io.vtable.netRead/netWrite`) and TLS
-  relay I/O on the socket/TLS path
+- keep plain-socket relay I/O fiber-safe (`io.vtable.netRead/netWrite`) and keep
+  upgraded TLS relay I/O on explicit `TLSSocket.read_relay()` /
+  `write_all_relay()` helpers, which internally use low-level nonblocking
+  `TLSStream.read()` / `write()` plus cooperative `std.Io` retry waits,
+  instead of funneling the long-lived tunnel through `TLSSocket`'s bounded
+  handshake/request-response timeout wrappers
 
 Outcome:
 

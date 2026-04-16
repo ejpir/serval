@@ -3,7 +3,9 @@
 //! Bidirectional byte relay used after successful HTTP/1.1 upgrade.
 //! Uses fiber-safe Io.vtable.netRead/netWrite for plain sockets so the
 //! Io scheduler can multiplex work while data is in-flight. TLS sockets
-//! fall back to blocking read/write (fine for the Threaded backend).
+//! use the explicit relay-mode `TLSSocket` API so long-lived upgraded
+//! tunnels keep low-level backpressure handling without reusing bounded
+//! request/response TLS wrappers.
 //!
 //! TigerStyle: Cooperative fibers, group cancellation for cleanup.
 
@@ -288,10 +290,17 @@ fn relayDirection(
     assert(@intFromPtr(destination) != 0);
 
     if (initial_bytes.len > 0) {
-        ioWriteAll(destination, io, initial_bytes, write_side) catch |err| {
-            logTunnelFailure(shared, io, "initial_write_failed", read_side, write_side, err, source, destination);
-            shared.finishTermination(mapFailureToTermination(err), io);
-            return;
+        ioWriteAll(destination, io, initial_bytes, write_side) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.ClientClosed,
+            error.UpstreamClosed,
+            error.ClientError,
+            error.UpstreamError,
+            => |relay_err| {
+                logTunnelFailure(shared, io, "initial_write_failed", read_side, write_side, relay_err, source, destination);
+                shared.finishTermination(mapFailureToTermination(relay_err), io);
+                return;
+            },
         };
         shared.noteProgress(read_side, @intCast(initial_bytes.len), io);
     }
@@ -305,20 +314,21 @@ fn relayDirection(
     while (true) {
         try std.Io.checkCancel(io);
 
-        const bytes_read = ioReadSome(source, io, &relay_buf, read_side) catch |err| {
-            switch (err) {
-                error.ClientClosed, error.UpstreamClosed => {
-                    halfCloseWrite(destination, write_side);
-                    logTunnelClosure(shared, io, "read_closed", read_side, write_side, source, destination);
-                    shared.markClosed(read_side, io);
-                    return;
-                },
-                else => {
-                    logTunnelFailure(shared, io, "read_failed", read_side, write_side, err, source, destination);
-                    shared.finishTermination(mapFailureToTermination(err), io);
-                    return;
-                },
-            }
+        const bytes_read = ioReadSome(source, io, &relay_buf, read_side) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.ClientClosed, error.UpstreamClosed => {
+                halfCloseWrite(destination, write_side);
+                logTunnelClosure(shared, io, "read_closed", read_side, write_side, source, destination);
+                shared.markClosed(read_side, io);
+                return;
+            },
+            error.ClientError,
+            error.UpstreamError,
+            => |relay_err| {
+                logTunnelFailure(shared, io, "read_failed", read_side, write_side, relay_err, source, destination);
+                shared.finishTermination(mapFailureToTermination(relay_err), io);
+                return;
+            },
         };
         if (bytes_read == 0) {
             halfCloseWrite(destination, write_side);
@@ -327,10 +337,17 @@ fn relayDirection(
             return;
         }
 
-        ioWriteAll(destination, io, relay_buf[0..bytes_read], write_side) catch |err| {
-            logTunnelFailure(shared, io, "write_failed", read_side, write_side, err, source, destination);
-            shared.finishTermination(mapFailureToTermination(err), io);
-            return;
+        ioWriteAll(destination, io, relay_buf[0..bytes_read], write_side) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.ClientClosed,
+            error.UpstreamClosed,
+            error.ClientError,
+            error.UpstreamError,
+            => |relay_err| {
+                logTunnelFailure(shared, io, "write_failed", read_side, write_side, relay_err, source, destination);
+                shared.finishTermination(mapFailureToTermination(relay_err), io);
+                return;
+            },
         };
         shared.noteProgress(read_side, bytes_read, io);
     }
@@ -438,31 +455,41 @@ fn forceAbortSocketIo(socket: *Socket) void {
 // ---------------------------------------------------------------------------
 
 /// Read some bytes from source. Returns 0 on EOF.
-/// Plain sockets use io.vtable.netRead (fiber-safe); TLS uses blocking read.
-fn ioReadSome(socket: *Socket, io: Io, buf: []u8, side: Side) RelayFailure!u32 {
+/// Plain sockets use io.vtable.netRead (fiber-safe); TLS uses the explicit
+/// relay-mode `TLSSocket.read_relay()` API so upgraded traffic stays on the
+/// long-lived tunnel path instead of request/response TLS wrappers.
+fn ioReadSome(socket: *Socket, io: Io, buf: []u8, side: Side) (RelayFailure || Io.Cancelable)!u32 {
     assert(@intFromPtr(socket) != 0);
     assert(buf.len > 0);
 
     return switch (socket.*) {
         .plain => |plain| {
             var read_bufs: [1][]u8 = .{buf};
-            const n = io.vtable.netRead(io.userdata, plain.fd, &read_bufs) catch |err| {
-                return mapNetError(side, err);
+            const n = io.vtable.netRead(io.userdata, plain.fd, &read_bufs) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => return mapNetError(side, err),
             };
             return @intCast(n);
         },
-        .tls => {
-            const n = socket.read(buf) catch |err| {
-                return mapSocketError(side, err);
-            };
-            return n;
+        .tls => |*tls_socket| tls_socket.read_relay(io, buf) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.ConnectionClosed,
+            error.ConnectionReset,
+            error.BrokenPipe,
+            => return closeFailure(side),
+            error.Timeout,
+            error.TLSError,
+            error.Unexpected,
+            => return errorFailure(side),
         },
     };
 }
 
 /// Write all bytes to destination.
-/// Plain sockets use io.vtable.netWrite (fiber-safe); TLS uses blocking write.
-fn ioWriteAll(socket: *Socket, io: Io, data: []const u8, side: Side) RelayFailure!void {
+/// Plain sockets use io.vtable.netWrite (fiber-safe); TLS uses the explicit
+/// relay-mode `TLSSocket.write_all_relay()` API so upgraded tunnel writes keep
+/// their low-level backpressure behavior.
+fn ioWriteAll(socket: *Socket, io: Io, data: []const u8, side: Side) (RelayFailure || Io.Cancelable)!void {
     assert(@intFromPtr(socket) != 0);
     assert(data.len > 0);
 
@@ -472,24 +499,24 @@ fn ioWriteAll(socket: *Socket, io: Io, data: []const u8, side: Side) RelayFailur
             while (sent < data.len) {
                 const pending = data[sent..];
                 const write_slices = [_][]const u8{pending};
-                const n = io.vtable.netWrite(io.userdata, plain.fd, &.{}, &write_slices, 1) catch |err| {
-                    return mapNetError(side, err);
+                const n = io.vtable.netWrite(io.userdata, plain.fd, &.{}, &write_slices, 1) catch |err| switch (err) {
+                    error.Canceled => return error.Canceled,
+                    else => return mapNetError(side, err),
                 };
                 if (n == 0) return closeFailure(side);
                 sent += n;
             }
         },
-        .tls => {
-            var sent: usize = 0;
-            var iterations: u32 = 0;
-            while (sent < data.len and iterations < Socket.max_write_iterations_count) : (iterations += 1) {
-                const n = socket.write(data[sent..]) catch |err| {
-                    return mapSocketError(side, err);
-                };
-                if (n == 0) return closeFailure(side);
-                sent += n;
-            }
-            if (sent < data.len) return errorFailure(side);
+        .tls => |*tls_socket| tls_socket.write_all_relay(io, data) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.ConnectionClosed,
+            error.ConnectionReset,
+            error.BrokenPipe,
+            => return closeFailure(side),
+            error.Timeout,
+            error.TLSError,
+            error.Unexpected,
+            => return errorFailure(side),
         },
     };
 }
@@ -509,19 +536,6 @@ fn errorFailure(side: Side) RelayFailure {
     return switch (side) {
         .client => error.ClientError,
         .upstream => error.UpstreamError,
-    };
-}
-
-fn mapSocketError(side: Side, err: serval_socket.SocketError) RelayFailure {
-    return switch (err) {
-        error.ConnectionClosed,
-        error.ConnectionReset,
-        error.BrokenPipe,
-        => closeFailure(side),
-        error.Timeout,
-        error.TLSError,
-        error.Unexpected,
-        => errorFailure(side),
     };
 }
 

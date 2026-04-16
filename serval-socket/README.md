@@ -25,6 +25,8 @@ This allows higher-level modules (pool, proxy, client, server) to work with sock
 | `Socket.Plain.init_server(fd)` | Create plain server socket from fd |
 | `Socket.TLS.TLSSocket.init_client(fd, ctx, host, enable_ktls, desired_alpn, verify_peer)` | Create TLS client socket with SNI |
 | `Socket.TLS.TLSSocket.init_server(fd, ctx)` | Create TLS server socket |
+| `Socket.TLS.TLSSocket.read_relay(io, buf)` | Relay-mode TLS read for long-lived upgraded tunnels |
+| `Socket.TLS.TLSSocket.write_all_relay(io, data)` | Relay-mode TLS write loop for long-lived upgraded tunnels |
 | `socket.read(buf)` | Read data into buffer |
 | `socket.write(data)` | Write data to socket |
 | `socket.write_all(data)` | Write all bytes (handles partial writes) |
@@ -106,7 +108,8 @@ Create TLS server socket for incoming client connection. Performs TLS handshake.
 
 ### socket.read(buf: []u8) SocketError!u32
 
-Read data into buffer. Works for both plain and TLS sockets.
+Read data into buffer. Works for both plain and TLS sockets on the normal
+bounded request/response path.
 
 **Parameters:**
 - `buf`: Buffer to read into (must be non-empty)
@@ -115,7 +118,8 @@ Read data into buffer. Works for both plain and TLS sockets.
 
 ### socket.write(data: []const u8) SocketError!u32
 
-Write data to socket. Works for both plain and TLS sockets.
+Write data to socket. Works for both plain and TLS sockets on the normal
+bounded request/response path.
 
 **Parameters:**
 - `data`: Data to write (must be non-empty)
@@ -140,6 +144,29 @@ Read at least min_bytes into buffer.
 - `min_bytes`: Minimum bytes to read (must be > 0 and <= buf.len)
 
 **Returns:** Total bytes read (may be more than min_bytes)
+
+### Socket.TLS.TLSSocket.read_relay(io, buf) (SocketError || Io.Cancelable)!u32
+
+Relay-mode TLS read for long-lived upgraded tunnels.
+
+Unlike `socket.read()`, this path does **not** apply the stream's configured
+request/response I/O timeout. Instead, it uses low-level nonblocking
+`TLSStream.read()` plus cooperative stdlib readiness waits so mechanics-layer
+relay code can be governed by caller cancellation and idle policy.
+
+Use this only for post-upgrade/full-duplex relay code such as WebSocket or raw
+h2 tunnel forwarding.
+
+### Socket.TLS.TLSSocket.write_all_relay(io, data) (SocketError || Io.Cancelable)!void
+
+Relay-mode TLS full-write helper for long-lived upgraded tunnels.
+
+Unlike `socket.write()` / `socket.write_all()`, this preserves low-level TLS
+backpressure handling (`WantRead` / `WantWrite`) instead of imposing bounded
+request/response I/O deadlines on the relay stream.
+
+Use this only for post-upgrade/full-duplex relay code such as WebSocket or raw
+h2 tunnel forwarding.
 
 ### socket.close() void
 
@@ -255,6 +282,7 @@ try socket.write_all(response);
 | Zero-copy splice only for plain/kTLS | TLS requires encryption/decryption - can't splice ciphertext |
 | SNI max 253 chars | RFC 6066 limit, bounded stack buffer (no allocation) |
 | SocketError unifies errors | Single error type for both plain and TLS operations |
+| Explicit TLSSocket relay methods | Long-lived upgraded tunnels must not inherit request/response TLS timeout semantics |
 | u32 return for read/write | TigerStyle S2: explicit bounded type instead of usize |
 | Bulk ops: write_all, read_at_least | Common patterns with bounded retry loops |
 
