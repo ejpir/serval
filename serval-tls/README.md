@@ -38,10 +38,12 @@ No business logic, only protocol implementation. Sits alongside serval-http and 
 - `TLSStream` - Unified TLS stream interface
   - `initServer()` / `initClient()` - Server/client TLS setup with default handshake + I/O timeouts from `serval-core.config.TlsConfig`
   - `initServerWithTimeouts()` / `initClientWithTimeouts()` - Server/client TLS setup with explicit handshake + I/O timeouts
-  - `read()` - Non-blocking TLS read primitive (returns `error.WantRead` / `error.WantWrite` on SSL backpressure)
-  - `readBounded()` / `readWithTimeout()` - TLS read with stored or explicit timeout enforcement
-  - `write()` - Non-blocking TLS write primitive
-  - `writeBounded()` / `writeWithTimeout()` - TLS write with stored or explicit timeout enforcement
+  - `readStep()` - Single non-blocking TLS read step (`bytes` / `closed` / `need_read` / `need_write`)
+  - `read()` - Non-blocking TLS read primitive (legacy compatibility mapping for `error.WantRead` / `error.WantWrite`)
+  - `readBounded()` / `readWithTimeout()` - TLS read with stored or explicit timeout enforcement (internally step-driven)
+  - `writeStep()` - Single non-blocking TLS write step (`bytes` / `closed` / `need_read` / `need_write`)
+  - `write()` - Non-blocking TLS write primitive (legacy compatibility mapping for `error.WantRead` / `error.WantWrite`)
+  - `writeBounded()` / `writeWithTimeout()` - TLS write with stored or explicit timeout enforcement (internally step-driven)
   - `close()` - Quiet TLS shutdown for deterministic teardown without peer-close `SIGPIPE`
   - `isKtls()` - Check if kTLS kernel offload is active (zero overhead)
   - `queryKtlsStatus()` - Get detailed kTLS TX/RX status (for diagnostics)
@@ -75,9 +77,9 @@ No business logic, only protocol implementation. Sits alongside serval-http and 
 - [x] Server certificate loading
 - [x] Client SNI support
 - [x] Upstream certificate verification (optional via `verify_upstream`)
-- [x] Non-blocking read/write primitives plus bounded timeout-enforcing wrappers
-- [x] Explicit `WantRead` vs `WantWrite` TLS read signaling for callers that
-  need direction-aware readiness handling
+- [x] Non-blocking step primitives (`readStep`/`writeStep`) plus bounded timeout-enforcing wrappers
+- [x] Compatibility `read`/`write` APIs preserving explicit `WantRead` vs `WantWrite`
+  signaling for existing callers
 - [x] Graceful shutdown (close_notify)
 - [x] Read-side diagnostics for `close_notify`, peer resets, and TLS protocol failures
 
