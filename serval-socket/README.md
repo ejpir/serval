@@ -31,6 +31,10 @@ This allows higher-level modules (pool, proxy, client, server) to work with sock
 | `socket.write(data)` | Write data to socket |
 | `socket.write_all(data)` | Write all bytes (handles partial writes) |
 | `socket.read_at_least(buf, min_bytes)` | Read at least min_bytes |
+| `terminated.readWithTimeout(socket, out, timeout_ns)` | Unified terminated read outcome (plain+TLS) |
+| `terminated.writeWithTimeout(socket, data, timeout_ns)` | Unified terminated write outcome (plain+TLS) |
+| `ReadOutcome` / `WriteOutcome` | Progress/closed/timeout result unions for terminated driver |
+| `DriverError` | Fatal terminated-driver transport errors |
 | `socket.close()` | Close socket and free resources |
 | `socket.get_fd()` | Get raw fd for splice/poll |
 | `socket.is_tls()` | Check if TLS socket |
@@ -144,6 +148,28 @@ Read at least min_bytes into buffer.
 - `min_bytes`: Minimum bytes to read (must be > 0 and <= buf.len)
 
 **Returns:** Total bytes read (may be more than min_bytes)
+
+### terminated.readWithTimeout(socket, out, timeout_ns) DriverError!ReadOutcome
+
+Bounded transport read driver for terminated protocol loops.
+
+- Works with both plain and TLS sockets.
+- Uses socket/TLS step APIs plus centralized readiness waits.
+- Returns `.bytes`, `.closed`, or `.timeout` instead of exposing TLS
+  `WantRead` / `WantWrite` to protocol drivers.
+
+Use this for terminated request/response drivers (for example h1/h2 server
+frame/request loops) that should not own transport retry choreography.
+
+### terminated.writeWithTimeout(socket, data, timeout_ns) DriverError!WriteOutcome
+
+Bounded transport write driver for terminated protocol loops.
+
+- Works with both plain and TLS sockets.
+- Preserves TLS direction flips internally (`need_read`/`need_write`).
+- Returns `.bytes`, `.closed`, or `.timeout` outcomes.
+
+Use this for terminated request/response driver write paths.
 
 ### Socket.TLS.TLSSocket.read_relay(io, buf) (SocketError || Io.Cancelable)!u32
 
