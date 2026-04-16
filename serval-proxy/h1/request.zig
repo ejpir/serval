@@ -63,9 +63,12 @@ pub const buildRequestBuffer = client_request.buildRequestBuffer;
 // Proxy-specific Request Sending (adapts Connection to Socket)
 // =============================================================================
 
-/// Send buffer to connection using fiber-safe I/O for plain sockets.
-/// TLS falls back to blocking writes because handshake/state transitions
-/// cannot safely yield mid-operation.
+/// Sends all bytes from `data` to `conn`.
+/// Preconditions: `data.len > 0`, `conn` must reference a live borrowed connection/socket, and `io`
+/// must be valid for plain-socket writes.
+/// Plain sockets use bounded fiber-safe writes via `io.vtable.netWrite`; TLS sockets delegate to
+/// `client_request.sendBufferToSocket` and map client write failures into `ForwardError.SendFailed`.
+/// Returns `ForwardError` when progress cannot be made or when an underlying write operation fails.
 pub fn sendBuffer(conn: *Connection, io: Io, data: []const u8) ForwardError!void {
     assert(data.len > 0); // S1: precondition - data must not be empty
 
@@ -103,9 +106,12 @@ fn sendBody(conn: *Connection, io: Io, body: []const u8) ForwardError!void {
     try sendBuffer(conn, io, body);
 }
 
-/// Send complete HTTP request (headers + body) to connection.
-/// effective_path: If set, use this path instead of request.path (for path rewriting).
-/// TigerStyle: Explicit io parameter for async I/O.
+/// Sends one full HTTP/1.1 request (headers then optional body) to `conn`.
+/// Preconditions: effective path (`effective_path` or `request.path`) must be non-empty, and caller
+/// keeps borrowed `conn`/`request` inputs alive for the full send operation.
+/// Builds headers into a fixed stack buffer; serialization overflow is reported as
+/// `ForwardError.SendFailed`.
+/// Returns `ForwardError` when header build/write or body write fails.
 pub fn sendRequest(conn: *Connection, io: Io, request: *const Request, effective_path: ?[]const u8) ForwardError!void {
     // Use effective_path if provided, otherwise use request.path
     const path = effective_path orelse request.path;

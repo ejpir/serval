@@ -62,9 +62,11 @@ pub const ConnectionState = struct {
         self.flow = try h2.ConnectionFlowControl.init(runtime_cfg.connection_window_size_bytes);
     }
 
-    /// Records that the HTTP/2 connection preface has been received.
-    /// Returns `error.DuplicatePreface` if the preface was already marked as received.
-    /// On success, flips `preface_received` to `true` and leaves the flow-control state unchanged.
+    /// Marks that the HTTP/2 client connection preface has been received.
+    /// Preconditions: `self` is a valid borrowed connection-state pointer.
+    /// Mutates only connection-state flags (no ownership transfer, no I/O side effects).
+    /// Returns `error.DuplicatePreface` when preface was already marked, otherwise success after setting
+    /// `preface_received = true`.
     pub fn markPrefaceReceived(self: *ConnectionState) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(self.flow.recv_window.available_bytes <= config.H2_MAX_WINDOW_SIZE_BYTES);
@@ -73,9 +75,11 @@ pub const ConnectionState = struct {
         self.preface_received = true;
     }
 
-    /// Records that the local SETTINGS frame has been sent.
-    /// Returns `error.LocalSettingsAlreadySent` if this connection has already sent its local settings.
-    /// On success, marks `local_settings_sent` and sets `local_settings_ack_pending` so the peer's acknowledgment is expected.
+    /// Marks that local SETTINGS has been sent and that peer ACK is now expected.
+    /// Preconditions: `self` is valid and this transition has not already occurred.
+    /// This mutates in-memory connection flags only and does not transfer ownership.
+    /// Returns `error.LocalSettingsAlreadySent` on duplicate transition; on success sets
+    /// `local_settings_sent` and `local_settings_ack_pending`.
     pub fn markLocalSettingsSent(self: *ConnectionState) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(self.local_settings.max_frame_size_bytes == self.runtime_cfg.max_frame_size_bytes);
@@ -119,9 +123,10 @@ pub const ConnectionState = struct {
         self.peer_settings_ack_pending = true;
     }
 
-    /// Marks the peer SETTINGS acknowledgment as sent.
-    /// Requires that a peer SETTINGS ACK is currently pending; this function asserts that precondition.
-    /// On success, clears `peer_settings_ack_pending` so the connection no longer expects to transmit that ACK.
+    /// Marks peer SETTINGS ACK as sent in connection state.
+    /// Preconditions: `self` is a valid borrowed pointer and ACK is currently pending.
+    /// Infallible state transition with no ownership transfer or I/O side effects.
+    /// Clears `peer_settings_ack_pending` so another ACK is not emitted for the same update.
     pub fn markPeerSettingsAckSent(self: *ConnectionState) void {
         assert(@intFromPtr(self) != 0);
         assert(self.peer_settings_ack_pending);
@@ -194,10 +199,10 @@ pub const ConnectionState = struct {
         try self.flow.recv_window.consume(bytes);
     }
 
-    /// Decreases the receive window for a specific stream by `bytes`.
-    /// This delegates to the stream table and propagates any window-management error it returns.
-    /// `stream_id` must identify a nonzero stream ID.
-    /// `bytes` is passed through unchanged to the underlying stream window update.
+    /// Decreases receive-window credit for one tracked stream.
+    /// Preconditions: `self` is valid and `stream_id > 0`.
+    /// Uses borrowed stream-table state owned by `self`; no ownership transfer occurs.
+    /// Returns `Error` from underlying stream/window bookkeeping when decrement cannot be applied.
     pub fn consumeStreamRecvWindow(self: *ConnectionState, stream_id: u32, bytes: u32) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(stream_id > 0);
@@ -214,10 +219,10 @@ pub const ConnectionState = struct {
         try self.flow.recv_window.increment(delta_bytes);
     }
 
-    /// Increases the receive window for a specific stream by `delta_bytes`.
-    /// This delegates to the stream table and propagates any window-management error it returns.
-    /// `stream_id` must identify a nonzero stream ID.
-    /// `delta_bytes` is passed through unchanged to the underlying stream window update.
+    /// Increases receive-window credit for one tracked stream.
+    /// Preconditions: `self` is valid and `stream_id > 0`.
+    /// Uses borrowed stream-table state owned by `self`; no ownership transfer occurs.
+    /// Returns `Error` from stream/window bookkeeping when increment cannot be applied.
     pub fn incrementStreamRecvWindow(self: *ConnectionState, stream_id: u32, delta_bytes: u32) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(stream_id > 0);
@@ -234,10 +239,10 @@ pub const ConnectionState = struct {
         try self.flow.send_window.consume(bytes);
     }
 
-    /// Decreases the send window for a specific stream by `bytes`.
-    /// This delegates to the stream table and propagates any window-management error it returns.
-    /// `stream_id` must identify a nonzero stream ID.
-    /// `bytes` is passed through unchanged to the underlying stream window update.
+    /// Decreases send-window credit for one tracked stream.
+    /// Preconditions: `self` is valid and `stream_id > 0`.
+    /// Uses borrowed stream-table state owned by `self`; no ownership transfer occurs.
+    /// Returns `Error` from stream/window bookkeeping when decrement cannot be applied.
     pub fn consumeStreamSendWindow(self: *ConnectionState, stream_id: u32, bytes: u32) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(stream_id > 0);
@@ -254,20 +259,20 @@ pub const ConnectionState = struct {
         try self.flow.send_window.increment(delta_bytes);
     }
 
-    /// Increases the send window for a specific stream by `delta_bytes`.
-    /// This delegates to the stream table and propagates any window-management error it returns.
-    /// `stream_id` must identify a nonzero stream ID.
-    /// `delta_bytes` is passed through unchanged to the underlying stream window update.
+    /// Increases send-window credit for one tracked stream.
+    /// Preconditions: `self` is valid and `stream_id > 0`.
+    /// Uses borrowed stream-table state owned by `self`; no ownership transfer occurs.
+    /// Returns `Error` from stream/window bookkeeping when increment cannot be applied.
     pub fn incrementStreamSendWindow(self: *ConnectionState, stream_id: u32, delta_bytes: u32) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(stream_id > 0);
         try self.streams.incrementSendWindow(stream_id, delta_bytes);
     }
 
-    /// Records that a GOAWAY frame has been received from the peer.
-    /// The stored peer last-stream ID is updated only when this is the first GOAWAY or the new ID is smaller.
-    /// This keeps the peer GOAWAY limit monotonic for later stream admission checks.
-    /// `last_stream_id` must be within the HTTP/2 peer-initiated stream ID range.
+    /// Records receipt of peer GOAWAY and updates peer last-stream bound monotonically.
+    /// Preconditions: `self` is valid and `last_stream_id` fits HTTP/2 31-bit stream-id range.
+    /// Infallible in-memory state mutation only; no ownership transfer or I/O side effects.
+    /// Keeps peer GOAWAY admission bound monotonic for subsequent stream-accept checks.
     pub fn markGoAwayReceived(self: *ConnectionState, last_stream_id: u32) void {
         assert(@intFromPtr(self) != 0);
         assert(last_stream_id <= 0x7fff_ffff);
@@ -278,10 +283,10 @@ pub const ConnectionState = struct {
         self.goaway_received = true;
     }
 
-    /// Records that a GOAWAY frame has been sent on this connection.
-    /// The stored last-stream ID is updated only when this is the first GOAWAY or the new ID is smaller.
-    /// This keeps the connection's outgoing GOAWAY limit monotonic.
-    /// `last_stream_id` must be within the HTTP/2 peer-initiated stream ID range.
+    /// Records outbound GOAWAY emission and updates local last-stream bound monotonically.
+    /// Preconditions: `self` is valid and `last_stream_id` fits HTTP/2 31-bit stream-id range.
+    /// Infallible in-memory state mutation only; no ownership transfer or I/O side effects.
+    /// Keeps outgoing GOAWAY bound monotonic for subsequent local stream-admission checks.
     pub fn markGoAwaySent(self: *ConnectionState, last_stream_id: u32) void {
         assert(@intFromPtr(self) != 0);
         assert(last_stream_id <= 0x7fff_ffff);

@@ -198,9 +198,13 @@ pub const ClientConnection = struct {
         try self.writeAll(frame);
     }
 
-    /// Complete the HTTP/2 client handshake by sending the preface and waiting for the peer's settings state.
-    /// Loops until peer settings are received and acknowledged, or until `h2.max_initial_parse_frames` frames have been parsed.
-    /// Returns `error.ConnectionClosing`, `error.UnexpectedHandshakeFrame`, `error.MissingInitialSettings`, or `error.WriteFailed` for the corresponding handshake failure.
+    /// Completes the client HTTP/2 handshake by sending preface+SETTINGS and processing handshake control frames.
+    /// Preconditions: `self` is valid and connection I/O is active; this method borrows `self` and does not
+    /// transfer ownership of connection resources.
+    /// Processing is bounded by `h2.max_initial_parse_frames`; only handshake-legal control actions are
+    /// accepted until peer SETTINGS is received and ACKed.
+    /// Returns `Error` for handshake-state violations and transport failures (for example
+    /// `ConnectionClosing`, `UnexpectedHandshakeFrame`, `MissingInitialSettings`, `WriteFailed`).
     pub fn completeHandshake(self: *ClientConnection) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(h2.max_initial_parse_frames > 0);
@@ -415,9 +419,11 @@ pub const ClientConnection = struct {
         try self.writeAll(frame);
     }
 
-    /// Replenish the connection and stream receive windows after bytes have been consumed.
-    /// A `consumed_bytes` value of zero is a no-op; otherwise both window counters are incremented and WINDOW_UPDATE frames are sent.
-    /// Propagates any error from window accounting, frame निर्माण, or writing either update frame.
+    /// Replenishes connection and stream receive windows after downstream bytes are consumed.
+    /// Preconditions: `stream_id > 0`; `self` is a valid borrowed connection state handle.
+    /// `consumed_bytes == 0` is a no-op; otherwise emits bounded WINDOW_UPDATE frames for connection and stream.
+    /// Returns `Error` for window-accounting failures, frame encoding failures, or write failures while
+    /// sending either WINDOW_UPDATE frame.
     pub fn replenishReceiveWindows(self: *ClientConnection, stream_id: u32, consumed_bytes: u32) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(stream_id > 0);
@@ -498,9 +504,12 @@ pub const ClientConnection = struct {
         return self.receiveActionHandlingControlTimeout(io, .none);
     }
 
-    /// Receive and dispatch the next frame while continuing past control frames.
-    /// Stops after `config.H2_CLIENT_MAX_FRAME_COUNT` control frames and returns `error.FrameLimitExceeded` if that bound is reached.
-    /// Uses `maybe_io` and `timeout` for frame reads, and propagates any I/O, parse, or runtime errors from the underlying receive path.
+    /// Receives frames until a non-control action is produced or the control-frame bound is reached.
+    /// Preconditions: `self` must be valid; frame processing uses borrowed connection/runtime state.
+    /// Uses `maybe_io` and `timeout` for reads and skips internal control actions (SETTINGS ACK/PING ACK)
+    /// by handling them in-line.
+    /// Returns `error.FrameLimitExceeded` when the bounded control-frame loop is exhausted, and otherwise
+    /// propagates I/O, parse, runtime, or control-write failures from the underlying paths.
     pub fn receiveActionHandlingControlTimeout(
         self: *ClientConnection,
         maybe_io: ?Io,

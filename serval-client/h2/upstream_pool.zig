@@ -31,6 +31,7 @@ const HttpProtocol = types.HttpProtocol;
 const Socket = socket_mod.Socket;
 
 const slot_count: usize = config.MAX_UPSTREAMS;
+/// Maximum live HTTP/2 sessions retained per upstream slot (active + rollover/draining states).
 pub const max_sessions_per_upstream: u8 = 2;
 
 /// Error set returned by HTTP/2 upstream pool operations (`acquireOrConnect` and session I/O helpers).

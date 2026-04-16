@@ -110,9 +110,12 @@ pub const SessionState = struct {
         self.peer_settings_ack_pending = false;
     }
 
-    /// Opens a new local request stream and configures its flow-control windows.
-    /// Returns `error.PrefaceNotSent` if the HTTP/2 preface has not been sent yet.
-    /// Returns `error.ConnectionClosing` or `error.MaxConcurrentStreamsExceeded` when the session can no longer accept a local stream; on success, the next local stream id advances by 2.
+    /// Opens a new local request stream and initializes per-stream flow-control windows.
+    /// Preconditions: `self` must be valid and client preface must already be marked sent.
+    /// Returns a borrowed `*h2.H2Stream` pointer owned by session stream storage; pointer validity depends
+    /// on stream presence in `self.streams`.
+    /// Returns `error.PrefaceNotSent`, `error.ConnectionClosing`, or `error.MaxConcurrentStreamsExceeded`
+    /// when a new local stream cannot be opened, otherwise advances next-local-stream-id by 2.
     pub fn openRequestStream(self: *SessionState, end_stream: bool) Error!*h2.H2Stream {
         assert(@intFromPtr(self) != 0);
         assert(self.next_local_stream_id > 0);

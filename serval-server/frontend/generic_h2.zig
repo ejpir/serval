@@ -212,10 +212,12 @@ pub fn GenericTlsH2FrontendHandler(
             self.tracked_generic_request_stream_count = 0;
         }
 
-        /// Processes HEADERS for a new HTTP/2 stream and routes it by request type.
-        /// gRPC requests are tracked and delegated to the bridge handler; extended CONNECT WebSocket requests use the WebSocket path.
-        /// Generic requests may be handled directly by `onRequest`, rejected with a response, or forwarded to an upstream selected from the request context.
-        /// Errors from tracking, upstream setup, or forwarding are returned unless they are translated into an HTTP response.
+        /// Processes HEADERS for a new HTTP/2 stream and routes by request class.
+        /// Preconditions: `self` valid, `stream_id > 0`, and `request`/`writer` are valid borrowed pointers.
+        /// Inputs are borrowed-only; no ownership transfer occurs while dispatching gRPC, extended
+        /// CONNECT WebSocket, or generic proxy/onRequest paths.
+        /// Returns `Error` for tracking/upstream/bridge failures unless the path is converted into an
+        /// explicit HTTP response.
         pub fn handleH2Headers(
             self: *Self,
             stream_id: u32,

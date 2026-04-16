@@ -234,8 +234,12 @@ pub fn Server(
             TlsReloadUnavailable,
         } || TlsReloadControlLockError || ReloadableServerCtxError || ssl.CreateServerCtxFromPemFilesError;
 
-        /// Atomically activate a new server TLS context generation from PEM paths.
-        /// Returns the activated generation number.
+        /// Atomically activates a new server TLS context generation from PEM cert/key paths.
+        /// Preconditions: `self` is valid and PEM paths fit bounded path-length assumptions.
+        /// Uses the published reload manager behind `tls_reload_control_mutex`; no ownership of path slices
+        /// is retained after the call.
+        /// Returns `ReloadServerTlsError` when reload is unavailable, lock acquisition times out, or PEM
+        /// load/activation fails; on success returns the new active generation id.
         pub fn reloadServerTlsFromPemFiles(
             self: *Self,
             cert_path: []const u8,
@@ -254,7 +258,12 @@ pub fn Server(
             return generation;
         }
 
-        /// Read current active server TLS generation.
+        /// Reads the currently active server TLS generation from the published reload manager.
+        /// Preconditions: `self` is valid and TLS reload manager is currently published.
+        /// This call borrows internal manager state under `tls_reload_control_mutex`; no ownership transfer
+        /// occurs.
+        /// Returns `error.TlsReloadUnavailable` when no manager is published, or
+        /// `error.TlsReloadControlLockTimeout` on lock-timeout; otherwise returns active generation id.
         pub fn activeServerTlsGeneration(
             self: *Self,
         ) error{ TlsReloadUnavailable, TlsReloadControlLockTimeout }!u32 {
@@ -328,23 +337,24 @@ pub fn Server(
             };
         }
 
-        /// Clean up server resources.
-        /// TigerStyle: Explicit deinit, pairs with init.
+        /// Cleans up server-owned runtime bookkeeping created by `init`/`run`.
+        /// Preconditions: `self` is valid and not concurrently mutated by another control thread.
+        /// Does not free caller-owned dependencies (for example `client_ctx`); only clears published
+        /// TLS-manager linkage.
+        /// Infallible teardown helper with no ownership transfer.
         pub fn deinit(self: *Self) void {
             // TigerStyle: Client context is owned by caller, not freed here.
             // Defensive reset of published TLS manager pointer for reuse-after-stop flows.
             self.unpublishTlsCtxManager();
         }
 
-        /// Run the server with concurrent connection handling.
-        /// TigerStyle: Explicit resource cleanup with defer.
-        ///
-        /// Parameters:
-        ///   - io: The async I/O runtime
-        ///   - shutdown: Atomic flag to signal shutdown (checked between accepts)
-        ///   - listener_fd_out: Optional pointer to store listener socket FD for external shutdown.
-        ///                      Close this FD from another thread to interrupt accept() and trigger shutdown.
-        ///                      TigerStyle: Explicit shutdown mechanism for testability.
+        /// Runs the server accept loop and connection handling until shutdown or fatal error.
+        /// Preconditions: configured port/listen host are valid and `shutdown` points to live atomic state;
+        /// optional `listener_fd_out` is borrowed for cross-thread shutdown signaling.
+        /// Publishes listener fd when provided, initializes frontend runtime orchestration, and performs
+        /// TLS bootstrap/reload wiring when configured; resources are released via `defer` on all exits.
+        /// Returns startup/runtime errors propagated from frontend preflight, listener setup, TLS context
+        /// setup, orchestration start, or per-connection serve paths.
         pub fn run(
             self: *Self,
             io: Io,
@@ -578,8 +588,10 @@ pub fn Server(
             io: *Io,
             stream: Io.net.Stream,
 
-            /// Write all data to connection (TLS or plain).
-            /// TigerStyle: Maps to connectionWrite with error handling.
+            /// Writes `data` to the associated connection (TLS or plain) via `connectionWrite`.
+            /// `self` fields are borrowed handles; ownership of stream/TLS state remains with caller.
+            /// Empty slices are treated as no-op for streaming helper compatibility.
+            /// Propagates write failures from TLS/plain transport paths.
             pub fn writeAll(self: *TlsWriter, data: []const u8) !void {
                 // S1: Precondition - data must be non-empty for write
                 // Note: Allow empty writes for flexibility (e.g., empty extra_headers)
@@ -954,9 +966,10 @@ pub fn Server(
                 };
             }
 
-            /// Delegates H2 header handling to the wrapped handler.
-            /// Any error returned by the inner handler is surfaced unchanged to the caller.
-            /// `writer` is forwarded unchanged.
+            /// Delegates H2 HEADERS handling to the wrapped inner handler.
+            /// Preconditions: `self`, `request`, and `writer` must be valid borrowed pointers for the call.
+            /// Ownership is not transferred; all inputs are forwarded unchanged.
+            /// Returns any error from the inner handler unchanged.
             pub fn handleH2Headers(
                 self: *@This(),
                 stream_id: u32,
@@ -967,9 +980,10 @@ pub fn Server(
                 return self.inner.handleH2Headers(stream_id, request, end_stream, writer);
             }
 
-            /// Delegates H2 DATA handling to the wrapped handler.
-            /// Any error returned by the inner handler is surfaced unchanged to the caller.
-            /// `writer` is forwarded unchanged.
+            /// Delegates H2 DATA handling to the wrapped inner handler.
+            /// Preconditions: `self` and `writer` are valid borrowed pointers; `payload` is borrowed input.
+            /// No ownership transfer occurs; arguments are passed through unchanged.
+            /// Returns any error from the inner handler unchanged.
             pub fn handleH2Data(
                 self: *@This(),
                 stream_id: u32,
@@ -981,17 +995,19 @@ pub fn Server(
             }
 
             /// Forwards H2 stream-reset notifications to the inner handler when supported.
-            /// The `stream_id` and raw error code are passed through unchanged.
-            /// If the handler does not implement the hook, this is a no-op.
+            /// Preconditions: `self` is valid and `stream_id` is provided by the runtime event source.
+            /// This is ownership-neutral passthrough (no retained references).
+            /// Infallible: if the hook is absent, this call is a no-op.
             pub fn handleH2StreamReset(self: *@This(), stream_id: u32, error_code_raw: u32) void {
                 if (comptime @hasDecl(Handler, "handleH2StreamReset")) {
                     self.inner.handleH2StreamReset(stream_id, error_code_raw);
                 }
             }
 
-            /// Forwards H2 connection-close notifications to the inner handler when supported.
-            /// The `goaway` frame is passed through unchanged.
-            /// If the handler does not implement the hook, this is a no-op.
+            /// Forwards H2 connection-close notification (`GOAWAY`) to the inner handler when supported.
+            /// Preconditions: `self` is valid; `goaway` is borrowed event data from runtime handling.
+            /// Ownership is not transferred and no references are retained after return.
+            /// Infallible passthrough: if the hook is absent, this call is a no-op.
             pub fn handleH2ConnectionClose(self: *@This(), goaway: serval_h2.GoAway) void {
                 if (comptime @hasDecl(Handler, "handleH2ConnectionClose")) {
                     self.inner.handleH2ConnectionClose(goaway);
@@ -1036,10 +1052,10 @@ pub fn Server(
                 }
             }
 
-            /// Records stream completion metrics, tracing, and optional structured logs for a closed H2 stream.
-            /// Removes the stream from local bookkeeping before emitting spans or logs.
-            /// Forwards the close notification to the inner handler when that hook exists.
-            /// `summary` supplies the final status, byte counts, duration, and error metadata.
+            /// Records metrics/tracing/log bookkeeping for a closed H2 stream and forwards close hook.
+            /// Preconditions: `self` is valid; `summary` is borrowed immutable close metadata.
+            /// Removes local stream bookkeeping before emitting spans/logs so ownership remains consistent.
+            /// Infallible close path: hook forwarding is optional and errors are not surfaced from this API.
             pub fn handleH2StreamClose(self: *@This(), summary: h2_server.StreamSummary) void {
                 const status = streamSummaryStatus(summary);
                 if (self.emit_stream_metrics) {
@@ -1425,9 +1441,11 @@ pub fn Server(
                 log.debug("h2 bridge: conn={d} started upstream reader task", .{self.connection_ctx.connection_id});
             }
 
-            /// Stops the upstream-reader background task group if it is running.
-            /// Sets the stop flag, cancels the task group, and clears the started state.
-            /// If no background task was started, this is a no-op.
+            /// Stops the upstream-reader background task group when running.
+            /// Preconditions: `self` is valid; internal group handles are owned by this wrapper.
+            /// Sets stop flag, cancels/awaits the task group, and clears started state.
+            /// Infallible API surface: if no task is active this is a no-op, and cancellation races are
+            /// handled internally.
             pub fn stopH2BackgroundTasks(self: *@This()) void {
                 assert(@intFromPtr(self) != 0);
 
@@ -1498,10 +1516,11 @@ pub fn Server(
                 return null;
             }
 
-            /// Opens a downstream bridge stream for an incoming H2 request and tracks bridge-side state.
-            /// Returns `UpstreamConnectionClosing` for a pending reset and `UnsupportedProtocol` for unsupported upstreams.
-            /// `request` is used to choose the upstream and `end_stream` is forwarded to the bridge open call.
-            /// `writer` is intentionally ignored.
+            /// Opens downstream bridge state for an incoming H2 request stream.
+            /// Preconditions: `self` valid, `stream_id > 0`, and `request` is a valid borrowed pointer.
+            /// `request`/`writer` are borrowed inputs; no ownership is transferred.
+            /// Returns `BridgeError` (including `UpstreamConnectionClosing`, `UnsupportedProtocol`,
+            /// `UpstreamRejected`, and bridge/session/open failures) when stream open cannot proceed.
             pub fn handleH2Headers(
                 self: *@This(),
                 stream_id: u32,
@@ -1571,10 +1590,11 @@ pub fn Server(
                 }
             }
 
-            /// Forwards DATA frames to the downstream bridge for an already-open stream.
-            /// Returns `UpstreamConnectionClosing` if a reset was already recorded for `stream_id`.
-            /// Returns `MissingBinding` when no downstream binding exists for the stream.
-            /// `payload` is sent under the bridge mutex and `writer` is intentionally ignored.
+            /// Forwards H2 DATA for an already-open downstream bridge stream.
+            /// Preconditions: `self` valid and `stream_id > 0`; `payload` is borrowed input bytes.
+            /// Performs bridge lookup under mutex; `writer` is borrowed and intentionally unused.
+            /// Returns `BridgeError` (`UpstreamConnectionClosing`, `MissingBinding`, or downstream bridge
+            /// send/session failures) when data cannot be forwarded safely.
             pub fn handleH2Data(
                 self: *@This(),
                 stream_id: u32,
@@ -1601,10 +1621,11 @@ pub fn Server(
                 try self.bridge.sendDownstreamData(stream_id, payload, end_stream);
             }
 
-            /// Cancels a pending downstream reset for `stream_id` and clears local tracking.
-            /// `stream_id == 0` is ignored. Matching gRPC completion tracking is removed first.
-            /// Bridge cancellation errors for missing bindings, streams, or sessions are swallowed.
-            /// `error_code_raw` is forwarded to the downstream cancel path unchanged.
+            /// Handles downstream stream reset by clearing local tracking and canceling bridge state.
+            /// Preconditions: `self` is valid; `stream_id == 0` is treated as no-op.
+            /// Uses bridge-owned state under mutex; no caller ownership transfer occurs.
+            /// Infallible API boundary: missing-binding/session/stream cancellation errors are intentionally
+            /// swallowed after best-effort cleanup.
             pub fn handleH2StreamReset(self: *@This(), stream_id: u32, error_code_raw: u32) void {
                 assert(@intFromPtr(self) != 0);
                 if (stream_id == 0) return;
@@ -3968,7 +3989,9 @@ pub fn Server(
     };
 }
 
-/// Convenience: Server with minimal overhead
+/// Returns a convenience server type wired with `SimplePool`, `NoopMetrics`, and `NoopTracer`.
+/// Use this when minimal infrastructure customization is desired and defaults are acceptable.
+/// Compile-time helper only: no runtime allocation, ownership, or error behavior at declaration time.
 pub fn MinimalServer(comptime Handler: type) type {
     return Server(Handler, pool_mod.SimplePool, metrics_mod.NoopMetrics, tracing_mod.NoopTracer);
 }
@@ -3980,9 +4003,10 @@ pub fn MinimalServer(comptime Handler: type) type {
 const TestHandler = struct {
     call_count: u32 = 0,
 
-    /// Increments `call_count` and returns a fixed loopback upstream.
-    /// `ctx` and `request` are ignored by this test helper.
-    /// The returned upstream always targets `127.0.0.1:8001` with index `0`.
+    /// Test helper that increments `call_count` and returns a fixed loopback upstream.
+    /// Preconditions: `self` is valid; `ctx`/`request` are borrowed test inputs and intentionally ignored.
+    /// Infallible deterministic selection (no allocation or ownership transfer).
+    /// Always returns upstream `127.0.0.1:8001` with index `0`.
     pub fn selectUpstream(self: *@This(), ctx: *Context, request: *const Request) types.Upstream {
         _ = ctx;
         _ = request;

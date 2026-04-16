@@ -212,7 +212,7 @@ git config core.hooksPath .githooks
 chmod +x .githooks/pre-commit
 ```
 
-That hook runs `zig build audit-pub-consts` before each commit.
+That hook runs `zig build audit-pub-consts` and the staged public-doc quality gate (`python3 scripts/check_doc_quality_gate.py`) before each commit.
 
 ## Examples
 

@@ -150,13 +150,15 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             };
         }
 
-        /// Forward request to upstream, returning response metadata.
-        /// Auto-retries up to `max_stale_retries` on stale pooled connections.
-        /// body_info contains metadata for streaming request body from client.
-        /// parent_span is the root request span for creating child trace spans.
-        /// client_tls is the TLS stream for client connection (for encrypted responses).
-        /// effective_path: If set, use this path instead of request.path (for path rewriting).
-        /// TigerStyle: Takes client stream for async I/O, bounded retries.
+        /// Forwards one downstream HTTP request to `upstream` and returns forwarding telemetry.
+        /// Preconditions: `upstream.port > 0`, and the effective request path (`effective_path` or
+        /// `request.path`) must be non-empty.
+        /// `client_tls`, `request`, and `upstream` are borrowed for the duration of this call; ownership
+        /// is never transferred, and connection ownership is returned to the pool/closed internally.
+        /// Performs bounded stale-connection retries (`max_stale_retries`) before returning failure.
+        /// Returns `ForwardError` on connect/send/receive/body-forwarding failures and policy/protocol
+        /// failures (for example unsupported protocol/body mode); on success returns `ForwardResult` with
+        /// status/byte counts and timing fields.
         pub fn forward(
             self: *Self,
             io: Io,
@@ -268,8 +270,12 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             return result;
         }
 
-        /// Forward a WebSocket upgrade request and switch to tunnel mode on 101.
-        /// Upgraded upstream connections are always closed, never returned to the pool.
+        /// Forwards a WebSocket upgrade request and, on `101`, transitions into tunnel relay mode.
+        /// Preconditions: `upstream.port > 0` and `request.path` must be non-empty.
+        /// `request`, `upstream`, and `initial_client_bytes` are borrowed inputs; this function does not
+        /// take caller ownership and always closes upgraded upstream connections instead of pooling them.
+        /// Returns `ForwardError` for upgrade validation failures, connect/send/receive failures, or tunnel
+        /// relay failures; on success returns `ForwardResult` with status/byte/timing metadata.
         pub fn forwardWebSocket(
             self: *Self,
             io: Io,
@@ -626,17 +632,14 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             return result;
         }
 
-        /// Forward a gRPC HTTP/2 connection by selecting an upstream from the
-        /// first request and then tunneling the full HTTP/2 byte stream
-        /// transparently.
-        ///
-        /// Supported upstream protocol combinations:
-        /// - `.h2c` + plaintext
-        /// - `.h2` + TLS
-        ///
-        /// TigerStyle: Bounded upfront parsing happens in serval-server; this
-        /// path performs raw relay only and never returns the upstream
-        /// connection to the pool.
+        /// Forwards a gRPC HTTP/2 connection by selecting an upstream from the first request and then
+        /// relaying the remaining HTTP/2 byte stream transparently.
+        /// Preconditions: `initial_client_bytes.len > 0`, `upstream.port > 0`, and upstream protocol must
+        /// be either plaintext `.h2c` or TLS `.h2`.
+        /// `request`, `upstream`, and `initial_client_bytes` are borrowed-only inputs; this path never
+        /// transfers ownership to the caller and never returns the upstream connection to the pool.
+        /// Returns `ForwardError.UnsupportedProtocol` for non-gRPC/unsupported protocol combinations,
+        /// otherwise propagates connect and tunnel relay failures as `ForwardError`.
         pub fn forwardGrpcH2c(
             self: *Self,
             io: Io,
@@ -730,10 +733,15 @@ pub fn Forwarder(comptime Pool: type, comptime Tracer: type) type {
             h2_proxy_frame_capacity_usize +
             serval_h2.header_block_capacity_bytes;
 
-        /// Forward an HTTP/1.1 `Upgrade: h2c` gRPC request by translating the
-        /// upgrade exchange into an upstream prior-knowledge h2c session.
-        /// After the initial request is translated, all further HTTP/2 bytes are
-        /// tunneled transparently end-to-end.
+        /// Forwards an HTTP/1.1 `Upgrade: h2c` gRPC request by translating the upgrade handshake
+        /// into an upstream prior-knowledge h2c stream, then relaying HTTP/2 bytes bidirectionally.
+        /// Preconditions: downstream must be plaintext (`client_tls == null`), upstream must be plain
+        /// `.h2c`, request must classify as gRPC, request body framing must not be chunked, and
+        /// `decoded_settings_payload.len` must not exceed the frame-capacity bound.
+        /// `request`, `upstream`, `initial_client_bytes_after_body`, and `decoded_settings_payload` are
+        /// borrowed-only inputs; this function does not take caller ownership of those buffers/pointers.
+        /// Returns `ForwardError.UnsupportedProtocol` when upgrade shape or protocol constraints are
+        /// violated, otherwise propagates connect/send/tunnel failures as `ForwardError`.
         pub fn forwardGrpcH2cUpgrade(
             self: *Self,
             io: Io,

@@ -11,3 +11,6 @@ fi
 
 echo "pre-commit: running pub const ownership audit"
 "${zig_bin}" build audit-pub-consts
+
+echo "pre-commit: running staged public-doc quality gate"
+python3 scripts/check_doc_quality_gate.py

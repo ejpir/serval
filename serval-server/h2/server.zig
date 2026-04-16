@@ -441,10 +441,13 @@ pub const ResponseWriter = struct {
         if (end_stream) try self.finishStream(state);
     }
 
-    /// Send response DATA on an open stream after response headers have been sent.
-    /// Rejects payloads larger than one frame and returns `PendingResponseData` if buffered data is still outstanding.
-    /// An empty payload only emits an empty final DATA frame when `end_stream` is true.
-    /// Otherwise the payload is buffered, flushed according to flow control, and the stream is finalized when the end of stream is reached.
+    /// Sends response DATA on the writer's bound stream after response headers are sent.
+    /// Preconditions: `self` is valid, stream id is non-zero, and writer state exists for the stream;
+    /// `payload` is borrowed input and not retained.
+    /// Empty payload emits only a final empty DATA frame when `end_stream` is true; non-empty payload is
+    /// buffered and flushed under flow-control constraints.
+    /// Returns `Error` for invalid response state, oversized payload, pending buffered data, frame/write
+    /// failures, or tracker/finalization failures.
     pub fn sendData(self: *ResponseWriter, payload: []const u8, end_stream: bool) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(self.stream_id > 0);
@@ -486,10 +489,11 @@ pub const ResponseWriter = struct {
         if (ended_stream) try self.finishStream(state);
     }
 
-    /// Send trailer headers on an open stream after response headers have been sent.
-    /// Fails if the stream state is missing, already closed, or has not emitted headers yet.
-    /// Encodes the trailers into HEADERS/CONTINUATION frames, writes them, marks response end, and finalizes the stream.
-    /// Returns errors from header encoding, frame assembly, write, tracking, or stream finalization.
+    /// Sends trailer headers on an open stream after response headers were emitted.
+    /// Preconditions: `self` is valid, stream id non-zero, and stream response state exists/open.
+    /// `trailers` is borrowed input and not retained after frame encoding.
+    /// Returns `Error` on invalid response state, header/frame encoding, transport write, tracking, or
+    /// stream-finalization failures.
     pub fn sendTrailers(self: *ResponseWriter, trailers: []const Header) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(self.stream_id > 0);
@@ -516,10 +520,11 @@ pub const ResponseWriter = struct {
         try self.finishStream(state);
     }
 
-    /// Send a stream reset using the raw HTTP/2 error code value.
-    /// Requires a live response writer with a positive `stream_id`.
-    /// If response state is still tracked for the stream, the stream is finalized locally after the reset is sent.
-    /// Returns any I/O or runtime error raised while emitting the reset.
+    /// Sends `RST_STREAM` for this writer's stream using raw HTTP/2 error code.
+    /// Preconditions: `self` is valid and `stream_id > 0`.
+    /// Infallible ownership behavior: runtime/writer state remains owned by caller; this function performs
+    /// best-effort local stream finalization when response state is present.
+    /// Returns `Error` for reset-frame emit, write, or stream-finalization failures.
     pub fn sendReset(self: *ResponseWriter, error_code_raw: u32) Error!void {
         assert(@intFromPtr(self) != 0);
         assert(self.stream_id > 0);
@@ -1125,10 +1130,10 @@ pub fn servePlainConnection(
     return servePlainConnectionWithInitialBytes(Handler, handler, runtime_cfg, fd, io, connection_id, &[_]u8{});
 }
 
-/// Serve a TLS connection without any extra initial bytes.
-/// Equivalent to calling `serveTlsConnectionWithInitialBytes(..., &[_]u8{})`.
-/// `tls_stream` is borrowed for the call and is not closed by this helper.
-/// Propagates any error from the underlying TLS connection driver.
+/// Serves one TLS connection without extra pre-read bytes.
+/// Preconditions: `handler` and `tls_stream` are valid borrowed pointers.
+/// `tls_stream` ownership remains with caller and is not closed by this helper.
+/// Returns `Error` propagated from the shared TLS connection driver path.
 pub fn serveTlsConnection(
     comptime Handler: type,
     handler: *Handler,
@@ -1155,10 +1160,11 @@ pub const RunError = h2_bootstrap.H2BootstrapError || frontend.FrontendOrchestra
     OutOfMemory,
 };
 
-/// Start the server accept loop for the configured HTTP/2 listener.
-/// Resolves the listen address, starts the frontend runtime orchestrator, and records the listener fd when `listener_fd_out` is provided.
-/// Accepted connections are handed to per-connection tasks until `shutdown` becomes true.
-/// Returns setup, TLS-configuration, listen, or orchestrator errors from server startup and accept-loop processing.
+/// Starts the HTTP/2 server accept loop for the configured listener.
+/// Preconditions: `handler` and `shutdown` pointers are valid; config listen host/port are valid.
+/// `listener_fd_out`, when provided, is a borrowed atomic slot used for cross-thread shutdown signaling.
+/// Initializes frontend orchestration, listener socket, and optional TLS context bootstrap before serving.
+/// Returns `RunError` for preflight/orchestrator/listen/TLS setup failures and runtime serve-path errors.
 pub fn run(
     comptime Handler: type,
     handler: *Handler,
@@ -1372,10 +1378,11 @@ pub fn servePlainConnectionWithInitialBytesOptions(
     );
 }
 
-/// Serve a TLS connection with pre-read bytes and explicit plain-connection options.
-/// `tls_stream` is borrowed for the call; this wrapper does not take ownership of the TLS stream.
-/// Initializes a connection I/O view over the TLS stream and forwards to the shared connection driver.
-/// Returns any error raised by the shared driver.
+/// Serves one TLS connection with pre-read bytes and explicit plain-connection options.
+/// Preconditions: `handler`/`tls_stream` are valid borrowed pointers.
+/// `tls_stream` remains caller-owned; this wrapper only creates a borrowed I/O view and forwards to the
+/// shared connection driver.
+/// Returns `Error` from shared connection serving path.
 pub fn serveTlsConnectionWithInitialBytesOptions(
     comptime Handler: type,
     handler: *Handler,
