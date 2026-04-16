@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const Io = std.Io;
 const posix = std.posix;
 
 const serval_core = @import("serval-core");
@@ -125,13 +126,16 @@ fn waitForReady(fd: i32, direction: ReadinessDirection, deadline_ns: u64) WaitFo
     if ((revents & events) == 0) return error.ReadinessWaitFailed;
 }
 
-fn plainReadStep(socket: *PlainSocket, out: []u8) DriverError!PlainReadStep {
+fn plainReadStep(socket: *PlainSocket, io: Io, out: []u8) DriverError!PlainReadStep {
     assert(@intFromPtr(socket) != 0);
     assert(out.len > 0);
 
-    const n = posix.read(socket.fd, out) catch |err| switch (err) {
-        error.WouldBlock => return .need_read,
-        error.ConnectionResetByPeer => return .closed,
+    var bufs: [1][]u8 = .{out};
+    const n = io.vtable.netRead(io.userdata, socket.fd, &bufs) catch |err| switch (err) {
+        error.SystemResources => return .need_read,
+        error.ConnectionResetByPeer,
+        error.SocketUnconnected,
+        => return .closed,
         else => return error.TransportFailed,
     };
 
@@ -141,35 +145,15 @@ fn plainReadStep(socket: *PlainSocket, out: []u8) DriverError!PlainReadStep {
     return .{ .bytes = bytes };
 }
 
-fn posixWriteCompat(fd: i32, data: []const u8) anyerror!usize {
-    assert(fd >= 0);
-    assert(data.len > 0);
-
-    if (@hasDecl(posix, "write")) {
-        return posix.write(fd, data);
-    }
-
-    while (true) {
-        const rc = std.c.write(fd, data.ptr, data.len);
-        switch (std.c.errno(rc)) {
-            .SUCCESS => return @intCast(rc),
-            .INTR => continue,
-            .AGAIN => return error.WouldBlock,
-            .PIPE => return error.BrokenPipe,
-            .CONNRESET => return error.ConnectionResetByPeer,
-            else => return error.Unexpected,
-        }
-    }
-}
-
-fn plainWriteStep(socket: *PlainSocket, data: []const u8) DriverError!PlainWriteStep {
+fn plainWriteStep(socket: *PlainSocket, io: Io, data: []const u8) DriverError!PlainWriteStep {
     assert(@intFromPtr(socket) != 0);
     assert(data.len > 0);
 
-    const n = posixWriteCompat(socket.fd, data) catch |err| switch (err) {
-        error.WouldBlock => return .need_write,
+    const write_slices = [_][]const u8{data};
+    const n = io.vtable.netWrite(io.userdata, socket.fd, &.{}, &write_slices, 1) catch |err| switch (err) {
+        error.SystemResources => return .need_write,
         error.ConnectionResetByPeer,
-        error.BrokenPipe,
+        error.SocketUnconnected,
         => return .closed,
         else => return error.TransportFailed,
     };
@@ -186,13 +170,13 @@ fn plainWriteStep(socket: *PlainSocket, data: []const u8) DriverError!PlainWrite
 /// Ownership/lifetime: caller retains ownership of `socket` and `out`.
 /// Failure semantics: returns `DriverError.TransportFailed` on unrecoverable
 /// syscall/TLS failures; otherwise returns `ReadOutcome`.
-pub fn readWithTimeout(socket: *Socket, out: []u8, timeout_ns: u64) DriverError!ReadOutcome {
+pub fn readWithTimeout(socket: *Socket, io: Io, out: []u8, timeout_ns: u64) DriverError!ReadOutcome {
     assert(@intFromPtr(socket) != 0);
     assert(out.len > 0);
     assert(timeout_ns > 0);
 
     const deadline_ns = deadlineFromTimeout(timeout_ns);
-    return readWithDeadline(socket, out, deadline_ns);
+    return readWithDeadline(socket, io, out, deadline_ns);
 }
 
 /// Read bytes until progress, close, or absolute monotonic deadline.
@@ -201,7 +185,7 @@ pub fn readWithTimeout(socket: *Socket, out: []u8, timeout_ns: u64) DriverError!
 /// Ownership/lifetime: caller retains ownership of `socket` and `out`.
 /// Failure semantics: returns `DriverError.TransportFailed` on unrecoverable
 /// syscall/TLS failures; returns `.timeout` when deadline budget expires.
-pub fn readWithDeadline(socket: *Socket, out: []u8, deadline_ns: u64) DriverError!ReadOutcome {
+pub fn readWithDeadline(socket: *Socket, io: Io, out: []u8, deadline_ns: u64) DriverError!ReadOutcome {
     assert(@intFromPtr(socket) != 0);
     assert(out.len > 0);
     assert(deadline_ns > 0);
@@ -213,7 +197,7 @@ pub fn readWithDeadline(socket: *Socket, out: []u8, deadline_ns: u64) DriverErro
 
         switch (socket.*) {
             .plain => |*plain_socket| {
-                const step = try plainReadStep(plain_socket, out);
+                const step = try plainReadStep(plain_socket, io, out);
                 switch (step) {
                     .bytes => |n| return .{ .bytes = n },
                     .closed => return .closed,
@@ -264,13 +248,13 @@ pub fn readWithDeadline(socket: *Socket, out: []u8, deadline_ns: u64) DriverErro
 /// Ownership/lifetime: caller retains ownership of `socket` and `data`.
 /// Failure semantics: returns `DriverError.TransportFailed` on unrecoverable
 /// syscall/TLS failures; otherwise returns `WriteOutcome`.
-pub fn writeWithTimeout(socket: *Socket, data: []const u8, timeout_ns: u64) DriverError!WriteOutcome {
+pub fn writeWithTimeout(socket: *Socket, io: Io, data: []const u8, timeout_ns: u64) DriverError!WriteOutcome {
     assert(@intFromPtr(socket) != 0);
     assert(data.len > 0);
     assert(timeout_ns > 0);
 
     const deadline_ns = deadlineFromTimeout(timeout_ns);
-    return writeWithDeadline(socket, data, deadline_ns);
+    return writeWithDeadline(socket, io, data, deadline_ns);
 }
 
 /// Write bytes until progress, close, or absolute monotonic deadline.
@@ -279,7 +263,7 @@ pub fn writeWithTimeout(socket: *Socket, data: []const u8, timeout_ns: u64) Driv
 /// Ownership/lifetime: caller retains ownership of `socket` and `data`.
 /// Failure semantics: returns `DriverError.TransportFailed` on unrecoverable
 /// syscall/TLS failures; returns `.timeout` when deadline budget expires.
-pub fn writeWithDeadline(socket: *Socket, data: []const u8, deadline_ns: u64) DriverError!WriteOutcome {
+pub fn writeWithDeadline(socket: *Socket, io: Io, data: []const u8, deadline_ns: u64) DriverError!WriteOutcome {
     assert(@intFromPtr(socket) != 0);
     assert(data.len > 0);
     assert(deadline_ns > 0);
@@ -291,7 +275,7 @@ pub fn writeWithDeadline(socket: *Socket, data: []const u8, deadline_ns: u64) Dr
 
         switch (socket.*) {
             .plain => |*plain_socket| {
-                const step = try plainWriteStep(plain_socket, data);
+                const step = try plainWriteStep(plain_socket, io, data);
                 switch (step) {
                     .bytes => |n| return .{ .bytes = n },
                     .closed => return .closed,
@@ -349,7 +333,22 @@ fn setNonblocking(fd: i32) !void {
     if (set_result < 0) return error.Unexpected;
 }
 
+fn testWrite(fd: std.posix.socket_t, data: []const u8) !usize {
+    while (true) {
+        const rc = std.c.write(fd, data.ptr, data.len);
+        switch (std.c.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            else => return error.WriteFailed,
+        }
+    }
+}
+
 test "readWithTimeout returns timeout on idle plain socket" {
+    var evented: std.Io.Evented = undefined;
+    try evented.init(std.testing.allocator, .{ .thread_limit = 0 });
+    defer evented.deinit();
+
     const fds = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
@@ -358,11 +357,15 @@ test "readWithTimeout returns timeout on idle plain socket" {
 
     var socket = Socket.Plain.init_client(fds[0]);
     var out: [8]u8 = undefined;
-    const outcome = try readWithTimeout(&socket, &out, time.millisToNanos(20));
+    const outcome = try readWithTimeout(&socket, evented.io(), &out, time.millisToNanos(20));
     try std.testing.expectEqual(ReadOutcome.timeout, outcome);
 }
 
 test "readWithTimeout returns bytes on plain socket" {
+    var evented: std.Io.Evented = undefined;
+    try evented.init(std.testing.allocator, .{ .thread_limit = 0 });
+    defer evented.deinit();
+
     const fds = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
@@ -370,11 +373,11 @@ test "readWithTimeout returns bytes on plain socket" {
     try setNonblocking(fds[0]);
 
     const payload = [_]u8{ 0x61, 0x62 };
-    try std.testing.expectEqual(@as(usize, payload.len), try posix.write(fds[1], &payload));
+    try std.testing.expectEqual(@as(usize, payload.len), try testWrite(fds[1], &payload));
 
     var socket = Socket.Plain.init_client(fds[0]);
     var out: [8]u8 = undefined;
-    const outcome = try readWithTimeout(&socket, &out, time.millisToNanos(20));
+    const outcome = try readWithTimeout(&socket, evented.io(), &out, time.millisToNanos(20));
     switch (outcome) {
         .bytes => |n| try std.testing.expectEqual(@as(u32, payload.len), n),
         else => return error.TestUnexpectedResult,
@@ -383,6 +386,10 @@ test "readWithTimeout returns bytes on plain socket" {
 }
 
 test "writeWithTimeout writes bytes on plain socket" {
+    var evented: std.Io.Evented = undefined;
+    try evented.init(std.testing.allocator, .{ .thread_limit = 0 });
+    defer evented.deinit();
+
     const fds = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
@@ -391,7 +398,7 @@ test "writeWithTimeout writes bytes on plain socket" {
 
     var socket = Socket.Plain.init_client(fds[0]);
     const payload = [_]u8{ 0x71, 0x72, 0x73 };
-    const outcome = try writeWithTimeout(&socket, &payload, time.millisToNanos(20));
+    const outcome = try writeWithTimeout(&socket, evented.io(), &payload, time.millisToNanos(20));
     switch (outcome) {
         .bytes => |n| try std.testing.expectEqual(@as(u32, payload.len), n),
         else => return error.TestUnexpectedResult,
@@ -403,6 +410,10 @@ test "writeWithTimeout writes bytes on plain socket" {
 }
 
 test "writeWithTimeout returns closed when peer is closed" {
+    var evented: std.Io.Evented = undefined;
+    try evented.init(std.testing.allocator, .{ .thread_limit = 0 });
+    defer evented.deinit();
+
     const fds = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
     defer posix.close(fds[0]);
 
@@ -411,6 +422,6 @@ test "writeWithTimeout returns closed when peer is closed" {
 
     var socket = Socket.Plain.init_client(fds[0]);
     const payload = [_]u8{0x31};
-    const outcome = try writeWithTimeout(&socket, &payload, time.millisToNanos(20));
+    const outcome = try writeWithTimeout(&socket, evented.io(), &payload, time.millisToNanos(20));
     try std.testing.expectEqual(WriteOutcome.closed, outcome);
 }

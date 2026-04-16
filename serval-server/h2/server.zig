@@ -42,9 +42,7 @@ const upgrade_preamble_size_bytes: usize =
     h2.frame_payload_capacity_bytes +
     h2.header_block_capacity_bytes;
 const tls_read_readiness_timeout_ns: u64 = config.H2_SERVER_IDLE_TIMEOUT_NS;
-const write_retry_sleep_ns: u64 = time.ns_per_ms;
 const write_stall_timeout_ns: u64 = 30 * time.ns_per_s;
-const write_max_retry_count: u32 = 30_000;
 const response_send_chunk_size_bytes: usize = h2.frame_payload_capacity_bytes;
 
 const ConnectionIo = union(enum) {
@@ -2698,6 +2696,15 @@ fn discardPrefix(recv_buf: []u8, buffer_len: *usize, prefix_len: usize) void {
     buffer_len.* -= prefix_len;
 }
 
+fn connectionIoSocketView(io_conn: *ConnectionIo) Socket {
+    assert(@intFromPtr(io_conn) != 0);
+
+    return switch (io_conn.*) {
+        .plain_fd => |fd| .{ .plain = .{ .fd = fd } },
+        .tls_stream => |tls_stream| .{ .tls = .{ .fd = tls_stream.fd, .stream = tls_stream.* } },
+    };
+}
+
 fn readSome(
     io_conn: *ConnectionIo,
     maybe_plain_reader: ?*Io.net.Stream.Reader,
@@ -2707,37 +2714,22 @@ fn readSome(
     assert(@intFromPtr(io_conn) != 0);
     assert(out.len > 0);
 
-    return switch (io_conn.*) {
-        .plain_fd => |fd| blk: {
-            _ = maybe_plain_reader;
-            var bufs: [1][]u8 = .{out};
-            const n = io.vtable.netRead(io.userdata, fd, &bufs) catch |read_err| {
-                return switch (read_err) {
-                    error.ConnectionResetByPeer,
-                    error.SocketUnconnected,
-                    => error.ConnectionClosed,
-                    else => error.ReadFailed,
-                };
-            };
-            break :blk n;
-        },
-        .tls_stream => |tls_stream| blk: {
-            var socket_view: Socket = .{ .tls = .{ .fd = tls_stream.fd, .stream = tls_stream.* } };
-            const outcome = terminated_transport.readWithTimeout(&socket_view, out, tls_read_readiness_timeout_ns) catch |driver_err| {
-                log.warn(
-                    "h2: readSome failed transport=tls fd={d} driver_err={s} bytes={d}",
-                    .{ tls_stream.fd, @errorName(driver_err), out.len },
-                );
-                return error.ReadFailed;
-            };
+    _ = maybe_plain_reader;
 
-            break :blk switch (outcome) {
-                .bytes => |n| @as(usize, @intCast(n)),
-                .closed,
-                .timeout,
-                => return error.ConnectionClosed,
-            };
-        },
+    var socket_view = connectionIoSocketView(io_conn);
+    const outcome = terminated_transport.readWithTimeout(&socket_view, io, out, tls_read_readiness_timeout_ns) catch |driver_err| {
+        log.warn(
+            "h2: readSome failed transport={s} fd={d} driver_err={s} bytes={d}",
+            .{ connectionIoTransportName(io_conn), connectionIoFd(io_conn), @errorName(driver_err), out.len },
+        );
+        return error.ReadFailed;
+    };
+
+    return switch (outcome) {
+        .bytes => |n| @as(usize, @intCast(n)),
+        .closed,
+        .timeout,
+        => error.ConnectionClosed,
     };
 }
 
@@ -2745,50 +2737,19 @@ fn writeSome(io_conn: *ConnectionIo, io: Io, out: []const u8) Error!usize {
     assert(@intFromPtr(io_conn) != 0);
     assert(out.len > 0);
 
-    return switch (io_conn.*) {
-        .plain_fd => |fd| blk: {
-            var write_buf: [config.SERVER_WRITE_BUFFER_SIZE_BYTES]u8 = undefined;
-            var writer = rawStreamForFd(fd).writer(io, &write_buf);
-            writer.interface.writeAll(out) catch {
-                const write_err = writer.err orelse error.Unexpected;
-                return switch (write_err) {
-                    error.SystemResources => error.WouldBlock,
-                    error.ConnectionResetByPeer,
-                    error.SocketUnconnected,
-                    => error.ConnectionClosed,
-                    else => error.WriteFailed,
-                };
-            };
-            if (writer.interface.buffered().len > 0) {
-                writer.interface.flush() catch {
-                    const flush_err = writer.err orelse error.Unexpected;
-                    return switch (flush_err) {
-                        error.SystemResources => error.WouldBlock,
-                        error.ConnectionResetByPeer,
-                        error.SocketUnconnected,
-                        => error.ConnectionClosed,
-                        else => error.WriteFailed,
-                    };
-                };
-            }
-            break :blk out.len;
-        },
-        .tls_stream => |tls_stream| blk: {
-            var socket_view: Socket = .{ .tls = .{ .fd = tls_stream.fd, .stream = tls_stream.* } };
-            const outcome = terminated_transport.writeWithTimeout(&socket_view, out, write_retry_sleep_ns) catch |driver_err| {
-                log.warn(
-                    "h2: writeSome failed transport=tls fd={d} driver_err={s} bytes={d}",
-                    .{ tls_stream.fd, @errorName(driver_err), out.len },
-                );
-                return error.WriteFailed;
-            };
+    var socket_view = connectionIoSocketView(io_conn);
+    const outcome = terminated_transport.writeWithTimeout(&socket_view, io, out, write_stall_timeout_ns) catch |driver_err| {
+        log.warn(
+            "h2: writeSome failed transport={s} fd={d} driver_err={s} bytes={d}",
+            .{ connectionIoTransportName(io_conn), connectionIoFd(io_conn), @errorName(driver_err), out.len },
+        );
+        return error.WriteFailed;
+    };
 
-            break :blk switch (outcome) {
-                .bytes => |n| @as(usize, @intCast(n)),
-                .closed => return error.ConnectionClosed,
-                .timeout => return error.WouldBlock,
-            };
-        },
+    return switch (outcome) {
+        .bytes => |n| @as(usize, @intCast(n)),
+        .closed => error.ConnectionClosed,
+        .timeout => error.WriteFailed,
     };
 }
 
@@ -2825,46 +2786,18 @@ fn connectionIoFd(io_conn: *const ConnectionIo) i32 {
 
 fn writeAll(io_conn: *ConnectionIo, io: Io, data: []const u8) Error!void {
     assert(@intFromPtr(io_conn) != 0);
-    assert(write_max_retry_count > 0);
+    assert(write_stall_timeout_ns > 0);
 
     if (data.len == 0) return;
 
     var written: usize = 0;
     var writes: usize = 0;
     const max_writes: usize = data.len + 1024;
-    var retry_count: u32 = 0;
-    var last_progress_ns: u64 = time.monotonicNanos();
 
     while (written < data.len and writes < max_writes) : (writes += 1) {
-        const n = writeSome(io_conn, io, data[written..]) catch |err| switch (err) {
-            error.WouldBlock => {
-                retry_count += 1;
-                const now_ns = time.monotonicNanos();
-                const since_progress_ns = now_ns -| last_progress_ns;
-                if (retry_count >= write_max_retry_count or since_progress_ns >= write_stall_timeout_ns) {
-                    log.warn(
-                        "h2: writeAll stalled transport={s} fd={d} written={d}/{d} retries={d} since_progress_ns={d}",
-                        .{
-                            connectionIoTransportName(io_conn),
-                            connectionIoFd(io_conn),
-                            written,
-                            data.len,
-                            retry_count,
-                            since_progress_ns,
-                        },
-                    );
-                    return error.WriteFailed;
-                }
-                std.Io.sleep(io, std.Io.Duration.fromNanoseconds(write_retry_sleep_ns), .awake) catch return error.WriteFailed;
-                continue;
-            },
-            else => return err,
-        };
-
+        const n = try writeSome(io_conn, io, data[written..]);
         if (n == 0) return error.ConnectionClosed;
         written += n;
-        retry_count = 0;
-        last_progress_ns = time.monotonicNanos();
     }
 
     if (written < data.len) {

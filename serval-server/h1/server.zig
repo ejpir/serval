@@ -526,7 +526,7 @@ pub fn Server(
 
             if (maybe_tls) |tls| {
                 var socket_view = makeTlsSocketView(tls);
-                const outcome = terminated_transport.readWithTimeout(&socket_view, buf, tls.io_timeout_ns) catch |driver_err| {
+                const outcome = terminated_transport.readWithTimeout(&socket_view, io.*, buf, tls.io_timeout_ns) catch |driver_err| {
                     log.debug(
                         "server: conn={d} TLS read driver error: {s}",
                         .{ conn_id, @errorName(driver_err) },
@@ -592,7 +592,7 @@ pub fn Server(
                 var iterations: u32 = 0;
                 while (written < data.len and iterations < Socket.max_write_iterations_count) : (iterations += 1) {
                     var socket_view = makeTlsSocketView(tls);
-                    const outcome = terminated_transport.writeWithTimeout(&socket_view, data[written..], tls.io_timeout_ns) catch |driver_err| {
+                    const outcome = terminated_transport.writeWithTimeout(&socket_view, io.*, data[written..], tls.io_timeout_ns) catch |driver_err| {
                         log.debug("server: TLS write driver error: {s}", .{@errorName(driver_err)});
                         return error.WriteFailed;
                     };
