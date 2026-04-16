@@ -43,6 +43,9 @@ const TLSStream = serval_tls.TLSStream;
 const ReloadableServerCtx = serval_tls.ReloadableServerCtx;
 const ReloadableServerCtxError = serval_tls.ReloadableServerCtxError;
 const HandshakeInfo = serval_tls.HandshakeInfo;
+const serval_socket = @import("serval-socket");
+const Socket = serval_socket.Socket;
+const terminated_transport = serval_socket.terminated;
 
 // Local h1 modules
 const connection = @import("connection.zig");
@@ -499,6 +502,14 @@ pub fn Server(
             return connectionRead(ctx.maybe_tls, ctx.io, ctx.stream, ctx.plain_reader, buf, ctx.conn_id);
         }
 
+        fn makeTlsSocketView(tls: *const TLSStream) Socket {
+            assert(@intFromPtr(tls) != 0);
+            assert(tls.fd >= 0);
+
+            const tls_copy = tls.*;
+            return .{ .tls = .{ .fd = tls.fd, .stream = tls_copy } };
+        }
+
         /// Read from connection (TLS or plain socket).
         /// Plain sockets stay on std.Io so fibers, readiness, and cancellation remain intact.
         /// TigerStyle: Explicit reads, deterministic behavior, no raw syscall bypass.
@@ -514,12 +525,21 @@ pub fn Server(
             assert(@intFromPtr(io) != 0); // S1: precondition
 
             if (maybe_tls) |tls| {
-                var mutable_tls = tls.*;
-                const n = mutable_tls.readBounded(buf) catch |err| {
-                    log.debug("server: conn={d} TLS read error: {s}", .{ conn_id, @errorName(err) });
+                var socket_view = makeTlsSocketView(tls);
+                const outcome = terminated_transport.readWithTimeout(&socket_view, buf, tls.io_timeout_ns) catch |driver_err| {
+                    log.debug(
+                        "server: conn={d} TLS read driver error: {s}",
+                        .{ conn_id, @errorName(driver_err) },
+                    );
                     return null;
                 };
-                return n;
+
+                return switch (outcome) {
+                    .bytes => |n| @as(usize, @intCast(n)),
+                    .closed,
+                    .timeout,
+                    => null,
+                };
             } else {
                 var fallback_reader_buf: [PLAIN_STREAM_READER_BUFFER_SIZE_BYTES]u8 = undefined;
                 var fallback_stream_reader = stream.reader(io.*, &fallback_reader_buf);
@@ -568,8 +588,28 @@ pub fn Server(
             assert(data.len > 0); // S1: precondition
 
             if (maybe_tls) |tls| {
-                var mutable_tls = tls.*;
-                _ = try mutable_tls.writeBounded(data);
+                var written: usize = 0;
+                var iterations: u32 = 0;
+                while (written < data.len and iterations < Socket.max_write_iterations_count) : (iterations += 1) {
+                    var socket_view = makeTlsSocketView(tls);
+                    const outcome = terminated_transport.writeWithTimeout(&socket_view, data[written..], tls.io_timeout_ns) catch |driver_err| {
+                        log.debug("server: TLS write driver error: {s}", .{@errorName(driver_err)});
+                        return error.WriteFailed;
+                    };
+
+                    switch (outcome) {
+                        .bytes => |n| {
+                            if (n == 0) return error.WriteFailed;
+                            written += @as(usize, @intCast(n));
+                            assert(written <= data.len);
+                        },
+                        .closed => return error.ConnectionClosed,
+                        .timeout => return error.Timeout,
+                    }
+                }
+
+                if (written < data.len) return error.WriteFailed;
+                assert(written == data.len);
             } else {
                 // Plain socket write (blocking - fiber yields to scheduler until send buffer accepts data)
                 var write_buf: [config.SERVER_WRITE_BUFFER_SIZE_BYTES]u8 =

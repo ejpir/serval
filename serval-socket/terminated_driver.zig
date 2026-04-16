@@ -141,11 +141,32 @@ fn plainReadStep(socket: *PlainSocket, out: []u8) DriverError!PlainReadStep {
     return .{ .bytes = bytes };
 }
 
+fn posixWriteCompat(fd: i32, data: []const u8) anyerror!usize {
+    assert(fd >= 0);
+    assert(data.len > 0);
+
+    if (@hasDecl(posix, "write")) {
+        return posix.write(fd, data);
+    }
+
+    while (true) {
+        const rc = std.c.write(fd, data.ptr, data.len);
+        switch (std.c.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .PIPE => return error.BrokenPipe,
+            .CONNRESET => return error.ConnectionResetByPeer,
+            else => return error.Unexpected,
+        }
+    }
+}
+
 fn plainWriteStep(socket: *PlainSocket, data: []const u8) DriverError!PlainWriteStep {
     assert(@intFromPtr(socket) != 0);
     assert(data.len > 0);
 
-    const n = posix.write(socket.fd, data) catch |err| switch (err) {
+    const n = posixWriteCompat(socket.fd, data) catch |err| switch (err) {
         error.WouldBlock => return .need_write,
         error.ConnectionResetByPeer,
         error.BrokenPipe,

@@ -25,6 +25,9 @@ const set_tcp_no_delay = serval_net.set_tcp_no_delay;
 const serval_tls = @import("serval-tls");
 const TLSStream = serval_tls.TLSStream;
 const ssl = serval_tls.ssl;
+const serval_socket = @import("serval-socket");
+const Socket = serval_socket.Socket;
+const terminated_transport = serval_socket.terminated;
 
 const Request = types.Request;
 
@@ -2719,12 +2722,21 @@ fn readSome(
             break :blk n;
         },
         .tls_stream => |tls_stream| blk: {
-            const n: u32 = tls_stream.readWithTimeout(out, tls_read_readiness_timeout_ns) catch |err| switch (err) {
-                error.Timeout => return error.ConnectionClosed,
-                error.ConnectionReset => return error.ConnectionClosed,
-                else => return error.ReadFailed,
+            var socket_view: Socket = .{ .tls = .{ .fd = tls_stream.fd, .stream = tls_stream.* } };
+            const outcome = terminated_transport.readWithTimeout(&socket_view, out, tls_read_readiness_timeout_ns) catch |driver_err| {
+                log.warn(
+                    "h2: readSome failed transport=tls fd={d} driver_err={s} bytes={d}",
+                    .{ tls_stream.fd, @errorName(driver_err), out.len },
+                );
+                return error.ReadFailed;
             };
-            break :blk @intCast(n);
+
+            break :blk switch (outcome) {
+                .bytes => |n| @as(usize, @intCast(n)),
+                .closed,
+                .timeout,
+                => return error.ConnectionClosed,
+            };
         },
     };
 }
@@ -2762,18 +2774,20 @@ fn writeSome(io_conn: *ConnectionIo, io: Io, out: []const u8) Error!usize {
             break :blk out.len;
         },
         .tls_stream => |tls_stream| blk: {
-            const n: u32 = tls_stream.write(out) catch |err| switch (err) {
-                error.WantRead, error.WantWrite => return error.WouldBlock,
-                error.ConnectionReset => return error.ConnectionClosed,
-                else => {
-                    log.warn(
-                        "h2: writeSome failed transport=tls fd={d} tls_err={s} bytes={d}",
-                        .{ tls_stream.fd, @errorName(err), out.len },
-                    );
-                    return error.WriteFailed;
-                },
+            var socket_view: Socket = .{ .tls = .{ .fd = tls_stream.fd, .stream = tls_stream.* } };
+            const outcome = terminated_transport.writeWithTimeout(&socket_view, out, write_retry_sleep_ns) catch |driver_err| {
+                log.warn(
+                    "h2: writeSome failed transport=tls fd={d} driver_err={s} bytes={d}",
+                    .{ tls_stream.fd, @errorName(driver_err), out.len },
+                );
+                return error.WriteFailed;
             };
-            break :blk @intCast(n);
+
+            break :blk switch (outcome) {
+                .bytes => |n| @as(usize, @intCast(n)),
+                .closed => return error.ConnectionClosed,
+                .timeout => return error.WouldBlock,
+            };
         },
     };
 }
