@@ -10,7 +10,6 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const Io = std.Io;
-const posix = std.posix;
 
 const serval_core = @import("serval-core");
 const config = serval_core.config;
@@ -26,6 +25,9 @@ const set_tcp_no_delay = serval_net.set_tcp_no_delay;
 const serval_tls = @import("serval-tls");
 const TLSStream = serval_tls.TLSStream;
 const ssl = serval_tls.ssl;
+const serval_socket = @import("serval-socket");
+const Socket = serval_socket.Socket;
+const terminated_transport = serval_socket.terminated;
 
 const Request = types.Request;
 
@@ -39,11 +41,8 @@ const upgrade_preamble_size_bytes: usize =
     (2 * h2.frame_header_size_bytes) +
     h2.frame_payload_capacity_bytes +
     h2.header_block_capacity_bytes;
-const read_max_retry_count: u32 = 30_000;
 const tls_read_readiness_timeout_ns: u64 = config.H2_SERVER_IDLE_TIMEOUT_NS;
-const write_retry_sleep_ns: u64 = time.ns_per_ms;
 const write_stall_timeout_ns: u64 = 30 * time.ns_per_s;
-const write_max_retry_count: u32 = 30_000;
 const response_send_chunk_size_bytes: usize = h2.frame_payload_capacity_bytes;
 
 const ConnectionIo = union(enum) {
@@ -1424,8 +1423,19 @@ fn serveConnectionWithInitialBytesOptions(
     assert(@intFromPtr(io_conn) != 0);
     assert(initial_bytes.len <= read_buffer_size_bytes);
 
-    const connection_storage = try std.heap.page_allocator.create(ConnectionStorage);
-    errdefer std.heap.page_allocator.destroy(connection_storage);
+    const connection_allocator = std.heap.page_allocator;
+
+    var connection_storage_ptr: ?*ConnectionStorage = null;
+    var response_states_ptr: ?*ResponseStateTable = null;
+    var stream_trackers_ptr: ?*StreamTrackerTable = null;
+    defer {
+        if (stream_trackers_ptr) |ptr| connection_allocator.destroy(ptr);
+        if (response_states_ptr) |ptr| connection_allocator.destroy(ptr);
+        if (connection_storage_ptr) |ptr| connection_allocator.destroy(ptr);
+    }
+
+    connection_storage_ptr = try connection_allocator.create(ConnectionStorage);
+    const connection_storage = connection_storage_ptr.?;
     connection_storage.* = .{};
     var runtime: runtime_mod.Runtime = undefined;
     try runtime.initInto(
@@ -1434,17 +1444,12 @@ fn serveConnectionWithInitialBytesOptions(
         &connection_storage.request_header_storage,
         &connection_storage.request_fields_storage,
     );
-    const response_states = try std.heap.page_allocator.create(ResponseStateTable);
-    errdefer std.heap.page_allocator.destroy(response_states);
+    response_states_ptr = try connection_allocator.create(ResponseStateTable);
+    const response_states = response_states_ptr.?;
     response_states.* = .{};
-    const stream_trackers = try std.heap.page_allocator.create(StreamTrackerTable);
-    errdefer std.heap.page_allocator.destroy(stream_trackers);
+    stream_trackers_ptr = try connection_allocator.create(StreamTrackerTable);
+    const stream_trackers = stream_trackers_ptr.?;
     stream_trackers.* = .{};
-    defer {
-        std.heap.page_allocator.destroy(stream_trackers);
-        std.heap.page_allocator.destroy(response_states);
-        std.heap.page_allocator.destroy(connection_storage);
-    }
     var connection_mutex: Io.Mutex = .init;
     var plain_reader: Io.net.Stream.Reader = undefined;
     const maybe_plain_reader = initMaybePlainReader(io_conn, io, &connection_storage.plain_read_buf, &plain_reader);
@@ -1606,8 +1611,19 @@ pub fn serveUpgradedConnection(
     assert(initial_client_h2_bytes.len <= read_buffer_size_bytes);
 
     var io_conn = ConnectionIo.initPlain(fd);
-    const connection_storage = try std.heap.page_allocator.create(ConnectionStorage);
-    errdefer std.heap.page_allocator.destroy(connection_storage);
+    const connection_allocator = std.heap.page_allocator;
+
+    var connection_storage_ptr: ?*ConnectionStorage = null;
+    var response_states_ptr: ?*ResponseStateTable = null;
+    var stream_trackers_ptr: ?*StreamTrackerTable = null;
+    defer {
+        if (stream_trackers_ptr) |ptr| connection_allocator.destroy(ptr);
+        if (response_states_ptr) |ptr| connection_allocator.destroy(ptr);
+        if (connection_storage_ptr) |ptr| connection_allocator.destroy(ptr);
+    }
+
+    connection_storage_ptr = try connection_allocator.create(ConnectionStorage);
+    const connection_storage = connection_storage_ptr.?;
     connection_storage.* = .{};
     var plain_reader = rawStreamForFd(fd).reader(io, &connection_storage.plain_read_buf);
     var runtime: runtime_mod.Runtime = undefined;
@@ -1617,17 +1633,12 @@ pub fn serveUpgradedConnection(
         &connection_storage.request_header_storage,
         &connection_storage.request_fields_storage,
     );
-    const response_states = try std.heap.page_allocator.create(ResponseStateTable);
-    errdefer std.heap.page_allocator.destroy(response_states);
+    response_states_ptr = try connection_allocator.create(ResponseStateTable);
+    const response_states = response_states_ptr.?;
     response_states.* = .{};
-    const stream_trackers = try std.heap.page_allocator.create(StreamTrackerTable);
-    errdefer std.heap.page_allocator.destroy(stream_trackers);
+    stream_trackers_ptr = try connection_allocator.create(StreamTrackerTable);
+    const stream_trackers = stream_trackers_ptr.?;
     stream_trackers.* = .{};
-    defer {
-        std.heap.page_allocator.destroy(stream_trackers);
-        std.heap.page_allocator.destroy(response_states);
-        std.heap.page_allocator.destroy(connection_storage);
-    }
     var connection_mutex: Io.Mutex = .init;
     try bootstrapUpgradedConnection(
         Handler,
@@ -2685,6 +2696,15 @@ fn discardPrefix(recv_buf: []u8, buffer_len: *usize, prefix_len: usize) void {
     buffer_len.* -= prefix_len;
 }
 
+fn connectionIoSocketView(io_conn: *ConnectionIo) Socket {
+    assert(@intFromPtr(io_conn) != 0);
+
+    return switch (io_conn.*) {
+        .plain_fd => |fd| .{ .plain = .{ .fd = fd } },
+        .tls_stream => |tls_stream| .{ .tls = .{ .fd = tls_stream.fd, .stream = tls_stream.* } },
+    };
+}
+
 fn readSome(
     io_conn: *ConnectionIo,
     maybe_plain_reader: ?*Io.net.Stream.Reader,
@@ -2694,67 +2714,22 @@ fn readSome(
     assert(@intFromPtr(io_conn) != 0);
     assert(out.len > 0);
 
-    return switch (io_conn.*) {
-        .plain_fd => |fd| blk: {
-            _ = maybe_plain_reader;
-            var bufs: [1][]u8 = .{out};
-            const n = io.vtable.netRead(io.userdata, fd, &bufs) catch |read_err| {
-                return switch (read_err) {
-                    error.ConnectionResetByPeer,
-                    error.SocketUnconnected,
-                    => error.ConnectionClosed,
-                    else => error.ReadFailed,
-                };
-            };
-            break :blk n;
-        },
-        .tls_stream => |tls_stream| blk: {
-            const readiness_timeout = timeoutForNanoseconds(tls_read_readiness_timeout_ns);
-            var retry_count: u32 = 0;
-            while (retry_count < read_max_retry_count) : (retry_count += 1) {
-                if (!tls_stream.hasPendingRead()) {
-                    try waitUntilReadable(tls_stream.fd, io, readiness_timeout);
-                }
+    _ = maybe_plain_reader;
 
-                const n: u32 = tls_stream.read(out) catch |err| switch (err) {
-                    error.WantRead, error.WantWrite => continue,
-                    error.ConnectionReset => return error.ConnectionClosed,
-                    else => return error.ReadFailed,
-                };
-                break :blk @intCast(n);
-            }
-
-            return error.ReadFailed;
-        },
+    var socket_view = connectionIoSocketView(io_conn);
+    const outcome = terminated_transport.readWithTimeout(&socket_view, io, out, tls_read_readiness_timeout_ns) catch |driver_err| {
+        log.warn(
+            "h2: readSome failed transport={s} fd={d} driver_err={s} bytes={d}",
+            .{ connectionIoTransportName(io_conn), connectionIoFd(io_conn), @errorName(driver_err), out.len },
+        );
+        return error.ReadFailed;
     };
-}
 
-fn timeoutForNanoseconds(timeout_ns: u64) Io.Timeout {
-    assert(timeout_ns > 0);
-    return .{ .duration = .{
-        .raw = Io.Duration.fromNanoseconds(@intCast(timeout_ns)),
-        .clock = .awake,
-    } };
-}
-
-fn waitUntilReadable(fd: i32, io: Io, timeout: Io.Timeout) Error!void {
-    assert(fd >= 0);
-    assert(tls_read_readiness_timeout_ns > 0);
-    var messages: [1]Io.net.IncomingMessage = .{Io.net.IncomingMessage.init};
-    var peek_buf: [1]u8 = undefined;
-    const maybe_err, _ = rawStreamForFd(fd).socket.receiveManyTimeout(
-        io,
-        &messages,
-        &peek_buf,
-        .{ .peek = true },
-        timeout,
-    );
-    if (maybe_err) |err| switch (err) {
-        error.Timeout => return error.ConnectionClosed,
-        error.ConnectionResetByPeer,
-        error.SocketUnconnected,
-        => return error.ConnectionClosed,
-        else => return error.ReadFailed,
+    return switch (outcome) {
+        .bytes => |n| @as(usize, @intCast(n)),
+        .closed,
+        .timeout,
+        => error.ConnectionClosed,
     };
 }
 
@@ -2762,48 +2737,19 @@ fn writeSome(io_conn: *ConnectionIo, io: Io, out: []const u8) Error!usize {
     assert(@intFromPtr(io_conn) != 0);
     assert(out.len > 0);
 
-    return switch (io_conn.*) {
-        .plain_fd => |fd| blk: {
-            var write_buf: [config.SERVER_WRITE_BUFFER_SIZE_BYTES]u8 = undefined;
-            var writer = rawStreamForFd(fd).writer(io, &write_buf);
-            writer.interface.writeAll(out) catch {
-                const write_err = writer.err orelse error.Unexpected;
-                return switch (write_err) {
-                    error.SystemResources => error.WouldBlock,
-                    error.ConnectionResetByPeer,
-                    error.SocketUnconnected,
-                    => error.ConnectionClosed,
-                    else => error.WriteFailed,
-                };
-            };
-            if (writer.interface.buffered().len > 0) {
-                writer.interface.flush() catch {
-                    const flush_err = writer.err orelse error.Unexpected;
-                    return switch (flush_err) {
-                        error.SystemResources => error.WouldBlock,
-                        error.ConnectionResetByPeer,
-                        error.SocketUnconnected,
-                        => error.ConnectionClosed,
-                        else => error.WriteFailed,
-                    };
-                };
-            }
-            break :blk out.len;
-        },
-        .tls_stream => |tls_stream| blk: {
-            const n: u32 = tls_stream.write(out) catch |err| switch (err) {
-                error.WantRead, error.WantWrite => return error.WouldBlock,
-                error.ConnectionReset => return error.ConnectionClosed,
-                else => {
-                    log.warn(
-                        "h2: writeSome failed transport=tls fd={d} tls_err={s} bytes={d}",
-                        .{ tls_stream.fd, @errorName(err), out.len },
-                    );
-                    return error.WriteFailed;
-                },
-            };
-            break :blk @intCast(n);
-        },
+    var socket_view = connectionIoSocketView(io_conn);
+    const outcome = terminated_transport.writeWithTimeout(&socket_view, io, out, write_stall_timeout_ns) catch |driver_err| {
+        log.warn(
+            "h2: writeSome failed transport={s} fd={d} driver_err={s} bytes={d}",
+            .{ connectionIoTransportName(io_conn), connectionIoFd(io_conn), @errorName(driver_err), out.len },
+        );
+        return error.WriteFailed;
+    };
+
+    return switch (outcome) {
+        .bytes => |n| @as(usize, @intCast(n)),
+        .closed => error.ConnectionClosed,
+        .timeout => error.WriteFailed,
     };
 }
 
@@ -2840,46 +2786,18 @@ fn connectionIoFd(io_conn: *const ConnectionIo) i32 {
 
 fn writeAll(io_conn: *ConnectionIo, io: Io, data: []const u8) Error!void {
     assert(@intFromPtr(io_conn) != 0);
-    assert(write_max_retry_count > 0);
+    assert(write_stall_timeout_ns > 0);
 
     if (data.len == 0) return;
 
     var written: usize = 0;
     var writes: usize = 0;
     const max_writes: usize = data.len + 1024;
-    var retry_count: u32 = 0;
-    var last_progress_ns: u64 = time.monotonicNanos();
 
     while (written < data.len and writes < max_writes) : (writes += 1) {
-        const n = writeSome(io_conn, io, data[written..]) catch |err| switch (err) {
-            error.WouldBlock => {
-                retry_count += 1;
-                const now_ns = time.monotonicNanos();
-                const since_progress_ns = now_ns -| last_progress_ns;
-                if (retry_count >= write_max_retry_count or since_progress_ns >= write_stall_timeout_ns) {
-                    log.warn(
-                        "h2: writeAll stalled transport={s} fd={d} written={d}/{d} retries={d} since_progress_ns={d}",
-                        .{
-                            connectionIoTransportName(io_conn),
-                            connectionIoFd(io_conn),
-                            written,
-                            data.len,
-                            retry_count,
-                            since_progress_ns,
-                        },
-                    );
-                    return error.WriteFailed;
-                }
-                std.Io.sleep(io, std.Io.Duration.fromNanoseconds(write_retry_sleep_ns), .awake) catch return error.WriteFailed;
-                continue;
-            },
-            else => return err,
-        };
-
+        const n = try writeSome(io_conn, io, data[written..]);
         if (n == 0) return error.ConnectionClosed;
         written += n;
-        retry_count = 0;
-        last_progress_ns = time.monotonicNanos();
     }
 
     if (written < data.len) {
@@ -2989,37 +2907,6 @@ fn appendFrame(out: []u8, frame_type: h2.FrameType, flags: u8, stream_id: u32, p
     });
     @memcpy(out[header.len..][0..payload.len], payload);
     return out[0 .. header.len + payload.len];
-}
-
-test "waitUntilReadable returns ConnectionClosed when timeout expires" {
-    const fds = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer posix.close(fds[0]);
-    defer posix.close(fds[1]);
-
-    const timeout: Io.Timeout = .{ .duration = .{
-        .raw = Io.Duration.fromMilliseconds(20),
-        .clock = .awake,
-    } };
-    try std.testing.expectError(error.ConnectionClosed, waitUntilReadable(fds[0], std.Options.debug_io, timeout));
-}
-
-test "waitUntilReadable preserves peeked data" {
-    const fds = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer posix.close(fds[0]);
-    defer posix.close(fds[1]);
-
-    const payload = [_]u8{0x24};
-    try std.testing.expectEqual(@as(usize, 1), try posix.write(fds[1], &payload));
-
-    const timeout: Io.Timeout = .{ .duration = .{
-        .raw = Io.Duration.fromMilliseconds(50),
-        .clock = .awake,
-    } };
-    try waitUntilReadable(fds[0], std.Options.debug_io, timeout);
-
-    var out: [1]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 1), try posix.read(fds[0], &out));
-    try std.testing.expectEqual(payload[0], out[0]);
 }
 
 test "buildResponseHeaderBlock encodes :status and application headers" {

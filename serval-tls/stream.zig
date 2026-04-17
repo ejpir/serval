@@ -55,6 +55,38 @@ const ReadinessDirection = enum {
     write,
 };
 
+/// Result of one non-blocking TLS read attempt.
+/// `.need_read`/`.need_write` signal readiness direction without throwing.
+pub const ReadStep = union(enum) {
+    bytes: u32,
+    closed,
+    need_read,
+    need_write,
+};
+
+/// Result of one non-blocking TLS write attempt.
+/// `.need_read`/`.need_write` signal readiness direction without throwing.
+pub const WriteStep = union(enum) {
+    bytes: u32,
+    closed,
+    need_read,
+    need_write,
+};
+
+/// Terminal errors for `readStep` (excludes retry/backpressure states).
+pub const ReadStepError = error{
+    ConnectionReset,
+    KtlsRead,
+    SslRead,
+};
+
+/// Terminal errors for `writeStep` (excludes retry/backpressure states).
+pub const WriteStepError = error{
+    ConnectionReset,
+    KtlsWrite,
+    SslWrite,
+};
+
 const WaitForReadyError = error{
     Timeout,
     ConnectionReset,
@@ -322,29 +354,32 @@ pub const TLSStream = struct {
         };
     }
 
-    /// Non-blocking TLS read primitive.
-    /// Returns number of bytes read, or 0 on clean shutdown.
-    /// TigerStyle: Explicit switch on mode (no default case).
-    pub fn read(self: *TLSStream, buf: []u8) !u32 {
+    /// Execute exactly one non-blocking TLS read step without readiness waits.
+    ///
+    /// Contract: `buf` must be non-empty and `self.fd` must reference an open,
+    /// non-blocking stream.
+    /// Ownership/lifetime: caller retains ownership of `self` and `buf`; both
+    /// must remain valid for the full duration of the call.
+    /// Failure semantics: returns `ReadStepError` on terminal TLS/fd failures;
+    /// backpressure is represented as `.need_read` / `.need_write` instead of
+    /// error unions.
+    pub fn readStep(self: *TLSStream, buf: []u8) ReadStepError!ReadStep {
         assert(buf.len > 0);
         assert(self.fd > 0);
 
-        switch (self.mode) {
-            .ktls => {
-                const result = posix.read(self.fd, buf);
-                const n = result catch |err| {
-                    return switch (err) {
-                        error.WouldBlock => error.WantRead,
-                        error.ConnectionResetByPeer => error.ConnectionReset,
-                        else => error.KtlsRead,
-                    };
+        return switch (self.mode) {
+            .ktls => blk: {
+                const n = posix.read(self.fd, buf) catch |err| switch (err) {
+                    error.WouldBlock => break :blk .need_read,
+                    error.ConnectionResetByPeer => return error.ConnectionReset,
+                    else => return error.KtlsRead,
                 };
-                if (n == 0) return 0;
+                if (n == 0) break :blk .closed;
                 const bytes_read: u32 = @intCast(n);
                 assert(bytes_read <= buf.len);
-                return bytes_read;
+                break :blk .{ .bytes = bytes_read };
             },
-            .userspace => |ssl_conn| {
+            .userspace => |ssl_conn| blk: {
                 const n = ssl.SSL_read(ssl_conn, buf.ptr, @intCast(buf.len));
                 if (n <= 0) {
                     const err = ssl.SSL_get_error(ssl_conn, n);
@@ -354,10 +389,10 @@ pub const TLSStream = struct {
                                 "TLS read closed: reason=close_notify fd={d} cipher={s}",
                                 .{ self.fd, self.info.cipher() },
                             );
-                            return 0;
+                            break :blk .closed;
                         },
-                        ssl.SSL_ERROR_WANT_READ => return error.WantRead,
-                        ssl.SSL_ERROR_WANT_WRITE => return error.WantWrite,
+                        ssl.SSL_ERROR_WANT_READ => break :blk .need_read,
+                        ssl.SSL_ERROR_WANT_WRITE => break :blk .need_write,
                         ssl.SSL_ERROR_SYSCALL => {
                             log.warn(
                                 "TLS read failed: reason=peer_reset fd={d} cipher={s} ssl_error={s} ret={d}",
@@ -384,11 +419,33 @@ pub const TLSStream = struct {
                         },
                     }
                 }
+
                 const bytes_read: u32 = @intCast(n);
                 assert(bytes_read <= buf.len);
-                return bytes_read;
+                break :blk .{ .bytes = bytes_read };
             },
-        }
+        };
+    }
+
+    /// Non-blocking TLS read primitive.
+    ///
+    /// Contract: `buf` must be non-empty and `self.fd` must reference a live
+    /// TLS stream.
+    /// Ownership/lifetime: caller retains ownership of `self` and `buf`.
+    /// Failure semantics: returns `error.WantRead`/`error.WantWrite` for
+    /// backpressure and terminal TLS/fd read failures for unrecoverable states.
+    /// Returns number of bytes read, or 0 on clean shutdown.
+    pub fn read(self: *TLSStream, buf: []u8) !u32 {
+        assert(buf.len > 0);
+        assert(self.fd > 0);
+
+        const step = self.readStep(buf) catch |err| return err;
+        return switch (step) {
+            .bytes => |n| n,
+            .closed => 0,
+            .need_read => error.WantRead,
+            .need_write => error.WantWrite,
+        };
     }
 
     /// Reads TLS application bytes using the stream's configured I/O timeout.
@@ -402,10 +459,13 @@ pub const TLSStream = struct {
     }
 
     /// Reads TLS application bytes with an explicit timeout budget in nanoseconds.
-    /// Preconditions: `buf.len > 0`, `fd > 0`, and `timeout_ns > 0`.
-    /// `buf` is caller-owned storage; no ownership transfer occurs.
-    /// Returns `error.Timeout` on readiness deadline exhaustion, `error.ConnectionReset` on reset paths,
-    /// or mode-specific TLS read errors (`SslRead`/`KtlsRead`) and `WantRead`/`WantWrite`-driven wait failures.
+    ///
+    /// Contract: `buf.len > 0`, `fd > 0`, and `timeout_ns > 0`.
+    /// Ownership/lifetime: `buf` and `self` stay caller-owned; no ownership
+    /// transfer occurs.
+    /// Failure semantics: returns `error.Timeout` when deadline budget expires,
+    /// `error.ConnectionReset` for reset paths, and mode-specific read failures
+    /// (`error.SslRead`/`error.KtlsRead`) for terminal TLS/fd errors.
     pub fn readWithTimeout(self: *TLSStream, buf: []u8, timeout_ns: u64) !u32 {
         assert(buf.len > 0);
         assert(self.fd > 0);
@@ -418,64 +478,69 @@ pub const TLSStream = struct {
         const deadline_ns = deadlineFromTimeout(timeout_ns);
         var iterations: u32 = 0;
         while (iterations < tls_io_max_iterations) : (iterations += 1) {
-            const n = self.read(buf) catch |err| switch (err) {
-                error.WantRead => {
+            const step = self.readStep(buf) catch |err| return err;
+            switch (step) {
+                .bytes => |n| {
+                    assert(n <= buf.len);
+                    return n;
+                },
+                .closed => return 0,
+                .need_read => {
                     waitForReady(self.fd, .read, deadline_ns) catch |wait_err| switch (wait_err) {
                         error.Timeout => return error.Timeout,
                         error.ConnectionReset => return error.ConnectionReset,
                         error.ReadinessWaitFailed => return readiness_wait_failed,
                     };
-                    continue;
                 },
-                error.WantWrite => {
+                .need_write => {
                     waitForReady(self.fd, .write, deadline_ns) catch |wait_err| switch (wait_err) {
                         error.Timeout => return error.Timeout,
                         error.ConnectionReset => return error.ConnectionReset,
                         error.ReadinessWaitFailed => return readiness_wait_failed,
                     };
-                    continue;
                 },
-                else => return err,
-            };
-            assert(n <= buf.len);
-            return n;
+            }
         }
 
         return error.Timeout;
     }
 
-    /// TLS write with nonblocking-aware error mapping.
-    /// Returns number of bytes written.
-    /// TigerStyle: Explicit switch on mode (no default case).
-    pub fn write(self: *TLSStream, data: []const u8) !u32 {
+    /// Execute exactly one non-blocking TLS write step without readiness waits.
+    ///
+    /// Contract: `data` must be non-empty and `self.fd` must reference a live
+    /// non-blocking TLS stream.
+    /// Ownership/lifetime: caller retains ownership of `self` and `data`; both
+    /// must remain valid for the full call duration.
+    /// Failure semantics: returns `WriteStepError` for terminal TLS/fd failures;
+    /// caller-facing backpressure is represented by `.need_read`/`.need_write`.
+    pub fn writeStep(self: *TLSStream, data: []const u8) WriteStepError!WriteStep {
         assert(data.len > 0);
         assert(self.fd > 0);
 
-        switch (self.mode) {
-            .ktls => {
+        return switch (self.mode) {
+            .ktls => blk: {
                 const file: std.Io.File = .{
                     .handle = self.fd,
                     .flags = .{ .nonblocking = true },
                 };
-                const n = file.writeStreaming(std.Options.debug_io, &.{}, &.{data}, 1) catch |err| {
-                    return switch (err) {
-                        error.BrokenPipe => error.ConnectionReset,
-                        error.WouldBlock => error.WantWrite,
-                        else => error.KtlsWrite,
-                    };
+                const n = file.writeStreaming(std.Options.debug_io, &.{}, &.{data}, 1) catch |err| switch (err) {
+                    error.BrokenPipe => return error.ConnectionReset,
+                    error.WouldBlock => break :blk .need_write,
+                    else => return error.KtlsWrite,
                 };
+                if (n == 0) break :blk .closed;
                 const bytes_written: u32 = @intCast(n);
                 assert(bytes_written <= data.len);
-                return bytes_written;
+                break :blk .{ .bytes = bytes_written };
             },
-            .userspace => |ssl_conn| {
+            .userspace => |ssl_conn| blk: {
                 const n = ssl.SSL_write(ssl_conn, data.ptr, @intCast(data.len));
                 if (n <= 0) {
                     const ssl_err = ssl.SSL_get_error(ssl_conn, n);
                     switch (ssl_err) {
-                        ssl.SSL_ERROR_WANT_READ => return error.WantRead,
-                        ssl.SSL_ERROR_WANT_WRITE => return error.WantWrite,
-                        ssl.SSL_ERROR_ZERO_RETURN => return error.ConnectionReset,
+                        ssl.SSL_ERROR_WANT_READ => break :blk .need_read,
+                        ssl.SSL_ERROR_WANT_WRITE => break :blk .need_write,
+                        ssl.SSL_ERROR_ZERO_RETURN => break :blk .closed,
                         ssl.SSL_ERROR_SYSCALL => return error.ConnectionReset,
                         else => return error.SslWrite,
                     }
@@ -483,9 +548,29 @@ pub const TLSStream = struct {
 
                 const bytes_written: u32 = @intCast(n);
                 assert(bytes_written <= data.len);
-                return bytes_written;
+                break :blk .{ .bytes = bytes_written };
             },
-        }
+        };
+    }
+
+    /// TLS write with nonblocking-aware error mapping.
+    ///
+    /// Contract: `data` must be non-empty and the stream must stay open.
+    /// Ownership/lifetime: caller retains ownership of `self` and `data`.
+    /// Failure semantics: returns `error.WantRead`/`error.WantWrite` for
+    /// backpressure and terminal TLS/fd write failures for fatal states.
+    /// Returns number of bytes written.
+    pub fn write(self: *TLSStream, data: []const u8) !u32 {
+        assert(data.len > 0);
+        assert(self.fd > 0);
+
+        const step = self.writeStep(data) catch |err| return err;
+        return switch (step) {
+            .bytes => |n| n,
+            .closed => error.ConnectionReset,
+            .need_read => error.WantRead,
+            .need_write => error.WantWrite,
+        };
     }
 
     /// Writes TLS application bytes using the stream's configured I/O timeout.
@@ -498,10 +583,13 @@ pub const TLSStream = struct {
     }
 
     /// Writes TLS application bytes with an explicit timeout budget in nanoseconds.
-    /// Preconditions: `data.len > 0`, `fd > 0`, and `timeout_ns > 0`.
-    /// `data` is borrowed input; no ownership is transferred or retained.
-    /// Returns `error.Timeout` when readiness deadline is exceeded, `error.ConnectionReset` for reset
-    /// paths, or mode-specific write failures (`SslWrite`/`KtlsWrite`).
+    ///
+    /// Contract: `data.len > 0`, `fd > 0`, and `timeout_ns > 0`.
+    /// Ownership/lifetime: `data` and `self` remain caller-owned and must stay
+    /// valid for the call duration.
+    /// Failure semantics: returns `error.Timeout` when readiness deadline
+    /// expires, `error.ConnectionReset` for reset/closed paths, and
+    /// mode-specific write failures (`error.SslWrite`/`error.KtlsWrite`).
     pub fn writeWithTimeout(self: *TLSStream, data: []const u8, timeout_ns: u64) !u32 {
         assert(data.len > 0);
         assert(self.fd > 0);
@@ -514,27 +602,28 @@ pub const TLSStream = struct {
         const deadline_ns = deadlineFromTimeout(timeout_ns);
         var iterations: u32 = 0;
         while (iterations < tls_io_max_iterations) : (iterations += 1) {
-            const n = self.write(data) catch |err| switch (err) {
-                error.WantRead => {
+            const step = self.writeStep(data) catch |err| return err;
+            switch (step) {
+                .bytes => |n| {
+                    assert(n <= data.len);
+                    return n;
+                },
+                .closed => return error.ConnectionReset,
+                .need_read => {
                     waitForReady(self.fd, .read, deadline_ns) catch |wait_err| switch (wait_err) {
                         error.Timeout => return error.Timeout,
                         error.ConnectionReset => return error.ConnectionReset,
                         error.ReadinessWaitFailed => return readiness_wait_failed,
                     };
-                    continue;
                 },
-                error.WantWrite => {
+                .need_write => {
                     waitForReady(self.fd, .write, deadline_ns) catch |wait_err| switch (wait_err) {
                         error.Timeout => return error.Timeout,
                         error.ConnectionReset => return error.ConnectionReset,
                         error.ReadinessWaitFailed => return readiness_wait_failed,
                     };
-                    continue;
                 },
-                else => return err,
-            };
-            assert(n <= data.len);
-            return n;
+            }
         }
 
         return error.Timeout;
@@ -732,6 +821,64 @@ fn populateHandshakeInfo(ssl_conn: *ssl.SSL, info: *HandshakeInfo) void {
 }
 
 // Tests
+fn makeKtlsTestStream(fd: c_int) TLSStream {
+    assert(fd > 0);
+    return .{
+        .fd = fd,
+        .mode = .{ .ktls = {} },
+        .allocator = std.testing.allocator,
+        .io_timeout_ns = default_tls_io_timeout_ns,
+        .info = HandshakeInfo{},
+    };
+}
+
+test "readStep returns need_read then bytes for kTLS mode" {
+    const fds = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer closeFd(fds[0]);
+    defer closeFd(fds[1]);
+
+    try setNonblocking(fds[0]);
+    try setNonblocking(fds[1]);
+
+    var stream = makeKtlsTestStream(fds[0]);
+    var buf: [4]u8 = undefined;
+
+    const step_idle = try stream.readStep(buf[0..1]);
+    try std.testing.expectEqual(ReadStep.need_read, step_idle);
+
+    const payload = [_]u8{0x5a};
+    try std.testing.expectEqual(@as(usize, 1), try posix.write(fds[1], &payload));
+
+    const step_data = try stream.readStep(buf[0..1]);
+    switch (step_data) {
+        .bytes => |n| try std.testing.expectEqual(@as(u32, 1), n),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(payload[0], buf[0]);
+}
+
+test "writeStep writes bytes for kTLS mode" {
+    const fds = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer closeFd(fds[0]);
+    defer closeFd(fds[1]);
+
+    try setNonblocking(fds[0]);
+    try setNonblocking(fds[1]);
+
+    var stream = makeKtlsTestStream(fds[0]);
+    const payload = [_]u8{ 0x42, 0x43 };
+    const step = try stream.writeStep(&payload);
+    switch (step) {
+        .bytes => |n| try std.testing.expectEqual(@as(u32, payload.len), n),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var out: [2]u8 = undefined;
+    const read_count = try posix.read(fds[1], &out);
+    try std.testing.expectEqual(@as(usize, payload.len), read_count);
+    try std.testing.expectEqualSlices(u8, &payload, &out);
+}
+
 test "waitForReady times out on idle readable fd" {
     const fds = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
     defer closeFd(fds[0]);
